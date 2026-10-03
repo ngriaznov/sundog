@@ -38,8 +38,8 @@ use crate::store::part::PartSet;
 #[cfg(feature = "spill")]
 use crate::store::spill::SpillConfig;
 use crate::store::{
-    ConflictResolver, Event, Lifetime, LoadError, Loader, LocalRearm, LwwResolver, Mode, Shard,
-    ShardOps, Sourced, Ttl, Weigher, encode_key, now_ms,
+    ConflictResolver, Event, Lifetime, LoadError, Loader, LocalRearm, LwwResolver, Mode,
+    RefreshRequest, Shard, ShardOps, Sourced, Ttl, Weigher, encode_key, now_ms, refresh_permille,
 };
 use crate::wire::WireRecord;
 
@@ -62,6 +62,7 @@ pub struct CacheBuilder<K, V> {
     prefold_enabled: bool,
     loader: Option<Loader<K, V>>,
     batch_window: Option<(Duration, usize)>,
+    refresh_ahead: Option<f64>,
     marker: PhantomData<fn() -> (K, V)>,
 }
 
@@ -88,6 +89,7 @@ where
             prefold_enabled: true,
             loader: None,
             batch_window: None,
+            refresh_ahead: None,
             marker: PhantomData,
         }
     }
@@ -235,6 +237,21 @@ where
         self
     }
 
+    /// Reloads an entry before it expires: a read that finds the entry past
+    /// `fraction` of its lifetime, `0.8` for the last fifth, answers with
+    /// it and asks for one reload through the loader. One node reloads each
+    /// key, the one its loads gather on, and its new value replaces the
+    /// entry like any write, so a hot key never expires and its source sees
+    /// one load per lifetime. A reload the source fails keeps the entry
+    /// until it expires; one that finds the key gone leaves it to expire.
+    /// Needs a loader and a [`CacheBuilder::ttl`], and works in every
+    /// [`Mode`] but [`Mode::Invalidation`]; `fraction` must lie strictly
+    /// between 0 and 1.
+    pub fn refresh_ahead(mut self, fraction: f64) -> Self {
+        self.refresh_ahead = Some(fraction);
+        self
+    }
+
     /// Configures the local SSD/NVMe spill tier: once `max_capacity` is
     /// exceeded, eviction demotes the coldest entries onto disk instead of
     /// discarding them, extending capacity beyond RAM. Off by default.
@@ -299,6 +316,7 @@ where
             prefold_enabled,
             loader,
             batch_window,
+            refresh_ahead,
             marker: _,
         } = self;
 
@@ -314,12 +332,21 @@ where
             return Err(CacheError::MergeWindowRequiresMergingResolver { cache: name });
         }
 
-        if let Err(reason) = validate_load_config(loader.is_some(), batch_window.is_some()) {
-            return Err(CacheError::InvalidLoadConfig {
-                cache: name,
-                reason,
-            });
-        }
+        let refresh_permille = match validate_load_config(LoadConfig {
+            has_loader: loader.is_some(),
+            has_batch_window: batch_window.is_some(),
+            refresh_ahead,
+            has_ttl: ttl.is_some(),
+            mode,
+        }) {
+            Ok(permille) => permille,
+            Err(reason) => {
+                return Err(CacheError::InvalidLoadConfig {
+                    cache: name,
+                    reason,
+                });
+            }
+        };
         let loader = match (loader, batch_window) {
             (Some(loader), Some((window, max_keys))) => Some(loader.with_window(window, max_keys)),
             (loader, _) => loader,
@@ -376,6 +403,9 @@ where
         let has_loader = loader.is_some();
         if let Some(loader) = loader {
             shard = shard.with_loader(loader);
+        }
+        if let Some(permille) = refresh_permille {
+            shard = shard.with_refresh_ahead(permille);
         }
         // Bounded wait for a first known peer, `Mode::Distributed` only,
         // before `attach_ownership` computes the first view; see
@@ -544,6 +574,26 @@ fn validate_merge_window(window: Duration, resolver_merges: bool) -> bool {
     window.is_zero() || resolver_merges
 }
 
+/// The live peers a key of cache `name`, open here under `mode`, may load
+/// or refresh on: they speak [`crate::wire::PROTOCOL_LOAD`], advertise a
+/// loader for `name`, and have it open under the same [`Mode`].
+fn loader_peers(cluster: &Cluster, name: &str, mode: Mode) -> HashSet<NodeId> {
+    let loaders = cluster.advertised_loaders();
+    let modes = cluster.advertised_cache_modes();
+    cluster
+        .peers()
+        .into_iter()
+        .filter(|peer| {
+            crate::wire::peer_supports(peer.protocol, crate::wire::PROTOCOL_LOAD)
+                && loaders
+                    .get(&peer.node)
+                    .is_some_and(|caches| caches.contains(name))
+                && modes.get(&peer.node).and_then(|caches| caches.get(name)) == Some(&mode)
+        })
+        .map(|peer| peer.node)
+        .collect()
+}
+
 /// Whether [`Cache::load`] in `mode` gathers each key's loads on one node.
 /// `Mode::Local` has no peers, and in `Mode::Replicated` a loaded value
 /// reaches every node anyway, so each loads for itself. Pure; unit tested
@@ -598,13 +648,42 @@ fn load_target(
     }
 }
 
-/// Whether the loading options a builder carries fit together: a batch
-/// window needs a loader to batch for. Pure; unit tested directly.
-fn validate_load_config(has_loader: bool, has_batch_window: bool) -> Result<(), &'static str> {
-    if has_batch_window && !has_loader {
+/// The loading options a builder carries, as [`validate_load_config`]
+/// checks them.
+#[derive(Clone, Copy)]
+struct LoadConfig {
+    has_loader: bool,
+    has_batch_window: bool,
+    refresh_ahead: Option<f64>,
+    has_ttl: bool,
+    mode: Mode,
+}
+
+/// Whether the loading options a builder carries fit together, and the
+/// refresh point in thousandths of a lifetime when refresh-ahead is on: a
+/// batch window needs a loader to batch for, and refresh-ahead needs a
+/// loader, a TTL to refresh ahead of, a mode whose reloaded value reaches
+/// the nodes that read it, and a fraction strictly between 0 and 1. Pure;
+/// unit tested directly.
+fn validate_load_config(config: LoadConfig) -> Result<Option<u64>, &'static str> {
+    if config.has_batch_window && !config.has_loader {
         return Err("batch_window needs a loader");
     }
-    Ok(())
+    let Some(fraction) = config.refresh_ahead else {
+        return Ok(None);
+    };
+    if !config.has_loader {
+        return Err("refresh_ahead needs a loader");
+    }
+    if !config.has_ttl {
+        return Err("refresh_ahead needs a ttl");
+    }
+    if matches!(config.mode, Mode::Invalidation) {
+        return Err("refresh_ahead does not apply to Mode::Invalidation");
+    }
+    refresh_permille(fraction)
+        .map(Some)
+        .ok_or("refresh_ahead takes a fraction strictly between 0 and 1")
 }
 
 /// Where a `Mode::Distributed` read's answer came from.
@@ -892,6 +971,82 @@ async fn spawn_cache_tasks<K, V>(
             tasks,
             merge_coalesce_task(Arc::clone(shard), cancel.clone()),
         );
+    }
+    if let Some(requests) = shard.take_refresh_requests() {
+        cluster.spawn_tracked_in(
+            tasks,
+            refresh_task(Arc::clone(shard), cluster.clone(), requests, cancel.clone()),
+        );
+    }
+}
+
+/// The most refresh requests [`refresh_task`] takes off its queue at once.
+const REFRESH_BURST: usize = 1_024;
+
+/// Drains the reloads reads ask for under [`CacheBuilder::refresh_ahead`].
+/// A key this node refreshes, the node [`load_target`] picks for it, and a
+/// key a peer's hint sent here reload in one [`Shard::refresh`] pass per
+/// drained burst; a key another node refreshes goes to it as a
+/// [`crate::wire::Msg::RefreshHint`], or reloads here when the hint cannot
+/// be sent. Counts `sundog_refreshes_total{cache, outcome}` and
+/// `sundog_refresh_hints_sent_total{cache}`.
+async fn refresh_task<K, V>(
+    shard: Arc<Shard<K, V>>,
+    cluster: Cluster,
+    mut requests: tokio::sync::mpsc::Receiver<RefreshRequest<K>>,
+    cancel: CancellationToken,
+) where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    let name = SmolStr::new(shard.name());
+    let mode = shard.mode();
+    let outcome = |outcome: &'static str| metrics::counter!("sundog_refreshes_total", "cache" => name.to_string(), "outcome" => outcome);
+    let (loaded, absent, failed) = (outcome("loaded"), outcome("absent"), outcome("failed"));
+    let hints_sent =
+        metrics::counter!("sundog_refresh_hints_sent_total", "cache" => name.to_string());
+    let mut burst = Vec::new();
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            received = requests.recv_many(&mut burst, REFRESH_BURST) => {
+                if received == 0 {
+                    return;
+                }
+            }
+        }
+        let me = cluster.node_id();
+        let capable = loader_peers(&cluster, &name, mode);
+        let view = shard.ownership_view();
+        let mut here = Vec::with_capacity(burst.len());
+        for request in burst.drain(..) {
+            let target = if request.hinted || matches!(mode, Mode::Local) {
+                LoadTarget::Here
+            } else {
+                let part = PartId::of_key(&request.key_bytes);
+                let owners = view.as_ref().map_or(&[][..], |view| view.owners_of(part));
+                load_target(mode, part, me, owners, &capable)
+            };
+            match target {
+                LoadTarget::Peer(peer)
+                    if cluster.mesh().send_refresh_hint(
+                        peer,
+                        name.clone(),
+                        request.key_bytes.clone(),
+                        request.ver,
+                    ) =>
+                {
+                    hints_sent.increment(1);
+                }
+                _ => here.push(request),
+            }
+        }
+        if !here.is_empty() {
+            let tally = shard.refresh(here).await;
+            loaded.increment(tally.loaded);
+            absent.increment(tally.absent);
+            failed.increment(tally.failed);
+        }
     }
 }
 
@@ -1448,6 +1603,18 @@ where
                 Ok(value)
             }
             Ok(OwnerAnswer::Remote(rec)) => {
+                if let Some(rec) = &rec
+                    && rec.value.is_some()
+                {
+                    self.shard.note_read(
+                        key,
+                        &rec.key,
+                        crate::store::hash_key_bytes(&rec.key),
+                        rec.ver,
+                        rec.expires_at_ms,
+                        now_ms(),
+                    );
+                }
                 let value = rec.and_then(|rec| decode_live_value::<V>(&rec));
                 record_fetch_outcome(
                     self.shard.name(),
@@ -1800,26 +1967,9 @@ where
         Ok(sourced)
     }
 
-    /// The live peers a key of this cache may load on: they speak
-    /// [`crate::wire::PROTOCOL_LOAD`], advertise a loader for this cache,
-    /// and have it open under the same [`Mode`].
+    /// [`loader_peers`] for this cache.
     fn loader_peers(&self) -> HashSet<NodeId> {
-        let name = self.shard.name();
-        let mode = self.shard.mode();
-        let loaders = self.cluster.advertised_loaders();
-        let modes = self.cluster.advertised_cache_modes();
-        self.cluster
-            .peers()
-            .into_iter()
-            .filter(|peer| {
-                crate::wire::peer_supports(peer.protocol, crate::wire::PROTOCOL_LOAD)
-                    && loaders
-                        .get(&peer.node)
-                        .is_some_and(|caches| caches.contains(name))
-                    && modes.get(&peer.node).and_then(|caches| caches.get(name)) == Some(&mode)
-            })
-            .map(|peer| peer.node)
-            .collect()
+        loader_peers(&self.cluster, self.shard.name(), self.shard.mode())
     }
 
     /// Writes `key` = `value`: stamps an HLC version, applies locally, and
@@ -4758,6 +4908,241 @@ mod tests {
         shut_down_all(nodes).await;
     }
 
+    /// `count` nodes with `name` open under `mode` with a 2s TTL and
+    /// refresh-ahead at 0.5, each with a batch loader that records its
+    /// calls in `log` and holds `v{key}.{n}`, `n` counting calls across all
+    /// nodes. Returns once every node sees the others advertise a loader.
+    async fn refreshing_nodes(
+        name: &'static str,
+        mode: Mode,
+        count: usize,
+        log: &LoadLog,
+    ) -> Vec<(Cluster, Cache<u32, String>)> {
+        let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut nodes: Vec<(Cluster, Cache<u32, String>)> = Vec::new();
+        for index in 0..count {
+            let builder = Cluster::builder(name).config(loopback_config());
+            let cluster = match nodes.first() {
+                None => builder.seeds(std::iter::empty()),
+                Some((seed, _)) => builder.seeds([seed.local_gossip_addr()]),
+            }
+            .build()
+            .await
+            .expect("node builds");
+            wait_for_peer_count(&cluster, index).await;
+            let node = cluster.node_id();
+            let (log, calls) = (Arc::clone(log), Arc::clone(&calls));
+            let cache = cluster
+                .cache::<u32, String>(name)
+                .mode(mode)
+                .ttl(Duration::from_secs(2))
+                .refresh_ahead(0.5)
+                .batch_loader(move |keys: Vec<u32>| {
+                    let (log, calls) = (Arc::clone(&log), Arc::clone(&calls));
+                    async move {
+                        let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        let mut sorted = keys.clone();
+                        sorted.sort_unstable();
+                        log.lock().expect("log lock").push((node, sorted));
+                        Ok::<_, SourceDown>(
+                            keys.into_iter()
+                                .map(|key| (key, format!("v{key}.{call}")))
+                                .collect::<HashMap<_, _>>(),
+                        )
+                    }
+                })
+                .open()
+                .await
+                .expect("opens");
+            nodes.push((cluster, cache));
+        }
+        wait_until(
+            Duration::from_secs(10),
+            "every node sees the others advertise a loader",
+            async || {
+                nodes
+                    .iter()
+                    .all(|(_, cache)| cache.loader_peers().len() == count - 1)
+            },
+        )
+        .await;
+        nodes
+    }
+
+    #[tokio::test]
+    async fn refresh_ahead_keeps_a_read_key_alive_past_its_expiry_on_one_node() {
+        let log = LoadLog::default();
+        let nodes = refreshing_nodes("cache-it-refresh-local", Mode::Local, 1, &log).await;
+        let cache = &nodes[0].1;
+        assert_eq!(
+            cache.load(&1).await.expect("load"),
+            Some("v1.1".to_string())
+        );
+        let loaded_at = Instant::now();
+        while loaded_at.elapsed() < Duration::from_millis(4_500) {
+            assert!(
+                cache.get(&1).await.is_some(),
+                "a key read through its refresh window never expires"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // A reload restarts the 2s lifetime, so the next refresh point is
+        // 1s later: over 4.5s of reads, the load and about four reloads.
+        let loads = log.lock().expect("log lock").len();
+        assert!(
+            (4..=6).contains(&loads),
+            "about one reload a refresh interval, not one per read: {loads} loads"
+        );
+        shut_down_all(nodes).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_ahead_reloads_a_replicated_key_once_on_its_refresher() {
+        let log = LoadLog::default();
+        let nodes =
+            refreshing_nodes("cache-it-refresh-replicated", Mode::Replicated, 2, &log).await;
+        let (a, cache_a) = &nodes[0];
+        let (b, cache_b) = &nodes[1];
+        let key = 7u32;
+        assert_eq!(
+            cache_a.load(&key).await.expect("load"),
+            Some("v7.1".to_string())
+        );
+        wait_until(
+            Duration::from_secs(5),
+            "b holds the loaded value",
+            async || cache_b.get(&key).await.is_some(),
+        )
+        .await;
+        let part = PartId::of_key(&encode_key(&key).expect("u32 encodes"));
+        let refresher = match load_target(
+            Mode::Replicated,
+            part,
+            a.node_id(),
+            &[],
+            &[b.node_id()].into_iter().collect(),
+        ) {
+            LoadTarget::Here => a.node_id(),
+            LoadTarget::Peer(peer) => peer,
+        };
+
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        for _ in 0..20 {
+            assert!(cache_a.get(&key).await.is_some());
+            assert!(cache_b.get(&key).await.is_some());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        wait_until(
+            Duration::from_secs(5),
+            "both nodes hold the reloaded value",
+            async || {
+                cache_a.get(&key).await == Some("v7.2".to_string())
+                    && cache_b.get(&key).await == Some("v7.2".to_string())
+            },
+        )
+        .await;
+        let log = log.lock().expect("log lock").clone();
+        assert_eq!(
+            log.len(),
+            2,
+            "one load and one reload for both nodes' reads: {log:?}"
+        );
+        assert_eq!(log[1], (refresher, vec![key]), "the refresher reloads");
+        shut_down_all(nodes).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_ahead_reloads_a_distributed_key_a_non_owner_fetches_on_its_owner() {
+        let log = LoadLog::default();
+        let nodes =
+            refreshing_nodes("cache-it-refresh-distributed", Mode::distributed(), 3, &log).await;
+        let (a, cache_a) = &nodes[0];
+        let key = (0..10_000u32)
+            .find(|key| !cache_a.owners_of(key).contains(&a.node_id()))
+            .expect("a key a does not own");
+        let owners = cache_a.owners_of(&key);
+        wait_until(
+            Duration::from_secs(10),
+            "every node agrees on the key's owners",
+            async || {
+                nodes
+                    .iter()
+                    .all(|(_, cache)| cache.owners_of(&key) == owners)
+            },
+        )
+        .await;
+        assert!(cache_a.load(&key).await.expect("load").is_some());
+        let first = log.lock().expect("log lock").len();
+
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert!(cache_a.fetch(&key).await.expect("fetch").is_some());
+        wait_until(
+            Duration::from_secs(5),
+            "the first owner reloads the key a non-owner read",
+            async || log.lock().expect("log lock").len() > first,
+        )
+        .await;
+        assert_eq!(
+            log.lock().expect("log lock")[first],
+            (owners[0], vec![key]),
+            "the first owner reloads"
+        );
+        shut_down_all(nodes).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_ahead_needs_a_loader_a_ttl_and_a_mode_that_carries_values() {
+        let cluster = Cluster::builder("cache-it-refresh-config")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node builds");
+        let loader = |key: u32| async move { Ok::<_, SourceDown>(Some(format!("v{key}"))) };
+        let reason = |result: Result<Cache<u32, String>, CacheError>| match result {
+            Err(CacheError::InvalidLoadConfig { reason, .. }) => reason,
+            other => panic!("an invalid load config, got {other:?}"),
+        };
+        assert_eq!(
+            reason(
+                cluster
+                    .cache::<u32, String>("no-ttl")
+                    .loader(loader)
+                    .refresh_ahead(0.8)
+                    .open()
+                    .await
+            ),
+            "refresh_ahead needs a ttl"
+        );
+        assert_eq!(
+            reason(
+                cluster
+                    .cache::<u32, String>("invalidation")
+                    .mode(Mode::Invalidation)
+                    .ttl(Duration::from_secs(1))
+                    .loader(loader)
+                    .refresh_ahead(0.8)
+                    .open()
+                    .await
+            ),
+            "refresh_ahead does not apply to Mode::Invalidation"
+        );
+        assert_eq!(
+            reason(
+                cluster
+                    .cache::<u32, String>("whole")
+                    .mode(Mode::Local)
+                    .ttl(Duration::from_secs(1))
+                    .loader(loader)
+                    .refresh_ahead(1.0)
+                    .open()
+                    .await
+            ),
+            "refresh_ahead takes a fraction strictly between 0 and 1"
+        );
+        cluster.shutdown().await;
+    }
+
     #[tokio::test]
     async fn a_new_lifetime_replicates_to_every_replica() {
         let name = "cache-it-ttl-replicated";
@@ -5149,14 +5534,56 @@ mod tests {
         assert!(spread.len() > 1, "parts spread across the loaders");
     }
 
+    fn load_config(has_loader: bool, has_batch_window: bool) -> LoadConfig {
+        LoadConfig {
+            has_loader,
+            has_batch_window,
+            refresh_ahead: None,
+            has_ttl: true,
+            mode: Mode::Replicated,
+        }
+    }
+
     #[test]
     fn validate_load_config_needs_a_loader_for_a_batch_window() {
-        assert_eq!(validate_load_config(false, false), Ok(()));
-        assert_eq!(validate_load_config(true, false), Ok(()));
-        assert_eq!(validate_load_config(true, true), Ok(()));
+        assert_eq!(validate_load_config(load_config(false, false)), Ok(None));
+        assert_eq!(validate_load_config(load_config(true, false)), Ok(None));
+        assert_eq!(validate_load_config(load_config(true, true)), Ok(None));
         assert_eq!(
-            validate_load_config(false, true),
+            validate_load_config(load_config(false, true)),
             Err("batch_window needs a loader")
+        );
+    }
+
+    #[test]
+    fn validate_load_config_checks_refresh_ahead() {
+        let refresh = |fraction, has_loader, has_ttl, mode| {
+            validate_load_config(LoadConfig {
+                has_loader,
+                has_batch_window: false,
+                refresh_ahead: Some(fraction),
+                has_ttl,
+                mode,
+            })
+        };
+        for mode in [Mode::Local, Mode::Replicated, Mode::distributed()] {
+            assert_eq!(refresh(0.8, true, true, mode), Ok(Some(800)), "{mode:?}");
+        }
+        assert_eq!(
+            refresh(0.8, false, true, Mode::Replicated),
+            Err("refresh_ahead needs a loader")
+        );
+        assert_eq!(
+            refresh(0.8, true, false, Mode::Replicated),
+            Err("refresh_ahead needs a ttl")
+        );
+        assert_eq!(
+            refresh(0.8, true, true, Mode::Invalidation),
+            Err("refresh_ahead does not apply to Mode::Invalidation")
+        );
+        assert_eq!(
+            refresh(1.0, true, true, Mode::Replicated),
+            Err("refresh_ahead takes a fraction strictly between 0 and 1")
         );
     }
 

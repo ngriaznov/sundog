@@ -2813,6 +2813,70 @@ where
         Some(decode_value(record_value(live.record.as_slice())))
     }
 
+    /// [`Engine::get_by_bytes`] that also returns the entry's version and
+    /// absolute expiry, `None` for none: what refresh-ahead checks a read
+    /// against.
+    pub(crate) fn get_with_lifetime(
+        &self,
+        key_bytes: &[u8],
+        hash: u64,
+        now_ms: u64,
+    ) -> Option<(V, Hlc, Option<u64>)> {
+        let stripe = self.stripes[stripe_index_from_hash(hash)].read();
+        let live = stripe
+            .live
+            .find(hash, |l| record_key(&l.record) == key_bytes)?;
+        if self.is_absent(live, key_bytes, &stripe.long_ttl, now_ms) || !is_resident(live) {
+            return None;
+        }
+        self.touch(live, now_ms);
+        let deadline = decode_expiry(live.wall_ms, live.expiry, key_bytes, &stripe.long_ttl);
+        Some((
+            decode_value(record_value(live.record.as_slice())),
+            live.ver(),
+            deadline,
+        ))
+    }
+
+    /// The version and absolute expiry of the key's live entry, resident or
+    /// spilled, and `None` with no live entry. Not an access.
+    pub(crate) fn lifetime_of(
+        &self,
+        key_bytes: &[u8],
+        hash: u64,
+        now_ms: u64,
+    ) -> Option<(Hlc, Option<u64>)> {
+        let stripe = self.stripes[stripe_index_from_hash(hash)].read();
+        let live = stripe
+            .live
+            .find(hash, |l| record_key(&l.record) == key_bytes)?;
+        if self.is_absent(live, key_bytes, &stripe.long_ttl, now_ms) {
+            return None;
+        }
+        Some((
+            live.ver(),
+            decode_expiry(live.wall_ms, live.expiry, key_bytes, &stripe.long_ttl),
+        ))
+    }
+
+    /// Registers a reload of a key that may still hold a live entry, for
+    /// refresh-ahead: readers keep answering from the entry while the
+    /// reload runs, and [`Engine::miss_or_join`] joins it only once the
+    /// entry is gone. `None` when a load for the key is already in flight.
+    /// The reload ends like any other load, through
+    /// [`Engine::complete_fresh_load`] or [`Engine::abandon_inflight`].
+    pub(crate) fn begin_refresh(&self, key_bytes: &Bytes, hash: u64) -> Option<Arc<Inflight<V>>> {
+        let mut stripe = self.stripes[stripe_index_from_hash(hash)].write();
+        if stripe.inflight.contains_key(key_bytes.as_ref()) {
+            return None;
+        }
+        let inflight = Arc::new(Inflight::new());
+        stripe
+            .inflight
+            .insert(key_bytes.clone(), Arc::clone(&inflight));
+        Some(inflight)
+    }
+
     /// Whether `key` has a live, unexpired, non-idle entry.
     pub(crate) fn contains_key(&self, key: &K, now_ms: u64) -> bool {
         let Ok(key_buf) = encode_key_for_read(key) else {

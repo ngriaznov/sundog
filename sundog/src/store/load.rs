@@ -307,6 +307,10 @@ where
     #[must_use]
     pub fn with_loader(mut self, loader: Loader<K, V>) -> Self {
         self.loader = Some(loader);
+        self.loader_calls = Some(metrics::counter!(
+            "sundog_loader_calls_total",
+            "cache" => self.name.to_string()
+        ));
         self
     }
 
@@ -353,10 +357,7 @@ where
         }
         let key_bytes = encode_key(key)?;
         let hash = engine::hash_key_bytes(key_bytes.as_ref());
-        if let Some(value) = self
-            .engine
-            .get_by_bytes(key_bytes.as_ref(), hash, self.now_ms())
-        {
+        if let Some(value) = self.read_resident(key, key_bytes.as_ref(), hash, self.now_ms()) {
             self.hits.increment(1);
             return Ok(Some(value));
         }
@@ -389,12 +390,16 @@ where
     }
 
     /// Runs the registered loader on `keys` without touching the cache:
-    /// what the source holds for them. Empty without a loader.
+    /// what the source holds for them. Empty without a loader. Counts
+    /// `sundog_loader_calls_total{cache}`.
     pub(crate) async fn call_loader(&self, keys: Vec<K>) -> Result<HashMap<K, V>, LoadError> {
-        match &self.loader {
-            Some(loader) => (loader.load)(keys).await,
-            None => Ok(HashMap::new()),
+        let Some(loader) = &self.loader else {
+            return Ok(HashMap::new());
+        };
+        if let Some(calls) = &self.loader_calls {
+            calls.increment(1);
         }
+        (loader.load)(keys).await
     }
 
     /// [`Shard::load_many`] with the keys this node misses read from
@@ -543,7 +548,7 @@ where
         let mut waits = Vec::with_capacity(todo.len());
         for (key, key_bytes, hash) in todo {
             let now = self.now_ms();
-            if let Some(value) = self.engine.get_by_bytes(key_bytes.as_ref(), hash, now) {
+            if let Some(value) = self.read_resident(&key, key_bytes.as_ref(), hash, now) {
                 self.hits.increment(1);
                 found.insert(key, value);
                 continue;

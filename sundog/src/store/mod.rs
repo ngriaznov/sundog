@@ -36,6 +36,7 @@ use crate::wire::{self, MAX_FRAME, WireRecord};
 mod engine;
 mod load;
 pub(crate) mod part;
+mod refresh;
 use engine::{ApplyOutcome, Engine, JoinOutcome, Reservation};
 
 /// Reference CRDT value types (a PN-Counter today) and the
@@ -66,10 +67,12 @@ pub const BUCKET_COUNT: usize = 1024;
 /// finer grain before either side sends a listing or a sketch.
 pub const PART_COUNT: usize = 64;
 
+pub(crate) use engine::hash_key_bytes;
 pub(crate) use load::Sourced;
 pub use load::{DEFAULT_MAX_BATCH_KEYS, LoadError, Loader};
 pub use part::PartId;
 pub(crate) use part::PartMask;
+pub(crate) use refresh::{RefreshRequest, refresh_permille};
 
 /// A custom per-entry weigher for size-bounded eviction: `(key, value) ->
 /// weight`. Boxed so [`crate::cache::CacheBuilder::weigher`] and
@@ -1642,8 +1645,15 @@ where
     /// [`Shard::with_loader`]'s loader, which [`Shard::load`] and
     /// [`Shard::load_many`] answer a miss through.
     loader: Option<Loader<K, V>>,
+    /// `sundog_loader_calls_total{cache}`, registered by
+    /// [`Shard::with_loader`] only, so a cache with no loader exports no
+    /// series.
+    loader_calls: Option<metrics::Counter>,
     /// The loads waiting for the loader's batch window to close.
     load_queue: load::LoadQueue<K, V>,
+    /// [`Shard::with_refresh_ahead`]'s configuration and state, `None`
+    /// without refresh-ahead.
+    refresh: Option<refresh::Refresh<K>>,
     /// `Some` only for `Mode::Distributed`, set once at construction via
     /// [`Shard::with_ownership`], before this shard is ever shared. Backs
     /// [`ShardOps::ownership_view`].
@@ -1792,7 +1802,9 @@ where
             hits,
             misses,
             loader: None,
+            loader_calls: None,
             load_queue: load::LoadQueue::new(),
+            refresh: None,
             ownership: None,
             residency: None,
             #[cfg(feature = "spill")]
@@ -1931,31 +1943,9 @@ where
         (resident_bytes >= self.max_resident_bytes).then_some(resident_bytes)
     }
 
-    /// Ends a [`Shard::get_or_load`] fill that finished at the ceiling:
-    /// hands `value` to every joined waiter without storing it, and counts
-    /// the loader run as a miss and an uncached fill.
-    fn finish_uncached_fill(
-        &self,
-        key_bytes: &Bytes,
-        hash: u64,
-        inflight: &engine::Inflight<V>,
-        value: V,
-    ) {
-        self.engine
-            .finish_uncached(key_bytes, hash, inflight, value);
-        self.misses.increment(1);
-        if let Some(refusals) = &self.ceiling_refusals {
-            refusals.fills.increment(1);
-        }
-    }
-
     /// Ends a loader run that returned `value` for `key`, the load stamped
-    /// `ver` before it started: stores the value through
-    /// [`engine::Engine::complete_fresh_load`], or hands it to joined
-    /// waiters uncached at the ceiling. A stored fill fans out per
-    /// [`fill_fans_out`] and emits [`Event::Created`]; one a write, removal
-    /// or invalidation overtook stores and sends nothing. Counts the run as
-    /// a miss either way.
+    /// `ver` before it started, through [`Shard::store_loaded`], and counts
+    /// the run as a miss.
     fn finish_fill(
         &self,
         key: &K,
@@ -1965,9 +1955,33 @@ where
         inflight: &engine::Inflight<V>,
         value: V,
     ) {
+        self.store_loaded(key, key_bytes, hash, ver, inflight, value);
+        self.misses.increment(1);
+    }
+
+    /// Stores a loaded `value` for `key` through
+    /// [`engine::Engine::complete_fresh_load`], the load stamped `ver`
+    /// before it started, or hands it to joined waiters uncached at the
+    /// ceiling. A stored value fans out per [`fill_fans_out`] and emits
+    /// [`Event::Created`], or [`Event::Updated`] over a live entry; one a
+    /// write, removal or invalidation overtook stores and sends nothing.
+    /// Returns whether the value was stored.
+    fn store_loaded(
+        &self,
+        key: &K,
+        key_bytes: &Bytes,
+        hash: u64,
+        ver: Hlc,
+        inflight: &engine::Inflight<V>,
+        value: V,
+    ) -> bool {
         if self.at_ceiling().is_some() {
-            self.finish_uncached_fill(key_bytes, hash, inflight, value);
-            return;
+            self.engine
+                .finish_uncached(key_bytes, hash, inflight, value);
+            if let Some(refusals) = &self.ceiling_refusals {
+                refusals.fills.increment(1);
+            }
+            return false;
         }
         let encoded = Bytes::from(
             postcard::to_stdvec(&value)
@@ -1987,25 +2001,24 @@ where
             self.now_ms(),
             inflight,
         );
-        self.misses.increment(1);
-        if matches!(
-            outcome,
-            engine::FillOutcome::Superseded | engine::FillOutcome::Invalidated
-        ) {
-            return;
-        }
+        let engine::FillOutcome::Installed { had_live } = outcome else {
+            return false;
+        };
         // A refusal means the cache is closing; the loaded value still
         // answers the read.
         if fill_fans_out(self.mode) {
             let _ = self.fan_out.push(FanOutItem::Applied(key.clone()));
         }
         if self.events.receiver_count() > 0 {
-            let _ = self.events.send(Event::Created {
-                key: key.clone(),
-                value,
-                origin: Origin::Local,
+            let key = key.clone();
+            let origin = Origin::Local;
+            let _ = self.events.send(if had_live {
+                Event::Updated { key, value, origin }
+            } else {
+                Event::Created { key, value, origin }
             });
         }
+        true
     }
 
     /// `Err(CacheError::OverMemoryCeiling)`, counted, when this shard is at
@@ -2872,7 +2885,7 @@ where
     /// the store module's docs and [`Shard::get_sync`], which never does
     /// this.
     pub async fn get(&self, key: &K) -> Option<V> {
-        if let Some(value) = self.engine.get(key, self.now_ms()) {
+        if let Some(value) = self.read_resident_key(key, self.now_ms()) {
             self.hits.increment(1);
             return Some(value);
         }
@@ -2894,7 +2907,7 @@ where
     /// value; it also promotes the entry back to residency on success.
     #[must_use]
     pub fn get_sync(&self, key: &K) -> Option<V> {
-        if let Some(value) = self.engine.get(key, self.now_ms()) {
+        if let Some(value) = self.read_resident_key(key, self.now_ms()) {
             self.hits.increment(1);
             Some(value)
         } else {
@@ -4554,6 +4567,11 @@ where
     #[allow(private_interfaces, reason = "see ShardOps::serve_load")]
     fn serve_load(&self, keys: Vec<Bytes>) -> BoxFuture<'_, crate::net::LoadServe> {
         Box::pin(self.serve_load_encoded(keys))
+    }
+
+    fn refresh_hint(&self, key: Bytes, ver: Hlc) -> BoxFuture<'_, ()> {
+        self.take_refresh_hint(&key, ver);
+        Box::pin(async {})
     }
 
     fn digests(&self) -> BoxFuture<'_, Vec<BucketDigest>> {

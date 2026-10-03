@@ -245,6 +245,157 @@ async fn memory_ceiling_pin_metrics(cluster: &Cluster) -> u64 {
         .expect("a capped cache counts its bytes")
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("source unavailable")]
+struct SourceDown;
+
+/// Drives `sundog_loader_calls_total{cache}` on a `Mode::Local` cache: one
+/// loader call for three missed keys, none for a hit, and one for a key the
+/// source lacks. A cache with no loader exports no series.
+async fn loader_calls_pin_metric(cluster: &Cluster) {
+    let cache = cluster
+        .cache::<u32, String>("load-pin")
+        .mode(Mode::Local)
+        .batch_loader(|keys: Vec<u32>| async move {
+            Ok::<_, SourceDown>(
+                keys.into_iter()
+                    .filter(|key| *key < 10)
+                    .map(|key| (key, format!("v{key}")))
+                    .collect::<std::collections::HashMap<_, _>>(),
+            )
+        })
+        .open()
+        .await
+        .expect("cache opens");
+    assert_eq!(
+        cache.load_many([1, 2, 3]).await.expect("load_many").len(),
+        3
+    );
+    assert_eq!(cache.load(&1).await.expect("load"), Some("v1".to_string()));
+    assert_eq!(cache.load(&11).await.expect("load"), None);
+}
+
+/// Drives `sundog_refreshes_total{cache, outcome}` on a `Mode::Local` cache
+/// with a 1s TTL and refresh-ahead at 0.5: three keys load together, then,
+/// once due, each is read in turn and reloads alone, one into a new value
+/// (`loaded`), one the source no longer holds (`absent`), and one whose
+/// reload fails (`failed`). Every loader call shows in
+/// `sundog_loader_calls_total{cache}`: four.
+async fn refresh_outcomes_pin_metrics(cluster: &Cluster) {
+    let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let cache = cluster
+        .cache::<u32, String>("refresh-pin")
+        .mode(Mode::Local)
+        .ttl(Duration::from_secs(1))
+        .refresh_ahead(0.5)
+        .batch_loader({
+            let calls = Arc::clone(&calls);
+            move |keys: Vec<u32>| {
+                let first = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                async move {
+                    if !first && keys.contains(&5) {
+                        return Err(SourceDown);
+                    }
+                    Ok(keys
+                        .into_iter()
+                        .filter(|key| first || *key == 2)
+                        .map(|key| (key, if first { "old" } else { "new" }.to_string()))
+                        .collect::<std::collections::HashMap<_, _>>())
+                }
+            }
+        })
+        .open()
+        .await
+        .expect("cache opens");
+    assert_eq!(
+        cache.load_many([2, 3, 5]).await.expect("load_many").len(),
+        3
+    );
+    tokio::time::sleep(Duration::from_millis(550)).await;
+    for (expected_calls, key) in [(2, 2u32), (3, 3), (4, 5)] {
+        assert!(cache.get(&key).await.is_some(), "key {key} is still live");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while calls.load(std::sync::atomic::Ordering::SeqCst) < expected_calls {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "key {key}'s reload never ran"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while cache.get(&2).await.as_deref() != Some("new") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "key 2 never reloaded"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Drives `sundog_refresh_hints_sent_total{cache}` across `cluster` and
+/// `peer`, both holding a `Mode::Replicated` cache with a 2s TTL and
+/// refresh-ahead at 0.5: 16 keys load on `cluster` and replicate, and once
+/// due both nodes read every key. Each key reloads on its one refresher,
+/// so the other node sends exactly one hint for it: 16 across both nodes,
+/// whichever of the two each key's refresher is.
+async fn refresh_hints_pin_metric(cluster: &Cluster, peer: &Cluster) {
+    let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let open = |node: &Cluster| {
+        let calls = Arc::clone(&calls);
+        node.cache::<u32, String>("refresh-hint-pin")
+            .mode(Mode::Replicated)
+            .ttl(Duration::from_secs(2))
+            .refresh_ahead(0.5)
+            .batch_loader(move |keys: Vec<u32>| {
+                let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                async move {
+                    Ok::<_, SourceDown>(
+                        keys.into_iter()
+                            .map(|key| (key, format!("v{key}.{call}")))
+                            .collect::<std::collections::HashMap<_, _>>(),
+                    )
+                }
+            })
+            .open()
+    };
+    let here = open(cluster).await.expect("cache opens");
+    let there = open(peer).await.expect("peer cache opens");
+    let keys: Vec<u32> = (0..16).collect();
+    assert_eq!(
+        here.load_many(keys.clone()).await.expect("load_many").len(),
+        16
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    for key in &keys {
+        while there.get(key).await.is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "key {key} never replicated"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    for key in &keys {
+        assert!(here.get(key).await.is_some());
+        assert!(there.get(key).await.is_some());
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    for key in &keys {
+        let first = format!("v{key}.1");
+        while here.get(key).await.as_ref() == Some(&first)
+            || there.get(key).await.as_ref() == Some(&first)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "key {key} never reloaded on both nodes"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
 /// Drives a genuine `sundog_fan_out_wait_timeouts_total{cache}` increment
 /// and pins `sundog_fan_out_backlog{cache}` nonzero through a bare
 /// `Shard`, with no `Cluster`/mesh to drain the fan-out queue. A
@@ -810,6 +961,9 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         u32::try_from(memory_ceiling_pin_metrics(&cluster).await).expect("one entry's bytes fit"),
     );
     assert!(ceiling_pin_bytes > 0.0);
+    loader_calls_pin_metric(&cluster).await;
+    refresh_outcomes_pin_metrics(&cluster).await;
+    refresh_hints_pin_metric(&cluster, &peer).await;
     #[cfg(feature = "spill")]
     let mut spill_dirs = spill_writes_and_promotes_pin_metrics(&cluster).await;
     #[cfg(feature = "spill")]
@@ -914,6 +1068,60 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         ),
         Some(1.0),
         "expected one uncached fill on the 'ceiling-pin' cache; got body:\n{body}"
+    );
+    // sundog_loader_calls_total: pinned by loader_calls_pin_metric and
+    // refresh_outcomes_pin_metrics; a cache without a loader has no series.
+    assert_eq!(
+        scraped_metric_value(&body, "sundog_loader_calls_total", &[("cache", "load-pin")]),
+        Some(2.0),
+        "expected two loader calls on the 'load-pin' cache; got body:\n{body}"
+    );
+    assert_eq!(
+        scraped_metric_value(
+            &body,
+            "sundog_loader_calls_total",
+            &[("cache", "refresh-pin")]
+        ),
+        Some(4.0),
+        "expected four loader calls on the 'refresh-pin' cache; got body:\n{body}"
+    );
+    assert!(
+        !body.contains("sundog_loader_calls_total{cache=\"counted\""),
+        "a cache with no loader counts no loader calls; got body:\n{body}"
+    );
+    // sundog_refreshes_total: pinned by refresh_outcomes_pin_metrics, one
+    // reload of each outcome.
+    for outcome in ["loaded", "absent", "failed"] {
+        assert_eq!(
+            scraped_metric_value(
+                &body,
+                "sundog_refreshes_total",
+                &[("cache", "refresh-pin"), ("outcome", outcome)]
+            ),
+            Some(1.0),
+            "expected one {outcome} reload on the 'refresh-pin' cache; got body:\n{body}"
+        );
+    }
+    // sundog_refresh_hints_sent_total: pinned by refresh_hints_pin_metric,
+    // one hint for each of 16 keys, from whichever node is not its refresher.
+    assert_eq!(
+        scraped_metric_value(
+            &body,
+            "sundog_refresh_hints_sent_total",
+            &[("cache", "refresh-hint-pin")]
+        ),
+        Some(16.0),
+        "expected sixteen refresh hints on the 'refresh-hint-pin' cache; got body:\n{body}"
+    );
+    assert_eq!(
+        scraped_metric_value(
+            &body,
+            "sundog_refreshes_total",
+            &[("cache", "refresh-hint-pin"), ("outcome", "loaded")]
+        )
+        .map(|reloads| reloads >= 16.0),
+        Some(true),
+        "every key reloads on its refresher; got body:\n{body}"
     );
     // sundog_clock_skew_rejected_total: pinned by the bare-Shard scenario
     // above, one record an hour ahead refused and one a second ahead applied.

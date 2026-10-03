@@ -43,7 +43,6 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::config::ClusterConfig;
 use crate::error::{CodecError, JoinError};
-#[cfg(all(test, not(feature = "sim")))]
 use crate::hlc::Hlc;
 use crate::membership::Peer;
 use crate::node::NodeId;
@@ -1727,6 +1726,31 @@ impl Mesh {
             conn::collect_load_reply(self.acquire_conn(peer, msg).await?).await
         })
         .await
+    }
+
+    /// Tells `peer`, the node that refreshes `key`, that a read here found
+    /// the entry at `ver` past its refresh point. One-way and best effort:
+    /// queued like an invalidation, and not sent to a peer older than
+    /// [`wire::PROTOCOL_LOAD`]. Returns whether it was queued.
+    pub(crate) fn send_refresh_hint(
+        &self,
+        peer: NodeId,
+        cache: SmolStr,
+        key: Bytes,
+        ver: Hlc,
+    ) -> bool {
+        if self
+            .require_peer_protocol(peer, wire::PROTOCOL_LOAD, "a refresh hint")
+            .is_err()
+        {
+            return false;
+        }
+        self.send(
+            peer,
+            MsgClass::Invalidate,
+            Msg::RefreshHint { cache, key, ver },
+        );
+        true
     }
 
     /// Distribution-mode anti-entropy round, step 1: like [`Mesh::ae_round`] but scoped to `local_buckets` at `view_hash`.
