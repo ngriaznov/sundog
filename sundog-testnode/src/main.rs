@@ -30,6 +30,13 @@
 //! `members`, `share <cache> <owners> <node-id>` and `quit`; see
 //! `ObserverNode::dispatch`.
 //!
+//! `SUNDOG_TESTNODE_LOADER_DELAY_MS` registers a loader on `"it"`: each call
+//! waits that long, then answers `src-{key}.{n}` for every key, `n`
+//! counting this node's loader calls, which the `loads` line reports.
+//! `SUNDOG_TESTNODE_TTL_MS` gives `"it"` a default TTL and
+//! `SUNDOG_TESTNODE_REFRESH_AHEAD` its refresh-ahead fraction; see
+//! `loading_from_env`.
+//!
 //! The ports are fixed unless overridden: `SUNDOG_TESTNODE_GOSSIP_PORT`
 //! (default 7946), `SUNDOG_TESTNODE_CONTROL_PORT` (8080) and, for a member
 //! built with the `prometheus` feature, `SUNDOG_TESTNODE_METRICS_PORT`
@@ -245,6 +252,7 @@ fn side_caches_from_env(raw: Option<&str>) -> Result<bool, String> {
 fn mode_from_env(mode: Option<&str>, owners: Option<u8>) -> Result<Mode, String> {
     match mode {
         None | Some("replicated") => Ok(Mode::Replicated),
+        Some("invalidation") => Ok(Mode::Invalidation),
         Some("distributed") => match owners {
             None => Ok(Mode::distributed()),
             Some(owners) => std::num::NonZeroU8::new(owners)
@@ -258,9 +266,81 @@ fn mode_from_env(mode: Option<&str>, owners: Option<u8>) -> Result<Mode, String>
                 }),
         },
         Some(other) => Err(format!(
-            "SUNDOG_TESTNODE_MODE must be \"replicated\" or \"distributed\", got {other:?}"
+            "SUNDOG_TESTNODE_MODE must be \"replicated\", \"invalidation\" or \"distributed\", \
+             got {other:?}"
         )),
     }
+}
+
+/// How many times this node's `"it"` loader has run, for the `loads` line.
+static LOADER_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// `"it"`'s loading options, from `SUNDOG_TESTNODE_LOADER_DELAY_MS`,
+/// `SUNDOG_TESTNODE_TTL_MS` and `SUNDOG_TESTNODE_REFRESH_AHEAD`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Loading {
+    /// A loader that waits this long a call; `None`, no loader.
+    loader_delay: Option<Duration>,
+    ttl: Option<Duration>,
+    refresh_ahead: Option<f64>,
+}
+
+/// Parses `"it"`'s loading options from those three variables' raw values,
+/// each optional; an unparsable value is an error. Pure; unit tested
+/// directly.
+fn loading_from_env(
+    loader_delay_ms: Option<&str>,
+    ttl_ms: Option<&str>,
+    refresh_ahead: Option<&str>,
+) -> Result<Loading, String> {
+    let millis = |name: &str, raw: Option<&str>| {
+        raw.map(|raw| {
+            raw.parse::<u64>()
+                .map(Duration::from_millis)
+                .map_err(|error| format!("{name} must be a u64 of milliseconds: {error}"))
+        })
+        .transpose()
+    };
+    Ok(Loading {
+        loader_delay: millis("SUNDOG_TESTNODE_LOADER_DELAY_MS", loader_delay_ms)?,
+        ttl: millis("SUNDOG_TESTNODE_TTL_MS", ttl_ms)?,
+        refresh_ahead: refresh_ahead
+            .map(|raw| {
+                raw.parse::<f64>().map_err(|error| {
+                    format!("SUNDOG_TESTNODE_REFRESH_AHEAD must be a fraction: {error}")
+                })
+            })
+            .transpose()?,
+    })
+}
+
+/// Applies `loading` to `"it"`'s builder: the TTL, a loader answering
+/// `src-{key}.{n}` after its delay, and refresh-ahead.
+fn apply_loading(
+    mut builder: CacheBuilder<String, String>,
+    loading: Loading,
+) -> CacheBuilder<String, String> {
+    if let Some(ttl) = loading.ttl {
+        builder = builder.ttl(ttl);
+    }
+    if let Some(delay) = loading.loader_delay {
+        builder = builder.batch_loader(move |keys: Vec<String>| async move {
+            let call = LOADER_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+            tokio::time::sleep(delay).await;
+            Ok::<_, std::convert::Infallible>(
+                keys.into_iter()
+                    .map(|key| {
+                        let value = format!("src-{key}.{call}");
+                        (key, value)
+                    })
+                    .collect::<std::collections::HashMap<_, _>>(),
+            )
+        });
+    }
+    if let Some(fraction) = loading.refresh_ahead {
+        builder = builder.refresh_ahead(fraction);
+    }
+    builder
 }
 
 /// Weighs one entry by its UTF-8 byte length, key plus value: the
@@ -456,6 +536,14 @@ async fn open_it_cache(
     let it_builder = apply_capacity_cap(
         it_builder,
         capacity_cap_from_env(max_capacity_bytes, max_entries),
+    );
+    let it_builder = apply_loading(
+        it_builder,
+        loading_from_env(
+            env::var("SUNDOG_TESTNODE_LOADER_DELAY_MS").ok().as_deref(),
+            env::var("SUNDOG_TESTNODE_TTL_MS").ok().as_deref(),
+            env::var("SUNDOG_TESTNODE_REFRESH_AHEAD").ok().as_deref(),
+        )?,
     );
     #[cfg(feature = "spill")]
     let it_builder = {
@@ -921,6 +1009,19 @@ impl TestNode {
             }
             // count -> <n>, "it"'s live-entry count.
             "count" => Reply::Line(self.cache.entry_count().await.to_string()),
+            // load k -> val <v> | none | err <e>, reading k through "it"'s loader.
+            "load" => {
+                let Some(key) = parts.next() else {
+                    return Reply::Line("err load needs a key".to_string());
+                };
+                Reply::Line(match self.cache.load(&key.to_string()).await {
+                    Ok(Some(value)) => format!("val {value}"),
+                    Ok(None) => "none".to_string(),
+                    Err(error) => format!("err {error}"),
+                })
+            }
+            // loads -> <n>, how many times this node's "it" loader has run.
+            "loads" => Reply::Line(LOADER_CALLS.load(Ordering::SeqCst).to_string()),
             // fill n -> ok | err <e>, bulk-inserting k0..kn = v0..vn.
             "fill" => {
                 let Some(count) = parse_arg::<u32>(parts.next()) else {
@@ -1435,6 +1536,37 @@ mod tests {
             mode_from_env(Some("replicated"), None),
             Ok(Mode::Replicated)
         );
+    }
+
+    #[test]
+    fn mode_from_env_reads_invalidation() {
+        assert_eq!(
+            mode_from_env(Some("invalidation"), None),
+            Ok(Mode::Invalidation)
+        );
+    }
+
+    #[test]
+    fn loading_from_env_reads_each_option_and_rejects_garbage() {
+        assert_eq!(
+            loading_from_env(None, None, None),
+            Ok(Loading {
+                loader_delay: None,
+                ttl: None,
+                refresh_ahead: None,
+            })
+        );
+        assert_eq!(
+            loading_from_env(Some("250"), Some("2000"), Some("0.5")),
+            Ok(Loading {
+                loader_delay: Some(Duration::from_millis(250)),
+                ttl: Some(Duration::from_secs(2)),
+                refresh_ahead: Some(0.5),
+            })
+        );
+        assert!(loading_from_env(Some("soon"), None, None).is_err());
+        assert!(loading_from_env(None, Some("-1"), None).is_err());
+        assert!(loading_from_env(None, None, Some("most")).is_err());
     }
 
     #[test]

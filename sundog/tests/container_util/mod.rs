@@ -599,6 +599,34 @@ impl Node {
         }
     }
 
+    /// `load k`, reading k through `"it"`'s loader: `Some(value)` on
+    /// `val <v>` and `None` on `none`.
+    /// # Errors
+    ///
+    /// Returns `Err` if the connection fails, or the reply is `err ...` or
+    /// matches neither `val <v>` nor `none`.
+    pub async fn load(&self, key: &str) -> Result<Option<String>, String> {
+        match self.command(&format!("load {key}")).await? {
+            reply if reply == "none" => Ok(None),
+            reply => reply
+                .strip_prefix("val ")
+                .map(str::to_string)
+                .map(Some)
+                .ok_or(reply),
+        }
+    }
+
+    /// `loads`, how many times this node's `"it"` loader has run.
+    /// # Errors
+    ///
+    /// Returns `Err` if the connection fails or the reply is not a number.
+    pub async fn loads(&self) -> Result<u64, String> {
+        let reply = self.command("loads").await?;
+        reply
+            .parse()
+            .map_err(|_| format!("unexpected reply to loads: {reply}"))
+    }
+
     /// `owners k`, the key's owning node ids in rendezvous score order.
     /// # Errors
     ///

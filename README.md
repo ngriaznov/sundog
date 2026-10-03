@@ -337,6 +337,65 @@ Every node gossips the mode of each cache it has open. Opening a name under a
 mode that conflicts with a live peer fails with `CacheError::ModeMismatch`. TTL
 and capacity are local knobs, free to differ.
 
+## Loading through your source
+
+`get_or_load` takes its loader per call, so only the calling node can run it.
+A cache can instead register one loader that every node runs the same way,
+and read through it with `load`:
+
+```rust
+let prices = cluster
+    .cache::<Sku, Price>("prices")
+    .mode(Mode::distributed())
+    .ttl(Duration::from_secs(60))
+    .batch_loader(|skus: Vec<Sku>| async move { db.prices(&skus).await }) // -> HashMap<Sku, Price>
+    .batch_window(Duration::from_millis(2), 500)
+    .refresh_ahead(0.8)
+    .open()
+    .await?;
+
+let price: Option<Price> = prices.load(&sku).await?; // None: the source holds no such key
+let many = prices.load_many(skus).await?;           // every key the cache or source holds
+```
+
+`batch_loader` reads many keys in one call, a key missing from the map being
+one the source lacks; `loader` takes a one-key loader answering `Option<V>`.
+A hit never reaches the loader, and a key the source lacks is not cached, so
+the next read asks again. Concurrent misses on one key share one load, the
+keys one call misses go to the loader together, and `batch_window` gathers
+the misses of every call within the window into one call of at most
+`max_keys` keys.
+
+In `Invalidation` and `Distributed` mode a missed key loads on one node for
+the whole cluster: the key's first owner that has a loader in `Distributed`,
+and otherwise the rendezvous winner for the key's part among the nodes with
+a loader. Every node missing the key in the same moment asks that node, and
+the node joins them to its own load, so the source sees one query however
+many nodes miss. In `Invalidation` mode each node keeps the value it read; in
+`Distributed` mode the owners keep it and a node that owns nothing of the key
+keeps no copy, as with `fetch`. A node that declines or cannot be reached has
+the key loaded locally, and a node whose loader fails fails the read with a
+`CacheError::Loader` carrying a `RemoteLoaderError` naming it. `Local` and
+`Replicated` caches load on the node that misses, and a `Replicated` value
+reaches every node once loaded.
+
+`refresh_ahead(fraction)` keeps a read key from expiring. A read that finds an
+entry past `fraction` of its lifetime answers with it and asks for one reload;
+the node the key's loads gather on reloads it, others send it a hint, and the
+new value replaces the entry with a full lifetime, replicated or forwarded
+like any write. A hot key read on every node then reloads about once each
+refresh interval, cluster-wide, and never misses. A reload the source fails
+keeps the entry until it expires, and one that finds the key gone leaves the
+entry to expire. Refresh-ahead needs a loader and a `ttl`, and applies to every
+mode but `Invalidation`, whose values do not travel between nodes. A load that
+an invalidation overtakes, a peer's write announced while the loader still
+read the old row, answers its callers and stores nothing.
+
+`sundog_loader_calls_total` counts loader calls per cache,
+`sundog_refreshes_total{outcome}` counts reloads by outcome (`loaded`,
+`absent`, `failed`) and `sundog_refresh_hints_sent_total` counts the hints a
+node sends to a key's refresher.
+
 ## Rolling upgrades
 
 Every node states its wire protocol version, `sundog::wire::PROTOCOL_VERSION`,
@@ -345,7 +404,7 @@ answers a peer only with what that peer's version understands: an older peer
 never receives a message kind its release cannot decode, and a newer peer
 limits itself the same way. One release step interoperates, so a cluster
 upgrades one node at a time with replication and repair running throughout.
-The current release speaks protocol 6 and serves protocol 4, the release
+The current release speaks protocol 7 and serves protocol 6, the release
 before it. A container test runs the previous release's node against the
 current one in both roles. Distribution mode's message kinds (`Fetch`,
 `FetchReply`, `FetchDeclined`, `AeDigestScoped`, `StBuckets`,
@@ -367,6 +426,13 @@ hello names another cluster, as when a node dials an address its own
 cluster's departed node held and another cluster's node holds now, so one
 cluster's writes never land in another's caches. A hello from an older
 release names no cluster and is accepted.
+
+Protocol 7 loads through another node's loader: `Load` and its replies
+`Loaded`, `LoadFailed` and `LoadDeclined`, and the one-way `RefreshHint`.
+Gossip carries a `loader:<cache>` key beside each cache's mode. A node picks
+only a protocol-7 peer advertising a loader to load or refresh a key, so a
+node of the previous release is never asked and loads through the current
+nodes still reach it wherever it owns the key.
 
 ## How nodes find each other
 

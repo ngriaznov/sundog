@@ -5,6 +5,55 @@ All notable changes to this project are documented in this file. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Reading through a registered loader.** `CacheBuilder::batch_loader`
+  registers a loader that reads many keys in one call and returns a map, a
+  key left out being one the source lacks, and `CacheBuilder::loader` one
+  that reads a key at a time and answers `Option<V>`. `Cache::load` reads a
+  key through it, `None` when the source does not hold it, and
+  `Cache::load_many` reads many. A hit never reaches the loader and a key
+  the source lacks is not cached. Concurrent misses on one key share one
+  load, the keys a call misses load together, and
+  `CacheBuilder::batch_window(window, max_keys)` gathers the misses of every
+  call within the window into one loader call of at most `max_keys` keys.
+  `Shard::with_loader`, `Shard::load` and `Shard::load_many` are the same at
+  the shard layer, and `store::Loader` is the registered loader.
+  `CacheError::NoLoader` answers a load on a cache with none, and
+  `CacheError::InvalidLoadConfig` fails `open` for options that do not fit
+  together.
+- **One load per key across the cluster.** In `Mode::Invalidation` and
+  `Mode::Distributed`, a missed key loads on one node: the key's first owner
+  with a loader in `Distributed`, otherwise the rendezvous winner for its
+  part among the nodes with one. Every node missing the key at once asks
+  that node, which joins them to its own load, so the source sees one query.
+  `Invalidation` nodes keep what they read; in `Distributed` the owners keep
+  it and a non-owner keeps nothing. A node that declines or cannot be reached
+  has the key loaded locally; a node whose loader fails fails the read with
+  `CacheError::Loader` carrying the new `RemoteLoaderError { node, message }`.
+  Gossip advertises a loader under a `loader:<cache>` key.
+- **Refresh-ahead.** `CacheBuilder::refresh_ahead(fraction)` reloads a read
+  key before it expires. A read past `fraction` of an entry's lifetime asks
+  for one reload, once per version of the entry; the node the key's loads
+  gather on reloads it, the others hint it with `Msg::RefreshHint`, and the
+  new value replaces the entry with a full lifetime, replicated or forwarded
+  per mode. A failed reload keeps the entry until it expires and lets reads
+  ask again after a second; a key the source lost is left to expire. Needs a
+  loader and a TTL; `Mode::Invalidation` rejects it.
+- **Loading metrics.** `sundog_loader_calls_total{cache}`,
+  `sundog_refreshes_total{cache, outcome}` with `loaded`, `absent` and
+  `failed`, and `sundog_refresh_hints_sent_total{cache}`.
+
+### Changed
+
+- **Protocol 7.** `wire::PROTOCOL_VERSION` is 7, adding `Msg::Load`,
+  `Msg::Loaded`, `Msg::LoadFailed`, `Msg::LoadDeclined` and
+  `Msg::RefreshHint`, all gated on `wire::PROTOCOL_LOAD`. A protocol-6 node
+  is never asked to load or refresh, and its gossip carries no loader key.
+- **A fill over a live entry emits `Event::Updated`.** A loaded value that
+  replaces a live entry, as a refresh does, emits `Updated`; a fill of a
+  missing key still emits `Created`.
+
 ### Fixed
 
 - **A fill an invalidation overtakes is no longer cached.** In

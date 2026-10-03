@@ -13,10 +13,11 @@ already justified by the code as it stands.
 
 ### Batch reads
 
-`insert_many`, `insert_many_with_ttl` and `remove_many` have no read
-counterpart. `get_many` takes one stripe lock per distinct bucket instead of
-one per key, and `fetch_many` groups keys by owner into one request per
-owner instead of one round trip per key.
+`insert_many`, `insert_many_with_ttl` and `remove_many` have no plain read
+counterpart; `load_many` reads many keys only through a loader. `get_many`
+takes one stripe lock per distinct bucket instead of one per key, and
+`fetch_many` groups keys by owner into one request per owner instead of one
+round trip per key.
 
 ### Latency histograms
 
@@ -175,24 +176,17 @@ whose RAM is bound by them.
 
 ## Reads
 
-### Cluster-wide load coalescing
+### Refresh-ahead in invalidation mode
 
-`get_or_load` collapses concurrent misses into one loader call on one node.
-When a popular key expires, every node that misses it still runs its own
-loader, so the backing store takes one query per node. A cluster-wide load
-picks one node per key, the key's first owner in `Distributed` mode and its
-rendezvous winner otherwise, to run the loader, and every other node that
-misses asks that node to load and waits for the result to arrive as an
-ordinary replicated write. A load request carries a deadline: a waiter
-whose loader node dies or stays silent past it runs the loader itself.
+`CacheBuilder::refresh_ahead` reloads a read key on the one node its loads
+gather on, and the new value travels to every node that holds it. An
+`Invalidation` cache sends no values, so each node holding a key would need
+its own reload, gathered on the loader node without that node answering from
+its own cached copy. That takes a load request that bypasses the responder's
+cache: a new message kind with the usual bump.
 
-This is deduplication, not mutual exclusion. Under a partition each side
-picks its own loader, two loads run, and last-write-wins settles their
-results like any two writes, so nothing here is the lease "Distributed
-locks and leader leases" refuses. A wire change with the usual bump.
-
-**Trigger:** a deployment whose backing store sees a burst of identical
-queries each time a popular key expires.
+**Trigger:** an `Invalidation` deployment whose hot keys expire under load
+and that cannot move to `Replicated` or `Distributed`.
 
 ### Hedged fetches
 
