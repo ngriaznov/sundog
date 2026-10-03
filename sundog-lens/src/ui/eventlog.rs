@@ -818,7 +818,13 @@ mod tests {
         let row = row(&model, "JOIN");
         assert!(row.contains("JOIN"), "{row}");
         assert!(row.contains("127.0.0.1"), "{row}");
-        assert!(row.contains(":7946 · protocol 6"), "{row}");
+        assert!(
+            row.contains(&format!(
+                ":7946 · protocol {}",
+                sundog::wire::PROTOCOL_VERSION
+            )),
+            "{row}"
+        );
         assert!(row.contains("it D2"), "{row}");
         assert!(row.contains("churn R"), "{row}");
         assert!(row.starts_with("00:00:"), "{row}");

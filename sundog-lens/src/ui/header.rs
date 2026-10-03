@@ -67,7 +67,7 @@ fn counters(scene: &Scene<'_>) -> Vec<Span<'static>> {
     spans
 }
 
-/// The protocols the live members speak: `proto 6`, or `proto 5·6 ⚠` when
+/// The protocols the live members speak: `proto 7`, or `proto 6·7 ⚠` when
 /// they differ among themselves or from this build.
 fn protocols(scene: &Scene<'_>) -> Vec<Span<'static>> {
     let look = scene.look;
@@ -328,7 +328,10 @@ mod tests {
         assert!(header.contains("◐ 1 leaving"), "{header}");
         assert!(header.contains("✖ 1 down"), "{header}");
         assert!(header.contains("○ 1 left"), "{header}");
-        assert!(header.contains("proto 6"), "{header}");
+        assert!(
+            header.contains(&format!("proto {PROTOCOL_VERSION}")),
+            "{header}"
+        );
         assert!(header.contains("observer · 0 anon"), "{header}");
         assert!(header.ends_with("00:00:20 UTC"), "{header}");
         assert!(header.contains('⣋') || header.contains('⠋'), "{header}");
@@ -363,7 +366,7 @@ mod tests {
         let mut old = testkit::member(2, MemberStatus::Live);
         old = sundog::observe::Member::new(
             Peer {
-                protocol: 5,
+                protocol: PROTOCOL_VERSION - 1,
                 ..old.peer.clone()
             },
             old.status,
@@ -382,7 +385,13 @@ mod tests {
         );
         let app = App::new(AppConfig::default());
         let (header, _) = draw_with(&app, &model, 140);
-        assert!(header.contains("proto 5·6 ⚠"), "{header}");
+        assert!(
+            header.contains(&format!(
+                "proto {}·{PROTOCOL_VERSION} ⚠",
+                PROTOCOL_VERSION - 1
+            )),
+            "{header}"
+        );
     }
 
     #[test]

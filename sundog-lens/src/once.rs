@@ -606,7 +606,7 @@ mod tests {
             (report.live, report.departing, report.down, report.left),
             (5, 1, 1, 1)
         );
-        assert_eq!(report.protocols, [6]);
+        assert_eq!(report.protocols, [sundog::wire::PROTOCOL_VERSION]);
         assert_eq!(report.members.len(), 8);
         let first = &report.members[0];
         assert_eq!(first.slot, "n1");
@@ -666,7 +666,11 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[0],
-            "fixture · 5 live · 1 departing · 1 down · 1 left · protocol 6 · observed 3.0 s via observer 127.0.0.1:41733"
+            format!(
+                "fixture · 5 live · 1 departing · 1 down · 1 left · protocol {} · observed 3.0 s \
+                 via observer 127.0.0.1:41733",
+                sundog::wire::PROTOCOL_VERSION
+            )
         );
         assert!(lines[1].starts_with("SLOT  NODE"), "{}", lines[1]);
         assert!(

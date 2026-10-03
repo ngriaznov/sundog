@@ -855,7 +855,9 @@ mod tests {
         assert!(text.contains("data 127.0.0.12:39211"), "{text}");
         assert!(text.contains("incarnation  1"), "{text}");
         assert!(
-            text.contains("protocol     6 (lens 6) · part ownership"),
+            text.contains(&format!(
+                "protocol     {PROTOCOL_VERSION} (lens {PROTOCOL_VERSION}) · part ownership"
+            )),
             "{text}"
         );
         assert!(text.contains("peers        — (no metrics)"), "{text}");
