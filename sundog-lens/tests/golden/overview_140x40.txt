@@ -1,4 +1,4 @@
- ●•• sundog lens  fixture   ● 5 live  ◐ 1 leaving  ✖ 1 down  ○ 1 left   proto 6   observer 127.0.0.1:41733 · 0 anon          ⠋ 00:01:21 UTC
+ ●•• sundog lens  fixture   ● 5 live  ◐ 1 leaving  ✖ 1 down  ○ 1 left   proto 7   observer 127.0.0.1:41733 · 0 anon          ⠋ 00:01:21 UTC
   1 Overview   2 Caches   3 Node   4 Timeline                               metrics 6/6 · 1 s     it · part view 5d69e3db ↻ settling 71.0 s
 ╭ Members · gossip ──────────────────────────────────────────────────────── 8 seen ╮╭ Throughput · metrics ────────────────────────────────╮
 │   NODE      GOSSIP          UP    P  CACHES   SHARE it          PEERS      OPS/S ││ 4.46k ops/s ▼3%   hit 55.1%   tx 15.9 MB/s           │
