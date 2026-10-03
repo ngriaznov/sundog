@@ -2955,6 +2955,12 @@ where
     /// and every joined waiter without storing it, and counts
     /// `sundog_ceiling_refusals_total{cache, kind="fill"}`.
     ///
+    /// An invalidation for `key` that lands while `loader` runs, from a peer
+    /// or [`Shard::invalidate_local`], means the loader may have read the
+    /// source before the change it announces: the fill returns its value to
+    /// the caller and every joined waiter without storing it, and the next
+    /// read loads afresh.
+    ///
     /// # Errors
     ///
     /// Returns [`CacheError::Loader`] if `loader` fails.
@@ -3049,7 +3055,10 @@ where
                             );
                             guard.complete();
                             self.misses.increment(1);
-                            if outcome == engine::FillOutcome::Superseded {
+                            if matches!(
+                                outcome,
+                                engine::FillOutcome::Superseded | engine::FillOutcome::Invalidated
+                            ) {
                                 return Ok(value);
                             }
                             // A refusal means the cache is closing; the
@@ -5809,6 +5818,130 @@ mod tests {
             vec![7],
             "only the insert fans out; the superseded fill sends nothing"
         );
+    }
+
+    #[tokio::test]
+    async fn get_or_load_drops_a_fill_an_invalidation_lands_during() {
+        let s = Shard::<u32, String>::new(
+            SmolStr::new("test"),
+            Mode::Invalidation,
+            NodeId::from(1),
+            10_000,
+            None,
+            None,
+        );
+        let started = tokio::sync::Notify::new();
+        let release = tokio::sync::Notify::new();
+        let load = s.get_or_load(
+            &7,
+            async |_key: &u32| -> Result<String, std::convert::Infallible> {
+                started.notify_one();
+                release.notified().await;
+                Ok("stale".to_string())
+            },
+        );
+        let race = async {
+            started.notified().await;
+            ShardOps::invalidate(&s, key_bytes(&7u32), hlc(now_ms(), 2)).await;
+            release.notify_one();
+        };
+        let (loaded, ()) = tokio::join!(load, race);
+        assert_eq!(
+            loaded.expect("load succeeds"),
+            "stale",
+            "the read that raced the invalidation answers with what it loaded"
+        );
+        assert_eq!(
+            s.get(&7).await,
+            None,
+            "a value read before the key changed elsewhere is not cached"
+        );
+        assert_eq!(
+            s.get_or_load(
+                &7,
+                async |_key: &u32| -> Result<String, std::convert::Infallible> {
+                    Ok("fresh".to_string())
+                }
+            )
+            .await
+            .expect("load succeeds"),
+            "fresh",
+            "the next read loads afresh"
+        );
+        assert_eq!(s.get(&7).await, Some("fresh".to_string()));
+    }
+
+    #[tokio::test]
+    async fn get_or_load_drops_a_fill_a_local_invalidation_lands_during() {
+        let s = shard::<u32, String>(1);
+        let started = tokio::sync::Notify::new();
+        let release = tokio::sync::Notify::new();
+        let load = s.get_or_load(
+            &7,
+            async |_key: &u32| -> Result<String, std::convert::Infallible> {
+                started.notify_one();
+                release.notified().await;
+                Ok("stale".to_string())
+            },
+        );
+        let race = async {
+            started.notified().await;
+            s.invalidate_local(&7).await;
+            release.notify_one();
+        };
+        let (loaded, ()) = tokio::join!(load, race);
+        assert_eq!(loaded.expect("load succeeds"), "stale");
+        assert_eq!(s.get(&7).await, None, "the busted key stays uncached");
+    }
+
+    #[tokio::test]
+    async fn get_or_load_waiters_share_a_dropped_fill_without_loading_again() {
+        let s = Shard::<u32, String>::new(
+            SmolStr::new("test"),
+            Mode::Invalidation,
+            NodeId::from(1),
+            10_000,
+            None,
+            None,
+        );
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let started = tokio::sync::Notify::new();
+        let release = tokio::sync::Notify::new();
+        let first = s.get_or_load(
+            &7,
+            async |_key: &u32| -> Result<String, std::convert::Infallible> {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                started.notify_one();
+                release.notified().await;
+                Ok("stale".to_string())
+            },
+        );
+        let rest = async {
+            started.notified().await;
+            let joined = s.get_or_load(
+                &7,
+                async |_key: &u32| -> Result<String, std::convert::Infallible> {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok("second".to_string())
+                },
+            );
+            let race = async {
+                tokio::task::yield_now().await;
+                ShardOps::invalidate(&s, key_bytes(&7u32), hlc(now_ms(), 2)).await;
+                release.notify_one();
+            };
+            let (joined, ()) = tokio::join!(joined, race);
+            joined
+        };
+        let (first, joined) = tokio::join!(first, rest);
+        assert_eq!(first.expect("load succeeds"), "stale");
+        assert_eq!(joined.expect("load succeeds"), "stale");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the joined read answers with the dropped fill's value"
+        );
+        assert_eq!(s.get(&7).await, None);
     }
 
     #[tokio::test]

@@ -1486,6 +1486,11 @@ where
     /// Reads `key`, invoking `loader` on a miss; concurrent misses collapse
     /// into one `loader` call.
     ///
+    /// An invalidation for `key` that lands while `loader` runs means the
+    /// loader may have read the source before the change it announces: the
+    /// call returns the loaded value without storing it, and the next read
+    /// loads afresh.
+    ///
     /// # Errors
     ///
     /// Returns [`CacheError::Loader`] if `loader` fails, or

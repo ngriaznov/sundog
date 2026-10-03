@@ -3,6 +3,19 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **A fill an invalidation overtakes is no longer cached.** In
+  `Mode::Invalidation`, a peer's write to a key that this node was loading
+  through `get_or_load` sent an invalidation that found nothing to drop, and
+  the fill then stored what the loader had read, possibly the row as it was
+  before that write, until the entry expired. An invalidation, or
+  `Cache::invalidate_local`, that lands while a load for the key runs now
+  marks the load: the fill answers the caller and every joined waiter with
+  the loaded value and stores nothing, so the next read loads afresh.
+
 ## [0.6.3] – 2026-10-02
 
 ### Added

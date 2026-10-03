@@ -591,9 +591,14 @@ pub(crate) struct Inflight<V> {
     /// the owner did.
     pub(crate) error: OnceLock<Arc<dyn std::error::Error + Send + Sync>>,
     /// Set iff the fill finished without storing its value, because the
-    /// shard sat at its memory ceiling: a joined waiter returns this value
-    /// instead of loading again.
+    /// shard sat at its memory ceiling or an invalidation landed during the
+    /// load: a joined waiter returns this value instead of loading again.
     pub(crate) value: OnceLock<V>,
+    /// Set when an invalidation for the key lands while the load runs. The
+    /// loader may have read the source before the change the invalidation
+    /// announces, so [`Engine::complete_fresh_load`] answers with the value
+    /// and stores nothing.
+    invalidated: AtomicBool,
 }
 
 impl<V> Inflight<V> {
@@ -602,6 +607,7 @@ impl<V> Inflight<V> {
             done: watch::channel(false).0,
             error: OnceLock::new(),
             value: OnceLock::new(),
+            invalidated: AtomicBool::new(false),
         }
     }
 
@@ -2109,6 +2115,10 @@ pub(crate) enum FillOutcome {
     /// A write or removal at least as new as the fill landed while the
     /// loader ran, and stays in place of the loaded value.
     Superseded,
+    /// An invalidation landed while the loader ran, so the loaded value may
+    /// predate the change it announces: nothing is stored, and joined
+    /// waiters answer with the value.
+    Invalidated,
 }
 
 /// Whether a fill stamped `fill` replaces what its key holds, `existing`
@@ -4369,7 +4379,8 @@ where
 
     /// Applies an inbound [`super::ShardOps::invalidate`]: drops the live entry
     /// at `key_bytes` iff `ver` is newer than whatever version is stored,
-    /// writing no tombstone of its own. Returns the departing version on an
+    /// writing no tombstone of its own, and marks a load in flight for the
+    /// key so its fill stores nothing. Returns the departing version on an
     /// actual removal, `None` otherwise.
     pub(crate) fn invalidate(&self, key_bytes: &[u8], hash: u64, ver: Hlc) -> Option<Hlc> {
         let bucket = stripe_index_from_hash(hash);
@@ -4385,6 +4396,9 @@ where
         if stored_ver.is_some_and(|sv| ver <= sv) {
             return None;
         }
+        if let Some(inflight) = stripe.inflight.get(key_bytes) {
+            inflight.invalidated.store(true, Ordering::Relaxed);
+        }
         let had_live = prior_tombstone.is_none() && stored_ver.is_some();
         if !had_live {
             return None;
@@ -4399,10 +4413,14 @@ where
 
     /// Drops the local live entry at `key_bytes` unconditionally, no version
     /// check, no tombstone, for [`super::Shard::invalidate_local`]'s
-    /// cache-busting escape hatch.
+    /// cache-busting escape hatch, and marks a load in flight for the key so
+    /// its fill stores nothing.
     pub(crate) fn invalidate_local(&self, key_bytes: &[u8], hash: u64) {
         let bucket = stripe_index_from_hash(hash);
         let mut stripe = self.stripes[bucket].write();
+        if let Some(inflight) = stripe.inflight.get(key_bytes) {
+            inflight.invalidated.store(true, Ordering::Relaxed);
+        }
         if let Some(removed) = remove_live(&mut stripe, hash, key_bytes) {
             drop(stripe);
             let part = part_index_from_hash(hash);
@@ -4617,7 +4635,8 @@ where
     }
 
     /// Applies a successful [`super::Shard::get_or_load`] fill under one
-    /// stripe write-lock acquisition: removes the `inflight` entry, and,
+    /// stripe write-lock acquisition: removes the `inflight` entry, stores
+    /// nothing if an invalidation landed during the load, and,
     /// when [`fill_supersedes`] allows it, replaces any prior tombstone or
     /// live entry for `write.key` with the loader's value and corrects
     /// `live_count` for the net change. A tombstone or live entry at least
@@ -4643,6 +4662,12 @@ where
         let outcome = {
             let mut stripe = self.stripes[bucket].write();
             stripe.inflight.remove(key_bytes.as_ref());
+            if inflight.invalidated.load(Ordering::Relaxed) {
+                drop(stripe);
+                let _ = inflight.value.set(value);
+                inflight.finish();
+                return FillOutcome::Invalidated;
+            }
             let existing = stripe
                 .tombstones
                 .get(key_bytes.as_ref())
@@ -7259,6 +7284,78 @@ mod tests {
         let (entries, weight) = engine.debug_totals();
         assert_eq!(entries, 0);
         assert_eq!(weight, 0);
+    }
+
+    #[test]
+    fn complete_fresh_load_stores_nothing_after_an_invalidation_during_the_load() {
+        for stamp in [hlc(2, 1), hlc(9, 1)] {
+            let engine = engine_u32_string(u64::MAX, None);
+            let key = 23u32;
+            let kb = key_bytes(key);
+            let hash = hash_key_bytes(kb.as_ref());
+            let JoinOutcome::Owner(inflight) = engine.miss_or_join(&kb, hash, 0) else {
+                panic!("first caller becomes the owner");
+            };
+            // The key changes elsewhere while the loader still reads the old
+            // row. The invalidation's version does not matter: the loader's
+            // read and the change have no order the versions could show.
+            assert_eq!(engine.invalidate(kb.as_ref(), hash, hlc(4, 2)), None);
+            let encoded = Bytes::from(postcard::to_stdvec("stale").expect("encode"));
+            let outcome = engine.complete_fresh_load(
+                FreshLoad {
+                    key: &key,
+                    key_bytes: &kb,
+                    hash,
+                    ver: stamp,
+                    value: "stale".to_string(),
+                    encoded,
+                    expires_at_ms: None,
+                },
+                0,
+                &inflight,
+            );
+            assert_eq!(outcome, FillOutcome::Invalidated, "fill stamped {stamp:?}");
+            assert_eq!(engine.get(&key, 0), None);
+            assert_eq!(
+                inflight.value.get().map(String::as_str),
+                Some("stale"),
+                "joined waiters answer with the loaded value"
+            );
+            assert_eq!(engine.digests(), engine.recompute_digests_paired());
+            assert_eq!(engine.debug_totals(), (0, 0));
+            assert!(
+                matches!(engine.miss_or_join(&kb, hash, 0), JoinOutcome::Owner(_)),
+                "the in-flight entry is gone, so the next read loads afresh"
+            );
+        }
+    }
+
+    #[test]
+    fn an_invalidation_before_the_load_starts_leaves_the_next_fill_alone() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let key = 23u32;
+        let kb = key_bytes(key);
+        let hash = hash_key_bytes(kb.as_ref());
+        assert_eq!(engine.invalidate(kb.as_ref(), hash, hlc(4, 2)), None);
+        let JoinOutcome::Owner(inflight) = engine.miss_or_join(&kb, hash, 0) else {
+            panic!("first caller becomes the owner");
+        };
+        let encoded = Bytes::from(postcard::to_stdvec("fresh").expect("encode"));
+        let outcome = engine.complete_fresh_load(
+            FreshLoad {
+                key: &key,
+                key_bytes: &kb,
+                hash,
+                ver: hlc(9, 1),
+                value: "fresh".to_string(),
+                encoded,
+                expires_at_ms: None,
+            },
+            0,
+            &inflight,
+        );
+        assert_eq!(outcome, FillOutcome::Installed { had_live: false });
+        assert_eq!(engine.get(&key, 0), Some("fresh".to_string()));
     }
 
     #[test]
