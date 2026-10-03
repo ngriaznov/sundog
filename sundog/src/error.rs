@@ -116,6 +116,16 @@ pub enum CacheError {
     /// A read-through loader returned an error.
     #[error("read-through loader failed")]
     Loader(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// `load` or `load_many` ran on a cache with no registered loader.
+    #[error("cache {cache:?} has no loader")]
+    NoLoader { cache: SmolStr },
+    /// The builder's loading options do not fit together, such as a batch
+    /// window with no loader.
+    #[error("cache {cache:?} has an invalid load config: {reason}")]
+    InvalidLoadConfig {
+        cache: SmolStr,
+        reason: &'static str,
+    },
     /// Encoding or decoding a key or value for the wire failed.
     #[error(transparent)]
     Codec(#[from] CodecError),

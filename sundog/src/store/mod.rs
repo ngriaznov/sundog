@@ -34,6 +34,7 @@ use crate::ownership::{Granularity, OwnershipTracker, OwnershipView, ResidencySe
 use crate::wire::{self, MAX_FRAME, WireRecord};
 
 mod engine;
+mod load;
 pub(crate) mod part;
 use engine::{ApplyOutcome, Engine, JoinOutcome, Reservation};
 
@@ -65,6 +66,7 @@ pub const BUCKET_COUNT: usize = 1024;
 /// finer grain before either side sends a listing or a sketch.
 pub const PART_COUNT: usize = 64;
 
+pub use load::{DEFAULT_MAX_BATCH_KEYS, LoadError, Loader};
 pub use part::PartId;
 pub(crate) use part::PartMask;
 
@@ -1614,6 +1616,11 @@ where
     hits: metrics::Counter,
     /// Handle for `sundog_cache_misses_total{cache}`, same reason as `hits`.
     misses: metrics::Counter,
+    /// [`Shard::with_loader`]'s loader, which [`Shard::load`] and
+    /// [`Shard::load_many`] answer a miss through.
+    loader: Option<Loader<K, V>>,
+    /// The loads waiting for the loader's batch window to close.
+    load_queue: load::LoadQueue<K, V>,
     /// `Some` only for `Mode::Distributed`, set once at construction via
     /// [`Shard::with_ownership`], before this shard is ever shared. Backs
     /// [`ShardOps::ownership_view`].
@@ -1761,6 +1768,8 @@ where
             weigher: None,
             hits,
             misses,
+            loader: None,
+            load_queue: load::LoadQueue::new(),
             ownership: None,
             residency: None,
             #[cfg(feature = "spill")]
@@ -1914,6 +1923,65 @@ where
         self.misses.increment(1);
         if let Some(refusals) = &self.ceiling_refusals {
             refusals.fills.increment(1);
+        }
+    }
+
+    /// Ends a loader run that returned `value` for `key`, the load stamped
+    /// `ver` before it started: stores the value through
+    /// [`engine::Engine::complete_fresh_load`], or hands it to joined
+    /// waiters uncached at the ceiling. A stored fill fans out per
+    /// [`fill_fans_out`] and emits [`Event::Created`]; one a write, removal
+    /// or invalidation overtook stores and sends nothing. Counts the run as
+    /// a miss either way.
+    fn finish_fill(
+        &self,
+        key: &K,
+        key_bytes: &Bytes,
+        hash: u64,
+        ver: Hlc,
+        inflight: &engine::Inflight<V>,
+        value: V,
+    ) {
+        if self.at_ceiling().is_some() {
+            self.finish_uncached_fill(key_bytes, hash, inflight, value);
+            return;
+        }
+        let encoded = Bytes::from(
+            postcard::to_stdvec(&value)
+                .expect("invariant: a value returned by the loader postcard-encodes"),
+        );
+        let expires_at_ms = self.expiry_for(None);
+        let outcome = self.engine.complete_fresh_load(
+            engine::FreshLoad {
+                key,
+                key_bytes,
+                hash,
+                ver,
+                value: value.clone(),
+                encoded,
+                expires_at_ms,
+            },
+            self.now_ms(),
+            inflight,
+        );
+        self.misses.increment(1);
+        if matches!(
+            outcome,
+            engine::FillOutcome::Superseded | engine::FillOutcome::Invalidated
+        ) {
+            return;
+        }
+        // A refusal means the cache is closing; the loaded value still
+        // answers the read.
+        if fill_fans_out(self.mode) {
+            let _ = self.fan_out.push(FanOutItem::Applied(key.clone()));
+        }
+        if self.events.receiver_count() > 0 {
+            let _ = self.events.send(Event::Created {
+                key: key.clone(),
+                value,
+                origin: Origin::Local,
+            });
         }
     }
 
@@ -3030,49 +3098,9 @@ where
                     // keeps its place.
                     let ver = self.stamp_local();
                     return match loader(key).await {
-                        Ok(value) if self.at_ceiling().is_some() => {
-                            self.finish_uncached_fill(&key_bytes, hash, &inflight, value.clone());
-                            guard.complete();
-                            Ok(value)
-                        }
                         Ok(value) => {
-                            let encoded = Bytes::from(postcard::to_stdvec(&value).expect(
-                                "invariant: a value returned by the loader postcard-encodes",
-                            ));
-                            let expires_at_ms = self.expiry_for(None);
-                            let outcome = self.engine.complete_fresh_load(
-                                engine::FreshLoad {
-                                    key,
-                                    key_bytes: &key_bytes,
-                                    hash,
-                                    ver,
-                                    value: value.clone(),
-                                    encoded,
-                                    expires_at_ms,
-                                },
-                                self.now_ms(),
-                                &inflight,
-                            );
+                            self.finish_fill(key, &key_bytes, hash, ver, &inflight, value.clone());
                             guard.complete();
-                            self.misses.increment(1);
-                            if matches!(
-                                outcome,
-                                engine::FillOutcome::Superseded | engine::FillOutcome::Invalidated
-                            ) {
-                                return Ok(value);
-                            }
-                            // A refusal means the cache is closing; the
-                            // loaded value still answers this read.
-                            if fill_fans_out(self.mode) {
-                                let _ = self.fan_out.push(FanOutItem::Applied(key.clone()));
-                            }
-                            if self.events.receiver_count() > 0 {
-                                let _ = self.events.send(Event::Created {
-                                    key: key.clone(),
-                                    value: value.clone(),
-                                    origin: Origin::Local,
-                                });
-                            }
                             Ok(value)
                         }
                         Err(err) => {

@@ -38,7 +38,7 @@ use crate::store::part::PartSet;
 #[cfg(feature = "spill")]
 use crate::store::spill::SpillConfig;
 use crate::store::{
-    ConflictResolver, Event, Lifetime, LocalRearm, LwwResolver, Mode, Shard, ShardOps, Ttl,
+    ConflictResolver, Event, Lifetime, Loader, LocalRearm, LwwResolver, Mode, Shard, ShardOps, Ttl,
     Weigher, encode_key, now_ms,
 };
 use crate::wire::WireRecord;
@@ -60,6 +60,8 @@ pub struct CacheBuilder<K, V> {
     spill: Option<SpillConfig>,
     merge_coalesce_window: Duration,
     prefold_enabled: bool,
+    loader: Option<Loader<K, V>>,
+    batch_window: Option<(Duration, usize)>,
     marker: PhantomData<fn() -> (K, V)>,
 }
 
@@ -84,6 +86,8 @@ where
             spill: None,
             merge_coalesce_window: Duration::ZERO,
             prefold_enabled: true,
+            loader: None,
+            batch_window: None,
             marker: PhantomData,
         }
     }
@@ -194,6 +198,43 @@ where
         self
     }
 
+    /// Registers the loader [`Cache::load`] and [`Cache::load_many`] answer
+    /// a miss through, one that reads many keys in one call, such as one
+    /// `SELECT … WHERE id IN (…)`. A key missing from the returned map is
+    /// one the source does not hold. Replaces any loader set before.
+    pub fn batch_loader<F, Fut, E>(mut self, load: F) -> Self
+    where
+        F: Fn(Vec<K>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<HashMap<K, V>, E>> + Send + 'static,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        self.loader = Some(Loader::batch(load));
+        self
+    }
+
+    /// [`CacheBuilder::batch_loader`] for a source read one key at a time:
+    /// `None` for a key it does not hold. The keys of one batch load
+    /// concurrently. Replaces any loader set before.
+    pub fn loader<F, Fut, E>(mut self, load: F) -> Self
+    where
+        F: Fn(K) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<Option<V>, E>> + Send + 'static,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        self.loader = Some(Loader::single(load));
+        self
+    }
+
+    /// Collects the keys this node misses within `window` of the first into
+    /// one loader call of at most `max_keys` keys; a larger batch splits
+    /// into concurrent calls. Default: a zero window, so each call loads
+    /// the keys it misses at once, at most
+    /// [`crate::store::DEFAULT_MAX_BATCH_KEYS`] a call. Needs a loader.
+    pub fn batch_window(mut self, window: Duration, max_keys: usize) -> Self {
+        self.batch_window = Some((window, max_keys));
+        self
+    }
+
     /// Configures the local SSD/NVMe spill tier: once `max_capacity` is
     /// exceeded, eviction demotes the coldest entries onto disk instead of
     /// discarding them, extending capacity beyond RAM. Off by default.
@@ -256,6 +297,8 @@ where
             spill,
             merge_coalesce_window,
             prefold_enabled,
+            loader,
+            batch_window,
             marker: _,
         } = self;
 
@@ -270,6 +313,17 @@ where
         if !validate_merge_window(merge_coalesce_window, resolver.merges()) {
             return Err(CacheError::MergeWindowRequiresMergingResolver { cache: name });
         }
+
+        if let Err(reason) = validate_load_config(loader.is_some(), batch_window.is_some()) {
+            return Err(CacheError::InvalidLoadConfig {
+                cache: name,
+                reason,
+            });
+        }
+        let loader = match (loader, batch_window) {
+            (Some(loader), Some((window, max_keys))) => Some(loader.with_window(window, max_keys)),
+            (loader, _) => loader,
+        };
 
         #[cfg(feature = "spill")]
         if let Some(cfg) = &spill
@@ -318,6 +372,9 @@ where
         }
         if let Some(weigher) = weigher {
             shard = shard.with_weigher(move |key: &K, value: &V| weigher(key, value));
+        }
+        if let Some(loader) = loader {
+            shard = shard.with_loader(loader);
         }
         // Bounded wait for a first known peer, `Mode::Distributed` only,
         // before `attach_ownership` computes the first view; see
@@ -481,6 +538,15 @@ fn validate_mode(
 /// the resolver can fold two values rather than only pick a side.
 fn validate_merge_window(window: Duration, resolver_merges: bool) -> bool {
     window.is_zero() || resolver_merges
+}
+
+/// Whether the loading options a builder carries fit together: a batch
+/// window needs a loader to batch for. Pure; unit tested directly.
+fn validate_load_config(has_loader: bool, has_batch_window: bool) -> Result<(), &'static str> {
+    if has_batch_window && !has_loader {
+        return Err("batch_window needs a loader");
+    }
+    Ok(())
 }
 
 /// Where a `Mode::Distributed` read's answer came from.
@@ -1517,6 +1583,38 @@ where
         make: impl AsyncFnOnce(&K) -> V,
     ) -> Result<V, CacheError> {
         self.shard.get_or_insert_with(key, make).await
+    }
+
+    /// Reads `key` through the loader registered with
+    /// [`CacheBuilder::batch_loader`] or [`CacheBuilder::loader`]: the
+    /// cached value on a hit, otherwise what the loader returns, `None` when
+    /// the source does not hold the key. Concurrent misses on one key
+    /// collapse into one load, and keys missing within the
+    /// [`CacheBuilder::batch_window`] share one loader call. A loaded value
+    /// is written under the cache's default TTL and fans out per [`Mode`]
+    /// like a [`Cache::get_or_load`] fill; a key the source lacks is not
+    /// cached, so the next read asks again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::NoLoader`] if no loader is registered,
+    /// [`CacheError::Loader`] if the loader fails, and
+    /// [`CacheError::Codec`] if `key` fails to encode.
+    pub async fn load(&self, key: &K) -> Result<Option<V>, CacheError> {
+        self.shard.load(key).await
+    }
+
+    /// [`Cache::load`] for many keys: the keys missing here go to the loader
+    /// together. The map holds every key the cache or the source holds.
+    ///
+    /// # Errors
+    ///
+    /// As [`Cache::load`]; a loader failure for any key fails the call.
+    pub async fn load_many(
+        &self,
+        keys: impl IntoIterator<Item = K>,
+    ) -> Result<HashMap<K, V>, CacheError> {
+        self.shard.load_many(keys).await
     }
 
     /// Writes `key` = `value`: stamps an HLC version, applies locally, and
@@ -4061,6 +4159,190 @@ mod tests {
         cluster.shutdown().await;
     }
 
+    #[derive(Debug, thiserror::Error)]
+    #[error("source unavailable")]
+    struct SourceDown;
+
+    #[tokio::test]
+    async fn load_and_load_many_read_through_the_registered_loader() {
+        let cluster = Cluster::builder("cache-it-load")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node builds");
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<Vec<u32>>::new()));
+        let cache = cluster
+            .cache::<u32, String>("prices")
+            .mode(Mode::Local)
+            .ttl(Duration::from_secs(600))
+            .batch_loader({
+                let calls = Arc::clone(&calls);
+                move |keys: Vec<u32>| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        let mut sorted = keys.clone();
+                        sorted.sort_unstable();
+                        calls.lock().expect("calls lock").push(sorted);
+                        Ok::<_, SourceDown>(
+                            keys.into_iter()
+                                .filter(|key| key.is_multiple_of(2))
+                                .map(|key| (key, format!("v{key}")))
+                                .collect::<HashMap<_, _>>(),
+                        )
+                    }
+                }
+            })
+            .open()
+            .await
+            .expect("opens");
+
+        assert_eq!(cache.load(&2).await.expect("load"), Some("v2".to_string()));
+        assert_eq!(cache.get(&2).await, Some("v2".to_string()));
+        assert!(
+            matches!(cache.ttl_of(&2), Some(Ttl::Remaining(left)) if left > Duration::from_secs(590)),
+            "a loaded value takes the cache's default TTL"
+        );
+        assert_eq!(cache.load(&3).await.expect("load"), None);
+        assert_eq!(
+            cache.load_many([2, 3, 4, 6]).await.expect("load_many"),
+            HashMap::from([
+                (2, "v2".to_string()),
+                (4, "v4".to_string()),
+                (6, "v6".to_string())
+            ])
+        );
+        assert_eq!(
+            calls.lock().expect("calls lock").clone(),
+            vec![vec![2], vec![3], vec![3, 4, 6]],
+            "a hit never reaches the loader; a key the source lacks is asked again"
+        );
+
+        let single = cluster
+            .cache::<u32, String>("names")
+            .mode(Mode::Local)
+            .loader(|key: u32| async move {
+                if key == 0 {
+                    Err(SourceDown)
+                } else {
+                    Ok((key < 10).then(|| format!("n{key}")))
+                }
+            })
+            .open()
+            .await
+            .expect("opens");
+        assert_eq!(single.load(&1).await.expect("load"), Some("n1".to_string()));
+        assert_eq!(single.load(&11).await.expect("load"), None);
+        assert!(matches!(single.load(&0).await, Err(CacheError::Loader(_))));
+
+        let plain = cluster
+            .cache::<u32, String>("plain")
+            .mode(Mode::Local)
+            .open()
+            .await
+            .expect("opens");
+        assert!(matches!(
+            plain.load(&1).await,
+            Err(CacheError::NoLoader { cache }) if cache == "plain"
+        ));
+        assert!(matches!(
+            cluster
+                .cache::<u32, String>("windowed")
+                .batch_window(Duration::from_millis(5), 10)
+                .open()
+                .await,
+            Err(CacheError::InvalidLoadConfig { cache, .. }) if cache == "windowed"
+        ));
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_batch_window_groups_misses_from_concurrent_loads() {
+        let cluster = Cluster::builder("cache-it-load-window")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node builds");
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<Vec<u32>>::new()));
+        let cache = cluster
+            .cache::<u32, String>("prices")
+            .mode(Mode::Local)
+            .batch_loader({
+                let calls = Arc::clone(&calls);
+                move |keys: Vec<u32>| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        let mut sorted = keys.clone();
+                        sorted.sort_unstable();
+                        calls.lock().expect("calls lock").push(sorted);
+                        Ok::<_, SourceDown>(
+                            keys.into_iter()
+                                .map(|key| (key, format!("v{key}")))
+                                .collect::<HashMap<_, _>>(),
+                        )
+                    }
+                }
+            })
+            .batch_window(Duration::from_millis(200), 3)
+            .open()
+            .await
+            .expect("opens");
+        let (a, b, c) = tokio::join!(cache.load(&1), cache.load(&2), cache.load(&3));
+        for (answer, key) in [(a, 1), (b, 2), (c, 3)] {
+            assert_eq!(answer.expect("load"), Some(format!("v{key}")));
+        }
+        assert_eq!(
+            calls.lock().expect("calls lock").clone(),
+            vec![vec![1, 2, 3]],
+            "three misses fill the batch and load in one call"
+        );
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_loaded_value_replicates_to_every_replica() {
+        let name = "cache-it-load-replicated";
+        let a = Cluster::builder(name)
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("a builds");
+        let b = Cluster::builder(name)
+            .seeds([a.local_gossip_addr()])
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("b builds");
+        wait_for_peer_count(&a, 1).await;
+        wait_for_peer_count(&b, 1).await;
+        let open = |cluster: &Cluster| {
+            cluster
+                .cache::<u32, String>("prices")
+                .mode(Mode::Replicated)
+                .loader(|key: u32| async move { Ok::<_, SourceDown>(Some(format!("v{key}"))) })
+                .open()
+        };
+        let cache_a = open(&a).await.expect("a opens");
+        let cache_b = open(&b).await.expect("b opens");
+
+        assert_eq!(
+            cache_a.load(&7).await.expect("load"),
+            Some("v7".to_string())
+        );
+        wait_until(
+            Duration::from_secs(10),
+            "b holds the loaded value",
+            async || cache_b.get(&7).await == Some("v7".to_string()),
+        )
+        .await;
+
+        b.shutdown().await;
+        a.shutdown().await;
+    }
+
     #[tokio::test]
     async fn a_new_lifetime_replicates_to_every_replica() {
         let name = "cache-it-ttl-replicated";
@@ -4367,6 +4649,17 @@ mod tests {
         );
 
         cluster.shutdown().await;
+    }
+
+    #[test]
+    fn validate_load_config_needs_a_loader_for_a_batch_window() {
+        assert_eq!(validate_load_config(false, false), Ok(()));
+        assert_eq!(validate_load_config(true, false), Ok(()));
+        assert_eq!(validate_load_config(true, true), Ok(()));
+        assert_eq!(
+            validate_load_config(false, true),
+            Err("batch_window needs a loader")
+        );
     }
 
     #[test]

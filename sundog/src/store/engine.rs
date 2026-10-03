@@ -599,6 +599,9 @@ pub(crate) struct Inflight<V> {
     /// announces, so [`Engine::complete_fresh_load`] answers with the value
     /// and stores nothing.
     invalidated: AtomicBool,
+    /// Set iff the load finished and the source holds nothing for the key:
+    /// a joined waiter answers `None` instead of loading again.
+    absent: AtomicBool,
 }
 
 impl<V> Inflight<V> {
@@ -608,7 +611,20 @@ impl<V> Inflight<V> {
             error: OnceLock::new(),
             value: OnceLock::new(),
             invalidated: AtomicBool::new(false),
+            absent: AtomicBool::new(false),
         }
+    }
+
+    /// A receiver for this load's end, for the caller that owns the load;
+    /// [`watch::Receiver::wait_for`] on it returns at once if the load
+    /// already ended.
+    pub(crate) fn subscribe(&self) -> watch::Receiver<bool> {
+        self.done.subscribe()
+    }
+
+    /// Whether the load ended with the source holding nothing for the key.
+    pub(crate) fn is_absent(&self) -> bool {
+        self.absent.load(Ordering::Relaxed)
     }
 
     /// Wakes every subscribed waiter; a receiver subscribed before this call
@@ -4744,6 +4760,21 @@ where
         error: Arc<dyn std::error::Error + Send + Sync>,
     ) {
         let _ = inflight.error.set(error);
+        self.finish_inflight(key_bytes, hash);
+        inflight.finish();
+    }
+
+    /// Records a loader run that found nothing for the key: removes the
+    /// `inflight` entry, and every joined waiter answers `None`.
+    pub(crate) fn finish_absent(&self, key_bytes: &Bytes, hash: u64, inflight: &Inflight<V>) {
+        inflight.absent.store(true, Ordering::Relaxed);
+        self.finish_inflight(key_bytes, hash);
+        inflight.finish();
+    }
+
+    /// Ends `inflight` with no outcome, as a dropped [`InflightGuard`]
+    /// does: every joined waiter wakes, re-reads and takes the load over.
+    pub(crate) fn abandon_inflight(&self, key_bytes: &Bytes, hash: u64, inflight: &Inflight<V>) {
         self.finish_inflight(key_bytes, hash);
         inflight.finish();
     }
