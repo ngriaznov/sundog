@@ -85,7 +85,7 @@ pub use config::ClusterConfig;
 #[cfg(feature = "tls")]
 pub use config::TlsConfig;
 pub use discovery::Discovery;
-pub use error::{CacheError, CodecError, JoinError};
+pub use error::{CacheError, CodecError, JoinError, RemoteLoaderError};
 pub use hlc::{Hlc, HlcClock};
 pub use node::{NodeId, NodeName};
 pub use store::crdt;

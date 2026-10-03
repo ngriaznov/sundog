@@ -28,8 +28,8 @@ use tokio_util::task::TaskTracker;
 use crate::cluster::Cluster;
 use crate::cluster::anti_entropy;
 use crate::config::ClusterConfig;
-use crate::error::CacheError;
-use crate::net::FetchOutcome;
+use crate::error::{CacheError, RemoteLoaderError};
+use crate::net::{FetchOutcome, LoadOutcome};
 use crate::node::NodeId;
 use crate::ownership::{OwnershipTracker, OwnershipView, ResidencySet};
 use crate::store::PartId;
@@ -38,8 +38,8 @@ use crate::store::part::PartSet;
 #[cfg(feature = "spill")]
 use crate::store::spill::SpillConfig;
 use crate::store::{
-    ConflictResolver, Event, Lifetime, Loader, LocalRearm, LwwResolver, Mode, Shard, ShardOps, Ttl,
-    Weigher, encode_key, now_ms,
+    ConflictResolver, Event, Lifetime, LoadError, Loader, LocalRearm, LwwResolver, Mode, Shard,
+    ShardOps, Sourced, Ttl, Weigher, encode_key, now_ms,
 };
 use crate::wire::WireRecord;
 
@@ -373,6 +373,7 @@ where
         if let Some(weigher) = weigher {
             shard = shard.with_weigher(move |key: &K, value: &V| weigher(key, value));
         }
+        let has_loader = loader.is_some();
         if let Some(loader) = loader {
             shard = shard.with_loader(loader);
         }
@@ -433,6 +434,9 @@ where
         }
 
         cluster.advertise_cache_mode(&name, mode);
+        if has_loader {
+            cluster.advertise_loader(&name);
+        }
         // `Replicated` and `Distributed` both have something to receive
         // before they can donate; every other mode is warm the moment it
         // opens.
@@ -538,6 +542,60 @@ fn validate_mode(
 /// the resolver can fold two values rather than only pick a side.
 fn validate_merge_window(window: Duration, resolver_merges: bool) -> bool {
     window.is_zero() || resolver_merges
+}
+
+/// Whether [`Cache::load`] in `mode` gathers each key's loads on one node.
+/// `Mode::Local` has no peers, and in `Mode::Replicated` a loaded value
+/// reaches every node anyway, so each loads for itself. Pure; unit tested
+/// directly.
+fn routes_loads(mode: Mode) -> bool {
+    matches!(mode, Mode::Invalidation | Mode::Distributed { .. })
+}
+
+/// The node a key's loads gather on, from this node's side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadTarget {
+    Here,
+    Peer(NodeId),
+}
+
+/// The node `part`'s loads gather on, among this node `me` and the peers in
+/// `capable` that can load for this cache. In `Mode::Distributed`, the
+/// first of the part's `owners`, in rank order, that is `me` or capable,
+/// and `me` when none is. In every other mode, the rendezvous winner for
+/// `part` among `me` and `capable`, ties to the lower [`NodeId`], so every
+/// node that agrees on who can load picks the same one. Pure; unit tested
+/// directly.
+fn load_target(
+    mode: Mode,
+    part: PartId,
+    me: NodeId,
+    owners: &[NodeId],
+    capable: &HashSet<NodeId>,
+) -> LoadTarget {
+    let chosen = match mode {
+        Mode::Distributed { .. } => owners
+            .iter()
+            .copied()
+            .find(|&node| node == me || capable.contains(&node))
+            .unwrap_or(me),
+        _ => capable
+            .iter()
+            .copied()
+            .chain(std::iter::once(me))
+            .max_by_key(|&node| {
+                (
+                    crate::ownership::rendezvous_score(node, part.raw()),
+                    std::cmp::Reverse(node),
+                )
+            })
+            .unwrap_or(me),
+    };
+    if chosen == me {
+        LoadTarget::Here
+    } else {
+        LoadTarget::Peer(chosen)
+    }
 }
 
 /// Whether the loading options a builder carries fit together: a batch
@@ -1601,7 +1659,13 @@ where
     /// [`CacheError::Loader`] if the loader fails, and
     /// [`CacheError::Codec`] if `key` fails to encode.
     pub async fn load(&self, key: &K) -> Result<Option<V>, CacheError> {
-        self.shard.load(key).await
+        if routes_loads(self.shard.mode()) {
+            self.shard
+                .load_from(key, &|keys| Box::pin(self.route_load(keys)))
+                .await
+        } else {
+            self.shard.load(key).await
+        }
     }
 
     /// [`Cache::load`] for many keys: the keys missing here go to the loader
@@ -1614,7 +1678,148 @@ where
         &self,
         keys: impl IntoIterator<Item = K>,
     ) -> Result<HashMap<K, V>, CacheError> {
-        self.shard.load_many(keys).await
+        if routes_loads(self.shard.mode()) {
+            self.shard
+                .load_many_from(keys, &|keys| Box::pin(self.route_load(keys)))
+                .await
+        } else {
+            self.shard.load_many(keys).await
+        }
+    }
+
+    /// The source [`Cache::load`] reads a miss from in `Mode::Invalidation`
+    /// and `Mode::Distributed`: each key goes to the node its loads gather
+    /// on, per [`load_target`], one request per node, and this node's own
+    /// keys to its loader, all at once. A peer that declines or cannot be
+    /// reached has its keys loaded here instead; a peer whose loader fails
+    /// fails the batch with [`RemoteLoaderError`].
+    async fn route_load(&self, keys: Vec<K>) -> Result<Sourced<K, V>, LoadError> {
+        let mode = self.shard.mode();
+        let me = self.cluster.node_id();
+        let capable = self.loader_peers();
+        let view = self.shard.ownership_view();
+        let mut here = Vec::new();
+        let mut remote: HashMap<NodeId, Vec<(K, bytes::Bytes)>> = HashMap::new();
+        for key in keys {
+            let Ok(key_bytes) = encode_key(&key) else {
+                here.push(key);
+                continue;
+            };
+            let part = PartId::of_key(&key_bytes);
+            let owners = view.as_ref().map_or(&[][..], |view| view.owners_of(part));
+            match load_target(mode, part, me, owners, &capable) {
+                LoadTarget::Here => here.push(key),
+                LoadTarget::Peer(peer) => remote.entry(peer).or_default().push((key, key_bytes)),
+            }
+        }
+        let local = async {
+            if here.is_empty() {
+                Ok(HashMap::new())
+            } else {
+                self.shard.call_loader(here).await
+            }
+        };
+        let remotes = futures::future::join_all(
+            remote
+                .into_iter()
+                .map(|(peer, keys)| self.load_on(peer, keys)),
+        );
+        let (local, remotes) = tokio::join!(local, remotes);
+        let mut sourced = Sourced {
+            store: local?,
+            answer: HashMap::new(),
+        };
+        for answer in remotes {
+            let answer = answer?;
+            sourced.store.extend(answer.store);
+            sourced.answer.extend(answer.answer);
+        }
+        Ok(sourced)
+    }
+
+    /// Asks `peer` to load `keys`. A record it stores comes back to be
+    /// stored here too in `Mode::Invalidation`, where each node caches its
+    /// own working set, and only answered with in `Mode::Distributed`,
+    /// where `peer` owns the key and this node does not.
+    async fn load_on(
+        &self,
+        peer: NodeId,
+        keys: Vec<(K, bytes::Bytes)>,
+    ) -> Result<Sourced<K, V>, LoadError> {
+        let request = keys
+            .iter()
+            .map(|(_, key_bytes)| key_bytes.clone())
+            .collect();
+        let outcome = self
+            .cluster
+            .mesh()
+            .load(peer, SmolStr::new(self.shard.name()), request)
+            .await;
+        let (found, uncached) = match outcome {
+            Ok(LoadOutcome::Loaded { found, uncached }) => (found, uncached),
+            Ok(LoadOutcome::Failed(message)) => {
+                return Err(Box::new(RemoteLoaderError {
+                    node: peer,
+                    message,
+                }));
+            }
+            Ok(LoadOutcome::Declined) | Err(_) => {
+                let keys = keys.into_iter().map(|(key, _)| key).collect();
+                return Ok(Sourced {
+                    store: self.shard.call_loader(keys).await?,
+                    answer: HashMap::new(),
+                });
+            }
+        };
+        let mut by_bytes: HashMap<bytes::Bytes, K> = keys
+            .into_iter()
+            .map(|(key, key_bytes)| (key_bytes, key))
+            .collect();
+        let mut sourced = Sourced {
+            store: HashMap::new(),
+            answer: HashMap::new(),
+        };
+        let stores_here = matches!(self.shard.mode(), Mode::Invalidation);
+        let records = found
+            .into_iter()
+            .filter_map(|rec| rec.value.map(|value| (rec.key, value, stores_here)));
+        let values = uncached.into_iter().map(|(key, value)| (key, value, false));
+        for (key_bytes, value_bytes, store) in records.chain(values) {
+            let (Some(key), Ok(value)) = (
+                by_bytes.remove(&key_bytes),
+                postcard::from_bytes::<V>(&value_bytes),
+            ) else {
+                continue;
+            };
+            if store {
+                sourced.store.insert(key, value);
+            } else {
+                sourced.answer.insert(key, value);
+            }
+        }
+        Ok(sourced)
+    }
+
+    /// The live peers a key of this cache may load on: they speak
+    /// [`crate::wire::PROTOCOL_LOAD`], advertise a loader for this cache,
+    /// and have it open under the same [`Mode`].
+    fn loader_peers(&self) -> HashSet<NodeId> {
+        let name = self.shard.name();
+        let mode = self.shard.mode();
+        let loaders = self.cluster.advertised_loaders();
+        let modes = self.cluster.advertised_cache_modes();
+        self.cluster
+            .peers()
+            .into_iter()
+            .filter(|peer| {
+                crate::wire::peer_supports(peer.protocol, crate::wire::PROTOCOL_LOAD)
+                    && loaders
+                        .get(&peer.node)
+                        .is_some_and(|caches| caches.contains(name))
+                    && modes.get(&peer.node).and_then(|caches| caches.get(name)) == Some(&mode)
+            })
+            .map(|peer| peer.node)
+            .collect()
     }
 
     /// Writes `key` = `value`: stamps an HLC version, applies locally, and
@@ -4343,6 +4548,216 @@ mod tests {
         a.shutdown().await;
     }
 
+    /// Every loader call any node made: the node and the keys, sorted.
+    type LoadLog = Arc<std::sync::Mutex<Vec<(NodeId, Vec<u32>)>>>;
+
+    /// Three nodes with `name` open under `mode`, each with a batch loader
+    /// that records its calls in `log`, takes 300ms, and holds `v{key}` for
+    /// every key; the loader on the node at index `fails` returns an error
+    /// instead. Returns once every node sees the other two advertise a
+    /// loader.
+    async fn three_loading_nodes(
+        name: &'static str,
+        mode: Mode,
+        log: &LoadLog,
+        fails: Option<usize>,
+    ) -> Vec<(Cluster, Cache<u32, String>)> {
+        let mut nodes: Vec<(Cluster, Cache<u32, String>)> = Vec::new();
+        for index in 0..3 {
+            let builder = Cluster::builder(name).config(loopback_config());
+            let cluster = match nodes.first() {
+                None => builder.seeds(std::iter::empty()),
+                Some((seed, _)) => builder.seeds([seed.local_gossip_addr()]),
+            }
+            .build()
+            .await
+            .expect("node builds");
+            wait_for_peer_count(&cluster, index).await;
+            let node = cluster.node_id();
+            let log = Arc::clone(log);
+            let cache = cluster
+                .cache::<u32, String>(name)
+                .mode(mode)
+                .batch_loader(move |keys: Vec<u32>| {
+                    let log = Arc::clone(&log);
+                    async move {
+                        let mut sorted = keys.clone();
+                        sorted.sort_unstable();
+                        log.lock().expect("log lock").push((node, sorted));
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        if fails == Some(index) {
+                            return Err(SourceDown);
+                        }
+                        Ok(keys
+                            .into_iter()
+                            .map(|key| (key, format!("v{key}")))
+                            .collect::<HashMap<_, _>>())
+                    }
+                })
+                .open()
+                .await
+                .expect("opens");
+            nodes.push((cluster, cache));
+        }
+        wait_until(
+            Duration::from_secs(10),
+            "every node sees the other two advertise a loader",
+            async || {
+                nodes
+                    .iter()
+                    .all(|(_, cache)| cache.loader_peers().len() == 2)
+            },
+        )
+        .await;
+        nodes
+    }
+
+    async fn shut_down_all(nodes: Vec<(Cluster, Cache<u32, String>)>) {
+        for (cluster, _) in nodes.into_iter().rev() {
+            cluster.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_invalidation_loads_of_a_key_gather_into_one_loader_call() {
+        let log = LoadLog::default();
+        let nodes =
+            three_loading_nodes("cache-it-load-gather", Mode::Invalidation, &log, None).await;
+        let (answers, ()) = tokio::join!(
+            futures::future::join_all(nodes.iter().map(|(_, cache)| cache.load(&7))),
+            async {}
+        );
+        for answer in answers {
+            assert_eq!(answer.expect("load"), Some("v7".to_string()));
+        }
+        assert_eq!(
+            log.lock().expect("log lock").len(),
+            1,
+            "three nodes asking at once share one loader call: {:?}",
+            log.lock().expect("log lock")
+        );
+        for (_, cache) in &nodes {
+            assert_eq!(
+                cache.get(&7).await,
+                Some("v7".to_string()),
+                "in Invalidation mode each node keeps what it loaded"
+            );
+        }
+        let loads_before = log.lock().expect("log lock").len();
+        let found = nodes[1].1.load_many([7, 8, 9]).await.expect("load_many");
+        assert_eq!(found.len(), 3);
+        assert_eq!(
+            nodes[1].1.load(&7).await.expect("load"),
+            Some("v7".to_string())
+        );
+        assert!(
+            log.lock().expect("log lock").len() > loads_before,
+            "the missing keys reach a loader"
+        );
+        shut_down_all(nodes).await;
+    }
+
+    #[tokio::test]
+    async fn a_distributed_load_runs_on_the_first_owner_and_stays_off_a_non_owner() {
+        let log = LoadLog::default();
+        let nodes =
+            three_loading_nodes("cache-it-load-owner", Mode::distributed(), &log, None).await;
+        let (a, cache_a) = &nodes[0];
+        let key = (0..10_000u32)
+            .find(|key| !cache_a.owners_of(key).contains(&a.node_id()))
+            .expect("a key a does not own");
+        let owners = cache_a.owners_of(&key);
+        wait_until(
+            Duration::from_secs(10),
+            "every node agrees on the key's owners",
+            async || {
+                nodes
+                    .iter()
+                    .all(|(_, cache)| cache.owners_of(&key) == owners)
+            },
+        )
+        .await;
+
+        assert_eq!(
+            cache_a.load(&key).await.expect("load"),
+            Some(format!("v{key}"))
+        );
+        assert_eq!(
+            log.lock().expect("log lock").clone(),
+            vec![(owners[0], vec![key])],
+            "the key's first owner runs the one load"
+        );
+        assert_eq!(cache_a.get(&key).await, None, "a non-owner keeps no copy");
+        wait_until(
+            Duration::from_secs(10),
+            "both owners hold the loaded value",
+            async || {
+                let mut held = 0;
+                for (cluster, cache) in &nodes {
+                    if owners.contains(&cluster.node_id()) && cache.get(&key).await.is_some() {
+                        held += 1;
+                    }
+                }
+                held == 2
+            },
+        )
+        .await;
+        assert_eq!(
+            cache_a.load(&key).await.expect("load"),
+            Some(format!("v{key}"))
+        );
+        assert_eq!(
+            log.lock().expect("log lock").len(),
+            1,
+            "the owner answers the second read from its copy"
+        );
+        shut_down_all(nodes).await;
+    }
+
+    #[tokio::test]
+    async fn a_failing_remote_loader_answers_with_a_remote_loader_error() {
+        let log = LoadLog::default();
+        let nodes = three_loading_nodes(
+            "cache-it-load-remote-failure",
+            Mode::Invalidation,
+            &log,
+            Some(1),
+        )
+        .await;
+        let (a, cache_a) = &nodes[0];
+        let failing = nodes[1].0.node_id();
+        let capable = cache_a.loader_peers();
+        let key = (0..10_000u32)
+            .find(|key| {
+                let part = PartId::of_key(&encode_key(key).expect("u32 encodes"));
+                load_target(Mode::Invalidation, part, a.node_id(), &[], &capable)
+                    == LoadTarget::Peer(failing)
+            })
+            .expect("a key whose loads gather on the failing node");
+        let err = cache_a
+            .load(&key)
+            .await
+            .expect_err("the remote loader fails");
+        let CacheError::Loader(source) = &err else {
+            panic!("a loader error, got {err:?}");
+        };
+        let remote =
+            std::iter::successors(Some(source.as_ref() as &dyn std::error::Error), |err| {
+                err.source()
+            })
+            .find_map(|err| err.downcast_ref::<RemoteLoaderError>())
+            .expect("the error chain names the remote loader");
+        assert_eq!(remote.node, failing);
+        assert_eq!(remote.message, "source unavailable");
+        assert_eq!(cache_a.get(&key).await, None);
+        assert_eq!(
+            log.lock().expect("log lock").clone(),
+            vec![(failing, vec![key])],
+            "a remote failure is not retried here"
+        );
+        shut_down_all(nodes).await;
+    }
+
     #[tokio::test]
     async fn a_new_lifetime_replicates_to_every_replica() {
         let name = "cache-it-ttl-replicated";
@@ -4649,6 +5064,89 @@ mod tests {
         );
 
         cluster.shutdown().await;
+    }
+
+    #[test]
+    fn routes_loads_only_where_values_do_not_reach_every_node() {
+        assert!(!routes_loads(Mode::Local));
+        assert!(!routes_loads(Mode::Replicated));
+        assert!(routes_loads(Mode::Invalidation));
+        assert!(routes_loads(Mode::distributed()));
+    }
+
+    #[test]
+    fn load_target_in_distributed_takes_the_first_owner_that_can_load() {
+        let me = NodeId::from(1);
+        let (a, b) = (NodeId::from(2), NodeId::from(3));
+        let part = PartId::from_raw(7);
+        let both: HashSet<NodeId> = [a, b].into_iter().collect();
+        let mode = Mode::distributed();
+        assert_eq!(
+            load_target(mode, part, me, &[a, b], &both),
+            LoadTarget::Peer(a)
+        );
+        assert_eq!(
+            load_target(mode, part, me, &[a, b], &[b].into_iter().collect()),
+            LoadTarget::Peer(b),
+            "an owner with no loader is skipped"
+        );
+        assert_eq!(
+            load_target(mode, part, me, &[me, a], &both),
+            LoadTarget::Here,
+            "this node, as the first owner, loads its own keys"
+        );
+        assert_eq!(
+            load_target(mode, part, me, &[a, b], &HashSet::new()),
+            LoadTarget::Here,
+            "with no owner able to load, this node loads"
+        );
+        assert_eq!(load_target(mode, part, me, &[], &both), LoadTarget::Here);
+    }
+
+    #[test]
+    fn load_target_elsewhere_is_one_rendezvous_winner_every_node_agrees_on() {
+        let nodes: Vec<NodeId> = (1..=5).map(NodeId::from).collect();
+        for raw in [0u16, 1, 99, 4_000, 65_535] {
+            let part = PartId::from_raw(raw);
+            let picks: HashSet<NodeId> = nodes
+                .iter()
+                .map(|&me| {
+                    let capable: HashSet<NodeId> =
+                        nodes.iter().copied().filter(|&n| n != me).collect();
+                    match load_target(Mode::Invalidation, part, me, &[], &capable) {
+                        LoadTarget::Here => me,
+                        LoadTarget::Peer(peer) => peer,
+                    }
+                })
+                .collect();
+            assert_eq!(
+                picks.len(),
+                1,
+                "part {raw}: every node picks the same loader"
+            );
+        }
+        let me = NodeId::from(1);
+        assert_eq!(
+            load_target(
+                Mode::Invalidation,
+                PartId::from_raw(3),
+                me,
+                &[],
+                &HashSet::new()
+            ),
+            LoadTarget::Here,
+            "alone, this node loads"
+        );
+        let spread: HashSet<NodeId> = (0..64u16)
+            .map(|raw| {
+                let capable: HashSet<NodeId> = nodes[1..].iter().copied().collect();
+                match load_target(Mode::Invalidation, PartId::from_raw(raw), me, &[], &capable) {
+                    LoadTarget::Here => me,
+                    LoadTarget::Peer(peer) => peer,
+                }
+            })
+            .collect();
+        assert!(spread.len() > 1, "parts spread across the loaders");
     }
 
     #[test]

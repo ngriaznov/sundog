@@ -480,6 +480,35 @@ pub(crate) enum FetchServe {
     Unavailable,
 }
 
+/// A [`RequestHandler`]'s answer to a [`crate::wire::Msg::Load`].
+pub(crate) enum LoadServe {
+    /// The record stored for each requested key the responder or its
+    /// source holds, and each value it loaded without storing.
+    Loaded {
+        found: Vec<WireRecord>,
+        uncached: Vec<(Bytes, Bytes)>,
+    },
+    /// The responder's loader failed, with the error's message.
+    Failed(String),
+    /// The responder cannot load for the requester: no loader, the cache
+    /// not open, or a requested key's part not warm here.
+    Unavailable,
+}
+
+/// What a [`Mesh::load`] request came back with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LoadOutcome {
+    /// See [`LoadServe::Loaded`].
+    Loaded {
+        found: Vec<WireRecord>,
+        uncached: Vec<(Bytes, Bytes)>,
+    },
+    /// See [`LoadServe::Failed`].
+    Failed(String),
+    /// The responder declined; the requester loads elsewhere.
+    Declined,
+}
+
 /// A [`RequestHandler`]'s answer to a scoped anti-entropy digest
 /// exchange, [`crate::wire::Msg::AeDigestScoped`] or
 /// [`crate::wire::Msg::AeDigestMasked`]: the responder's digests to
@@ -631,6 +660,15 @@ pub trait RequestHandler: Send + Sync + 'static {
     fn fetch(&self, cache: SmolStr, key: Bytes, view_hash: u64) -> BoxFuture<'_, FetchServe> {
         let _ = (cache, key, view_hash);
         Box::pin(async { FetchServe::Unavailable })
+    }
+
+    /// Serves a [`crate::wire::Msg::Load`]. Default:
+    /// `LoadServe::Unavailable`; `LoadServe` is `pub(crate)` for the same
+    /// reason `FetchServe` is, see [`RequestHandler::fetch`].
+    #[allow(private_interfaces, reason = "see RequestHandler::fetch's doc comment")]
+    fn load(&self, cache: SmolStr, keys: Vec<Bytes>) -> BoxFuture<'_, LoadServe> {
+        let _ = (cache, keys);
+        Box::pin(async { LoadServe::Unavailable })
     }
 
     /// Serves a [`crate::wire::Msg::AeDigestScoped`]. Default:
@@ -1671,6 +1709,26 @@ impl Mesh {
         .await
     }
 
+    /// Asks `peer` to load `keys` of `cache` through its loader.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] if `peer` is unknown, speaks a protocol
+    /// older than [`wire::PROTOCOL_LOAD`], or the exchange fails.
+    pub(crate) async fn load(
+        &self,
+        peer: NodeId,
+        cache: SmolStr,
+        keys: Vec<Bytes>,
+    ) -> Result<LoadOutcome, CodecError> {
+        self.require_peer_protocol(peer, wire::PROTOCOL_LOAD, "a load request")?;
+        timed("load request", async {
+            let msg = Msg::Load { cache, keys };
+            conn::collect_load_reply(self.acquire_conn(peer, msg).await?).await
+        })
+        .await
+    }
+
     /// Distribution-mode anti-entropy round, step 1: like [`Mesh::ae_round`] but scoped to `local_buckets` at `view_hash`.
     ///
     /// # Errors
@@ -1860,6 +1918,14 @@ mod tests {
         Unavailable,
     }
 
+    /// [`FixtureHandler::load_fixture`]'s controllable outcome, one variant
+    /// per [`LoadServe`] shape.
+    enum LoadFixture {
+        Loaded(Vec<WireRecord>, Vec<(Bytes, Bytes)>),
+        Failed(&'static str),
+        Unavailable,
+    }
+
     /// [`FixtureHandler::ae_scoped_fixture`]'s controllable outcome, one
     /// variant per [`AeServeOutcome`] shape.
     enum AeScopedFixture {
@@ -1882,6 +1948,7 @@ mod tests {
         snapshot_unavailable: bool,
         ownership_view_hash: Option<u64>,
         fetch_fixture: FetchFixture,
+        load_fixture: LoadFixture,
         ae_scoped_fixture: AeScopedFixture,
         buckets_available: bool,
         buckets_cold: bool,
@@ -1904,6 +1971,7 @@ mod tests {
                 snapshot_unavailable: false,
                 ownership_view_hash: None,
                 fetch_fixture: FetchFixture::Unavailable,
+                load_fixture: LoadFixture::Unavailable,
                 ae_scoped_fixture: AeScopedFixture::Unavailable,
                 buckets_available: false,
                 buckets_cold: false,
@@ -2045,6 +2113,27 @@ mod tests {
                         responder_view_hash: *responder_view_hash,
                     },
                     FetchFixture::Unavailable => FetchServe::Unavailable,
+                }
+            })
+        }
+
+        fn load(&self, _cache: SmolStr, keys: Vec<Bytes>) -> BoxFuture<'_, LoadServe> {
+            Box::pin(async move {
+                match &self.load_fixture {
+                    LoadFixture::Loaded(found, uncached) => LoadServe::Loaded {
+                        found: found
+                            .iter()
+                            .filter(|rec| keys.contains(&rec.key))
+                            .cloned()
+                            .collect(),
+                        uncached: uncached
+                            .iter()
+                            .filter(|(key, _)| keys.contains(key))
+                            .cloned()
+                            .collect(),
+                    },
+                    LoadFixture::Failed(message) => LoadServe::Failed((*message).to_string()),
+                    LoadFixture::Unavailable => LoadServe::Unavailable,
                 }
             })
         }
@@ -3329,6 +3418,105 @@ mod tests {
             .await
             .expect("fetch succeeds");
         assert_eq!(outcome, FetchOutcome::Found(Some(rec)));
+    }
+
+    #[tokio::test]
+    async fn load_returns_the_responders_records_and_uncached_values() {
+        let rec = sample_record(1);
+        let handler = Arc::new(FixtureHandler {
+            load_fixture: LoadFixture::Loaded(
+                vec![rec.clone()],
+                vec![(Bytes::from_static(b"k2"), Bytes::from_static(b"v2"))],
+            ),
+            ..Default::default()
+        });
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+
+        let outcome = client
+            .load(
+                NodeId::from(1),
+                SmolStr::new("users"),
+                vec![
+                    rec.key.clone(),
+                    Bytes::from_static(b"k2"),
+                    Bytes::from_static(b"k3"),
+                ],
+            )
+            .await
+            .expect("load succeeds");
+        assert_eq!(
+            outcome,
+            LoadOutcome::Loaded {
+                found: vec![rec],
+                uncached: vec![(Bytes::from_static(b"k2"), Bytes::from_static(b"v2"))],
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn load_reports_the_responders_loader_failure() {
+        let handler = Arc::new(FixtureHandler {
+            load_fixture: LoadFixture::Failed("source unavailable"),
+            ..Default::default()
+        });
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+
+        let outcome = client
+            .load(
+                NodeId::from(1),
+                SmolStr::new("users"),
+                vec![Bytes::from_static(b"k1")],
+            )
+            .await
+            .expect("the exchange succeeds");
+        assert_eq!(
+            outcome,
+            LoadOutcome::Failed("source unavailable".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn load_is_declined_against_the_default_handler_body() {
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+
+        let outcome = client
+            .load(
+                NodeId::from(1),
+                SmolStr::new("users"),
+                vec![Bytes::from_static(b"k1")],
+            )
+            .await
+            .expect("the exchange succeeds");
+        assert_eq!(outcome, LoadOutcome::Declined);
+    }
+
+    #[tokio::test]
+    async fn load_refuses_to_dial_a_peer_older_than_protocol_load() {
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![peer_at_protocol(
+            NodeId::from(1),
+            server.local_addr(),
+            wire::PROTOCOL_LOAD - 1,
+        )]);
+
+        let result = client
+            .load(
+                NodeId::from(1),
+                SmolStr::new("users"),
+                vec![Bytes::from_static(b"k1")],
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a peer older than PROTOCOL_LOAD is never sent a load request"
+        );
     }
 
     #[tokio::test]

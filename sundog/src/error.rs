@@ -201,6 +201,19 @@ pub enum CacheError {
     MergeWindowRequiresMergingResolver { cache: SmolStr },
 }
 
+/// A loader on another node failed while loading for this one. A
+/// [`CacheError::Loader`] from `Cache::load` or `Cache::load_many` carries
+/// it in its [`std::error::Error::source`] chain; a failure of this node's
+/// own loader carries the loader's error there instead.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("the loader on node {node} failed: {message}")]
+pub struct RemoteLoaderError {
+    /// The node whose loader failed.
+    pub node: NodeId,
+    /// That loader error's message.
+    pub message: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

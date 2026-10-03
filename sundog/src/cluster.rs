@@ -47,7 +47,7 @@ use crate::error::JoinError;
 use crate::hlc::Hlc;
 use crate::membership::{CacheModes, Membership, Peer};
 use crate::net::{
-    AeServeOutcome, BoundListener, FetchServe, Greeting, InboundMsg, Mesh, OutFrame,
+    AeServeOutcome, BoundListener, FetchServe, Greeting, InboundMsg, LoadServe, Mesh, OutFrame,
     RequestHandler, StServe, batch_forward,
 };
 use crate::node::{NodeId, NodeName};
@@ -432,13 +432,26 @@ impl Cluster {
 
     /// The cluster-side half of [`crate::cache::Cache::close`]: drops `name`
     /// from the shard registry, this node's local mode map and warmth set,
-    /// and clears its gossiped mode so live peers stop seeing it advertised.
+    /// and clears its gossiped mode and loader so live peers stop seeing
+    /// either advertised.
     /// Idempotent: closing an already-forgotten name changes nothing.
     pub(crate) fn forget_cache(&self, name: &str) {
         self.inner.shards.write_shards().remove(name);
         self.inner.local_modes.write_modes().remove(name);
         self.inner.warmth.forget(name);
         self.inner.membership.clear_cache_mode(name);
+        self.inner.membership.clear_loader(name);
+    }
+
+    /// Gossips that this node has a loader for cache `name`, so peers pick
+    /// it to load and refresh that cache's keys.
+    pub(crate) fn advertise_loader(&self, name: &str) {
+        self.inner.membership.set_loader(name);
+    }
+
+    /// Every live peer's advertised loaders, as membership reports them.
+    pub(crate) fn advertised_loaders(&self) -> crate::membership::CacheLoaders {
+        self.inner.membership.cache_loaders().borrow().clone()
     }
 
     /// A fresh watch subscription on the live peer set, for loops that react to
@@ -1095,6 +1108,15 @@ impl RequestHandler for ClusterRequestHandler {
         })
     }
 
+    fn load(&self, cache: SmolStr, keys: Vec<Bytes>) -> BoxFuture<'_, LoadServe> {
+        Box::pin(async move {
+            match self.lookup(&cache) {
+                Some(shard) => shard.serve_load(keys).await,
+                None => LoadServe::Unavailable,
+            }
+        })
+    }
+
     fn ae_digest_scoped(
         &self,
         cache: SmolStr,
@@ -1543,6 +1565,19 @@ fn note_streaming_peers(activity: &InboundActivity, drained: &[InboundMsg]) {
 /// messages coalesces into one `apply_remote_batch` call; a `ForwardBatch`
 /// under a stale view hash is first re-forwarded to its records' current
 /// owners (see [`reforward_stale_view`]), then applied like any other.
+/// The shard `cache` names, looked up in the registry once per drained
+/// burst and remembered in `shard_cache`; `None` for a cache not open here.
+fn burst_shard<'a>(
+    shard_cache: &'a mut HashMap<SmolStr, Option<Arc<dyn ShardOps>>>,
+    shards: &ShardRegistry,
+    cache: &SmolStr,
+) -> Option<&'a Arc<dyn ShardOps>> {
+    shard_cache
+        .entry(cache.clone())
+        .or_insert_with(|| lookup_shard(shards, cache))
+        .as_ref()
+}
+
 async fn inbound_loop(
     shards: ShardRegistry,
     activity: Arc<InboundActivity>,
@@ -1583,10 +1618,7 @@ async fn inbound_loop(
                     hops,
                     recs,
                 } => {
-                    let shard = shard_cache
-                        .entry(cache.clone())
-                        .or_insert_with(|| lookup_shard(&shards, &cache));
-                    if let Some(shard) = shard {
+                    if let Some(shard) = burst_shard(&mut shard_cache, &shards, &cache) {
                         reforward_stale_view(
                             &mesh,
                             ReforwardBatch {
@@ -1608,13 +1640,15 @@ async fn inbound_loop(
                         apply_pending_replicate(&shards, &mut shard_cache, old_cache, old_recs)
                             .await;
                     }
-                    let shard = shard_cache
-                        .entry(cache.clone())
-                        .or_insert_with(|| lookup_shard(&shards, &cache));
-                    if let Some(shard) = shard {
-                        shard.invalidate(key, ver).await;
-                    } else {
+                    let Some(shard) = burst_shard(&mut shard_cache, &shards, &cache) else {
                         tracing::trace!(%cache, %from, "invalidate for unknown cache; dropped");
+                        continue;
+                    };
+                    shard.invalidate(key, ver).await;
+                }
+                Msg::RefreshHint { cache, key, ver } => {
+                    if let Some(shard) = burst_shard(&mut shard_cache, &shards, &cache) {
+                        shard.refresh_hint(key, ver).await;
                     }
                 }
                 // `Hello` and the request/response messages never reach this channel.
@@ -1642,6 +1676,10 @@ async fn inbound_loop(
                 | Msg::StaleView { .. }
                 | Msg::StBucketDone { .. }
                 | Msg::StBucketAck { .. }
+                | Msg::Load { .. }
+                | Msg::Loaded { .. }
+                | Msg::LoadFailed { .. }
+                | Msg::LoadDeclined { .. }
                 | Msg::ReqDone => {}
             }
         }

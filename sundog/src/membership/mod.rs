@@ -52,6 +52,16 @@ fn cache_key(name: &str) -> String {
     format!("{CACHE_KEY_PREFIX}{name}")
 }
 
+/// Prefix for the per-cache keys `Membership::set_loader` sets: the full
+/// key is `loader:<name>`, present while this node has `name` open with a
+/// registered loader. A node older than protocol 7 reads no such key.
+const LOADER_KEY_PREFIX: &str = "loader:";
+
+/// Builds the gossip key that advertises a loader for one cache.
+fn loader_key(name: &str) -> String {
+    format!("{LOADER_KEY_PREFIX}{name}")
+}
+
 /// One live cluster member as seen through gossip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Peer {
@@ -77,6 +87,10 @@ pub struct Peer {
 /// absent, never a placeholder value.
 pub(crate) type CacheModes = HashMap<NodeId, HashMap<SmolStr, Mode>>;
 
+/// The caches each live peer advertises a loader for, keyed by peer. A peer
+/// with no loader for any cache is absent.
+pub(crate) type CacheLoaders = HashMap<NodeId, HashSet<SmolStr>>;
+
 /// A live peer's flags [`cluster::absence`](crate::cluster::absence) needs
 /// captured at the instant it drops out of the live set: whether it
 /// gossiped a graceful departure ([`DEPARTING_KEY`]).
@@ -92,8 +106,10 @@ pub(crate) type LiveObserver = Box<dyn Fn(&HashMap<NodeId, LiveFlags>) + Send>;
 /// A request to the background gossip loop, the sole owner of the chitchat
 /// handle.
 enum Command {
-    SetCacheMode(SmolStr, Mode),
-    ClearCacheMode(SmolStr),
+    /// Sets one key of this node's own gossip state.
+    SetKey(String, String),
+    /// Deletes one key of this node's own gossip state.
+    DeleteKey(String),
     Shutdown(oneshot::Sender<()>),
     Crash(oneshot::Sender<()>),
 }
@@ -106,6 +122,7 @@ enum Command {
 pub struct Membership {
     peers: watch::Receiver<Vec<Peer>>,
     cache_modes: watch::Receiver<CacheModes>,
+    cache_loaders: watch::Receiver<CacheLoaders>,
     local: Peer,
     commands: mpsc::UnboundedSender<Command>,
 }
@@ -193,6 +210,7 @@ impl Membership {
 
         let (peers_tx, peers_rx) = watch::channel(Vec::new());
         let (cache_modes_tx, cache_modes_rx) = watch::channel(HashMap::new());
+        let (cache_loaders_tx, cache_loaders_rx) = watch::channel(HashMap::new());
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
 
         // A departing node's `DEPARTING_KEY` write needs at least one full
@@ -203,6 +221,7 @@ impl Membership {
         let publishers = Publishers {
             peers: peers_tx,
             cache_modes: cache_modes_tx,
+            cache_loaders: cache_loaders_tx,
             observer,
         };
         tokio::spawn(run(
@@ -217,6 +236,7 @@ impl Membership {
         Ok(Self {
             peers: peers_rx,
             cache_modes: cache_modes_rx,
+            cache_loaders: cache_loaders_rx,
             local,
             commands: commands_tx,
         })
@@ -246,18 +266,37 @@ impl Membership {
     /// the `cache:<name>` gossip key. Safe to call unconditionally after
     /// every `open()`; setting the same value twice is a no-op.
     pub(crate) fn set_cache_mode(&self, name: &str, mode: Mode) {
+        let _ = self.commands.send(Command::SetKey(
+            cache_key(name),
+            mode.as_token().to_string(),
+        ));
+    }
+
+    /// A live-updating view of every live peer's [`CacheLoaders`],
+    /// published in lockstep with [`Membership::peers`].
+    pub(crate) fn cache_loaders(&self) -> watch::Receiver<CacheLoaders> {
+        self.cache_loaders.clone()
+    }
+
+    /// Advertises a loader for cache `name` under the `loader:<name>`
+    /// gossip key.
+    pub(crate) fn set_loader(&self, name: &str) {
         let _ = self
             .commands
-            .send(Command::SetCacheMode(SmolStr::new(name), mode));
+            .send(Command::SetKey(loader_key(name), "1".to_string()));
+    }
+
+    /// Deletes the `loader:<name>` gossip key. Safe to call on a name never
+    /// advertised.
+    pub(crate) fn clear_loader(&self, name: &str) {
+        let _ = self.commands.send(Command::DeleteKey(loader_key(name)));
     }
 
     /// Deletes the `cache:<name>` gossip key, so live peers stop seeing this
     /// node advertise `name` once the deletion propagates. Safe to call on a
     /// name never advertised or already cleared.
     pub(crate) fn clear_cache_mode(&self, name: &str) {
-        let _ = self
-            .commands
-            .send(Command::ClearCacheMode(SmolStr::new(name)));
+        let _ = self.commands.send(Command::DeleteKey(cache_key(name)));
     }
 
     /// Gossips a departure, waits three gossip intervals for it to spread,
@@ -552,6 +591,28 @@ fn advertised_cache_modes(node_state: &NodeState) -> HashMap<SmolStr, Mode> {
     parse_cache_modes(node_state)
 }
 
+/// The caches `node_state` advertises a loader for: none once it gossips a
+/// departure, like [`advertised_cache_modes`].
+fn advertised_loaders(node_state: &NodeState) -> HashSet<SmolStr> {
+    if is_departing(node_state) {
+        return HashSet::new();
+    }
+    parse_loaders(node_state)
+}
+
+/// Reads every `loader:<name>` key off `node_state`.
+pub(crate) fn parse_loaders(node_state: &NodeState) -> HashSet<SmolStr> {
+    node_state
+        .iter_prefix(LOADER_KEY_PREFIX)
+        .map(|(key, _)| {
+            SmolStr::new(
+                key.strip_prefix(LOADER_KEY_PREFIX)
+                    .expect("invariant: iter_prefix only yields keys starting with the prefix"),
+            )
+        })
+        .collect()
+}
+
 /// Reads every `cache:<name>` key off `node_state` into a `name -> Mode`
 /// map, logging and skipping any value that isn't a recognized [`Mode`] token.
 pub(crate) fn parse_cache_modes(node_state: &NodeState) -> HashMap<SmolStr, Mode> {
@@ -677,6 +738,7 @@ pub(crate) fn incarnation_is_dead(
 struct Publishers {
     peers: watch::Sender<Vec<Peer>>,
     cache_modes: watch::Sender<CacheModes>,
+    cache_loaders: watch::Sender<CacheLoaders>,
     observer: Option<LiveObserver>,
 }
 
@@ -691,6 +753,7 @@ async fn run(
     let Publishers {
         peers: peers_tx,
         cache_modes: cache_modes_tx,
+        cache_loaders: cache_loaders_tx,
         observer,
     } = publishers;
     let mut seeds = seeds.fuse();
@@ -713,6 +776,7 @@ async fn run(
             live = live_nodes.select_next_some() => {
                 let mut peers: Vec<Peer> = Vec::new();
                 let mut cache_modes: CacheModes = HashMap::new();
+                let mut cache_loaders: CacheLoaders = HashMap::new();
                 let mut live_flags: HashMap<NodeId, LiveFlags> = HashMap::new();
                 for (id, state) in live.iter().filter(|(id, _)| *id != &self_chitchat_id) {
                     let Some(peer) = parse_peer(id, state) else { continue };
@@ -722,6 +786,10 @@ async fn run(
                         tracing::warn!(peer = %peer.node, peer_protocol = peer.protocol, "{notice}");
                     }
                     cache_modes.insert(peer.node, advertised_cache_modes(state));
+                    let loaders = advertised_loaders(state);
+                    if !loaders.is_empty() {
+                        cache_loaders.insert(peer.node, loaders);
+                    }
                     live_flags.insert(
                         peer.node,
                         LiveFlags {
@@ -737,24 +805,17 @@ async fn run(
                 if let Some(observer) = &observer {
                     observer(&live_flags);
                 }
+                let _ = cache_loaders_tx.send(cache_loaders);
                 let _ = cache_modes_tx.send(cache_modes);
                 let _ = peers_tx.send(peers);
             }
             command = commands_rx.recv() => {
                 match command {
-                    Some(Command::SetCacheMode(name, mode)) => {
-                        chitchat
-                            .lock()
-                            .await
-                            .self_node_state()
-                            .set(cache_key(&name), mode.as_token());
+                    Some(Command::SetKey(key, value)) => {
+                        chitchat.lock().await.self_node_state().set(key, value);
                     }
-                    Some(Command::ClearCacheMode(name)) => {
-                        chitchat
-                            .lock()
-                            .await
-                            .self_node_state()
-                            .delete(&cache_key(&name));
+                    Some(Command::DeleteKey(key)) => {
+                        chitchat.lock().await.self_node_state().delete(&key);
                     }
                     Some(Command::Shutdown(reply)) => {
                         // Gossips the departure before leaving, and waits
@@ -962,6 +1023,32 @@ mod tests {
         assert_eq!(caches.len(), 1, "the deleted key no longer appears");
         assert!(!caches.contains_key("users"));
         assert_eq!(caches.get("orders"), Some(&Mode::Local));
+    }
+
+    #[test]
+    fn parse_loaders_reads_every_loader_key_and_nothing_else() {
+        let mut state = state_with(&[
+            ("loader:users", "1"),
+            ("loader:orders", "1"),
+            ("cache:users", "replicated"),
+        ]);
+        let expected: HashSet<SmolStr> =
+            ["users", "orders"].into_iter().map(SmolStr::new).collect();
+        assert_eq!(parse_loaders(&state), expected);
+        assert!(
+            !parse_cache_modes(&state).contains_key("loader:users"),
+            "a loader key is no cache mode"
+        );
+        state.delete(&loader_key("users"));
+        assert_eq!(
+            parse_loaders(&state),
+            [SmolStr::new("orders")].into_iter().collect()
+        );
+        let leaving = state_with(&[("loader:users", "1"), (DEPARTING_KEY, "1")]);
+        assert!(
+            advertised_loaders(&leaving).is_empty(),
+            "a departing node loads for no one"
+        );
     }
 
     #[test]

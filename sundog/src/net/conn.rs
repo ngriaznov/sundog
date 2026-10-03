@@ -18,7 +18,8 @@ use super::outbox::DropOldestQueue;
 use super::tcp::{TcpListener, TcpStream};
 use super::{
     AeMismatch, AePartReply, AeRoundOutcome, AeServeOutcome, BucketStreamItem, FetchOutcome,
-    Greeting, InboundMsg, MeshInner, MeshStream, OutFrame, RequestHandler, TlsCtx,
+    Greeting, InboundMsg, LoadOutcome, LoadServe, MeshInner, MeshStream, OutFrame, RequestHandler,
+    TlsCtx,
 };
 use crate::error::CodecError;
 use crate::hlc::Hlc;
@@ -594,6 +595,7 @@ async fn handle_accepted(
                 | Msg::AeDigestScoped { .. }
                 | Msg::AeDigestMasked { .. }
                 | Msg::StBuckets { .. }
+                | Msg::Load { .. }
         );
         let stop = dispatch_one(
             msg,
@@ -641,10 +643,12 @@ async fn dispatch_one(
         Msg::Invalidate { .. }
         | Msg::Replicate { .. }
         | Msg::ReplicateBatch { .. }
-        | Msg::ForwardBatch { .. } => {
+        | Msg::ForwardBatch { .. }
+        | Msg::RefreshHint { .. } => {
             let _ = inbound_tx.send(InboundMsg { from, msg }).await;
             false
         }
+        Msg::Load { cache, keys } => serve_load(framed, cache, keys, handler, cancel).await,
         Msg::StRequest { cache } => {
             serve_state_transfer(framed, cache, handler, cancel, peer_protocol).await
         }
@@ -729,10 +733,11 @@ async fn dispatch_one(
         }
         // A duplicate `Hello`, or `StChunk`/`AeBucket`/`AeSketch`/
         // `AePartDigests`/`AePart`/`AePartSketch`/`StUnavailable`/
-        // `FetchReply`/`StBucketChunk`/`StaleView`/`ReqDone` sent only as
-        // replies on a connection this node initiated, never on one being
-        // served here. `StBucketDone` is likewise never dispatched here:
-        // only `serve_st_buckets` sends it, to a requester.
+        // `FetchReply`/`StBucketChunk`/`StaleView`/`Loaded`/`LoadFailed`/
+        // `LoadDeclined`/`ReqDone` sent only as replies on a connection this
+        // node initiated, never on one being served here. `StBucketDone` is
+        // likewise never dispatched here: only `serve_st_buckets` sends it,
+        // to a requester.
         Msg::Hello { .. }
         | Msg::StChunk { .. }
         | Msg::AeBucket { .. }
@@ -746,6 +751,9 @@ async fn dispatch_one(
         | Msg::StBucketChunk { .. }
         | Msg::StaleView { .. }
         | Msg::StBucketDone { .. }
+        | Msg::Loaded { .. }
+        | Msg::LoadFailed { .. }
+        | Msg::LoadDeclined { .. }
         | Msg::ReqDone => false,
     }
 }
@@ -949,6 +957,69 @@ async fn serve_fetch(
         super::FetchServe::Unavailable => Msg::FetchDeclined { cache },
     };
     send_batch_or_cancelled(framed, &[reply, Msg::ReqDone], cancel).await
+}
+
+/// Serves a `Load`: the handler loads the keys, and the answer goes back as
+/// [`loaded_replies`] or one `LoadFailed`/`LoadDeclined`, then `ReqDone`.
+async fn serve_load(
+    framed: &mut PeerFramed,
+    cache: SmolStr,
+    keys: Vec<Bytes>,
+    handler: &dyn RequestHandler,
+    cancel: &CancellationToken,
+) -> bool {
+    let mut replies = match handler.load(cache.clone(), keys).await {
+        LoadServe::Loaded { found, uncached } => {
+            loaded_replies(found, uncached, LOADED_REPLY_BUDGET)
+        }
+        LoadServe::Failed(message) => vec![Msg::LoadFailed { cache, message }],
+        LoadServe::Unavailable => vec![Msg::LoadDeclined { cache }],
+    };
+    replies.push(Msg::ReqDone);
+    send_batch_or_cancelled(framed, &replies, cancel).await
+}
+
+/// The bytes of keys and values one [`Msg::Loaded`] carries before
+/// [`loaded_replies`] starts the next: half a frame, leaving room for the
+/// records' fixed fields.
+const LOADED_REPLY_BUDGET: usize = MAX_FRAME / 2;
+
+/// Splits a load's answer into [`Msg::Loaded`] messages, each holding at
+/// most `budget` bytes of keys and values unless one entry alone is
+/// larger; always at least one message. Pure; unit tested directly.
+fn loaded_replies(
+    found: Vec<WireRecord>,
+    uncached: Vec<(Bytes, Bytes)>,
+    budget: usize,
+) -> Vec<Msg> {
+    let mut replies = Vec::new();
+    let mut current = (Vec::new(), Vec::new());
+    let mut used = 0usize;
+    let entries = found
+        .into_iter()
+        .map(Ok)
+        .chain(uncached.into_iter().map(Err));
+    for entry in entries {
+        let len = match &entry {
+            Ok(rec) => rec.key.len() + rec.value.as_ref().map_or(0, Bytes::len),
+            Err((key, value)) => key.len() + value.len(),
+        };
+        if used > 0 && used + len > budget {
+            let (found, uncached) = std::mem::take(&mut current);
+            replies.push(Msg::Loaded { found, uncached });
+            used = 0;
+        }
+        used += len;
+        match entry {
+            Ok(rec) => current.0.push(rec),
+            Err(pair) => current.1.push(pair),
+        }
+    }
+    if replies.is_empty() || !current.0.is_empty() || !current.1.is_empty() {
+        let (found, uncached) = current;
+        replies.push(Msg::Loaded { found, uncached });
+    }
+    replies
 }
 
 /// Serves an `AeDigestScoped`: an epoch check ahead of an ordinary digest
@@ -1569,6 +1640,28 @@ pub(super) async fn collect_fetch_reply(reply: Reply) -> Result<FetchOutcome, Co
     outcome.ok_or_else(|| unexpected_close("fetch reply"))
 }
 
+/// Reads a `Load`'s replies: every `Loaded` message's records gathered, or
+/// the responder's `LoadFailed` or `LoadDeclined`.
+pub(super) async fn collect_load_reply(reply: Reply) -> Result<LoadOutcome, CodecError> {
+    let outcome = collect_replies(reply, "load reply", None, |msg, out| match msg {
+        Msg::Loaded { found, uncached } => match out {
+            Some(LoadOutcome::Loaded {
+                found: all_found,
+                uncached: all_uncached,
+            }) => {
+                all_found.extend(found);
+                all_uncached.extend(uncached);
+            }
+            _ => *out = Some(LoadOutcome::Loaded { found, uncached }),
+        },
+        Msg::LoadFailed { message, .. } => *out = Some(LoadOutcome::Failed(message)),
+        Msg::LoadDeclined { .. } => *out = Some(LoadOutcome::Declined),
+        _ => {}
+    })
+    .await?;
+    outcome.ok_or_else(|| unexpected_close("load reply"))
+}
+
 /// Reads digest replies like [`collect_ae_mismatches`], but epoch-checked: the last `StaleView` seen wins over every mismatch.
 pub(super) async fn collect_ae_round_scoped(reply: Reply) -> Result<AeRoundOutcome, CodecError> {
     type Seed = (Vec<AeMismatch>, Option<u64>);
@@ -1758,6 +1851,82 @@ pub(super) fn bucket_stream(
 
 #[cfg(test)]
 mod tests {
+
+    fn rec(key: &'static [u8], value: &'static [u8]) -> WireRecord {
+        WireRecord {
+            key: Bytes::from_static(key),
+            value: Some(Bytes::from_static(value)),
+            ver: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                node: NodeId::from(1),
+            },
+            expires_at_ms: None,
+        }
+    }
+
+    /// Each reply's key and value byte count.
+    fn reply_sizes(replies: &[Msg]) -> Vec<usize> {
+        replies
+            .iter()
+            .map(|msg| match msg {
+                Msg::Loaded { found, uncached } => {
+                    found
+                        .iter()
+                        .map(|rec| rec.key.len() + rec.value.as_ref().map_or(0, Bytes::len))
+                        .sum::<usize>()
+                        + uncached
+                            .iter()
+                            .map(|(key, value)| key.len() + value.len())
+                            .sum::<usize>()
+                }
+                other => panic!("only Loaded replies, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn loaded_replies_split_past_the_budget_and_keep_every_entry() {
+        let found = vec![
+            rec(b"k1", b"aaaa"),
+            rec(b"k2", b"bbbb"),
+            rec(b"k3", b"cccc"),
+        ];
+        let uncached = vec![(Bytes::from_static(b"k4"), Bytes::from_static(b"dddd"))];
+        let replies = super::loaded_replies(found.clone(), uncached.clone(), 12);
+        assert_eq!(
+            reply_sizes(&replies),
+            vec![12, 12],
+            "6 bytes an entry, two a reply"
+        );
+        let (mut all_found, mut all_uncached) = (Vec::new(), Vec::new());
+        for reply in replies {
+            if let Msg::Loaded { found, uncached } = reply {
+                all_found.extend(found);
+                all_uncached.extend(uncached);
+            }
+        }
+        assert_eq!(all_found, found);
+        assert_eq!(all_uncached, uncached);
+    }
+
+    #[test]
+    fn loaded_replies_send_one_reply_for_nothing_and_an_oversized_entry_alone() {
+        assert_eq!(
+            super::loaded_replies(Vec::new(), Vec::new(), 12),
+            vec![Msg::Loaded {
+                found: Vec::new(),
+                uncached: Vec::new()
+            }]
+        );
+        let replies = super::loaded_replies(
+            vec![rec(b"k1", b"aaaaaaaaaaaaaaaa"), rec(b"k2", b"bb")],
+            Vec::new(),
+            8,
+        );
+        assert_eq!(reply_sizes(&replies), vec![18, 4]);
+    }
+
     #[test]
     fn listing_or_sketch_crosses_over_past_min_bucket() {
         let entry = |n: u64| crate::store::KeyVersion {

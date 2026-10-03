@@ -23,9 +23,11 @@ use serde::de::DeserializeOwned;
 use tokio::sync::{Notify, watch};
 
 use super::engine::{self, Inflight, JoinOutcome};
-use super::{Shard, SharedLoaderFailure, encode_key};
+use super::{PartId, Shard, ShardOps, SharedLoaderFailure, encode_key};
 use crate::error::CacheError;
 use crate::hlc::Hlc;
+use crate::net::LoadServe;
+use crate::wire::WireRecord;
 
 /// The error a [`Loader`] reports, type-erased.
 pub type LoadError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -141,6 +143,20 @@ where
         self.max_keys
     }
 }
+
+/// What a [`SourceFn`] returned for one batch: the values to store as fills
+/// and the values to answer with but not store, such as a value another
+/// node loaded for a key this node does not own. A key in neither is one
+/// the source does not hold.
+pub(crate) struct Sourced<K, V> {
+    pub(crate) store: HashMap<K, V>,
+    pub(crate) answer: HashMap<K, V>,
+}
+
+/// Where a batch's keys are read from: the registered loader, or a router
+/// that sends some keys to the node their loads gather on.
+pub(crate) type SourceFn<'a, K, V> =
+    dyn Fn(Vec<K>) -> BoxFuture<'a, Result<Sourced<K, V>, LoadError>> + Send + Sync + 'a;
 
 /// What one queued load ended with, for the call that queued it: the
 /// loaded value, `None` for a key the source does not hold, or the
@@ -312,6 +328,29 @@ where
     /// [`CacheError::Loader`] if the loader fails, and
     /// [`CacheError::Codec`] if `key` fails to encode.
     pub async fn load(&self, key: &K) -> Result<Option<V>, CacheError> {
+        self.load_from(key, &|keys| {
+            Box::pin(async move {
+                Ok(Sourced {
+                    store: self.call_loader(keys).await?,
+                    answer: HashMap::new(),
+                })
+            })
+        })
+        .await
+    }
+
+    /// [`Shard::load`] with a miss read from `source`; see
+    /// [`Shard::load_many_from`].
+    pub(crate) async fn load_from(
+        &self,
+        key: &K,
+        source: &SourceFn<'_, K, V>,
+    ) -> Result<Option<V>, CacheError> {
+        if self.loader.is_none() {
+            return Err(CacheError::NoLoader {
+                cache: self.name.clone(),
+            });
+        }
         let key_bytes = encode_key(key)?;
         let hash = engine::hash_key_bytes(key_bytes.as_ref());
         if let Some(value) = self
@@ -321,7 +360,9 @@ where
             self.hits.increment(1);
             return Ok(Some(value));
         }
-        let mut found = self.load_many(std::iter::once(key.clone())).await?;
+        let mut found = self
+            .load_many_from(std::iter::once(key.clone()), source)
+            .await?;
         Ok(found.remove(key))
     }
 
@@ -335,6 +376,34 @@ where
     pub async fn load_many(
         &self,
         keys: impl IntoIterator<Item = K>,
+    ) -> Result<HashMap<K, V>, CacheError> {
+        self.load_many_from(keys, &|keys| {
+            Box::pin(async move {
+                Ok(Sourced {
+                    store: self.call_loader(keys).await?,
+                    answer: HashMap::new(),
+                })
+            })
+        })
+        .await
+    }
+
+    /// Runs the registered loader on `keys` without touching the cache:
+    /// what the source holds for them. Empty without a loader.
+    pub(crate) async fn call_loader(&self, keys: Vec<K>) -> Result<HashMap<K, V>, LoadError> {
+        match &self.loader {
+            Some(loader) => (loader.load)(keys).await,
+            None => Ok(HashMap::new()),
+        }
+    }
+
+    /// [`Shard::load_many`] with the keys this node misses read from
+    /// `source`, which the cache layer points at the node each key's loads
+    /// gather on. Batching, collapse and the fill guard are the same.
+    pub(crate) async fn load_many_from(
+        &self,
+        keys: impl IntoIterator<Item = K>,
+        source: &SourceFn<'_, K, V>,
     ) -> Result<HashMap<K, V>, CacheError> {
         let Some(loader) = self.loader.as_ref() else {
             return Err(CacheError::NoLoader {
@@ -354,7 +423,7 @@ where
         while !todo.is_empty() {
             let (owned, waits) = self.claim(std::mem::take(&mut todo), &mut found).await;
             if !owned.is_empty() {
-                self.submit(loader, owned).await;
+                self.submit(loader, source, owned).await;
             }
             for wait in waits {
                 let (key, resolved) = match wait {
@@ -398,6 +467,60 @@ where
             }
         }
         Ok(found)
+    }
+
+    /// Serves a peer's [`crate::wire::Msg::Load`] for `keys`, encoded, as
+    /// [`Shard::load_many`] reads them here: the record stored for each key
+    /// the cache or source holds, or the loaded value alone where the fill
+    /// was not stored. A `Mode::Distributed` shard declines while any
+    /// requested key's part is cold or unverified here, as a fetch does. An
+    /// undecodable key counts as one the source lacks.
+    pub(crate) async fn serve_load_encoded(&self, keys: Vec<Bytes>) -> LoadServe {
+        if self.loader.is_none() {
+            return LoadServe::Unavailable;
+        }
+        if keys.iter().any(|key| {
+            let part = PartId::of_key(key);
+            self.is_cold_part(part) || self.is_unverified_part(part)
+        }) {
+            return LoadServe::Unavailable;
+        }
+        let decoded: Vec<K> = keys
+            .iter()
+            .filter_map(|key| postcard::from_bytes::<K>(key).ok())
+            .collect();
+        let loaded = match self.load_many(decoded).await {
+            Ok(loaded) => loaded,
+            Err(CacheError::Loader(err)) => return LoadServe::Failed(err.to_string()),
+            Err(err) => return LoadServe::Failed(err.to_string()),
+        };
+        let held: Vec<K> = loaded.keys().cloned().collect();
+        let mut stored: HashMap<Bytes, WireRecord> = self
+            .records_for_typed(&held)
+            .await
+            .into_iter()
+            .filter(|rec| !rec.is_tombstone())
+            .map(|rec| (rec.key.clone(), rec))
+            .collect();
+        let mut found = Vec::with_capacity(loaded.len());
+        let mut uncached = Vec::new();
+        for (key, value) in loaded {
+            let Ok(key_bytes) = encode_key(&key) else {
+                continue;
+            };
+            if let Some(rec) = stored.remove(&key_bytes) {
+                found.push(rec);
+            } else {
+                uncached.push((
+                    key_bytes,
+                    Bytes::from(
+                        postcard::to_stdvec(&value)
+                            .expect("invariant: a value the shard holds postcard-encodes"),
+                    ),
+                ));
+            }
+        }
+        LoadServe::Loaded { found, uncached }
     }
 
     /// Answers each of `todo` from the cache where it can, and otherwise
@@ -481,9 +604,14 @@ where
     /// leader. The first caller to queue into an empty queue leads: it
     /// waits out the window, or until the queue is full, then loads
     /// everything queued.
-    async fn submit(&self, loader: &Loader<K, V>, items: Vec<Queued<K, V>>) {
+    async fn submit(
+        &self,
+        loader: &Loader<K, V>,
+        source: &SourceFn<'_, K, V>,
+        items: Vec<Queued<K, V>>,
+    ) {
         if loader.window.is_zero() {
-            self.run_batch(loader, items).await;
+            self.run_batch(loader, source, items).await;
             return;
         }
         let leads = {
@@ -508,26 +636,32 @@ where
         }
         let batch = std::mem::take(&mut *self.load_queue.lock());
         release.armed = false;
-        self.run_batch(loader, batch).await;
+        self.run_batch(loader, source, batch).await;
     }
 
     /// Loads `items` in calls of at most [`Loader::max_keys`] keys, run
     /// concurrently.
-    async fn run_batch(&self, loader: &Loader<K, V>, items: Vec<Queued<K, V>>) {
+    async fn run_batch(
+        &self,
+        loader: &Loader<K, V>,
+        source: &SourceFn<'_, K, V>,
+        items: Vec<Queued<K, V>>,
+    ) {
         join_all(
             chunked(items, loader.max_keys)
                 .into_iter()
-                .map(|chunk| self.run_chunk(loader, chunk)),
+                .map(|chunk| self.run_chunk(source, chunk)),
         )
         .await;
     }
 
-    /// One loader call: fills each key's slot before ending its in-flight
-    /// load, so every waiter it wakes finds the outcome. A key the loader
-    /// returns is stored like a [`Shard::get_or_load`] fill; a key it
-    /// leaves out ends absent; a failure fails every key. Dropping this
-    /// future mid-call releases every load it holds.
-    async fn run_chunk(&self, loader: &Loader<K, V>, chunk: Vec<Queued<K, V>>) {
+    /// One source call: fills each key's slot before ending its in-flight
+    /// load, so every waiter it wakes finds the outcome. A key the source
+    /// returns to store is stored like a [`Shard::get_or_load`] fill, one
+    /// it returns to answer with ends uncached, a key it leaves out ends
+    /// absent, and a failure fails every key. Each counts as a miss.
+    /// Dropping this future mid-call releases every load it holds.
+    async fn run_chunk(&self, source: &SourceFn<'_, K, V>, chunk: Vec<Queued<K, V>>) {
         let guards: Vec<_> = chunk
             .iter()
             .map(|item| {
@@ -539,10 +673,13 @@ where
             })
             .collect();
         let keys = chunk.iter().map(|item| item.key.clone()).collect();
-        match (loader.load)(keys).await {
-            Ok(mut values) => {
+        match source(keys).await {
+            Ok(Sourced {
+                mut store,
+                mut answer,
+            }) => {
                 for (item, guard) in chunk.into_iter().zip(guards) {
-                    if let Some(value) = values.remove(&item.key) {
+                    if let Some(value) = store.remove(&item.key) {
                         let _ = item.slot.set(Ok(Some(value.clone())));
                         self.finish_fill(
                             &item.key,
@@ -552,6 +689,15 @@ where
                             &item.inflight,
                             value,
                         );
+                    } else if let Some(value) = answer.remove(&item.key) {
+                        let _ = item.slot.set(Ok(Some(value.clone())));
+                        self.engine.finish_uncached(
+                            &item.key_bytes,
+                            item.hash,
+                            &item.inflight,
+                            value,
+                        );
+                        self.misses.increment(1);
                     } else {
                         let _ = item.slot.set(Ok(None));
                         self.engine

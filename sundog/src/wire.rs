@@ -58,7 +58,10 @@ pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 ///   [`Msg::AeDigestMasked`]. See [`PROTOCOL_PART_OWNERSHIP`].
 /// - 6: [`Msg::Hello`] names the sender's cluster. See
 ///   [`PROTOCOL_CLUSTER_ID`].
-pub const PROTOCOL_VERSION: u16 = 6;
+/// - 7: Loading through another node's loader. Adds [`Msg::Load`],
+///   [`Msg::Loaded`], [`Msg::LoadFailed`], [`Msg::LoadDeclined`] and
+///   [`Msg::RefreshHint`]. See [`PROTOCOL_LOAD`].
+pub const PROTOCOL_VERSION: u16 = 7;
 
 /// The oldest peer protocol this build still serves in full.
 pub const MIN_PROTOCOL_VERSION: u16 = 1;
@@ -104,6 +107,13 @@ pub const PROTOCOL_PART_OWNERSHIP: u16 = 5;
 /// cluster's node now holds never writes into it. A `Hello` from an older
 /// peer decodes with `cluster` [`UNNAMED_CLUSTER`] and is accepted.
 pub const PROTOCOL_CLUSTER_ID: u16 = 6;
+
+/// The protocol that introduced loading through another node's loader:
+/// [`Msg::Load`] and its replies [`Msg::Loaded`], [`Msg::LoadFailed`] and
+/// [`Msg::LoadDeclined`], and the one-way [`Msg::RefreshHint`]. A node
+/// picks a peer to load or refresh a key only among peers that speak it,
+/// and the wire layer refuses to send either to an older peer regardless.
+pub const PROTOCOL_LOAD: u16 = 7;
 
 /// The `cluster` a [`Msg::Hello`] carries when its sender names none: a
 /// peer older than [`PROTOCOL_CLUSTER_ID`], or a bare [`crate::net::Mesh`]
@@ -398,6 +408,38 @@ pub enum Msg {
         cache: SmolStr,
         view_hash: u64,
         buckets: Vec<(u16, u64, u64)>,
+    },
+    /// "Load these keys through your loader": sent to the node a key's
+    /// loads gather on. The responder answers from its cache where it can,
+    /// joins a load already running for a key, and loads the rest in one
+    /// loader call, so every node asking for a key in the same moment
+    /// shares one load. Introduced in protocol 7.
+    Load { cache: SmolStr, keys: Vec<Bytes> },
+    /// Answers [`Msg::Load`], in as many messages as the records need:
+    /// `found` holds the record the responder stores for each requested key
+    /// it or its source holds, and `uncached` pairs a key with a value the
+    /// responder loaded but did not store, at its memory ceiling or
+    /// because an invalidation overtook the load. A requested key in
+    /// neither is one the source does not hold.
+    Loaded {
+        found: Vec<WireRecord>,
+        uncached: Vec<(Bytes, Bytes)>,
+    },
+    /// Answers [`Msg::Load`] when the responder's loader failed, with the
+    /// error's message.
+    LoadFailed { cache: SmolStr, message: String },
+    /// Declines a [`Msg::Load`]: the responder has no loader for `cache`,
+    /// does not have it open, or, in `Mode::Distributed`, cannot vouch for
+    /// a requested key's part yet. The requester loads elsewhere.
+    LoadDeclined { cache: SmolStr },
+    /// "This key nears its expiry": one-way, sent to the node that
+    /// refreshes `key` by a node whose read found the entry at version `ver`
+    /// past its refresh point. The refresher reloads the key once, if it
+    /// still holds that version. Introduced in protocol 7.
+    RefreshHint {
+        cache: SmolStr,
+        key: Bytes,
+        ver: Hlc,
     },
 }
 
@@ -1217,6 +1259,44 @@ mod tests {
         roundtrip(&Msg::FetchDeclined {
             cache: SmolStr::new("prices"),
         });
+    }
+
+    #[test]
+    fn roundtrip_load_and_its_replies() {
+        roundtrip(&Msg::Load {
+            cache: SmolStr::new("prices"),
+            keys: vec![Bytes::from_static(b"k1"), Bytes::from_static(b"k2")],
+        });
+        roundtrip(&Msg::Loaded {
+            found: vec![sample_record(Some("v1"))],
+            uncached: vec![(Bytes::from_static(b"k2"), Bytes::from_static(b"v2"))],
+        });
+        roundtrip(&Msg::Loaded {
+            found: Vec::new(),
+            uncached: Vec::new(),
+        });
+        roundtrip(&Msg::LoadFailed {
+            cache: SmolStr::new("prices"),
+            message: "source unavailable".to_string(),
+        });
+        roundtrip(&Msg::LoadDeclined {
+            cache: SmolStr::new("prices"),
+        });
+    }
+
+    #[test]
+    fn roundtrip_refresh_hint() {
+        roundtrip(&Msg::RefreshHint {
+            cache: SmolStr::new("prices"),
+            key: Bytes::from_static(b"k1"),
+            ver: sample_record(Some("v1")).ver,
+        });
+    }
+
+    #[test]
+    fn a_protocol_6_peer_supports_no_load_message() {
+        assert!(!peer_supports(6, PROTOCOL_LOAD));
+        assert!(peer_supports(PROTOCOL_VERSION, PROTOCOL_LOAD));
     }
 
     #[test]

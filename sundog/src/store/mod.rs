@@ -66,6 +66,7 @@ pub const BUCKET_COUNT: usize = 1024;
 /// finer grain before either side sends a listing or a sketch.
 pub const PART_COUNT: usize = 64;
 
+pub(crate) use load::Sourced;
 pub use load::{DEFAULT_MAX_BATCH_KEYS, LoadError, Loader};
 pub use part::PartId;
 pub(crate) use part::PartMask;
@@ -704,6 +705,28 @@ pub trait ShardOps: Send + Sync {
     /// version. Not routed through [`ConflictResolver`]: an invalidation
     /// carries no value, so `Hlc` order is the only signal.
     fn invalidate(&self, key: Bytes, ver: Hlc) -> BoxFuture<'_, ()>;
+
+    /// Serves a peer's [`crate::wire::Msg::Load`] for `keys`, encoded:
+    /// loads them through this shard's loader, joining loads already in
+    /// flight, and answers with the record stored for each key the cache
+    /// or its source holds. Default: unavailable, for a shard with no
+    /// loader.
+    #[allow(
+        private_interfaces,
+        reason = "LoadServe is crate-private like the rest of the load path; \
+                  see crate::net::RequestHandler::fetch"
+    )]
+    fn serve_load(&self, keys: Vec<Bytes>) -> BoxFuture<'_, crate::net::LoadServe> {
+        let _ = keys;
+        Box::pin(async { crate::net::LoadServe::Unavailable })
+    }
+
+    /// Takes a peer's [`crate::wire::Msg::RefreshHint`]: the peer read
+    /// `key` at version `ver` past its refresh point. Default: ignores it.
+    fn refresh_hint(&self, key: Bytes, ver: Hlc) -> BoxFuture<'_, ()> {
+        let _ = (key, ver);
+        Box::pin(async {})
+    }
 
     /// This shard's current per-bucket XOR digests, `(bucket, digest)` for all
     /// [`BUCKET_COUNT`] buckets. The first step of an anti-entropy round.
@@ -4526,6 +4549,11 @@ where
                 });
             }
         })
+    }
+
+    #[allow(private_interfaces, reason = "see ShardOps::serve_load")]
+    fn serve_load(&self, keys: Vec<Bytes>) -> BoxFuture<'_, crate::net::LoadServe> {
+        Box::pin(self.serve_load_encoded(keys))
     }
 
     fn digests(&self) -> BoxFuture<'_, Vec<BucketDigest>> {

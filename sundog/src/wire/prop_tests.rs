@@ -135,6 +135,29 @@ fn msg_strategy() -> impl Strategy<Value = Msg> {
             .prop_map(|(cache, recs)| Msg::ReplicateBatch { cache, recs }),
         Just(Msg::ReqDone),
         part_msg_strategy(),
+        load_msg_strategy(),
+    ]
+}
+
+/// The protocol-7 loading variants, split out of [`msg_strategy`] for the
+/// same reason as [`part_msg_strategy`].
+fn load_msg_strategy() -> impl Strategy<Value = Msg> {
+    prop_oneof![
+        (
+            smol_str_strategy(),
+            proptest::collection::vec(bytes_strategy(), 0..8),
+        )
+            .prop_map(|(cache, keys)| Msg::Load { cache, keys }),
+        (
+            proptest::collection::vec(wire_record_strategy(), 0..8),
+            proptest::collection::vec((bytes_strategy(), bytes_strategy()), 0..8),
+        )
+            .prop_map(|(found, uncached)| Msg::Loaded { found, uncached }),
+        (smol_str_strategy(), ".{0,32}")
+            .prop_map(|(cache, message)| Msg::LoadFailed { cache, message }),
+        smol_str_strategy().prop_map(|cache| Msg::LoadDeclined { cache }),
+        (smol_str_strategy(), bytes_strategy(), hlc_strategy())
+            .prop_map(|(cache, key, ver)| Msg::RefreshHint { cache, key, ver }),
     ]
 }
 
