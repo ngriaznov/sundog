@@ -1155,7 +1155,7 @@ mod process_tests {
         let path = dir.join("fake-testnode.sh");
         std::fs::write(
             &path,
-            "#!/bin/sh\necho testnode-ready\ntrap 'exit 0' TERM\nwhile true; do sleep 0.05; done\n",
+            "#!/bin/sh\ntrap 'exit 0' TERM\necho testnode-ready\nwhile true; do sleep 0.05; done\n",
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1249,7 +1249,7 @@ mod process_tests {
         let path = dir.join("stubborn-testnode.sh");
         std::fs::write(
             &path,
-            "#!/bin/sh\necho testnode-ready\ntrap '' TERM\nwhile true; do sleep 0.05; done\n",
+            "#!/bin/sh\ntrap '' TERM\necho testnode-ready\nwhile true; do sleep 0.05; done\n",
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1375,7 +1375,7 @@ mod process_tests {
              echo \"ports ${SUNDOG_TESTNODE_GOSSIP_PORT-unset} ${SUNDOG_TESTNODE_CONTROL_PORT-unset} \
              ${SUNDOG_TESTNODE_METRICS_PORT-unset} ip=$SUNDOG_TESTNODE_BIND_IP \
              seeds=$SUNDOG_SEEDS\" >&2\n\
-             echo testnode-ready\ntrap 'exit 0' TERM\nwhile true; do sleep 0.05; done\n",
+             trap 'exit 0' TERM\necho testnode-ready\nwhile true; do sleep 0.05; done\n",
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1503,7 +1503,7 @@ mod process_tests {
         std::fs::write(
             &path,
             format!(
-                "#!/bin/sh\nsleep {seconds}\necho testnode-ready\ntrap 'exit 0' TERM\nwhile true; do sleep 0.05; done\n"
+                "#!/bin/sh\nsleep {seconds}\ntrap 'exit 0' TERM\necho testnode-ready\nwhile true; do sleep 0.05; done\n"
             ),
         )
         .unwrap();

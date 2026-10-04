@@ -3279,6 +3279,7 @@ async fn chaos_distributed_crashes_churn_and_drops_still_converge() {
     // own `Burst` arm's key/value format exactly, so the convergence check
     // below knows the full expected keyspace beyond `0..FILL_KEYS`.
     let mut burst_entries: Vec<(String, String)> = Vec::new();
+    let mut unrepaired_drops = std::collections::HashSet::new();
     let mut crashes = 0u32;
     let deadline = std::time::Instant::now() + Duration::from_secs(secs);
     let mut iteration = 0u64;
@@ -3318,8 +3319,15 @@ async fn chaos_distributed_crashes_churn_and_drops_still_converge() {
             // it; a second crash inside that window can take the last copy.
             // The next action waits until every key is back on two owners.
             wait_for_entry_sum(&nodes, expected_sum, RESETTLE_WAIT, iteration).await;
+            unrepaired_drops.clear();
             eprintln!("chaos[{iteration}]: every key is back on {OWNERS} owners");
         } else {
+            if let ChaosAction::Drop { key_index, .. } = action
+                && repeats_an_unrepaired_drop(&mut unrepaired_drops, key_index)
+            {
+                let expected_sum = usize::from(OWNERS) * (FILL_KEYS as usize + burst_entries.len());
+                wait_for_entry_sum(&nodes, expected_sum, RESETTLE_WAIT, iteration).await;
+            }
             if let ChaosAction::Burst { count, .. } = action {
                 for j in 0..count {
                     let key = format!("burst-{run_seed:x}-{iteration}-{j}");
@@ -3348,6 +3356,38 @@ async fn chaos_distributed_crashes_churn_and_drops_still_converge() {
         node.stop().await.expect("node stops");
     }
     net.close().await.expect("network closes");
+}
+
+/// Records a drop of fill key `key_index` in `unrepaired`, the fill keys
+/// dropped since the cluster last settled; true when it already held the
+/// key, and the cluster must settle before this drop, which then leaves the
+/// key the only one recorded. Chaos actions follow each other within
+/// milliseconds, far inside one anti-entropy interval: dropping a key again
+/// before its first drop is repaired can take its other copy, the same two
+/// failures against two owners a crash waits out. Pure; unit tested
+/// directly.
+fn repeats_an_unrepaired_drop(
+    unrepaired: &mut std::collections::HashSet<u32>,
+    key_index: u32,
+) -> bool {
+    if unrepaired.insert(key_index) {
+        return false;
+    }
+    unrepaired.clear();
+    unrepaired.insert(key_index);
+    true
+}
+
+#[test]
+fn only_a_repeat_drop_since_the_last_settle_waits_for_one() {
+    let mut unrepaired = std::collections::HashSet::new();
+    assert!(!repeats_an_unrepaired_drop(&mut unrepaired, 1593));
+    assert!(!repeats_an_unrepaired_drop(&mut unrepaired, 829));
+    assert!(repeats_an_unrepaired_drop(&mut unrepaired, 1593));
+    assert_eq!(unrepaired, std::collections::HashSet::from([1593]));
+    assert!(!repeats_an_unrepaired_drop(&mut unrepaired, 829));
+    unrepaired.clear();
+    assert!(!repeats_an_unrepaired_drop(&mut unrepaired, 1593));
 }
 
 /// The sum of every node's `loads` count.

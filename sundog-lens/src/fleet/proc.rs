@@ -620,8 +620,8 @@ mod tests {
             "node.sh",
             "echo \"cluster=$1 ip=$SUNDOG_TESTNODE_BIND_IP\" >&2\n\
              echo booting\n\
-             echo testnode-ready\n\
              trap 'exit 0' TERM\n\
+             echo testnode-ready\n\
              while true; do sleep 0.05; done",
         );
         let layout = Layout::PerAddress(Ipv4Addr::new(127, 0, 0, 77));

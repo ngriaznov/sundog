@@ -305,9 +305,11 @@ mod tests {
 
     #[tokio::test]
     async fn get_reports_a_refused_connection() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/", listener.local_addr().unwrap());
-        drop(listener);
+        // Bound and never listening: connections are refused, and no other
+        // socket takes the port while the connect is in flight.
+        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let url = format!("http://{}/", reserved.local_addr().unwrap());
         let result = get(&url, Duration::from_secs(5)).await;
         assert!(matches!(result, Err(HttpError::Io(_))), "{result:?}");
     }

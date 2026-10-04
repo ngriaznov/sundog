@@ -7,7 +7,7 @@
 
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -24,7 +24,7 @@ use sundog_lens::source::scrape::{
 };
 use sundog_lens::source::{Feed, FeedConfig, Update};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpSocket};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -50,6 +50,20 @@ struct State {
     metrics_requests: AtomicUsize,
     /// How long `/readyz` waits before it answers, in milliseconds.
     ready_delay_ms: AtomicU64,
+    /// Set by [`Exporter::stop`]: every later connection closes unanswered.
+    stopped: AtomicBool,
+}
+
+/// A loopback address whose connections are refused, held for as long as the
+/// returned socket lives: bound, never listening, so no other socket can take
+/// the port and answer while a connect is in flight.
+fn refusing_port() -> (TcpSocket, SocketAddr) {
+    let socket = TcpSocket::new_v4().expect("a socket");
+    socket
+        .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("the socket binds");
+    let addr = socket.local_addr().expect("a local address");
+    (socket, addr)
 }
 
 /// An HTTP/1.1 server that closes every connection after one answer.
@@ -78,6 +92,7 @@ impl Exporter {
             last_ready: AtomicU16::new(ready.last().copied().unwrap_or(200)),
             metrics_requests: AtomicUsize::new(0),
             ready_delay_ms: AtomicU64::new(0),
+            stopped: AtomicBool::new(false),
         });
         let served = Arc::clone(&state);
         let task = tokio::spawn(async move {
@@ -88,6 +103,10 @@ impl Exporter {
                 };
                 if behavior == Behavior::Hang {
                     hung.push(stream);
+                    continue;
+                }
+                if served.stopped.load(Ordering::SeqCst) {
+                    drop(stream);
                     continue;
                 }
                 let state = Arc::clone(&served);
@@ -147,8 +166,16 @@ impl Exporter {
         self.state.metrics_status.store(status, Ordering::SeqCst);
     }
 
-    /// Stops answering: later connections are refused.
-    fn stop(self) {
+    /// Stops answering: every later connection closes unanswered. The
+    /// listener stays bound, so no other socket takes the port and answers in
+    /// its place.
+    fn stop(&self) {
+        self.state.stopped.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for Exporter {
+    fn drop(&mut self) {
         self.task.abort();
     }
 }
@@ -292,9 +319,7 @@ async fn an_exporter_that_never_answers_times_out_at_the_deadline() {
 
 #[tokio::test]
 async fn a_refused_connection_is_a_connect_error() {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
+    let (_reserved, addr) = refusing_port();
     let target = Target {
         addr: testkit::gossip_addr(1),
         node: testkit::node_id(1, 0),
