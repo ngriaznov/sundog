@@ -24,7 +24,7 @@ use sundog_lens::source::scrape::{
 };
 use sundog_lens::source::{Feed, FeedConfig, Update};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::{TcpListener, TcpSocket};
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -52,18 +52,6 @@ struct State {
     ready_delay_ms: AtomicU64,
     /// Set by [`Exporter::stop`]: every later connection closes unanswered.
     stopped: AtomicBool,
-}
-
-/// A loopback address whose connections are refused, held for as long as the
-/// returned socket lives: bound, never listening, so no other socket can take
-/// the port and answer while a connect is in flight.
-fn refusing_port() -> (TcpSocket, SocketAddr) {
-    let socket = TcpSocket::new_v4().expect("a socket");
-    socket
-        .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .expect("the socket binds");
-    let addr = socket.local_addr().expect("a local address");
-    (socket, addr)
 }
 
 /// An HTTP/1.1 server that closes every connection after one answer.
@@ -319,7 +307,7 @@ async fn an_exporter_that_never_answers_times_out_at_the_deadline() {
 
 #[tokio::test]
 async fn a_refused_connection_is_a_connect_error() {
-    let (_reserved, addr) = refusing_port();
+    let addr = testkit::refusing_addr();
     let target = Target {
         addr: testkit::gossip_addr(1),
         node: testkit::node_id(1, 0),

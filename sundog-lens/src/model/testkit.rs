@@ -23,6 +23,29 @@ pub fn gossip_addr(index: u8) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 10 + index], 7946))
 }
 
+/// A loopback address nothing listens on, whose connections are refused.
+///
+/// Its port lies below every default ephemeral range (Linux starts at
+/// 32768, macOS and Windows at 49152), so no socket bound to port 0, a
+/// concurrent test's listener included, is handed it while a connect to it
+/// is in flight. The port is the first in 20000..30000, from an offset
+/// derived from the process id, that a probe listener can bind.
+///
+/// # Panics
+///
+/// Panics when every port in that range is taken.
+#[must_use]
+pub fn refusing_addr() -> SocketAddr {
+    const FIRST: u16 = 20_000;
+    const SPAN: u16 = 10_000;
+    let offset = u16::try_from(std::process::id() % u32::from(SPAN)).expect("below SPAN");
+    (0..SPAN)
+        .map(|step| FIRST + (offset + step) % SPAN)
+        .map(|port| SocketAddr::from(([127, 0, 0, 1], port)))
+        .find(|addr| std::net::TcpListener::bind(addr).is_ok())
+        .expect("a free port in 20000..30000")
+}
+
 /// The node id of fixture node `index` at identity `generation`. The leading
 /// hex digits grow with `index` (up to 80), so ids sort in index order and
 /// their four-digit short forms differ.
@@ -410,6 +433,16 @@ mod tests {
         assert_ne!(node_id(1, 0), node_id(2, 0));
         assert_ne!(node_id(1, 0), node_id(1, 1));
         assert_eq!(gossip_addr(1), "127.0.0.11:7946".parse().unwrap());
+    }
+
+    #[test]
+    fn a_refusing_address_is_loopback_below_every_ephemeral_range_and_refuses() {
+        let addr = refusing_addr();
+        assert!(addr.ip().is_loopback());
+        assert!((20_000..30_000).contains(&addr.port()), "{addr}");
+        let refused = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+            .expect_err("nothing listens there");
+        assert_eq!(refused.kind(), std::io::ErrorKind::ConnectionRefused);
     }
 
     #[test]
