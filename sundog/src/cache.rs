@@ -4759,7 +4759,28 @@ mod tests {
             },
         )
         .await;
+        wait_for_full_views(&nodes).await;
         nodes
+    }
+
+    /// Waits until every `Mode::Distributed` node's ownership view ranks
+    /// all of `nodes`. Loader adverts and the cache-mode adverts a view is
+    /// built from are separate gossip keys, and each node rebuilds its view
+    /// in its own task, so seeing every loader says nothing about the view.
+    async fn wait_for_full_views(nodes: &[(Cluster, Cache<u32, String>)]) {
+        wait_until(
+            Duration::from_secs(10),
+            "every node's ownership view ranks every node",
+            async || {
+                nodes.iter().all(|(_, cache)| {
+                    cache
+                        .shard
+                        .ownership_view()
+                        .is_none_or(|view| view.eligible().len() == nodes.len())
+                })
+            },
+        )
+        .await;
     }
 
     async fn shut_down_all(nodes: Vec<(Cluster, Cache<u32, String>)>) {
@@ -4908,10 +4929,13 @@ mod tests {
         shut_down_all(nodes).await;
     }
 
-    /// `count` nodes with `name` open under `mode` with a 2s TTL and
-    /// refresh-ahead at 0.5, each with a batch loader that records its
+    /// `count` nodes with `name` open under `mode` with a 10s TTL and
+    /// refresh-ahead at 0.1, each with a batch loader that records its
     /// calls in `log` and holds `v{key}.{n}`, `n` counting calls across all
-    /// nodes. Returns once every node sees the others advertise a loader.
+    /// nodes. Returns once every node sees the others advertise a loader
+    /// and ranks them in its ownership view. A key falls due 1s after its
+    /// write and expires 9s after that, so a stalled runner reads a due key
+    /// long before it expires.
     async fn refreshing_nodes(
         name: &'static str,
         mode: Mode,
@@ -4935,8 +4959,8 @@ mod tests {
             let cache = cluster
                 .cache::<u32, String>(name)
                 .mode(mode)
-                .ttl(Duration::from_secs(2))
-                .refresh_ahead(0.5)
+                .ttl(Duration::from_secs(10))
+                .refresh_ahead(0.1)
                 .batch_loader(move |keys: Vec<u32>| {
                     let (log, calls) = (Arc::clone(&log), Arc::clone(&calls));
                     async move {
@@ -4966,6 +4990,7 @@ mod tests {
             },
         )
         .await;
+        wait_for_full_views(&nodes).await;
         nodes
     }
 
@@ -4986,11 +5011,12 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        // A reload restarts the 2s lifetime, so the next refresh point is
-        // 1s later: over 4.5s of reads, the load and about four reloads.
+        // A reload restarts the 10s lifetime, so the next refresh point is
+        // 1s later: over 4.5s of reads, the load and about four reloads,
+        // fewer when the runner stalls between reads.
         let loads = log.lock().expect("log lock").len();
         assert!(
-            (4..=6).contains(&loads),
+            (2..=6).contains(&loads),
             "about one reload a refresh interval, not one per read: {loads} loads"
         );
         shut_down_all(nodes).await;

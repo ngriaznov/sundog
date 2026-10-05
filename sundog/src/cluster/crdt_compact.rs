@@ -617,20 +617,16 @@ mod tests {
             membership::LiveFlags { departing: false },
         )]));
         absence.observe(&HashMap::new());
-        tokio::time::sleep(retire_after * 2).await;
-        crdt_compact_tick(
-            shard.as_ref(),
-            &name,
-            &cluster,
-            &absence,
-            three_bounds(retire_after),
-        )
-        .await;
+        let a_minute = CompactionBounds {
+            receipt_ttl_ms: 60_000,
+            ..three_bounds(retire_after)
+        };
+        crdt_compact_tick(shard.as_ref(), &name, &cluster, &absence, a_minute).await;
         assert!(
             absence.gone_since(gone).is_some(),
-            "two bounds gone: still tracked"
+            "gone within the receipt lifetime: still tracked"
         );
-        tokio::time::sleep(retire_after * 2).await;
+        tokio::time::sleep(retire_after * 4).await;
         crdt_compact_tick(
             shard.as_ref(),
             &name,
