@@ -36,6 +36,7 @@ use crate::wire::{self, MAX_FRAME, WireRecord};
 mod engine;
 mod load;
 pub(crate) mod part;
+mod read_timing;
 mod refresh;
 use engine::{ApplyOutcome, Engine, JoinOutcome, Reservation};
 
@@ -1642,6 +1643,8 @@ where
     hits: metrics::Counter,
     /// Handle for `sundog_cache_misses_total{cache}`, same reason as `hits`.
     misses: metrics::Counter,
+    /// `sundog_read_duration_seconds{cache,outcome}`, sampled.
+    read_durations: read_timing::ReadDurations,
     /// [`Shard::with_loader`]'s loader, which [`Shard::load`] and
     /// [`Shard::load_many`] answer a miss through.
     loader: Option<Loader<K, V>>,
@@ -1694,6 +1697,20 @@ struct SpillRead {
     reads_io_error: metrics::Counter,
     /// `sundog_spill_promotions_total{cache}`.
     promotions: metrics::Counter,
+    /// `sundog_spill_read_duration_seconds{cache}`: every disk read, a
+    /// read's own from the wait for its permit to its outcome, a batched
+    /// background read's from its positional read to its outcome.
+    read_duration: metrics::Histogram,
+}
+
+#[cfg(feature = "spill")]
+impl SpillRead {
+    /// Counts one disk read's `outcome` and records its duration since
+    /// `started`.
+    fn finish(&self, outcome: &metrics::Counter, started: std::time::Instant) {
+        outcome.increment(1);
+        self.read_duration.record(started.elapsed());
+    }
 }
 
 /// [`Shard::attach_spill`]'s result: the parts the reopen replayed at
@@ -1762,6 +1779,7 @@ where
         let engine = Arc::new(Engine::new(max_capacity, tti, None, None));
         let hits = metrics::counter!("sundog_cache_hits_total", "cache" => name.to_string());
         let misses = metrics::counter!("sundog_cache_misses_total", "cache" => name.to_string());
+        let read_durations = read_timing::ReadDurations::new(&name);
         let skew_rejected =
             metrics::counter!("sundog_clock_skew_rejected_total", "cache" => name.to_string());
         let fan_out = Arc::new(FanOutQueue::new(name.clone(), !matches!(mode, Mode::Local)));
@@ -1801,6 +1819,7 @@ where
             weigher: None,
             hits,
             misses,
+            read_durations,
             loader: None,
             loader_calls: None,
             load_queue: load::LoadQueue::new(),
@@ -2353,6 +2372,10 @@ where
                     "sundog_spill_promotions_total",
                     "cache" => self.name.to_string(),
                 ),
+                read_duration: metrics::histogram!(
+                    "sundog_spill_read_duration_seconds",
+                    "cache" => self.name.to_string(),
+                ),
             })
             .unwrap_or_else(|_| panic!("invariant: attach_spill runs at most once per shard"));
         Ok(AttachSpillOutcome {
@@ -2883,18 +2906,23 @@ where
     /// `spawn_blocking`, and, on success, promoted back to residency under
     /// a fresh stripe write lock; either way it still counts as a hit. See
     /// the store module's docs and [`Shard::get_sync`], which never does
-    /// this.
+    /// this. One read in 256 on each thread is timed into
+    /// `sundog_read_duration_seconds{cache,outcome}`.
     pub async fn get(&self, key: &K) -> Option<V> {
+        let started = read_timing::start_read();
         if let Some(value) = self.read_resident_key(key, self.now_ms()) {
             self.hits.increment(1);
+            self.read_durations.record(started, true);
             return Some(value);
         }
         #[cfg(feature = "spill")]
         if let Some(value) = self.get_spilled(key).await {
             self.hits.increment(1);
+            self.read_durations.record(started, true);
             return Some(value);
         }
         self.misses.increment(1);
+        self.read_durations.record(started, false);
         None
     }
 
@@ -2904,14 +2932,18 @@ where
     /// documented behavioral difference between the sync and async twins:
     /// the RAM-only synchronous path never touches disk, so it cannot read a
     /// value that has moved there. Use [`Shard::get`] to read a spilled
-    /// value; it also promotes the entry back to residency on success.
+    /// value; it also promotes the entry back to residency on success. Timed
+    /// into `sundog_read_duration_seconds` on the same per-thread sample.
     #[must_use]
     pub fn get_sync(&self, key: &K) -> Option<V> {
+        let started = read_timing::start_read();
         if let Some(value) = self.read_resident_key(key, self.now_ms()) {
             self.hits.increment(1);
+            self.read_durations.record(started, true);
             Some(value)
         } else {
             self.misses.increment(1);
+            self.read_durations.record(started, false);
             None
         }
     }
@@ -2977,6 +3009,7 @@ where
         let spill_read = self.spill_read.get()?;
         let tier = Arc::clone(self.engine.spill()?);
         let (ver, loc) = self.engine.spilled_loc(key_bytes, hash, self.now_ms())?;
+        let started = std::time::Instant::now();
         let permit = Arc::clone(&spill_read.semaphore)
             .acquire_owned()
             .await
@@ -2989,7 +3022,7 @@ where
         let bytes = match read {
             Ok(Ok(Some(bytes))) => bytes,
             Ok(Ok(None)) => {
-                spill_read.reads_stale.increment(1);
+                spill_read.finish(&spill_read.reads_stale, started);
                 return None;
             }
             Ok(Err(err)) => {
@@ -2998,19 +3031,19 @@ where
                     error = %err,
                     "sundog spill: positional read failed"
                 );
-                spill_read.reads_io_error.increment(1);
+                spill_read.finish(&spill_read.reads_io_error, started);
                 return None;
             }
             Err(_join_err) => {
-                spill_read.reads_io_error.increment(1);
+                spill_read.finish(&spill_read.reads_io_error, started);
                 return None;
             }
         };
         let Ok(value) = postcard::from_bytes::<V>(&bytes.encoded) else {
-            spill_read.reads_io_error.increment(1);
+            spill_read.finish(&spill_read.reads_io_error, started);
             return None;
         };
-        spill_read.reads_hit.increment(1);
+        spill_read.finish(&spill_read.reads_hit, started);
         Some((ver, value, bytes.encoded))
     }
 
@@ -4400,17 +4433,16 @@ where
     let Ok(permit) = Arc::clone(&spill_read.semaphore).acquire_owned().await else {
         return Vec::new();
     };
-    let reads_hit = spill_read.reads_hit.clone();
-    let reads_stale = spill_read.reads_stale.clone();
-    let reads_io_error = spill_read.reads_io_error.clone();
+    let spill_read = spill_read.clone();
     let cache_name = cache_name.to_string();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let mut out = Vec::with_capacity(spilled.len());
         for (key_bytes, ver, expires_at_ms, loc) in spilled {
+            let started = std::time::Instant::now();
             match tier.read_at(loc) {
                 Ok(Some(bytes)) => {
-                    reads_hit.increment(1);
+                    spill_read.finish(&spill_read.reads_hit, started);
                     out.push(WireRecord {
                         key: key_bytes,
                         value: Some(bytes.encoded),
@@ -4419,7 +4451,7 @@ where
                     });
                 }
                 Ok(None) => {
-                    reads_stale.increment(1);
+                    spill_read.finish(&spill_read.reads_stale, started);
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -4427,7 +4459,7 @@ where
                         error = %err,
                         "sundog spill: anti-entropy/snapshot read failed"
                     );
-                    reads_io_error.increment(1);
+                    spill_read.finish(&spill_read.reads_io_error, started);
                 }
             }
         }

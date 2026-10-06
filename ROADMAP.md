@@ -19,21 +19,6 @@ takes one stripe lock per distinct bucket instead of one per key, and
 `fetch_many` groups keys by owner into one request per owner instead of one
 round trip per key.
 
-### Latency histograms
-
-Every `sundog_*` metric is a counter or a gauge. Latency exists only as two
-accumulating sums, the fan-out and spill wait totals, with no buckets and no
-timing at all for a hit, a miss, a fetch or a spill read. Histograms for
-those four are what a dashboard needs to show a p99. The exporter test pins
-each one.
-
-### A span on the fetch path
-
-State transfer and anti-entropy rounds already carry `tracing` spans, and a
-user's own OpenTelemetry subscriber already receives every event the crate
-emits. `fetch` has no span, so an owner round trip is invisible in a trace.
-One span with the owner, the outcome and the attempt count closes that.
-
 ### Cluster health with ownership, backlog and spill
 
 `Cluster::peers()` and `Cluster::health()` exist. `Health` carries
@@ -95,8 +80,8 @@ fleet and is the recording the README shows.
 
 What remains needs data nothing exports yet. Pulls and repairs in flight per
 part need the state-transfer and anti-entropy requests of the observer
-above. The parts whose fetches are slowest or most frequent need a per-part
-counter or a latency histogram in the exporter.
+above. The parts whose fetches are slowest or most frequent need per-part
+counts: `sundog_fetch_duration_seconds` is per cache.
 
 ### Snapshot export and import
 
@@ -194,7 +179,9 @@ A fetch asks one owner and waits for it. An owner that is slow but alive
 holds the read for the whole round trip, so a fetch's tail latency is its
 slowest owner's. A hedged fetch sends to a second owner once the first has
 taken longer than the fetch latency's p95 and takes whichever answer
-arrives first. The threshold comes from the fetch histogram under "Next".
+arrives first. The exported `sundog_fetch_duration_seconds` histogram is
+not readable in process, so the threshold is either configured from it or
+tracked by the node itself.
 
 **Trigger:** a fetch p99 well above its p50 on a cluster whose owners are
 all healthy.

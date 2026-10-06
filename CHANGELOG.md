@@ -3,6 +3,22 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Latency histograms.** `sundog_read_duration_seconds{cache, outcome}`
+  times one `get` or `get_sync` in 256 on each thread, `hit` or `miss`;
+  `sundog_fetch_duration_seconds{cache, outcome}` times every
+  `Cache::fetch` that asks an owner, `remote`, `miss` or `error`; and, with
+  `spill`, `sundog_spill_read_duration_seconds{cache}` times every disk
+  read. Both Prometheus install paths render them as histogram buckets from
+  1µs to 10s, `telemetry::LATENCY_BUCKETS`, which a query aggregates across
+  nodes. The Grafana dashboard gains read and fetch p99 panels.
+- **A span on the fetch path.** `Cache::fetch` runs in a debug-level
+  `sundog.fetch` span with the cache, the last owner asked, the outcome and
+  the number of owner requests.
+
 ## [0.6.4] – 2026-10-04
 
 ### Added

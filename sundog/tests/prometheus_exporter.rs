@@ -213,6 +213,29 @@ async fn count_hits_and_misses(cluster: &Cluster) {
     assert!(loads.iter().all(|value| value == "joined"));
 }
 
+/// Drives `sundog_read_duration_seconds{cache="timed-reads",outcome}`: on a
+/// fresh thread, whose per-thread read count starts at zero, 256 hits and
+/// then 256 misses, so exactly one read of each is timed.
+async fn read_durations_pin_metrics(cluster: &Cluster) {
+    let timed = cluster
+        .cache::<u32, String>("timed-reads")
+        .mode(Mode::Local)
+        .open()
+        .await
+        .expect("cache opens");
+    timed.insert(1, "a".into()).await.expect("insert");
+    std::thread::spawn(move || {
+        for _ in 0..256 {
+            assert_eq!(timed.get_sync(&1), Some("a".to_string()));
+        }
+        for _ in 0..256 {
+            assert_eq!(timed.get_sync(&2), None);
+        }
+    })
+    .join()
+    .expect("the reads finish");
+}
+
 /// Drives `sundog_ceiling_refusals_total{cache, kind}` and
 /// `sundog_cache_bytes{cache}` on a `Mode::Local` cache whose memory ceiling
 /// is one byte: one accepted insert, two refused writes (`kind="write"`),
@@ -955,6 +978,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     seed_sketch_mismatch(&cluster, &peer).await;
     seed_part_mismatch(&cluster, &peer).await;
     count_hits_and_misses(&cluster).await;
+    read_durations_pin_metrics(&cluster).await;
     fan_out_wait_timeout_pin_metrics().await;
     clock_skew_pin_metrics().await;
     let ceiling_pin_bytes = f64::from(
@@ -1033,6 +1057,23 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         Some(5.0),
         "expected 5 misses on the 'counted' cache; got body:\n{body}"
     );
+    for outcome in ["hit", "miss"] {
+        let labels = [("cache", "timed-reads"), ("outcome", outcome)];
+        assert_eq!(
+            scraped_metric_value(&body, "sundog_read_duration_seconds_count", &labels),
+            Some(1.0),
+            "one {outcome} in 256 is timed; got body:\n{body}"
+        );
+        assert_eq!(
+            scraped_metric_value(
+                &body,
+                "sundog_read_duration_seconds_bucket",
+                &[labels[0], labels[1], ("le", "10")]
+            ),
+            Some(1.0),
+            "the timed {outcome} lands in the 10s bucket; got body:\n{body}"
+        );
+    }
     assert!(
         scraped_metric_value(&body, "sundog_cache_entries", &[("cache", "counted")]).is_some(),
         "expected a sundog_cache_entries line for the 'counted' cache; got body:\n{body}"
@@ -1191,6 +1232,23 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
              body:\n{body}"
         );
     }
+    for outcome in ["remote", "miss", "error"] {
+        let labels = [("cache", "prices"), ("outcome", outcome)];
+        assert_eq!(
+            scraped_metric_value(&body, "sundog_fetch_duration_seconds_count", &labels),
+            scraped_metric_value(&body, "sundog_fetch_total", &labels),
+            "every {outcome} fetch that asked an owner is timed; got body:\n{body}"
+        );
+    }
+    assert_eq!(
+        scraped_metric_value(
+            &body,
+            "sundog_fetch_duration_seconds_count",
+            &[("cache", "prices"), ("outcome", "local")]
+        ),
+        None,
+        "a local fetch asks no owner and is not timed; got body:\n{body}"
+    );
     assert!(
         scraped_metric_value(
             &body,
@@ -1265,6 +1323,25 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
             ),
             Some(1.0),
             "expected exactly one disk hit; got body:\n{body}"
+        );
+        let disk_reads: f64 = ["hit", "stale", "io_error"]
+            .iter()
+            .filter_map(|&outcome| {
+                scraped_metric_value(
+                    &body,
+                    "sundog_spill_reads_total",
+                    &[("cache", "spilled"), ("outcome", outcome)],
+                )
+            })
+            .sum();
+        assert_eq!(
+            scraped_metric_value(
+                &body,
+                "sundog_spill_read_duration_seconds_count",
+                &[("cache", "spilled")]
+            ),
+            Some(disk_reads),
+            "every disk read is timed; got body:\n{body}"
         );
         assert_eq!(
             scraped_metric_value(

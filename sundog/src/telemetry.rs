@@ -13,6 +13,11 @@
 //! whichever runs second fails rather than replacing the first recorder.
 //! Neither panics on that failure; see each function's `# Errors`.
 //!
+//! Both install the same recorder: every `sundog_*_duration_seconds`
+//! histogram renders as Prometheus histogram buckets from
+//! [`LATENCY_BUCKETS`], which aggregate across nodes in a Prometheus query,
+//! rather than as per-node quantiles, which do not.
+//!
 //! Install the recorder before opening a cache. A cache resolves its
 //! per-cache handles (`sundog_cache_hits_total{cache}`,
 //! `sundog_spill_entries{cache}`, and the like) once, when it opens, against
@@ -23,10 +28,49 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use metrics_exporter_prometheus::PrometheusBuilder;
 pub use metrics_exporter_prometheus::{BuildError, PrometheusHandle};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+/// The upper bounds, in seconds, of every `sundog_*_duration_seconds`
+/// histogram's buckets: 1µs to 10s in 1-2.5-5 steps, from a resident read
+/// to a fetch that waits out its timeout.
+pub const LATENCY_BUCKETS: [f64; 22] = [
+    0.000_001,
+    0.000_002_5,
+    0.000_005,
+    0.000_01,
+    0.000_025,
+    0.000_05,
+    0.000_1,
+    0.000_25,
+    0.000_5,
+    0.001,
+    0.002_5,
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+];
+
+/// The recorder both install paths use: [`LATENCY_BUCKETS`] for every
+/// metric whose name ends in `_duration_seconds`.
+fn builder() -> PrometheusBuilder {
+    PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            Matcher::Suffix("_duration_seconds".to_owned()),
+            &LATENCY_BUCKETS,
+        )
+        .expect("invariant: LATENCY_BUCKETS is not empty")
+}
 
 /// What `install_listener`'s `GET /readyz` route reports.
 pub(crate) trait ReadinessSource: Send + Sync + 'static {
@@ -46,7 +90,7 @@ pub(crate) fn install_listener(
     addr: SocketAddr,
     readiness: Arc<dyn ReadinessSource>,
 ) -> Result<(), BuildError> {
-    let handle = PrometheusBuilder::new().install_recorder()?;
+    let handle = builder().install_recorder()?;
     let std_listener = std::net::TcpListener::bind(addr)
         .and_then(|listener| {
             listener.set_nonblocking(true)?;
@@ -134,5 +178,35 @@ async fn respond(
 ///
 /// Returns [`BuildError`] if a `metrics` recorder is already installed.
 pub fn prometheus_handle() -> Result<PrometheusHandle, BuildError> {
-    PrometheusBuilder::new().install_recorder()
+    builder().install_recorder()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn latency_buckets_rise_from_a_microsecond_to_ten_seconds() {
+        assert_eq!(LATENCY_BUCKETS.first(), Some(&0.000_001));
+        assert_eq!(LATENCY_BUCKETS.last(), Some(&10.0));
+        assert!(LATENCY_BUCKETS.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn the_builder_buckets_duration_histograms() {
+        let recorder = builder().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            metrics::histogram!("sundog_test_duration_seconds").record(0.003);
+        });
+        let body = handle.render();
+        assert!(
+            body.contains("sundog_test_duration_seconds_bucket{le=\"0.005\"} 1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("sundog_test_duration_seconds_bucket{le=\"0.0025\"} 0"),
+            "{body}"
+        );
+    }
 }

@@ -58,6 +58,7 @@ zerocopy = { version = "0.8.56", features = ["derive"] }
 [dev-dependencies]
 anyhow = "1.0.104"
 arbitrary = { version = "1.4.2", features = ["derive"] }
+metrics-util = { version = "0.20.4", default-features = false, features = ["debugging"] }
 proptest = "1.11.0"
 proptest-arbitrary-interop = "0.1.0"
 rcgen = "0.14.9"

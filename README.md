@@ -640,6 +640,19 @@ Install the recorder before opening a cache: a cache binds its per-cache
 handles when it opens. A ready-made Grafana dashboard lives at
 [`ops/grafana-dashboard.json`](ops/grafana-dashboard.json).
 
+Latency is three histograms in seconds, bucketed from 1µs to 10s
+(`sundog::telemetry::LATENCY_BUCKETS`) so a Prometheus query aggregates
+them across nodes. `sundog_read_duration_seconds{cache, outcome}` times one
+`get` or `get_sync` in 256 on each thread, `outcome` `hit` or `miss`: its
+count is a sample count, and the read rate stays
+`sundog_cache_hits_total` and `sundog_cache_misses_total`.
+`sundog_fetch_duration_seconds{cache, outcome}` times every `Cache::fetch`
+that asks an owner, `outcome` `remote`, `miss` or `error`. With `spill`,
+`sundog_spill_read_duration_seconds{cache}` times every disk read.
+`Cache::fetch` also runs in a debug-level `sundog.fetch` span carrying the
+cache, the last owner asked, the outcome and the number of owner requests,
+so an owner round trip shows in a trace.
+
 With `spill`, every cache open also emits
 `sundog_spill_reopen_total{cache, outcome, reason}`, `outcome` `warm` for a
 fast reopen straight from a checkpoint snapshot or `cold_fallback` for the
