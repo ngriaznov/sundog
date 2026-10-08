@@ -5137,55 +5137,135 @@ mod tests {
         shut_down_all(nodes).await;
     }
 
+    /// Per `(name, cache, outcome)` metric, a counter's value or a
+    /// histogram's sample count, drained from `snapshotter`.
+    fn drained(
+        snapshotter: &metrics_util::debugging::Snapshotter,
+    ) -> std::collections::BTreeMap<(String, String, String), u64> {
+        use metrics_util::debugging::DebugValue;
+        let mut values = std::collections::BTreeMap::new();
+        for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+            let label = |name: &str| {
+                key.key()
+                    .labels()
+                    .find(|label| label.key() == name)
+                    .map(|label| label.value().to_owned())
+                    .unwrap_or_default()
+            };
+            let n = match value {
+                DebugValue::Counter(n) => n,
+                DebugValue::Histogram(samples) => samples.len() as u64,
+                DebugValue::Gauge(_) => continue,
+            };
+            values.insert(
+                (
+                    key.key().name().to_owned(),
+                    label("cache"),
+                    label("outcome"),
+                ),
+                n,
+            );
+        }
+        values
+    }
+
+    /// Each call under its own cache label, so the test sees which calls
+    /// are timed, not only how many per outcome.
     #[test]
     fn only_a_fetch_that_asked_an_owner_is_timed() {
-        use std::collections::BTreeMap;
-
-        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-        let recorder = DebuggingRecorder::new();
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
+        let calls = [
+            ("local", 0),
+            ("local", 2),
+            ("remote", 1),
+            ("miss", 1),
+            ("error", 0),
+            ("error", 3),
+        ];
         metrics::with_local_recorder(&recorder, || {
             let started = std::time::Instant::now();
-            for (outcome, attempts) in [
-                ("local", 0),
-                ("local", 2),
-                ("remote", 1),
-                ("miss", 1),
-                ("error", 0),
-                ("error", 3),
-            ] {
-                record_fetch_outcome(&tracing::Span::none(), "timed", outcome, attempts, started);
+            for (index, (outcome, attempts)) in calls.into_iter().enumerate() {
+                let cache = format!("call{index}");
+                record_fetch_outcome(&tracing::Span::none(), &cache, outcome, attempts, started);
             }
         });
-        let (mut counted, mut timed) = (BTreeMap::new(), BTreeMap::new());
-        for (key, _, _, value) in snapshotter.snapshot().into_vec() {
-            let outcome = key
-                .key()
-                .labels()
-                .find(|label| label.key() == "outcome")
-                .map(|label| label.value().to_owned())
-                .expect("an outcome label");
-            match value {
-                DebugValue::Counter(n) => *counted.entry(outcome).or_insert(0) += n,
-                DebugValue::Histogram(samples) => {
-                    *timed.entry(outcome).or_insert(0) += samples.len() as u64;
-                }
-                DebugValue::Gauge(_) => {}
-            }
+        let values = drained(&snapshotter);
+        for (index, (outcome, attempts)) in calls.into_iter().enumerate() {
+            let key = |name: &str| (name.to_owned(), format!("call{index}"), outcome.to_owned());
+            assert_eq!(
+                values.get(&key("sundog_fetch_total")),
+                Some(&1),
+                "{outcome} with {attempts} owner requests is counted"
+            );
+            assert_eq!(
+                values.get(&key("sundog_fetch_duration_seconds")),
+                (attempts > 0).then_some(&1),
+                "{outcome} with {attempts} owner requests is timed iff it asked an owner"
+            );
         }
-        let outcomes = |counts: [u64; 4]| {
-            ["error", "local", "miss", "remote"]
-                .into_iter()
-                .map(str::to_owned)
-                .zip(counts)
-                .collect::<BTreeMap<_, _>>()
+    }
+
+    /// Through `Cache::fetch`: a fetch answered without asking an owner is
+    /// counted and not timed, on a cache with no ownership view and on a
+    /// `Mode::Distributed` key this node owns warm; a fetch that asks an
+    /// owner is counted and timed.
+    #[tokio::test]
+    async fn a_fetch_is_timed_only_when_it_asks_an_owner() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let fetched = |cache: &str, outcome: &str| {
+            let values = drained(&snapshotter);
+            let get = |name: &str| {
+                values
+                    .get(&(name.to_owned(), cache.to_owned(), outcome.to_owned()))
+                    .copied()
+            };
+            (
+                get("sundog_fetch_total"),
+                get("sundog_fetch_duration_seconds"),
+            )
         };
-        assert_eq!(counted, outcomes([2, 2, 1, 1]), "every fetch is counted");
-        assert_eq!(
-            timed,
-            outcomes([1, 1, 1, 1]),
-            "only the fetches with an owner request are timed"
-        );
+
+        let cluster = Cluster::builder("cache-it-fetch-timed")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node builds");
+        let plain = cluster
+            .cache::<u32, String>("fetch-timed-plain")
+            .open()
+            .await
+            .expect("opens");
+        assert_eq!(plain.fetch(&1).await.expect("fetch"), None);
+        assert_eq!(fetched("fetch-timed-plain", "local"), (Some(1), None));
+        cluster.shutdown().await;
+
+        let log = LoadLog::default();
+        let nodes =
+            three_loading_nodes("cache-it-fetch-timed", Mode::distributed(), &log, None).await;
+        let (a, cache_a) = &nodes[0];
+        let local = (0..10_000u32)
+            .find(|key| cache_a.owners_of(key).contains(&a.node_id()))
+            .expect("a key a owns");
+        let part = PartId::of_key(&encode_key(&local).expect("u32 encodes"));
+        wait_until(
+            Duration::from_secs(10),
+            "a holds the owned key's part warm",
+            async || !cache_a.shard.is_cold_part(part),
+        )
+        .await;
+        let remote = (0..10_000u32)
+            .find(|key| !cache_a.owners_of(key).contains(&a.node_id()))
+            .expect("a key a does not own");
+        let _ = drained(&snapshotter);
+        assert_eq!(cache_a.fetch(&local).await.expect("fetch"), None);
+        assert_eq!(fetched("cache-it-fetch-timed", "local"), (Some(1), None));
+        assert_eq!(cache_a.fetch(&remote).await.expect("fetch"), None);
+        assert_eq!(fetched("cache-it-fetch-timed", "miss"), (Some(1), Some(1)));
+        shut_down_all(nodes).await;
     }
 
     #[tokio::test]
