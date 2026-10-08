@@ -1949,8 +1949,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::test_support::{
-        EndingDiscovery, loopback_config, registered_shard, wait_for_no_peers, wait_for_peer_count,
-        wait_until,
+        EndingDiscovery, loopback_config, registered_shard, scoped_subscriber, wait_for_no_peers,
+        wait_for_peer_count, wait_until,
     };
     use super::*;
     use crate::error::CacheError;
@@ -3636,7 +3636,8 @@ mod tests {
     /// A [`tracing::Subscriber`] that counts `cluster::anti_entropy`'s
     /// `outcome = "decoded"`/`"fallback"` events, standing in for the
     /// process-global `metrics` recorder, too fragile to install per-test.
-    /// `set_default` is thread-local, scoped to this single-threaded test.
+    /// Installed through [`scoped_subscriber`], thread-local to this
+    /// single-threaded test.
     struct AeSketchOutcomeSubscriber {
         decoded: Arc<AtomicUsize>,
         fallback: Arc<AtomicUsize>,
@@ -3801,7 +3802,7 @@ mod tests {
         .expect("replicate traffic settles within the bound");
 
         let listing = Arc::new(AtomicUsize::new(0));
-        let _guard = tracing::subscriber::set_default(AePartsOutcomeSubscriber {
+        let _guard = scoped_subscriber(AePartsOutcomeSubscriber {
             listing: Arc::clone(&listing),
         });
 
@@ -3882,7 +3883,7 @@ mod tests {
 
         let decoded = Arc::new(AtomicUsize::new(0));
         let fallback = Arc::new(AtomicUsize::new(0));
-        let _guard = tracing::subscriber::set_default(AeSketchOutcomeSubscriber {
+        let _guard = scoped_subscriber(AeSketchOutcomeSubscriber {
             decoded: Arc::clone(&decoded),
             fallback: Arc::clone(&fallback),
         });
@@ -3968,7 +3969,7 @@ mod tests {
 
         let decoded = Arc::new(AtomicUsize::new(0));
         let fallback = Arc::new(AtomicUsize::new(0));
-        let _guard = tracing::subscriber::set_default(AeSketchOutcomeSubscriber {
+        let _guard = scoped_subscriber(AeSketchOutcomeSubscriber {
             decoded: Arc::clone(&decoded),
             fallback: Arc::clone(&fallback),
         });

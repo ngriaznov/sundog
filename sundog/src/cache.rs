@@ -4993,8 +4993,9 @@ mod tests {
     async fn a_fetch_span_names_the_owner_asked_its_outcome_and_its_attempts() {
         use tracing_subscriber::layer::SubscriberExt as _;
         let spans = FetchSpans::default();
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
+        let _guard = crate::cluster::test_support::scoped_subscriber(
+            tracing_subscriber::registry().with(spans.clone()),
+        );
         let log = LoadLog::default();
         let nodes =
             three_loading_nodes("cache-it-fetch-span", Mode::distributed(), &log, None).await;
@@ -5073,7 +5074,7 @@ mod tests {
         use tracing_subscriber::Layer as _;
         use tracing_subscriber::layer::SubscriberExt as _;
         let spans = FetchSpans::default();
-        let _guard = tracing::subscriber::set_default(
+        let _guard = crate::cluster::test_support::scoped_subscriber(
             tracing_subscriber::registry().with(
                 spans
                     .clone()
