@@ -3578,34 +3578,59 @@ async fn refresh_ahead_keeps_a_replicated_key_read_on_every_node_alive() {
     net.close().await.expect("network closes");
 }
 
-/// The previous release has no loader and never speaks protocol 7: beside
-/// it in a `Mode::Distributed` cluster, the current nodes load every key,
-/// one loader call a key, and the loaded value still reaches the previous
-/// release's node wherever it owns the key.
+/// Beside the previous release in a `Mode::Distributed` cluster, every key a
+/// current node loads takes one loader call and the value reaches the
+/// previous release's node wherever it owns the key. A previous release
+/// that speaks [`sundog::wire::PROTOCOL_LOAD`] loads too: a current node's
+/// load of a key whose first owner is the previous release runs on the
+/// previous release's loader. An older one has no loader, and the current
+/// nodes load every key.
 #[tokio::test]
-async fn loads_beside_the_previous_release_skip_it_and_still_reach_it() {
+async fn loads_beside_the_previous_release_take_one_call_a_key_and_reach_it() {
     const CLUSTER: &str = "load-mixed";
-    const KEYS: usize = 12;
+    const KEYS: u64 = 12;
     require_containers!();
 
+    let previous_loads =
+        sundog::wire::peer_supports(PREVIOUS_RELEASE_PROTOCOL, sundog::wire::PROTOCOL_LOAD);
     let previous = build_previous_testnode();
     let net = Arc::new(Network::new_network());
-    let old_env = [
-        ("SUNDOG_TESTNODE_MODE", "distributed"),
-        ("SUNDOG_TESTNODE_OWNERS", "2"),
-    ];
     let env = [
         ("SUNDOG_TESTNODE_MODE", "distributed"),
         ("SUNDOG_TESTNODE_OWNERS", "2"),
         ("SUNDOG_TESTNODE_LOADER_DELAY_MS", "0"),
     ];
-    let old = Node::spawn_binary(&net, CLUSTER, "n1", &[], &old_env, previous).await;
+    let old_env = if previous_loads { &env[..] } else { &env[..2] };
+    let old = Node::spawn_binary(&net, CLUSTER, "n1", &[], old_env, previous).await;
     let n2 = Node::spawn_with_env(&net, CLUSTER, "n2", &[&seed("n1")], &env).await;
     let n3 = Node::spawn_with_env(&net, CLUSTER, "n3", &[&seed("n1")], &env).await;
     let nodes = [&old, &n2, &n3];
     wait_for_peers(&nodes, 2).await;
     let old_id = old.node_id().await.expect("id");
+    let loaders: &[&Node] = if previous_loads { &nodes } else { &nodes[1..] };
 
+    if previous_loads {
+        // Until the previous release's loader advert reaches n3, n3 loads
+        // its keys elsewhere; each probe is a fresh key whose first owner is
+        // the previous release.
+        let mut attempt = 0;
+        eventually_with_logs(Duration::from_secs(60), &nodes, || {
+            attempt += 1;
+            let key = format!("probe{attempt}");
+            async move {
+                let [old, n2, n3] = nodes;
+                if n2.owners(&key).await.expect("owners").first() != Some(&old_id) {
+                    return false;
+                }
+                let before = old.loads().await.expect("loads");
+                n3.load(&key).await.expect("load").is_some()
+                    && old.loads().await.expect("loads") == before + 1
+            }
+        })
+        .await;
+    }
+
+    let before = total_loads(loaders).await;
     let mut old_owned = 0;
     for index in 0..KEYS {
         let key = format!("mixed{index}");
@@ -3625,9 +3650,9 @@ async fn loads_beside_the_previous_release_skip_it_and_still_reach_it() {
     }
     assert!(old_owned > 0, "the previous release owns some of the keys");
     assert_eq!(
-        total_loads(&[&n2, &n3]).await,
-        KEYS as u64,
-        "one loader call a key, all on the current nodes"
+        total_loads(loaders).await - before,
+        KEYS,
+        "one loader call a key across the nodes with a loader"
     );
 
     old.stop().await.expect("old node stops");
