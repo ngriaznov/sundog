@@ -714,15 +714,17 @@ fn fetch_retry_backoff() -> Duration {
     Duration::from_millis(rand::rng().random_range(10..50))
 }
 
-/// Counts one [`Cache::fetch`] in `sundog_fetch_total{cache,outcome}`,
-/// records `outcome` on its `span` and, for a fetch that asked an owner,
-/// started at `asked_since`, its duration in
-/// `sundog_fetch_duration_seconds{cache,outcome}`.
+/// Counts one [`Cache::fetch`], started at `started`, in
+/// `sundog_fetch_total{cache,outcome}`, records `outcome` on its `span` and,
+/// when it made at least one owner request (`attempts`), records its
+/// duration in `sundog_fetch_duration_seconds{cache,outcome}`. A fetch that
+/// asked no owner is not timed, whatever its outcome.
 fn record_fetch_outcome(
     span: &tracing::Span,
     cache: &str,
     outcome: &'static str,
-    asked_since: Option<std::time::Instant>,
+    attempts: u32,
+    started: std::time::Instant,
 ) {
     metrics::counter!(
         "sundog_fetch_total",
@@ -731,7 +733,7 @@ fn record_fetch_outcome(
     )
     .increment(1);
     span.record("outcome", outcome);
-    if let Some(started) = asked_since {
+    if attempts > 0 {
         metrics::histogram!(
             "sundog_fetch_duration_seconds",
             "cache" => cache.to_string(),
@@ -1598,6 +1600,15 @@ where
     /// is [`Cache::get`] wrapped in `Ok`, counted `outcome="local"`
     /// unconditionally, so callers don't need to branch on mode.
     ///
+    /// A fetch that asks an owner records its duration in
+    /// `sundog_fetch_duration_seconds{cache,outcome}` under its outcome:
+    /// `remote`, `miss`, `error`, or `local` when a changed ownership view
+    /// hands the key back to this node after an owner was asked. A fetch
+    /// that asks no owner is not timed. Each fetch runs in a debug-level
+    /// `sundog.fetch` span carrying the cache, the last owner asked (this
+    /// node for a local answer), the outcome (none for a key that fails to
+    /// encode) and the number of owner requests.
+    ///
     /// # Errors
     ///
     /// Returns [`CacheError::Codec`] if `key` fails to encode, and
@@ -1607,15 +1618,6 @@ where
     /// from a genuine miss, which returns `Ok(None)`.
     /// An owner whose ownership view differs from this node's is retried
     /// with a short jittered backoff before the next owner is tried.
-    ///
-    /// A fetch that asks an owner records its duration in
-    /// `sundog_fetch_duration_seconds{cache,outcome}` under its outcome:
-    /// `remote`, `miss`, `error`, or `local` when a changed ownership view
-    /// hands the key back to this node after an owner was asked. A fetch
-    /// that asks no owner is not timed. Each fetch runs in a debug-level
-    /// `sundog.fetch` span carrying the cache, the last owner asked (this
-    /// node for a local answer), the outcome (none for a key that fails to
-    /// encode) and the number of owner requests.
     pub async fn fetch(&self, key: &K) -> Result<Option<V>, CacheError> {
         let span = tracing::debug_span!(
             "sundog.fetch",
@@ -1636,7 +1638,7 @@ where
         let Some(view) = self.shard.ownership_view() else {
             let value = self.shard.get(key).await;
             span.record("owner", tracing::field::display(self.cluster.node_id()));
-            record_fetch_outcome(span, self.shard.name(), "local", None);
+            record_fetch_outcome(span, self.shard.name(), "local", 0, started);
             return Ok(value);
         };
         let key_bytes = encode_key(key)?;
@@ -1644,10 +1646,9 @@ where
         let answer = self
             .owner_answer(key, &key_bytes, view, span, &mut attempts)
             .await;
-        let asked_since = (attempts > 0).then_some(started);
         match answer {
             Ok(OwnerAnswer::Local(value)) => {
-                record_fetch_outcome(span, self.shard.name(), "local", asked_since);
+                record_fetch_outcome(span, self.shard.name(), "local", attempts, started);
                 Ok(value)
             }
             Ok(OwnerAnswer::Remote(rec)) => {
@@ -1668,12 +1669,13 @@ where
                     span,
                     self.shard.name(),
                     if value.is_some() { "remote" } else { "miss" },
-                    asked_since,
+                    attempts,
+                    started,
                 );
                 Ok(value)
             }
             Err(err) => {
-                record_fetch_outcome(span, self.shard.name(), "error", asked_since);
+                record_fetch_outcome(span, self.shard.name(), "error", attempts, started);
                 Err(err)
             }
         }
@@ -4767,7 +4769,8 @@ mod tests {
     /// that records its calls in `log`, takes 300ms, and holds `v{key}` for
     /// every key; the loader on the node at index `fails` returns an error
     /// instead. Returns once every node sees the other two advertise a
-    /// loader and ranks all three in its ownership view.
+    /// loader and, under `Mode::Distributed`, ranks all three in its
+    /// ownership view.
     async fn three_loading_nodes(
         name: &'static str,
         mode: Mode,
@@ -5046,8 +5049,10 @@ mod tests {
     }
 
     /// A subscriber that leaves the debug-level `sundog.fetch` span disabled
-    /// sees nothing of the fetch on the span the caller fetches in, even
-    /// when that span declares fields of the same names.
+    /// sees nothing of a fetch or an `expire` on the span the caller runs it
+    /// in, even when that span declares fields of the same names: neither
+    /// on a cache with no ownership view, nor through a `Mode::Distributed`
+    /// cache's owner requests.
     #[tokio::test]
     async fn a_disabled_fetch_span_records_nothing_on_the_callers_span() {
         use tracing::Instrument as _;
@@ -5090,6 +5095,97 @@ mod tests {
         assert_eq!(spans.last_named("caller"), Some(Vec::new()));
         assert_eq!(spans.last_named("sundog.fetch"), None);
         cluster.shutdown().await;
+
+        let log = LoadLog::default();
+        let nodes = three_loading_nodes(
+            "cache-it-fetch-span-disabled-dist",
+            Mode::distributed(),
+            &log,
+            None,
+        )
+        .await;
+        let (a, cache_a) = &nodes[0];
+        let remote = (0..10_000u32)
+            .find(|key| !cache_a.owners_of(key).contains(&a.node_id()))
+            .expect("a key a does not own");
+        let local = (0..10_000u32)
+            .find(|key| cache_a.owners_of(key).contains(&a.node_id()))
+            .expect("a key a owns");
+        cache_a
+            .insert(remote, "there".to_owned())
+            .await
+            .expect("insert");
+        let caller = tracing::info_span!(
+            "caller",
+            owner = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+            attempts = tracing::field::Empty,
+        );
+        async {
+            cache_a.fetch(&remote).await.expect("remote fetch");
+            cache_a.fetch(&local).await.expect("local fetch");
+            cache_a
+                .expire(&remote, Duration::from_secs(60))
+                .await
+                .expect("expire");
+        }
+        .instrument(caller.clone())
+        .await;
+        drop(caller);
+        assert_eq!(spans.last_named("caller"), Some(Vec::new()));
+        assert_eq!(spans.last_named("sundog.fetch"), None);
+        shut_down_all(nodes).await;
+    }
+
+    #[test]
+    fn only_a_fetch_that_asked_an_owner_is_timed() {
+        use std::collections::BTreeMap;
+
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let started = std::time::Instant::now();
+            for (outcome, attempts) in [
+                ("local", 0),
+                ("local", 2),
+                ("remote", 1),
+                ("miss", 1),
+                ("error", 0),
+                ("error", 3),
+            ] {
+                record_fetch_outcome(&tracing::Span::none(), "timed", outcome, attempts, started);
+            }
+        });
+        let (mut counted, mut timed) = (BTreeMap::new(), BTreeMap::new());
+        for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+            let outcome = key
+                .key()
+                .labels()
+                .find(|label| label.key() == "outcome")
+                .map(|label| label.value().to_owned())
+                .expect("an outcome label");
+            match value {
+                DebugValue::Counter(n) => *counted.entry(outcome).or_insert(0) += n,
+                DebugValue::Histogram(samples) => {
+                    *timed.entry(outcome).or_insert(0) += samples.len() as u64;
+                }
+                DebugValue::Gauge(_) => {}
+            }
+        }
+        let outcomes = |counts: [u64; 4]| {
+            ["error", "local", "miss", "remote"]
+                .into_iter()
+                .map(str::to_owned)
+                .zip(counts)
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(counted, outcomes([2, 2, 1, 1]), "every fetch is counted");
+        assert_eq!(
+            timed,
+            outcomes([1, 1, 1, 1]),
+            "only the fetches with an owner request are timed"
+        );
     }
 
     #[tokio::test]
@@ -5202,7 +5298,7 @@ mod tests {
     /// refresh-ahead fraction, each with a batch loader that records its
     /// calls in `log` and holds `v{key}.{n}`, `n` counting calls across all
     /// nodes. Returns once every node sees the others advertise a loader
-    /// and ranks them in its ownership view.
+    /// and, under `Mode::Distributed`, ranks them all in its ownership view.
     async fn refreshing_nodes(
         name: &'static str,
         mode: Mode,
@@ -5265,10 +5361,11 @@ mod tests {
     #[tokio::test]
     async fn refresh_ahead_keeps_a_read_key_alive_past_its_expiry_on_one_node() {
         let log = LoadLog::default();
-        // A 3s TTL refreshed a third of the way in: a key falls due 1s
-        // after its write and expires 2s after that, well inside the 4.5s
-        // of reads below.
-        let lifetime = (Duration::from_secs(3), 1.0 / 3.0);
+        // A 5s TTL refreshed a fifth of the way in: a key falls due 1s
+        // after its write and expires 4s after that, so a runner stalled
+        // for up to 4s still reads it in time, and the 7s of reads below
+        // outlive the lifetime.
+        let lifetime = (Duration::from_secs(5), 0.2);
         let nodes =
             refreshing_nodes("cache-it-refresh-local", Mode::Local, 1, lifetime, &log).await;
         let cache = &nodes[0].1;
@@ -5277,19 +5374,19 @@ mod tests {
             Some("v1.1".to_string())
         );
         let loaded_at = Instant::now();
-        while loaded_at.elapsed() < Duration::from_millis(4_500) {
+        while loaded_at.elapsed() < Duration::from_secs(7) {
             assert!(
                 cache.get(&1).await.is_some(),
                 "a key read through its refresh window never expires"
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        // A reload restarts the 3s lifetime, so the next refresh point is
-        // 1s later: over 4.5s of reads, the load and about four reloads,
-        // fewer when the runner stalls between reads.
+        // A reload restarts the 5s lifetime, so the next refresh point is
+        // 1s later: over 7s of reads, the load and about six reloads, fewer
+        // when the runner stalls between reads.
         let loads = log.lock().expect("log lock").len();
         assert!(
-            (2..=6).contains(&loads),
+            (2..=8).contains(&loads),
             "about one reload a refresh interval, not one per read: {loads} loads"
         );
         shut_down_all(nodes).await;

@@ -48,6 +48,19 @@ async fn prometheus_handle_buckets_the_crate_histograms_and_no_application_one()
         ),
         "the timed hits render in the first of LATENCY_BUCKETS; got body:\n{body}"
     );
+    let timed_hits = body
+        .lines()
+        .find(|line| {
+            line.starts_with("sundog_read_duration_seconds_count{")
+                && line.contains("cache=\"handle-buckets\"")
+                && line.contains("outcome=\"hit\"")
+        })
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|count| count.parse::<f64>().ok());
+    assert!(
+        timed_hits.is_some_and(|count| (2.0..=6.0).contains(&count)),
+        "768 hits on a fresh thread time two to six, got {timed_hits:?}; body:\n{body}"
+    );
     assert!(
         body.contains("# TYPE app_request_duration_seconds summary"),
         "an application histogram keeps the exporter's default rendering; got body:\n{body}"

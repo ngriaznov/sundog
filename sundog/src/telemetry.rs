@@ -1,8 +1,8 @@
 //! Prometheus metrics export, behind a `prometheus` feature flag, off by
-//! default. The `metrics::counter!`, `gauge!` and `histogram!` calls spread
-//! across the crate are unconditional; without this feature they fall through to `metrics`'s
-//! no-op default recorder. This module wires an actual Prometheus recorder
-//! into the process, two ways:
+//! default. The `metrics::counter!`, `gauge!` and `histogram!` calls
+//! spread across the crate are unconditional; without this feature they
+//! fall through to `metrics`'s no-op default recorder. This module wires an
+//! actual Prometheus recorder into the process, two ways:
 //!
 //! - [`crate::cluster::ClusterBuilder::prometheus_listen`] installs a recorder
 //!   and serves `GET /metrics`, `GET /readyz`, and `GET /healthz` itself.
@@ -39,7 +39,7 @@ use tokio::net::{TcpListener, TcpStream};
 /// [`DURATION_HISTOGRAMS`]: 1µs to 10s in 1-2.5-5 steps. A resident read
 /// lands in the first bucket, and a fetch that waits out its timeout in the
 /// last ones.
-pub const LATENCY_BUCKETS: [f64; 22] = [
+pub const LATENCY_BUCKETS: &[f64] = &[
     0.000_001,
     0.000_002_5,
     0.000_005,
@@ -64,8 +64,10 @@ pub const LATENCY_BUCKETS: [f64; 22] = [
     10.0,
 ];
 
-/// Every histogram the crate records, each bucketed by [`LATENCY_BUCKETS`].
-pub const DURATION_HISTOGRAMS: [&str; 3] = [
+/// Every histogram the crate records, each bucketed by [`LATENCY_BUCKETS`];
+/// `sundog_spill_read_duration_seconds` is recorded only with the `spill`
+/// feature.
+pub const DURATION_HISTOGRAMS: &[&str] = &[
     "sundog_read_duration_seconds",
     "sundog_fetch_duration_seconds",
     "sundog_spill_read_duration_seconds",
@@ -78,7 +80,7 @@ fn builder() -> PrometheusBuilder {
         .iter()
         .fold(PrometheusBuilder::new(), |builder, &name| {
             builder
-                .set_buckets_for_metric(Matcher::Full(name.to_owned()), &LATENCY_BUCKETS)
+                .set_buckets_for_metric(Matcher::Full(name.to_owned()), LATENCY_BUCKETS)
                 .expect("invariant: LATENCY_BUCKETS is not empty")
         })
 }
@@ -208,13 +210,13 @@ mod tests {
         let recorder = builder().build_recorder();
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
-            for name in DURATION_HISTOGRAMS {
+            for &name in DURATION_HISTOGRAMS {
                 metrics::histogram!(name).record(0.003);
             }
             metrics::histogram!("app_request_duration_seconds").record(0.003);
         });
         let body = handle.render();
-        for name in DURATION_HISTOGRAMS {
+        for &name in DURATION_HISTOGRAMS {
             assert!(body.contains(&format!("# TYPE {name} histogram")), "{body}");
             assert!(
                 body.contains(&format!("{name}_bucket{{le=\"0.005\"}} 1")),
@@ -236,8 +238,9 @@ mod tests {
     }
 
     /// Every string literal in the crate's `src/` naming a `sundog_` metric
-    /// that ends in `_duration_seconds`, so a histogram added without
-    /// buckets fails here.
+    /// that ends in `_duration_seconds` is in [`DURATION_HISTOGRAMS`], so a
+    /// duration histogram added under such a name without buckets fails
+    /// here.
     #[test]
     fn every_histogram_the_crate_records_is_bucketed() {
         fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -271,7 +274,10 @@ mod tests {
         }
         assert_eq!(
             named,
-            DURATION_HISTOGRAMS.map(str::to_owned).into_iter().collect(),
+            DURATION_HISTOGRAMS
+                .iter()
+                .map(|&name| name.to_owned())
+                .collect(),
             "every recorded histogram is in DURATION_HISTOGRAMS"
         );
     }

@@ -1700,8 +1700,8 @@ struct SpillRead {
     promotions: metrics::Counter,
     /// `sundog_spill_read_duration_seconds{cache}`: every disk read
     /// `sundog_spill_reads_total` counts. A read of its own (a `get`, a
-    /// loader's spilled-key read) is timed from its wait for a permit to its
-    /// outcome; a read of [`read_spilled_batch`]'s (anti-entropy, snapshots,
+    /// loader's spilled-key read, a re-arm by `expire`, `touch` or
+    /// `persist`) is timed from its wait for a permit to its outcome; a read of [`read_spilled_batch`]'s (anti-entropy, snapshots,
     /// answering a peer's fetch) from its positional read to its outcome. A
     /// conflict resolution's disk read is neither counted nor timed.
     read_duration: metrics::Histogram,
@@ -2911,7 +2911,8 @@ where
     /// a fresh stripe write lock; either way it still counts as a hit. See
     /// the store module's docs and [`Shard::get_sync`], which never does
     /// this. About one read in 256 on each thread is timed into
-    /// `sundog_read_duration_seconds{cache,outcome}`; see `read_timing`.
+    /// `sundog_read_duration_seconds{cache,outcome}`, at a stride drawn
+    /// uniformly from 128 to 384 reads.
     pub async fn get(&self, key: &K) -> Option<V> {
         let started = read_timing::start_read();
         if let Some(value) = self.read_resident_key(key, self.now_ms()) {

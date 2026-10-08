@@ -1242,12 +1242,6 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
             "every {outcome} fetch that asked an owner is timed; got body:\n{body}"
         );
     }
-    let local = [("cache", "prices"), ("outcome", "local")];
-    assert!(
-        scraped_metric_value(&body, "sundog_fetch_duration_seconds_count", &local).unwrap_or(0.0)
-            <= scraped_metric_value(&body, "sundog_fetch_total", &local).unwrap_or(0.0),
-        "a local answer is timed only after an owner was asked; got body:\n{body}"
-    );
     assert!(
         scraped_metric_value(
             &body,

@@ -404,9 +404,10 @@ answers a peer only with what that peer's version understands: an older peer
 never receives a message kind its release cannot decode, and a newer peer
 limits itself the same way. One release step interoperates, so a cluster
 upgrades one node at a time with replication and repair running throughout.
-The current release speaks protocol 7 and serves every peer back to
-protocol 6. A container test runs the previous release's node against the
-current one in both roles. Distribution mode's message kinds (`Fetch`,
+The current release speaks protocol 7, and
+`sundog::wire::MIN_PROTOCOL_VERSION`, protocol 1, is the oldest peer
+protocol it serves. A container test runs the previous release's node
+against the current one in both roles. Distribution mode's message kinds (`Fetch`,
 `FetchReply`, `FetchDeclined`, `AeDigestScoped`, `StBuckets`,
 `StBucketChunk`, `ForwardBatch`, and `StaleView`) are gated on protocol 3: a distributed cache forms only among protocol-3
 peers advertising it, and a protocol-2 peer mid-rollout is never eligible to
