@@ -1646,11 +1646,8 @@ where
         let answer = self
             .owner_answer(key, &key_bytes, view, span, &mut attempts)
             .await;
-        match answer {
-            Ok(OwnerAnswer::Local(value)) => {
-                record_fetch_outcome(span, self.shard.name(), "local", attempts, started);
-                Ok(value)
-            }
+        let (outcome, fetched) = match answer {
+            Ok(OwnerAnswer::Local(value)) => ("local", Ok(value)),
             Ok(OwnerAnswer::Remote(rec)) => {
                 if let Some(rec) = &rec
                     && rec.value.is_some()
@@ -1665,20 +1662,15 @@ where
                     );
                 }
                 let value = rec.and_then(|rec| decode_live_value::<V>(&rec));
-                record_fetch_outcome(
-                    span,
-                    self.shard.name(),
-                    if value.is_some() { "remote" } else { "miss" },
-                    attempts,
-                    started,
-                );
-                Ok(value)
+                (if value.is_some() { "remote" } else { "miss" }, Ok(value))
             }
-            Err(err) => {
-                record_fetch_outcome(span, self.shard.name(), "error", attempts, started);
-                Err(err)
-            }
-        }
+            Err(err) => ("error", Err(err)),
+        };
+        // One call for every answer, with the owner requests this fetch
+        // made, so a local answer reached after asking an owner is timed
+        // exactly like a remote one.
+        record_fetch_outcome(span, self.shard.name(), outcome, attempts, started);
+        fetched
     }
 
     /// [`Cache::fetch`]'s answer for a `Mode::Distributed` key under
@@ -4893,6 +4885,26 @@ mod tests {
         shut_down_all(nodes).await;
     }
 
+    /// Waits until every owner of `key` holds its part warm and verified, so
+    /// a fetch of it gets an answer rather than a decline.
+    async fn wait_for_warm_owners(nodes: &[(Cluster, Cache<u32, String>)], key: u32) {
+        let part = PartId::of_key(&encode_key(&key).expect("u32 encodes"));
+        let owners = nodes[0].1.owners_of(&key);
+        wait_until(
+            Duration::from_secs(10),
+            "every owner holds the key's part warm",
+            async || {
+                nodes
+                    .iter()
+                    .filter(|(cluster, _)| owners.contains(&cluster.node_id()))
+                    .all(|(_, cache)| {
+                        !cache.shard.is_cold_part(part) && !cache.shard.is_unverified_part(part)
+                    })
+            },
+        )
+        .await;
+    }
+
     /// One closed span's name and recorded fields.
     type ClosedSpan = (&'static str, HashMap<&'static str, String>);
 
@@ -4992,6 +5004,8 @@ mod tests {
             .take(2)
             .collect();
         let (present, absent) = (not_owned[0], not_owned[1]);
+        wait_for_warm_owners(&nodes, present).await;
+        wait_for_warm_owners(&nodes, absent).await;
         let local_key = (0..10_000u32)
             .find(|key| cache_a.owners_of(key).contains(&a.node_id()))
             .expect("a key a owns");
@@ -5260,6 +5274,7 @@ mod tests {
         let remote = (0..10_000u32)
             .find(|key| !cache_a.owners_of(key).contains(&a.node_id()))
             .expect("a key a does not own");
+        wait_for_warm_owners(&nodes, remote).await;
         let _ = drained(&snapshotter);
         assert_eq!(cache_a.fetch(&local).await.expect("fetch"), None);
         assert_eq!(fetched("cache-it-fetch-timed", "local"), (Some(1), None));
