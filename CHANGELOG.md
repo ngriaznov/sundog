@@ -22,6 +22,22 @@ All notable changes to this project are documented in this file. Format follows
   `sundog.fetch` span with the cache, the last owner asked, the outcome and
   the number of owner requests.
 
+### Fixed
+
+- **A batch write past its spill reservation no longer stalls.** With
+  `spill`, an `insert_many` or `insert_many_with_ttl`, or a replicated,
+  repaired or transferred batch, whose evictions needed more than the whole
+  flush queue held its first reservation's unspent budget through the retry
+  that asks for the rest. That retry, clamped to the whole queue, could then
+  never be granted: the call waited out `SpillConfig::spill_wait_timeout`
+  and evicted the remainder with no reservation, which can drop a victim as
+  `queue_full`, or, in `Mode::Replicated` and `Mode::Distributed`, keep it
+  resident past capacity. A node joining a spilling `Replicated` cluster
+  paused that long on its pull from the donor. The first reservation now
+  returns its unspent budget before the retry, so the retry is granted as
+  the flusher drains, and a victim too large for the whole flush queue sends
+  the batch straight to the no-reservation path instead of retrying.
+
 ## [0.6.4] – 2026-10-04
 
 ### Added

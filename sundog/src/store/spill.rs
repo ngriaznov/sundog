@@ -831,6 +831,11 @@ pub(crate) struct Reservation<'a> {
 }
 
 impl Reservation<'_> {
+    /// The pre-paid budget not yet spent.
+    pub(crate) fn remaining(&self) -> u32 {
+        self.remaining
+    }
+
     /// Spends up to `bytes` from this reservation's pre-paid budget
     /// without touching the semaphore. Returns `true` with `remaining`
     /// decremented if covered; `false` and untouched otherwise, leaving
@@ -1143,8 +1148,7 @@ impl SpillTier {
         bytes: u32,
         timeout: Duration,
     ) -> Result<Reservation<'_>, SpillWaitTimedOut> {
-        let total_permits = u32::try_from(self.inner.flush_queue_bytes).unwrap_or(u32::MAX);
-        let clamped = bytes.min(total_permits);
+        let clamped = bytes.min(self.whole_queue_permits());
         let started = Instant::now();
         // Covers every exit, including a dropped future, since
         // `_waiter`'s Drop always runs.
@@ -1169,6 +1173,12 @@ impl SpillTier {
                 Err(SpillWaitTimedOut)
             }
         }
+    }
+
+    /// The most [`SpillTier::reserve`] ever grants: one permit per byte of
+    /// `flush_queue_bytes`, saturating at `u32::MAX`.
+    pub(crate) fn whole_queue_permits(&self) -> u32 {
+        u32::try_from(self.inner.flush_queue_bytes).unwrap_or(u32::MAX)
     }
 
     /// Returns `bytes` of admitted-but-never-queued capacity to `admit`.
