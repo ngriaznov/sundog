@@ -714,12 +714,12 @@ fn fetch_retry_backoff() -> Duration {
     Duration::from_millis(rand::rng().random_range(10..50))
 }
 
-/// Emits `sundog_fetch_total{cache, outcome}` for one [`Cache::fetch`] call.
 /// Counts one [`Cache::fetch`] in `sundog_fetch_total{cache,outcome}`,
-/// records `outcome` on its span and, for a fetch that asked an owner,
+/// records `outcome` on its `span` and, for a fetch that asked an owner,
 /// started at `asked_since`, its duration in
 /// `sundog_fetch_duration_seconds{cache,outcome}`.
 fn record_fetch_outcome(
+    span: &tracing::Span,
     cache: &str,
     outcome: &'static str,
     asked_since: Option<std::time::Instant>,
@@ -730,7 +730,7 @@ fn record_fetch_outcome(
         "outcome" => outcome
     )
     .increment(1);
-    tracing::Span::current().record("outcome", outcome);
+    span.record("outcome", outcome);
     if let Some(started) = asked_since {
         metrics::histogram!(
             "sundog_fetch_duration_seconds",
@@ -1609,34 +1609,45 @@ where
     /// with a short jittered backoff before the next owner is tried.
     ///
     /// A fetch that asks an owner records its duration in
-    /// `sundog_fetch_duration_seconds{cache,outcome}`. Each fetch runs in a
-    /// debug-level `sundog.fetch` span carrying the cache, the last owner
-    /// asked (this node for a local answer), the outcome and the number of
-    /// owner requests.
-    #[tracing::instrument(
-        level = "debug",
-        name = "sundog.fetch",
-        skip_all,
-        fields(
+    /// `sundog_fetch_duration_seconds{cache,outcome}` under its outcome:
+    /// `remote`, `miss`, `error`, or `local` when a changed ownership view
+    /// hands the key back to this node after an owner was asked. A fetch
+    /// that asks no owner is not timed. Each fetch runs in a debug-level
+    /// `sundog.fetch` span carrying the cache, the last owner asked (this
+    /// node for a local answer), the outcome (none for a key that fails to
+    /// encode) and the number of owner requests.
+    pub async fn fetch(&self, key: &K) -> Result<Option<V>, CacheError> {
+        let span = tracing::debug_span!(
+            "sundog.fetch",
             cache = %self.shard.name(),
             owner = tracing::field::Empty,
             outcome = tracing::field::Empty,
             attempts = 0u32,
-        ),
-    )]
-    pub async fn fetch(&self, key: &K) -> Result<Option<V>, CacheError> {
+        );
+        let fetch = self.fetch_in(key, &span);
+        tracing::Instrument::instrument(fetch, span.clone()).await
+    }
+
+    /// [`Cache::fetch`] inside its `sundog.fetch` span. Every field is
+    /// recorded on `span` itself, so a span the subscriber disables records
+    /// nothing and never writes to the caller's span.
+    async fn fetch_in(&self, key: &K, span: &tracing::Span) -> Result<Option<V>, CacheError> {
         let started = std::time::Instant::now();
         let Some(view) = self.shard.ownership_view() else {
             let value = self.shard.get(key).await;
-            tracing::Span::current()
-                .record("owner", tracing::field::display(self.cluster.node_id()));
-            record_fetch_outcome(self.shard.name(), "local", None);
+            span.record("owner", tracing::field::display(self.cluster.node_id()));
+            record_fetch_outcome(span, self.shard.name(), "local", None);
             return Ok(value);
         };
         let key_bytes = encode_key(key)?;
-        match self.owner_answer(key, &key_bytes, view).await {
+        let mut attempts = 0u32;
+        let answer = self
+            .owner_answer(key, &key_bytes, view, span, &mut attempts)
+            .await;
+        let asked_since = (attempts > 0).then_some(started);
+        match answer {
             Ok(OwnerAnswer::Local(value)) => {
-                record_fetch_outcome(self.shard.name(), "local", None);
+                record_fetch_outcome(span, self.shard.name(), "local", asked_since);
                 Ok(value)
             }
             Ok(OwnerAnswer::Remote(rec)) => {
@@ -1654,14 +1665,15 @@ where
                 }
                 let value = rec.and_then(|rec| decode_live_value::<V>(&rec));
                 record_fetch_outcome(
+                    span,
                     self.shard.name(),
                     if value.is_some() { "remote" } else { "miss" },
-                    Some(started),
+                    asked_since,
                 );
                 Ok(value)
             }
             Err(err) => {
-                record_fetch_outcome(self.shard.name(), "error", Some(started));
+                record_fetch_outcome(span, self.shard.name(), "error", asked_since);
                 Err(err)
             }
         }
@@ -1670,7 +1682,9 @@ where
     /// [`Cache::fetch`]'s answer for a `Mode::Distributed` key under
     /// `view`: this node's own copy when it owns the key's part warm, or
     /// else the record the first owner to answer holds, tried in rendezvous
-    /// order with the stale-view retry `fetch` documents.
+    /// order with the stale-view retry `fetch` documents. Counts each owner
+    /// request in `attempts` and records it, and the owner asked, on
+    /// `span`.
     ///
     /// # Errors
     ///
@@ -1680,12 +1694,13 @@ where
         key: &K,
         key_bytes: &bytes::Bytes,
         view: Arc<OwnershipView>,
+        span: &tracing::Span,
+        attempts: &mut u32,
     ) -> Result<OwnerAnswer<V>, CacheError> {
         let part = PartId::of_key(key_bytes);
         // An unverified part (warm-reloaded or regained, not yet checked
         // against a live co-owner) counts as not owned here: it can hold a
         // record a co-owner deleted while this node was down or not an owner.
-        let span = tracing::Span::current();
         let self_node = self.cluster.node_id();
         if view.owns(part) && !self.shard.is_unverified_part(part) {
             let value = self.shard.get(key).await;
@@ -1705,16 +1720,15 @@ where
         let mut view = view;
         let mut owners = other_owners(&view, part, self_node);
         let mut owner_idx = 0usize;
-        let mut attempts = 0u32;
         // When the current owner first answered `Stale` with this node's
         // view unchanged: its retry window runs from here.
         let mut stale_since: Option<tokio::time::Instant> = None;
 
         while owner_idx < owners.len() {
             let owner = owners[owner_idx];
-            attempts += 1;
+            *attempts += 1;
             span.record("owner", tracing::field::display(owner));
-            span.record("attempts", attempts);
+            span.record("attempts", *attempts);
             let outcome = tokio::time::timeout(
                 attempt_timeout,
                 mesh.fetch(
@@ -2165,7 +2179,10 @@ where
             return Ok(false);
         };
         let key_bytes = encode_key(key)?;
-        match self.owner_answer(key, &key_bytes, view).await? {
+        let answer = self
+            .owner_answer(key, &key_bytes, view, &tracing::Span::none(), &mut 0)
+            .await?;
+        match answer {
             // The view moved to one that owns the part warm meanwhile.
             OwnerAnswer::Local(_) => {
                 Ok(self.shard.rearm_local(key, lifetime).await? == LocalRearm::Rearmed)
@@ -4750,7 +4767,7 @@ mod tests {
     /// that records its calls in `log`, takes 300ms, and holds `v{key}` for
     /// every key; the loader on the node at index `fails` returns an error
     /// instead. Returns once every node sees the other two advertise a
-    /// loader.
+    /// loader and ranks all three in its ownership view.
     async fn three_loading_nodes(
         name: &'static str,
         mode: Mode,
@@ -4873,9 +4890,12 @@ mod tests {
         shut_down_all(nodes).await;
     }
 
-    /// The fields of every closed `sundog.fetch` span, in close order.
+    /// One closed span's name and recorded fields.
+    type ClosedSpan = (&'static str, HashMap<&'static str, String>);
+
+    /// Every closed span, in close order.
     #[derive(Clone, Default)]
-    struct FetchSpans(Arc<std::sync::Mutex<Vec<HashMap<&'static str, String>>>>);
+    struct FetchSpans(Arc<std::sync::Mutex<Vec<ClosedSpan>>>);
 
     /// One span's recorded fields.
     #[derive(Default)]
@@ -4901,9 +4921,7 @@ mod tests {
             id: &tracing::span::Id,
             ctx: tracing_subscriber::layer::Context<'_, S>,
         ) {
-            if attrs.metadata().name() == "sundog.fetch"
-                && let Some(span) = ctx.span(id)
-            {
+            if let Some(span) = ctx.span(id) {
                 let mut fields = SpanFields::default();
                 attrs.record(&mut fields);
                 span.extensions_mut().insert(fields);
@@ -4927,23 +4945,32 @@ mod tests {
             if let Some(span) = ctx.span(&id)
                 && let Some(fields) = span.extensions_mut().remove::<SpanFields>()
             {
-                self.0.lock().expect("spans lock").push(fields.0);
+                self.0
+                    .lock()
+                    .expect("spans lock")
+                    .push((span.name(), fields.0));
             }
         }
     }
 
     impl FetchSpans {
-        /// The last closed fetch span's fields, as `(name, value)` pairs.
-        fn last(&self) -> Vec<(&'static str, String)> {
+        /// The fields of the last closed span named `name`, as sorted
+        /// `(field, value)` pairs; `None` when no such span closed.
+        fn last_named(&self, name: &str) -> Option<Vec<(&'static str, String)>> {
             let spans = self.0.lock().expect("spans lock");
-            let mut fields: Vec<_> = spans
-                .last()
-                .expect("a fetch span closed")
+            let (_, fields) = spans.iter().rev().find(|(span, _)| *span == name)?;
+            let mut fields: Vec<_> = fields
                 .iter()
-                .map(|(name, value)| (*name, value.clone()))
+                .map(|(field, value)| (*field, value.clone()))
                 .collect();
             fields.sort();
-            fields
+            Some(fields)
+        }
+
+        /// The last closed `sundog.fetch` span's fields.
+        fn last(&self) -> Vec<(&'static str, String)> {
+            self.last_named("sundog.fetch")
+                .expect("a fetch span closed")
         }
     }
 
@@ -5016,6 +5043,53 @@ mod tests {
         assert_eq!(cache_a.fetch(&local_key).await.expect("fetch"), None);
         assert_eq!(spans.last(), fields(a.node_id(), "local", 0));
         shut_down_all(nodes).await;
+    }
+
+    /// A subscriber that leaves the debug-level `sundog.fetch` span disabled
+    /// sees nothing of the fetch on the span the caller fetches in, even
+    /// when that span declares fields of the same names.
+    #[tokio::test]
+    async fn a_disabled_fetch_span_records_nothing_on_the_callers_span() {
+        use tracing::Instrument as _;
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let spans = FetchSpans::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(
+                spans
+                    .clone()
+                    .with_filter(tracing::level_filters::LevelFilter::INFO),
+            ),
+        );
+        let cluster = Cluster::builder("cache-it-fetch-span-disabled")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node builds");
+        let cache = cluster
+            .cache::<u32, String>("cache-it-fetch-span-disabled")
+            .open()
+            .await
+            .expect("opens");
+        let caller = tracing::info_span!(
+            "caller",
+            owner = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+            attempts = tracing::field::Empty,
+        );
+        assert_eq!(
+            cache
+                .fetch(&1)
+                .instrument(caller.clone())
+                .await
+                .expect("fetch"),
+            None
+        );
+        drop(caller);
+        assert_eq!(spans.last_named("caller"), Some(Vec::new()));
+        assert_eq!(spans.last_named("sundog.fetch"), None);
+        cluster.shutdown().await;
     }
 
     #[tokio::test]
@@ -5119,17 +5193,21 @@ mod tests {
         shut_down_all(nodes).await;
     }
 
-    /// `count` nodes with `name` open under `mode` with a 10s TTL and
-    /// refresh-ahead at 0.1, each with a batch loader that records its
-    /// calls in `log` and holds `v{key}.{n}`, `n` counting calls across all
-    /// nodes. Returns once every node sees the others advertise a loader
-    /// and ranks them in its ownership view. A key falls due 1s after its
+    /// A 10s TTL with refresh-ahead at 0.1: a key falls due 1s after its
     /// write and expires 9s after that, so a stalled runner reads a due key
     /// long before it expires.
+    const LONG_REFRESH: (Duration, f64) = (Duration::from_secs(10), 0.1);
+
+    /// `count` nodes with `name` open under `mode` with `lifetime`'s TTL and
+    /// refresh-ahead fraction, each with a batch loader that records its
+    /// calls in `log` and holds `v{key}.{n}`, `n` counting calls across all
+    /// nodes. Returns once every node sees the others advertise a loader
+    /// and ranks them in its ownership view.
     async fn refreshing_nodes(
         name: &'static str,
         mode: Mode,
         count: usize,
+        lifetime: (Duration, f64),
         log: &LoadLog,
     ) -> Vec<(Cluster, Cache<u32, String>)> {
         let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -5149,8 +5227,8 @@ mod tests {
             let cache = cluster
                 .cache::<u32, String>(name)
                 .mode(mode)
-                .ttl(Duration::from_secs(10))
-                .refresh_ahead(0.1)
+                .ttl(lifetime.0)
+                .refresh_ahead(lifetime.1)
                 .batch_loader(move |keys: Vec<u32>| {
                     let (log, calls) = (Arc::clone(&log), Arc::clone(&calls));
                     async move {
@@ -5187,7 +5265,12 @@ mod tests {
     #[tokio::test]
     async fn refresh_ahead_keeps_a_read_key_alive_past_its_expiry_on_one_node() {
         let log = LoadLog::default();
-        let nodes = refreshing_nodes("cache-it-refresh-local", Mode::Local, 1, &log).await;
+        // A 3s TTL refreshed a third of the way in: a key falls due 1s
+        // after its write and expires 2s after that, well inside the 4.5s
+        // of reads below.
+        let lifetime = (Duration::from_secs(3), 1.0 / 3.0);
+        let nodes =
+            refreshing_nodes("cache-it-refresh-local", Mode::Local, 1, lifetime, &log).await;
         let cache = &nodes[0].1;
         assert_eq!(
             cache.load(&1).await.expect("load"),
@@ -5201,7 +5284,7 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        // A reload restarts the 10s lifetime, so the next refresh point is
+        // A reload restarts the 3s lifetime, so the next refresh point is
         // 1s later: over 4.5s of reads, the load and about four reloads,
         // fewer when the runner stalls between reads.
         let loads = log.lock().expect("log lock").len();
@@ -5215,8 +5298,14 @@ mod tests {
     #[tokio::test]
     async fn refresh_ahead_reloads_a_replicated_key_once_on_its_refresher() {
         let log = LoadLog::default();
-        let nodes =
-            refreshing_nodes("cache-it-refresh-replicated", Mode::Replicated, 2, &log).await;
+        let nodes = refreshing_nodes(
+            "cache-it-refresh-replicated",
+            Mode::Replicated,
+            2,
+            LONG_REFRESH,
+            &log,
+        )
+        .await;
         let (a, cache_a) = &nodes[0];
         let (b, cache_b) = &nodes[1];
         let key = 7u32;
@@ -5270,8 +5359,14 @@ mod tests {
     #[tokio::test]
     async fn refresh_ahead_reloads_a_distributed_key_a_non_owner_fetches_on_its_owner() {
         let log = LoadLog::default();
-        let nodes =
-            refreshing_nodes("cache-it-refresh-distributed", Mode::distributed(), 3, &log).await;
+        let nodes = refreshing_nodes(
+            "cache-it-refresh-distributed",
+            Mode::distributed(),
+            3,
+            LONG_REFRESH,
+            &log,
+        )
+        .await;
         let (a, cache_a) = &nodes[0];
         let key = (0..10_000u32)
             .find(|key| !cache_a.owners_of(key).contains(&a.node_id()))

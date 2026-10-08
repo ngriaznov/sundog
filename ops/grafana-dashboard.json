@@ -117,7 +117,7 @@
       "id": 8,
       "type": "timeseries",
       "title": "Read p99 (per cache)",
-      "description": "The 99th percentile of get and get_sync across every node, from one read in 256 per thread.",
+      "description": "The 99th percentile of get and get_sync across every node, from about one read in 256 per thread.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "x": 0, "y": 20, "w": 12, "h": 7 },
       "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },

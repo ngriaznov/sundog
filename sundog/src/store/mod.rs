@@ -1678,9 +1678,10 @@ where
 /// [`Shard::with_spill`]'s read-side counterpart to the tier itself: the
 /// semaphore [`Shard::get`]/[`Shard::get_or_load`]'s disk reads acquire a
 /// permit from before `spawn_blocking`-ing a positional read, bounded by
-/// the configured `read_concurrency`, plus the four `Counter` handles
-/// those reads and the anti-entropy/snapshot read path count against,
-/// precomputed for the same reason `Shard::hits`/`Shard::misses` are.
+/// the configured `read_concurrency`, plus the four `Counter` handles and
+/// the `Histogram` handle those reads and the batched read path count and
+/// time against, precomputed for the same reason `Shard::hits`/`Shard::misses`
+/// are.
 #[cfg(feature = "spill")]
 #[derive(Clone)]
 struct SpillRead {
@@ -1697,9 +1698,12 @@ struct SpillRead {
     reads_io_error: metrics::Counter,
     /// `sundog_spill_promotions_total{cache}`.
     promotions: metrics::Counter,
-    /// `sundog_spill_read_duration_seconds{cache}`: every disk read, a
-    /// read's own from the wait for its permit to its outcome, a batched
-    /// background read's from its positional read to its outcome.
+    /// `sundog_spill_read_duration_seconds{cache}`: every disk read
+    /// `sundog_spill_reads_total` counts. A read of its own (a `get`, a
+    /// loader's spilled-key read) is timed from its wait for a permit to its
+    /// outcome; a read of [`read_spilled_batch`]'s (anti-entropy, snapshots,
+    /// answering a peer's fetch) from its positional read to its outcome. A
+    /// conflict resolution's disk read is neither counted nor timed.
     read_duration: metrics::Histogram,
 }
 
@@ -2906,8 +2910,8 @@ where
     /// `spawn_blocking`, and, on success, promoted back to residency under
     /// a fresh stripe write lock; either way it still counts as a hit. See
     /// the store module's docs and [`Shard::get_sync`], which never does
-    /// this. One read in 256 on each thread is timed into
-    /// `sundog_read_duration_seconds{cache,outcome}`.
+    /// this. About one read in 256 on each thread is timed into
+    /// `sundog_read_duration_seconds{cache,outcome}`; see `read_timing`.
     pub async fn get(&self, key: &K) -> Option<V> {
         let started = read_timing::start_read();
         if let Some(value) = self.read_resident_key(key, self.now_ms()) {
@@ -11658,6 +11662,51 @@ mod tests {
             assert_eq!(made, spilled_value.clone());
             assert_eq!(shard.get_sync(&spilled_key), Some(spilled_value));
 
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Each disk read is counted and timed once, a batched read
+        /// (`snapshot_chunks`) and a read of its own (`get`) alike.
+        #[tokio::test]
+        async fn every_disk_read_is_counted_and_timed_once() {
+            use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let (shard, spilled_key, spilled_value, _resident_key, _resident_value, dir) =
+                shard_with_one_spilled_entry("timed-reads").await;
+            // Disk reads counted and timed since the last call: a snapshot
+            // drains both.
+            let reads = || {
+                let (mut counted, mut timed) = (0, 0);
+                for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+                    match (key.key().name(), value) {
+                        ("sundog_spill_reads_total", DebugValue::Counter(n)) => counted += n,
+                        ("sundog_spill_read_duration_seconds", DebugValue::Histogram(v)) => {
+                            timed += v.len();
+                        }
+                        _ => {}
+                    }
+                }
+                (counted, timed)
+            };
+            assert_eq!(reads(), (0, 0));
+
+            let records: Vec<WireRecord> = ShardOps::snapshot_chunks(&shard)
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .flatten()
+                .collect();
+            assert_eq!(
+                records.len(),
+                2,
+                "both records, the spilled one read from disk"
+            );
+            assert_eq!(reads(), (1, 1), "the batched read is counted and timed");
+
+            assert_eq!(shard.get(&spilled_key).await, Some(spilled_value));
+            assert_eq!(reads(), (1, 1), "the get's own read is counted and timed");
             let _ = std::fs::remove_dir_all(&dir);
         }
 

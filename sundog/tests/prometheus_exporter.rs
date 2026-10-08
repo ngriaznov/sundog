@@ -214,8 +214,8 @@ async fn count_hits_and_misses(cluster: &Cluster) {
 }
 
 /// Drives `sundog_read_duration_seconds{cache="timed-reads",outcome}`: on a
-/// fresh thread, whose per-thread read count starts at zero, 256 hits and
-/// then 256 misses, so exactly one read of each is timed.
+/// fresh thread, 768 hits and then 768 misses. Timed reads fall 128 to 384
+/// reads apart, so each run of 768 times between two and six reads.
 async fn read_durations_pin_metrics(cluster: &Cluster) {
     let timed = cluster
         .cache::<u32, String>("timed-reads")
@@ -225,10 +225,10 @@ async fn read_durations_pin_metrics(cluster: &Cluster) {
         .expect("cache opens");
     timed.insert(1, "a".into()).await.expect("insert");
     std::thread::spawn(move || {
-        for _ in 0..256 {
+        for _ in 0..768 {
             assert_eq!(timed.get_sync(&1), Some("a".to_string()));
         }
-        for _ in 0..256 {
+        for _ in 0..768 {
             assert_eq!(timed.get_sync(&2), None);
         }
     })
@@ -1059,10 +1059,10 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     );
     for outcome in ["hit", "miss"] {
         let labels = [("cache", "timed-reads"), ("outcome", outcome)];
-        assert_eq!(
-            scraped_metric_value(&body, "sundog_read_duration_seconds_count", &labels),
-            Some(1.0),
-            "one {outcome} in 256 is timed; got body:\n{body}"
+        let timed = scraped_metric_value(&body, "sundog_read_duration_seconds_count", &labels);
+        assert!(
+            timed.is_some_and(|count| (2.0..=6.0).contains(&count)),
+            "768 reads with outcome {outcome} time two to six, got {timed:?}; body:\n{body}"
         );
         assert_eq!(
             scraped_metric_value(
@@ -1070,8 +1070,8 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
                 "sundog_read_duration_seconds_bucket",
                 &[labels[0], labels[1], ("le", "10")]
             ),
-            Some(1.0),
-            "the timed {outcome} lands in the 10s bucket; got body:\n{body}"
+            timed,
+            "every timed {outcome} lands under 10s; got body:\n{body}"
         );
     }
     assert!(
@@ -1232,6 +1232,8 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
              body:\n{body}"
         );
     }
+    // Every remote, miss and error fetch here asks an owner (the error
+    // one dials owners that crashed), so each is timed.
     for outcome in ["remote", "miss", "error"] {
         let labels = [("cache", "prices"), ("outcome", outcome)];
         assert_eq!(
@@ -1240,14 +1242,11 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
             "every {outcome} fetch that asked an owner is timed; got body:\n{body}"
         );
     }
-    assert_eq!(
-        scraped_metric_value(
-            &body,
-            "sundog_fetch_duration_seconds_count",
-            &[("cache", "prices"), ("outcome", "local")]
-        ),
-        None,
-        "a local fetch asks no owner and is not timed; got body:\n{body}"
+    let local = [("cache", "prices"), ("outcome", "local")];
+    assert!(
+        scraped_metric_value(&body, "sundog_fetch_duration_seconds_count", &local).unwrap_or(0.0)
+            <= scraped_metric_value(&body, "sundog_fetch_total", &local).unwrap_or(0.0),
+        "a local answer is timed only after an owner was asked; got body:\n{body}"
     );
     assert!(
         scraped_metric_value(

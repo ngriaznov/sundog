@@ -404,8 +404,8 @@ answers a peer only with what that peer's version understands: an older peer
 never receives a message kind its release cannot decode, and a newer peer
 limits itself the same way. One release step interoperates, so a cluster
 upgrades one node at a time with replication and repair running throughout.
-The current release speaks protocol 7 and serves protocol 6, the release
-before it. A container test runs the previous release's node against the
+The current release speaks protocol 7 and serves every peer back to
+protocol 6. A container test runs the previous release's node against the
 current one in both roles. Distribution mode's message kinds (`Fetch`,
 `FetchReply`, `FetchDeclined`, `AeDigestScoped`, `StBuckets`,
 `StBucketChunk`, `ForwardBatch`, and `StaleView`) are gated on protocol 3: a distributed cache forms only among protocol-3
@@ -431,8 +431,8 @@ Protocol 7 loads through another node's loader: `Load` and its replies
 `Loaded`, `LoadFailed` and `LoadDeclined`, and the one-way `RefreshHint`.
 Gossip carries a `loader:<cache>` key beside each cache's mode. A node picks
 only a protocol-7 peer advertising a loader to load or refresh a key, so a
-node of the previous release is never asked and loads through the current
-nodes still reach it wherever it owns the key.
+protocol-6 node is never asked and loads through the protocol-7 nodes
+still reach it wherever it owns the key.
 
 ## How nodes find each other
 
@@ -642,16 +642,23 @@ handles when it opens. A ready-made Grafana dashboard lives at
 
 Latency is three histograms in seconds, bucketed from 1µs to 10s
 (`sundog::telemetry::LATENCY_BUCKETS`) so a Prometheus query aggregates
-them across nodes. `sundog_read_duration_seconds{cache, outcome}` times one
-`get` or `get_sync` in 256 on each thread, `outcome` `hit` or `miss`: its
-count is a sample count, and the read rate stays
-`sundog_cache_hits_total` and `sundog_cache_misses_total`.
-`sundog_fetch_duration_seconds{cache, outcome}` times every `Cache::fetch`
-that asks an owner, `outcome` `remote`, `miss` or `error`. With `spill`,
-`sundog_spill_read_duration_seconds{cache}` times every disk read.
-`Cache::fetch` also runs in a debug-level `sundog.fetch` span carrying the
-cache, the last owner asked, the outcome and the number of owner requests,
-so an owner round trip shows in a trace.
+them across nodes. The buckets apply to these three names only
+(`sundog::telemetry::DURATION_HISTOGRAMS`); a histogram the application
+records through the same recorder renders as the exporter's default
+summary. `sundog_read_duration_seconds{cache, outcome}` times about one
+`get` or `get_sync` in 256 on each thread, `outcome` `hit` or `miss`. The
+stride to the next timed read varies from 128 to 384 reads, so a thread
+that reads several caches in a fixed rotation times each of them. Its count
+is a sample count; the read rate stays `sundog_cache_hits_total` and
+`sundog_cache_misses_total`. `sundog_fetch_duration_seconds{cache,
+outcome}` times every `Cache::fetch` that asks an owner, under the fetch's
+outcome: `remote`, `miss`, `error`, or `local` when a changed ownership
+view hands the key back to this node after an owner was asked. With
+`spill`, `sundog_spill_read_duration_seconds{cache}` times every disk read
+`sundog_spill_reads_total` counts. `Cache::fetch` also runs in a
+debug-level `sundog.fetch` span carrying the cache, the last owner asked,
+the outcome and the number of owner requests, so an owner round trip shows
+in a trace.
 
 With `spill`, every cache open also emits
 `sundog_spill_reopen_total{cache, outcome, reason}`, `outcome` `warm` for a

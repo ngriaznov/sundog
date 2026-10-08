@@ -8,13 +8,16 @@ All notable changes to this project are documented in this file. Format follows
 ### Added
 
 - **Latency histograms.** `sundog_read_duration_seconds{cache, outcome}`
-  times one `get` or `get_sync` in 256 on each thread, `hit` or `miss`;
+  times about one `get` or `get_sync` in 256 on each thread, `hit` or
+  `miss`, at a stride that varies from 128 to 384 reads;
   `sundog_fetch_duration_seconds{cache, outcome}` times every
-  `Cache::fetch` that asks an owner, `remote`, `miss` or `error`; and, with
+  `Cache::fetch` that asks an owner, under the fetch's outcome; and, with
   `spill`, `sundog_spill_read_duration_seconds{cache}` times every disk
-  read. Both Prometheus install paths render them as histogram buckets from
-  1µs to 10s, `telemetry::LATENCY_BUCKETS`, which a query aggregates across
-  nodes. The Grafana dashboard gains read and fetch p99 panels.
+  read `sundog_spill_reads_total` counts. Both Prometheus install paths
+  render these three, `telemetry::DURATION_HISTOGRAMS`, as histogram
+  buckets from 1µs to 10s, `telemetry::LATENCY_BUCKETS`, which a query
+  aggregates across nodes; any other histogram keeps the exporter's default
+  summary. The Grafana dashboard gains read and fetch p99 panels.
 - **A span on the fetch path.** `Cache::fetch` runs in a debug-level
   `sundog.fetch` span with the cache, the last owner asked, the outcome and
   the number of owner requests.

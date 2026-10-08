@@ -29,7 +29,7 @@ addresses once it forms, under `cluster formed`.
 |---|---|
 | `sundog_cache_hits_total{cache}` | reads answered from this node's copy |
 | `sundog_cache_misses_total{cache}` | reads that found no entry on this node, one per loader run for `get_or_load` |
-| `sundog_read_duration_seconds{cache, outcome}` | histogram of `get` and `get_sync` durations, `hit` or `miss`, one read in 256 per thread |
+| `sundog_read_duration_seconds{cache, outcome}` | histogram of `get` and `get_sync` durations, `hit` or `miss`, about one read in 256 per thread |
 | `sundog_cache_entries{cache}` | live entries on this node |
 | `sundog_cache_bytes{cache}` | a cache with a `max_resident_bytes` ceiling: resident bytes of this node's live entries, as `Cache::resident_bytes` counts them |
 | `sundog_ceiling_refusals_total{cache, kind}` | a cache with a `max_resident_bytes` ceiling: local writes refused (`write`) and fills returned uncached (`fill`) |
@@ -61,7 +61,7 @@ addresses once it forms, under `cluster formed`.
 | `sundog_rebalance_parts_total{cache, direction}` | parts pulled `in`, released `out`, or `served` to another node's pull |
 | `sundog_rebalance_pull_timeouts_total{cache}` | part pulls that timed out repeatedly and left the rest to anti-entropy |
 | `sundog_fetch_total{cache, outcome}` | `fetch` calls by outcome: `local`, `remote`, `miss` or `error` |
-| `sundog_fetch_duration_seconds{cache, outcome}` | histogram of every `fetch` that asked an owner, `remote`, `miss` or `error` |
+| `sundog_fetch_duration_seconds{cache, outcome}` | histogram of every `fetch` that asked an owner, under its outcome: `remote`, `miss`, `error`, or `local` after a view change |
 | `sundog_forwarded_writes_total{cache}` | writes sent on to a part's owners |
 | `sundog_stale_view_total{cache}` | anti-entropy rounds a peer declined over a different ownership view |
 | `sundog_unowned_inbound_dropped_total{cache}` | inbound records dropped for a part this node does not own |
@@ -81,7 +81,7 @@ addresses once it forms, under `cluster formed`.
 | `sundog_spill_bytes_used{cache}` | bytes the region files hold |
 | `sundog_spill_writes_total{cache}` | values written to disk |
 | `sundog_spill_reads_total{cache, outcome}` | disk reads: `hit`, `stale` or `io_error` |
-| `sundog_spill_read_duration_seconds{cache}` | histogram of every disk read's duration |
+| `sundog_spill_read_duration_seconds{cache}` | histogram of the duration of every disk read `sundog_spill_reads_total` counts |
 | `sundog_spill_promotions_total{cache}` | spilled entries promoted back to RAM |
 | `sundog_spill_region_reclaims_total{cache}` | regions reclaimed as the ring wrapped |
 | `sundog_spill_dropped_total{cache, reason}` | evictions that did not reach disk, by reason |

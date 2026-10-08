@@ -1,6 +1,6 @@
 //! Prometheus metrics export, behind a `prometheus` feature flag, off by
-//! default. The `metrics::counter!`/`gauge!` calls spread across the crate
-//! are unconditional; without this feature they fall through to `metrics`'s
+//! default. The `metrics::counter!`, `gauge!` and `histogram!` calls spread
+//! across the crate are unconditional; without this feature they fall through to `metrics`'s
 //! no-op default recorder. This module wires an actual Prometheus recorder
 //! into the process, two ways:
 //!
@@ -13,10 +13,12 @@
 //! whichever runs second fails rather than replacing the first recorder.
 //! Neither panics on that failure; see each function's `# Errors`.
 //!
-//! Both install the same recorder: every `sundog_*_duration_seconds`
-//! histogram renders as Prometheus histogram buckets from
-//! [`LATENCY_BUCKETS`], which aggregate across nodes in a Prometheus query,
-//! rather than as per-node quantiles, which do not.
+//! Both install the same recorder: each of [`DURATION_HISTOGRAMS`] renders
+//! as Prometheus histogram buckets from [`LATENCY_BUCKETS`], which aggregate
+//! across nodes in a Prometheus query, rather than as per-node quantiles,
+//! which do not. The buckets match those names exactly, so a histogram the
+//! application records through the same recorder renders as the exporter's
+//! default summary.
 //!
 //! Install the recorder before opening a cache. A cache resolves its
 //! per-cache handles (`sundog_cache_hits_total{cache}`,
@@ -33,9 +35,10 @@ use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-/// The upper bounds, in seconds, of every `sundog_*_duration_seconds`
-/// histogram's buckets: 1µs to 10s in 1-2.5-5 steps, from a resident read
-/// to a fetch that waits out its timeout.
+/// The upper bounds, in seconds, of the buckets of each of
+/// [`DURATION_HISTOGRAMS`]: 1µs to 10s in 1-2.5-5 steps. A resident read
+/// lands in the first bucket, and a fetch that waits out its timeout in the
+/// last ones.
 pub const LATENCY_BUCKETS: [f64; 22] = [
     0.000_001,
     0.000_002_5,
@@ -61,15 +64,23 @@ pub const LATENCY_BUCKETS: [f64; 22] = [
     10.0,
 ];
 
-/// The recorder both install paths use: [`LATENCY_BUCKETS`] for every
-/// metric whose name ends in `_duration_seconds`.
+/// Every histogram the crate records, each bucketed by [`LATENCY_BUCKETS`].
+pub const DURATION_HISTOGRAMS: [&str; 3] = [
+    "sundog_read_duration_seconds",
+    "sundog_fetch_duration_seconds",
+    "sundog_spill_read_duration_seconds",
+];
+
+/// The recorder both install paths use: [`LATENCY_BUCKETS`] for each of
+/// [`DURATION_HISTOGRAMS`], matched by full name.
 fn builder() -> PrometheusBuilder {
-    PrometheusBuilder::new()
-        .set_buckets_for_metric(
-            Matcher::Suffix("_duration_seconds".to_owned()),
-            &LATENCY_BUCKETS,
-        )
-        .expect("invariant: LATENCY_BUCKETS is not empty")
+    DURATION_HISTOGRAMS
+        .iter()
+        .fold(PrometheusBuilder::new(), |builder, &name| {
+            builder
+                .set_buckets_for_metric(Matcher::Full(name.to_owned()), &LATENCY_BUCKETS)
+                .expect("invariant: LATENCY_BUCKETS is not empty")
+        })
 }
 
 /// What `install_listener`'s `GET /readyz` route reports.
@@ -193,20 +204,75 @@ mod tests {
     }
 
     #[test]
-    fn the_builder_buckets_duration_histograms() {
+    fn the_builder_buckets_each_crate_histogram_and_no_other() {
         let recorder = builder().build_recorder();
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
-            metrics::histogram!("sundog_test_duration_seconds").record(0.003);
+            for name in DURATION_HISTOGRAMS {
+                metrics::histogram!(name).record(0.003);
+            }
+            metrics::histogram!("app_request_duration_seconds").record(0.003);
         });
         let body = handle.render();
+        for name in DURATION_HISTOGRAMS {
+            assert!(body.contains(&format!("# TYPE {name} histogram")), "{body}");
+            assert!(
+                body.contains(&format!("{name}_bucket{{le=\"0.005\"}} 1")),
+                "{body}"
+            );
+            assert!(
+                body.contains(&format!("{name}_bucket{{le=\"0.0025\"}} 0")),
+                "{body}"
+            );
+        }
         assert!(
-            body.contains("sundog_test_duration_seconds_bucket{le=\"0.005\"} 1"),
-            "{body}"
+            body.contains("# TYPE app_request_duration_seconds summary"),
+            "an application histogram keeps the exporter's default: {body}"
         );
         assert!(
-            body.contains("sundog_test_duration_seconds_bucket{le=\"0.0025\"} 0"),
+            !body.contains("app_request_duration_seconds_bucket"),
             "{body}"
+        );
+    }
+
+    /// Every string literal in the crate's `src/` naming a `sundog_` metric
+    /// that ends in `_duration_seconds`, so a histogram added without
+    /// buckets fails here.
+    #[test]
+    fn every_histogram_the_crate_records_is_bucketed() {
+        fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("src/ reads") {
+                let path = entry.expect("a directory entry").path();
+                if path.is_dir() {
+                    rust_sources(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        rust_sources(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let mut named = std::collections::BTreeSet::new();
+        for file in files {
+            let source = std::fs::read_to_string(&file).expect("a source file reads");
+            for (start, _) in source.match_indices("\"sundog_") {
+                let rest = &source[start + 1..];
+                let name = &rest[..rest.find('"').expect("a closing quote")];
+                let metric_name = name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+                if metric_name && name.ends_with("_duration_seconds") {
+                    named.insert(name.to_owned());
+                }
+            }
+        }
+        assert_eq!(
+            named,
+            DURATION_HISTOGRAMS.map(str::to_owned).into_iter().collect(),
+            "every recorded histogram is in DURATION_HISTOGRAMS"
         );
     }
 }
