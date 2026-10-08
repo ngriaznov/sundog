@@ -303,7 +303,7 @@ async fn join_after_bulk_insert(
 /// as fast as `yield_now` allows. Returns `fut`'s output plus whether the
 /// gauge was ever seen above zero; that observation is logged context,
 /// not proof of a genuine suspension (see
-/// `a_saturated_flush_queue_measurably_slows_the_joiners_pull_from_donor`).
+/// `a_saturated_flush_queue_paces_the_joiners_pull_without_refusing_an_eviction`).
 async fn observe_waiters_during<F, T>(cache_name: &'static str, fut: F) -> (T, bool)
 where
     F: std::future::Future<Output = T>,
@@ -333,25 +333,55 @@ where
     (result, seen_waiter.load(Ordering::Relaxed))
 }
 
-/// A saturated flush queue measurably slows node `b`'s joiner-bootstrap
-/// pull, confirming admission backpressure reaches the replication path
-/// and not only the local write path it shares.
+/// Asserts `cache` ran out no reservation wait and refused no eviction, as
+/// either `queue_full` or `deferred`, in the scraped `body`.
+fn assert_paced_without_refusals(body: &str, cache: &str) {
+    let wait_timeouts = metric_count(
+        body,
+        "sundog_spill_wait_timeouts_total",
+        &[("cache", cache)],
+    );
+    let refused: u64 = ["queue_full", "deferred"]
+        .iter()
+        .map(|&reason| {
+            metric_count(
+                body,
+                "sundog_spill_dropped_total",
+                &[("cache", cache), ("reason", reason)],
+            )
+        })
+        .sum();
+    eprintln!("pacing: {cache} wait_timeouts={wait_timeouts} refused={refused}");
+    assert_eq!(
+        wait_timeouts, 0,
+        "{cache}: every apply batch's reservation is granted as the flusher drains"
+    );
+    assert_eq!(
+        refused, 0,
+        "{cache}: the joiner's pull waits for room instead of refusing an eviction"
+    );
+}
+
+/// Admission backpressure reaches node `b`'s joiner-bootstrap pull, not
+/// only the local write path it shares: the pull's ~22 MB of evictions
+/// pass through a 64 KB flush queue with no eviction refused and no
+/// reservation wait run out, which holds only if every apply batch waits
+/// for the flusher to make room. A `Mode::Replicated` tier keeps a refused
+/// eviction resident and counts it `reason="deferred"`, so a pull that
+/// outran admission would show there. The same pull through a flush queue
+/// as large as the disk budget, where `reserve` never has to wait, is the
+/// control, held to the same bar.
 ///
-/// Compares saturated `flush_queue_bytes` (`reserve()` repeatedly waits)
-/// against generous (`reserve` essentially never waits). The proof is the
-/// wall-clock difference in `b`'s `open()` time; `sundog_spill_waiters`
-/// is logged context only, since it bumps before the acquire is awaited
-/// and can't tell "never waited" from "waited and got room instantly".
-/// `sundog_spill_wait_timeouts_total` is likewise logged, not asserted at
-/// zero: the retry loop can legitimately exhaust the timeout here, so a
-/// real timeout is expected, and every key staying correct below is what
-/// proves it costs no correctness.
+/// `sundog_spill_waiters` is logged context only, since it bumps before
+/// the acquire is awaited and can't tell "never waited" from "waited and
+/// got room instantly". Wall-clock time is logged, not compared: the
+/// admission wait costs only the flusher's own write time, which on a
+/// fast disk is within the noise of the generous run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_saturated_flush_queue_measurably_slows_the_joiners_pull_from_donor() {
-    /// Large enough that the variable cost (disk/channel throughput under
-    /// a saturated semaphore) dominates the fixed cost every joiner pays
-    /// (gossip settle, one anti-entropy round); at 10k entries the fixed
-    /// cost alone swamped any real admission delay.
+async fn a_saturated_flush_queue_paces_the_joiners_pull_without_refusing_an_eviction() {
+    /// About 22 MB, over 300 times [`SATURATED_FLUSH_QUEUE_BYTES`], so the
+    /// saturated pull's batches run past their reservations again and
+    /// again.
     const ENTRIES: u32 = 80_000;
     const MAX_CAPACITY: u64 = 64;
     const REGION_BYTES: u64 = 2 * 1024 * 1024;
@@ -360,10 +390,6 @@ async fn a_saturated_flush_queue_measurably_slows_the_joiners_pull_from_donor() 
     const SATURATED_FLUSH_QUEUE_BYTES: u64 = 64 * 1024;
     /// The whole disk budget; `reserve` should never have to wait here.
     const GENEROUS_FLUSH_QUEUE_BYTES: u64 = CAPACITY_BYTES;
-    /// Observed: generous ~0.6-0.7s; saturated ~1.9s or more, always
-    /// over a second. 300ms is a conservative fraction of the smallest
-    /// observed gap.
-    const MIN_SLOWDOWN: Duration = Duration::from_millis(300);
 
     let handle = metrics_handle();
 
@@ -430,24 +456,8 @@ async fn a_saturated_flush_queue_measurably_slows_the_joiners_pull_from_donor() 
     }
 
     let body = handle.render();
-    // Logged, not asserted at zero: a real timeout here is an expected
-    // outcome of the retry design (see the test doc), not a bug.
-    let saturated_timeouts = metric_count(
-        &body,
-        "sundog_spill_wait_timeouts_total",
-        &[("cache", "pace-saturated")],
-    );
-    eprintln!("pacing: saturated_timeouts={saturated_timeouts}");
-
-    // sundog_spill_waiters can't distinguish "never waited" from "waited
-    // and got room instantly", so it is logged context only; the
-    // wall-clock comparison below is the actual proof.
-    assert!(
-        saturated_elapsed >= generous_elapsed + MIN_SLOWDOWN,
-        "a saturated flush queue must measurably slow the joiner's own bulk pull: \
-         saturated={saturated_elapsed:?} generous={generous_elapsed:?} (need at least \
-         {MIN_SLOWDOWN:?} more)"
-    );
+    assert_paced_without_refusals(&body, "pace-saturated");
+    assert_paced_without_refusals(&body, "pace-generous");
 
     cache_donor_sat.close().await;
     cache_joiner_sat.close().await;

@@ -319,6 +319,19 @@ impl<K> FanOutQueue<K> {
     }
 }
 
+/// Whether a [`Shard::retry_reservation_deficit`] round proves further
+/// rounds futile: it was `granted` the whole flush queue (`whole_queue`
+/// permits), spent none of it (`unspent` is still `granted`), and still
+/// owes a `deficit`. The victim it stopped at then needs more than the
+/// whole queue, which no reservation can ever cover. A round granted less
+/// than the whole queue proves nothing: its victim may only need more than
+/// that round asked for, and the next round asks for its whole deficit.
+/// Pure; unit tested directly.
+#[cfg(feature = "spill")]
+const fn retry_round_is_futile(granted: u32, whole_queue: u32, unspent: u32, deficit: u64) -> bool {
+    deficit > 0 && granted == whole_queue && unspent == granted
+}
+
 /// Whether [`FanOutQueue::wait_for_room`] keeps waiting: `true` while
 /// `pending_len` is at or above `capacity`.
 fn fan_out_over_capacity(pending_len: usize, capacity: usize) -> bool {
@@ -3802,7 +3815,10 @@ where
     /// deficit still outstanding, this makes one closing
     /// [`engine::Engine::enforce_capacity`] call (`reservation: None`) so the
     /// deficit is resolved before this call returns, not deferred to
-    /// whatever write happens to touch this shard next.
+    /// whatever write happens to touch this shard next. A round that held
+    /// the whole flush queue and spent none of it ends the retries at once
+    /// (see [`retry_round_is_futile`]): the victim it stopped at needs more
+    /// than the whole queue, so no later reservation could cover it either.
     #[cfg_attr(
         not(feature = "spill"),
         allow(
@@ -3840,11 +3856,20 @@ where
                 let bytes = u32::try_from(deficit).unwrap_or(u32::MAX);
                 match tier.reserve(bytes, remaining).await {
                     Ok(mut reservation) => {
+                        let granted = reservation.remaining();
                         deficit = self.engine.enforce_capacity_with_reservation(
                             start_bucket,
                             Some(&mut reservation),
                             self.now_ms(),
                         );
+                        if retry_round_is_futile(
+                            granted,
+                            tier.whole_queue_permits(),
+                            reservation.remaining(),
+                            deficit,
+                        ) {
+                            break;
+                        }
                     }
                     // `reserve` already recorded
                     // `sundog_spill_wait_timeouts_total`; the fallback below resolves the rest.
@@ -3876,7 +3901,7 @@ where
         let batch_entries: Vec<(u64, K, Bytes, Hlc, Incoming<V>)> =
             prepared.into_iter().map(to_batch_entry).collect();
 
-        let (mut reservation, deadline) = self
+        let (reservation, deadline) = self
             .reserve_for_batch(
                 batch_entries
                     .iter()
@@ -3890,31 +3915,36 @@ where
         }
         let now = self.now_ms();
         let mut applied_keys: Vec<K> = Vec::new();
-        let mut deficit = 0u64;
-        for (bucket, group) in by_stripe.into_iter().enumerate() {
-            if group.is_empty() {
-                continue;
+        // The reservation lives in this block only, so its unspent budget
+        // is back with the tier before `retry_reservation_deficit` asks for
+        // a fresh one: a retry clamped to the whole flush queue can never be
+        // granted while this call still holds part of it.
+        let deficit = {
+            let mut reservation = reservation;
+            let mut deficit = 0u64;
+            for (bucket, group) in by_stripe.into_iter().enumerate() {
+                if group.is_empty() {
+                    continue;
+                }
+                let (outcomes, bucket_deficit) = self.engine.apply_many_with_reservation(
+                    bucket,
+                    group,
+                    self.resolver.as_ref(),
+                    self.tombstone_ttl_ms,
+                    self.tombstone_max_ttl_ms,
+                    now,
+                    reservation.as_mut(),
+                );
+                deficit += bucket_deficit;
+                for outcome in outcomes {
+                    applied_keys.extend(outcome.key().cloned());
+                    self.handle_apply_outcome(outcome, Origin::Local, false);
+                }
+                self.hand_off_bulk(&mut applied_keys, false);
             }
-            let (outcomes, bucket_deficit) = self.engine.apply_many_with_reservation(
-                bucket,
-                group,
-                self.resolver.as_ref(),
-                self.tombstone_ttl_ms,
-                self.tombstone_max_ttl_ms,
-                now,
-                reservation.as_mut(),
-            );
-            deficit += bucket_deficit;
-            for outcome in outcomes {
-                applied_keys.extend(outcome.key().cloned());
-                self.handle_apply_outcome(outcome, Origin::Local, false);
-            }
-            self.hand_off_bulk(&mut applied_keys, false);
-        }
+            deficit
+        };
         self.hand_off_bulk(&mut applied_keys, true);
-        // Ends the reservation's borrow before requesting a fresh one; `let
-        // _ =` works on every build, including the placeholder without `spill`.
-        let _ = reservation;
         self.retry_reservation_deficit(0, deficit, deadline).await;
     }
 
@@ -4532,7 +4562,7 @@ where
             // One reservation for the whole decoded batch (see
             // `Shard::reserve_for_batch`) throttles replication, anti-entropy
             // repair, and state-transfer apply alike through this one method.
-            let (mut reservation, deadline) = self
+            let (reservation, deadline) = self
                 .reserve_for_batch(
                     decoded
                         .iter()
@@ -4548,36 +4578,39 @@ where
                 by_stripe[engine::stripe_index_from_hash(entry.0)].push(entry);
             }
             let now = self.now_ms();
-            let mut deficit = 0u64;
-            for (bucket, group) in by_stripe.into_iter().enumerate() {
-                if group.is_empty() {
-                    continue;
+            // Scoped as in `Shard::apply_grouped`: the reservation is back
+            // with the tier before the retry asks for a fresh one.
+            let deficit = {
+                let mut reservation = reservation;
+                let mut deficit = 0u64;
+                for (bucket, group) in by_stripe.into_iter().enumerate() {
+                    if group.is_empty() {
+                        continue;
+                    }
+                    let mut origins = Vec::with_capacity(group.len());
+                    let entries: Vec<_> = group
+                        .into_iter()
+                        .map(|(hash, key, key_bytes, ver, incoming, origin)| {
+                            origins.push(origin);
+                            (hash, key, key_bytes, ver, incoming)
+                        })
+                        .collect();
+                    let (outcomes, bucket_deficit) = self.engine.apply_many_with_reservation(
+                        bucket,
+                        entries,
+                        self.resolver.as_ref(),
+                        self.tombstone_ttl_ms,
+                        self.tombstone_max_ttl_ms,
+                        now,
+                        reservation.as_mut(),
+                    );
+                    deficit += bucket_deficit;
+                    for (outcome, origin) in outcomes.into_iter().zip(origins) {
+                        self.handle_apply_outcome(outcome, origin, true);
+                    }
                 }
-                let mut origins = Vec::with_capacity(group.len());
-                let entries: Vec<_> = group
-                    .into_iter()
-                    .map(|(hash, key, key_bytes, ver, incoming, origin)| {
-                        origins.push(origin);
-                        (hash, key, key_bytes, ver, incoming)
-                    })
-                    .collect();
-                let (outcomes, bucket_deficit) = self.engine.apply_many_with_reservation(
-                    bucket,
-                    entries,
-                    self.resolver.as_ref(),
-                    self.tombstone_ttl_ms,
-                    self.tombstone_max_ttl_ms,
-                    now,
-                    reservation.as_mut(),
-                );
-                deficit += bucket_deficit;
-                for (outcome, origin) in outcomes.into_iter().zip(origins) {
-                    self.handle_apply_outcome(outcome, origin, true);
-                }
-            }
-            // See `Shard::apply_grouped`'s identical line: `let _ =` works
-            // on every build.
-            let _ = reservation;
+                deficit
+            };
             self.retry_reservation_deficit(0, deficit, deadline).await;
         })
     }
@@ -10161,6 +10194,29 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "spill")]
+    #[test]
+    fn a_retry_round_is_futile_only_when_the_whole_queue_covered_nothing() {
+        const WHOLE: u32 = 4096;
+        assert!(
+            retry_round_is_futile(WHOLE, WHOLE, WHOLE, 5000),
+            "the whole queue, nothing spent, a deficit still owed: the victim exceeds the queue"
+        );
+        assert!(
+            !retry_round_is_futile(300, WHOLE, 300, 700),
+            "granted less than the queue and nothing spent: the next round asks for 700, \
+             which the queue can grant"
+        );
+        assert!(
+            !retry_round_is_futile(WHOLE, WHOLE, 96, 700),
+            "the round spent from its reservation: progress, keep retrying"
+        );
+        assert!(
+            !retry_round_is_futile(WHOLE, WHOLE, WHOLE, 0),
+            "nothing owed: the loop ends on its own"
+        );
+    }
+
     #[test]
     fn fan_out_over_capacity_at_or_above_the_cap_only() {
         assert!(!fan_out_over_capacity(4, 5), "under capacity: no wait");
@@ -12233,6 +12289,173 @@ mod tests {
                 );
             }
 
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A batch whose evictions need more than the whole flush queue,
+        /// local (`insert_many`) or replicated (`apply_remote_batch`), hands
+        /// its first reservation's unspent budget back before the retry asks
+        /// for more. The retry, clamped to the whole queue, is then granted
+        /// as the flusher drains, rather than waiting out
+        /// `spill_wait_timeout` and evicting with no reservation at all.
+        ///
+        /// Every record is the same length and the queue holds ten and a
+        /// half of them, so the first reservation always leaves half a
+        /// record unspent; the flusher stays paused through the per-bucket
+        /// loop, so the retry's deficit always exceeds the whole queue.
+        #[tokio::test]
+        async fn a_batch_past_a_clamped_reservation_never_waits_out_its_budget() {
+            use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+            const KEYS: u32 = 200;
+            // Keys 1000.. encode in two bytes and "v" x 10 in eleven.
+            const FIRST_KEY: u32 = 1_000;
+            let record_len = u64::from(crate::store::spill::spill_record_len(2, 11));
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            for (name, remote) in [("clamped-local", false), ("clamped-remote", true)] {
+                let dir = temp_dir(name);
+                let cfg = SpillConfig::new(&dir, 1 << 20)
+                    .region_bytes(64 * 1024)
+                    .flush_queue_bytes(record_len * 10 + record_len / 2)
+                    .spill_wait_timeout(Duration::from_secs(5));
+                let shard = Shard::<u32, String>::new(
+                    SmolStr::new(name),
+                    Mode::Local,
+                    NodeId::from(1u64),
+                    5,
+                    None,
+                    None,
+                )
+                .with_spill(&cfg)
+                .expect("tier opens");
+                let tier = Arc::clone(shard.engine.spill().expect("with_spill attaches a tier"));
+                tier.pause_flusher();
+                let resume = std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(100));
+                    tier.resume_flusher();
+                });
+
+                let keys = FIRST_KEY..FIRST_KEY + KEYS;
+                let started = std::time::Instant::now();
+                if remote {
+                    let records = keys
+                        .clone()
+                        .map(|k| wire_record(k, "vvvvvvvvvv", hlc(u64::from(k), 2)))
+                        .collect();
+                    ShardOps::apply_remote_batch(&shard, records).await;
+                } else {
+                    shard
+                        .insert_many(keys.clone().map(|k| (k, "v".repeat(10))))
+                        .await
+                        .expect("insert_many");
+                }
+                let took = started.elapsed();
+                resume.join().expect("the resume thread finishes");
+
+                let (mut timeouts, mut dropped) = (0, 0);
+                for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+                    let of_this_cache = key
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == "cache" && label.value() == name);
+                    if let (true, DebugValue::Counter(n)) = (of_this_cache, value) {
+                        match key.key().name() {
+                            "sundog_spill_wait_timeouts_total" => timeouts += n,
+                            "sundog_spill_dropped_total" => dropped += n,
+                            _ => {}
+                        }
+                    }
+                }
+                assert_eq!(
+                    timeouts, 0,
+                    "{name}: no reservation wait runs out ({took:?})"
+                );
+                assert_eq!(dropped, 0, "{name}: every eviction reaches disk");
+                assert!(
+                    took < Duration::from_secs(4),
+                    "{name}: the batch finishes well inside its 5s budget, took {took:?}"
+                );
+                for k in keys {
+                    assert!(
+                        shard.get(&k).await.is_some(),
+                        "{name}: key {k} is present, resident or spilled"
+                    );
+                }
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        /// A victim whose spill record needs more than the whole flush queue
+        /// can never be admitted. The first retry holds the whole queue and
+        /// covers nothing, so the batch goes straight to its closing
+        /// no-reservation pass rather than retrying, or waiting, until its
+        /// 5s budget runs out; that pass still brings the shard back to its
+        /// cap, dropping every victim as `queue_full` on this `Mode::Local`
+        /// tier.
+        #[tokio::test]
+        async fn a_victim_larger_than_the_flush_queue_ends_the_retries_at_once() {
+            use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+            const NAME: &str = "oversize-victims";
+            const KEYS: u32 = 20;
+            const CAP: u32 = 2;
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let dir = temp_dir(NAME);
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(64 * 1024)
+                .flush_queue_bytes(u64::from(crate::store::spill::spill_record_len(2, 11)))
+                .spill_wait_timeout(Duration::from_secs(5));
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new(NAME),
+                Mode::Local,
+                NodeId::from(1u64),
+                u64::from(CAP),
+                None,
+                None,
+            )
+            .with_spill(&cfg)
+            .expect("tier opens");
+
+            let started = std::time::Instant::now();
+            shard
+                .insert_many((1_000..1_000 + KEYS).map(|k| (k, "v".repeat(200))))
+                .await
+                .expect("insert_many");
+            let took = started.elapsed();
+
+            // One snapshot for every counter: a snapshot drains them.
+            let counters = snapshotter.snapshot().into_vec();
+            let counter = |name: &str| -> u64 {
+                counters
+                    .iter()
+                    .filter(|(key, ..)| key.key().name() == name)
+                    .map(|(.., value)| match value {
+                        DebugValue::Counter(n) => *n,
+                        _ => 0,
+                    })
+                    .sum()
+            };
+            assert_eq!(
+                counter("sundog_spill_wait_timeouts_total"),
+                0,
+                "no reservation wait runs out ({took:?})"
+            );
+            assert_eq!(
+                shard.entry_count().await,
+                u64::from(CAP),
+                "the closing pass brings the shard back to its cap"
+            );
+            assert_eq!(
+                counter("sundog_spill_dropped_total"),
+                u64::from(KEYS - CAP),
+                "every victim the queue could never admit is dropped as queue_full"
+            );
+            assert!(
+                took < Duration::from_secs(2),
+                "the batch ends its retries at once, took {took:?} of its 5s budget"
+            );
             let _ = std::fs::remove_dir_all(&dir);
         }
 

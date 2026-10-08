@@ -316,7 +316,18 @@ async fn bulk_insert_in_one_call_over_a_flush_queue_too_small_for_the_first_rese
         &[("cache", CACHE_NAME), ("reason", "deferred")],
     );
     let spilled_entries = metric_count(&body, "sundog_spill_entries", &[("cache", CACHE_NAME)]);
+    let wait_timeouts = metric_count(
+        &body,
+        "sundog_spill_wait_timeouts_total",
+        &[("cache", CACHE_NAME)],
+    );
 
+    assert_eq!(
+        wait_timeouts, 0,
+        "the retry after the clamped reservation is granted as the flusher drains, never \
+         waiting out spill_wait_timeout: the first reservation's unspent budget is back with \
+         the tier before the retry asks for the whole queue"
+    );
     assert_eq!(
         dropped_queue_full, 0,
         "one insert_many call whose own reservation is clamped to {FLUSH_QUEUE_BYTES} bytes, \
