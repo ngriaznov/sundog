@@ -80,7 +80,7 @@ pub fn build_testnode() -> &'static Path {
 
 /// The release whose test node [`build_previous_testnode`] builds: the one
 /// this checkout must interoperate with across a rolling upgrade.
-pub const PREVIOUS_RELEASE_TAG: &str = "v0.6.4";
+pub const PREVIOUS_RELEASE_TAG: &str = "v0.6.5";
 
 /// The `wire::PROTOCOL_VERSION` that [`PREVIOUS_RELEASE_TAG`] speaks. Tests
 /// that depend on what the previous release supports, such as the ownership
