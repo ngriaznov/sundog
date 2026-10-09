@@ -187,7 +187,7 @@ cache, `distributed` adds:
 | `Miss` | The owner holds nothing, on an equal view, in a trusted warm part: a definitive miss. |
 | `StaleView` | The owner holds nothing in a part it trusts and its view differs. A fetch retries it; the explanation counts it as no answer. |
 | `Declined` | The owner cannot vouch for the key: the cache is not open there, its copy of the part is unverified or stale whatever the views say, or the part is cold with no record on an equal view. |
-| `Unreached` | No answer: `NotAMember` of the mesh, `ProtocolTooOld`, `TimedOut` within `fetch_timeout`, an `Io` error, or a `Codec` error. |
+| `Unreached` | No answer: `NotAMember` of the mesh, `ProtocolTooOld`, `TimedOut` within `fetch_timeout`, an `Io` error, or a `Codec` error. A crashed owner reads as a refused connection, an `Io` error, on Linux and macOS, and as `TimedOut` on Windows, which retries a refused connect for about two seconds. |
 
 `source` is `Local` when `local_read` answers, else the first owner whose
 probe is `Held` or `Miss`, else `Unavailable`, which a fetch reports as

@@ -6903,6 +6903,17 @@ mod tests {
         shut_down_all(nodes).await;
     }
 
+    /// Whether `answer` is what a probe of a crashed owner reads: a refused
+    /// connection, or a timeout where the platform retries a refused
+    /// loopback connect for longer than `fetch_timeout`, as Windows does
+    /// for about two seconds.
+    fn crashed_owner_answer(answer: ProbeAnswer) -> bool {
+        matches!(
+            answer,
+            ProbeAnswer::Unreached(Unreached::Io(_) | Unreached::TimedOut)
+        )
+    }
+
     /// An owner whose node crashed gives no answer, while the other owner
     /// still answers: the view keeps naming the crashed owner, the fetch
     /// moves past it, and the source is the second owner.
@@ -6927,11 +6938,8 @@ mod tests {
         let explanation = cache_a.explain(&key).await.expect("explains");
         let read = distributed_of(cache_a, key, &explanation);
         assert!(
-            matches!(
-                read.probes[0].answer,
-                ProbeAnswer::Unreached(Unreached::Io(_))
-            ),
-            "a crashed owner's connection fails: {:?}",
+            crashed_owner_answer(read.probes[0].answer),
+            "a crashed owner gives no answer: {:?}",
             read.probes[0].answer
         );
         assert_eq!(held_record(&read.probes[1]).reads, Reads::Value);
@@ -7067,7 +7075,7 @@ mod tests {
         assert!(
             read.probes
                 .iter()
-                .all(|probe| matches!(probe.answer, ProbeAnswer::Unreached(Unreached::Io(_)))),
+                .all(|probe| crashed_owner_answer(probe.answer)),
             "no crashed owner answers: {:?}",
             answers_of(read)
         );
