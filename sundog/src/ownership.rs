@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::cluster::Cluster;
+use crate::explain::Residency;
 use crate::membership::{CacheModes, Peer};
 use crate::node::NodeId;
 use crate::store::part::{PART_SPACE, PartSet};
@@ -720,6 +721,15 @@ impl Settlement {
     fn owns(&self, part: PartId) -> bool {
         self.owned.as_ref().is_none_or(|owned| owned.contains(part))
     }
+
+    /// Whether `part` is outside the last settled view and not served by a
+    /// pull or verification since; `false` before any view is settled.
+    fn is_unsettled(&self, part: PartId) -> bool {
+        self.settled
+            .as_ref()
+            .is_some_and(|settled| !settled.contains(part))
+            && !self.served.contains(part)
+    }
 }
 
 /// One in-flight pull's hold on a [`ResidencySet`], from
@@ -835,12 +845,34 @@ impl ResidencySet {
     /// served by a pull or verification since. `false` before any view is
     /// settled.
     pub(crate) fn is_unsettled(&self, part: PartId) -> bool {
-        let settlement = self.settlement.read();
-        settlement
-            .settled
-            .as_ref()
-            .is_some_and(|settled| !settled.contains(part))
-            && !settlement.served.contains(part)
+        self.settlement.read().is_unsettled(part)
+    }
+
+    /// Every mark on `part`, with `owns` from the ownership view the
+    /// caller decides under and a disown grace measured to `now`. Each mark
+    /// is read under its own lock, released before the next, in the order
+    /// writers nest them: settlement, cold, unverified, stale, releasing.
+    /// A writer moving several marks at once can show some from before the
+    /// move and some from after; each mark a reader sees is one a writer
+    /// set.
+    pub(crate) fn residency_of(&self, part: PartId, owns: bool, now: Instant) -> Residency {
+        let unsettled = self.is_unsettled(part);
+        let cold_marked = self.cold.read().contains(part);
+        let unverified = self.unverified.read().contains(part);
+        let stale = self.stale.read().contains(part);
+        let releasing_for = self
+            .releasing
+            .read()
+            .get(&part)
+            .map(|since| now.saturating_duration_since(*since));
+        Residency {
+            owns,
+            releasing_for,
+            cold_marked,
+            unsettled,
+            unverified,
+            stale,
+        }
     }
 
     /// Marks each of `parts` cold: owned here, not yet pulled.
@@ -2093,6 +2125,119 @@ mod tests {
     /// A part by raw id, for residency tests that only need distinct parts.
     fn p(raw: u16) -> PartId {
         PartId::from_raw(raw)
+    }
+
+    #[test]
+    fn residency_of_reports_each_mark_alone() {
+        let set = ResidencySet::new();
+        let now = Instant::now();
+        assert_eq!(set.residency_of(p(1), true, now), Residency::new(true));
+        assert_eq!(set.residency_of(p(1), false, now), Residency::new(false));
+
+        set.mark_cold(&[p(2)]);
+        set.mark_stale(&[p(3)]);
+        set.mark_releasing(&[p(4)]);
+        let only = |part, owns| set.residency_of(part, owns, Instant::now());
+        assert_eq!(
+            only(p(2), true),
+            Residency {
+                cold_marked: true,
+                ..Residency::new(true)
+            }
+        );
+        assert_eq!(
+            only(p(3), true),
+            Residency {
+                stale: true,
+                ..Residency::new(true)
+            }
+        );
+        let releasing = only(p(4), false);
+        assert!(releasing.releasing_for.is_some() && releasing.resident() && !releasing.owns);
+
+        let all =
+            OwnershipView::compute(NodeId::from(1u64), vec![NodeId::from(1u64)], NonZeroU8::MIN);
+        set.settle(&all);
+        assert!(
+            !only(p(5), true).unsettled,
+            "every part of the settled view is settled"
+        );
+        let other = OwnershipView::compute(
+            NodeId::from(2u64),
+            vec![NodeId::from(1u64), NodeId::from(2u64)],
+            NonZeroU8::MIN,
+        );
+        set.settle(&other);
+        let gained = PartId::all()
+            .find(|&part| !other.owns(part))
+            .expect("two nodes split the parts");
+        assert!(
+            only(gained, true).unsettled && only(gained, true).implicitly_cold(),
+            "a part outside the settled view is unsettled, so implicitly cold while owned"
+        );
+        set.mark_serving(&[gained]);
+        assert!(!only(gained, true).unsettled, "a served part settles");
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn residency_of_reports_a_replayed_part_apart_from_a_stale_one() {
+        let set = ResidencySet::new();
+        set.mark_unverified(&[p(1)]);
+        let replayed = set.residency_of(p(1), true, Instant::now());
+        assert!(replayed.unverified && !replayed.stale && replayed.distrusted());
+    }
+
+    #[test]
+    fn residency_of_measures_the_grace_from_the_first_mark_and_unmark_restarts_it() {
+        let set = ResidencySet::new();
+        set.mark_releasing(&[p(1)]);
+        let since = Instant::now();
+        let later = since + Duration::from_secs(5);
+        let first = set
+            .residency_of(p(1), false, later)
+            .releasing_for
+            .expect("releasing");
+        assert!(first >= Duration::from_secs(5), "{first:?}");
+        set.mark_releasing(&[p(1)]);
+        let again = set
+            .residency_of(p(1), false, later)
+            .releasing_for
+            .expect("releasing");
+        assert!(
+            again >= first,
+            "a second mark keeps the first clock: {again:?} {first:?}"
+        );
+        set.unmark(&[p(1)]);
+        assert_eq!(set.residency_of(p(1), false, later).releasing_for, None);
+        assert_eq!(
+            set.residency_of(p(2), false, since).releasing_for,
+            None,
+            "a part never marked releasing reports no grace"
+        );
+    }
+
+    #[test]
+    fn settlement_is_unsettled_is_the_one_definition() {
+        let set = ResidencySet::new();
+        assert!(
+            !set.is_unsettled(p(1)),
+            "nothing is unsettled before a settle"
+        );
+        let other = OwnershipView::compute(
+            NodeId::from(2u64),
+            vec![NodeId::from(1u64), NodeId::from(2u64)],
+            NonZeroU8::MIN,
+        );
+        set.settle(&other);
+        for part in PartId::all() {
+            assert_eq!(
+                set.is_unsettled(part),
+                set.residency_of(part, true, Instant::now()).unsettled,
+                "{part:?}"
+            );
+            assert_eq!(set.is_unsettled(part), !other.owns(part), "{part:?}");
+        }
     }
 
     #[test]

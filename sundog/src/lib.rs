@@ -68,6 +68,7 @@ pub mod cluster;
 pub mod config;
 pub mod discovery;
 pub mod error;
+pub mod explain;
 pub mod hlc;
 pub mod membership;
 pub mod net;
@@ -77,6 +78,7 @@ pub(crate) mod ownership;
 pub mod store;
 #[cfg(feature = "prometheus")]
 pub mod telemetry;
+pub(crate) mod verdict;
 pub mod wire;
 
 pub use cache::{Cache, CacheBuilder};

@@ -43,6 +43,7 @@ use crate::discovery::mdns::Mdns;
 use crate::discovery::statics::Static;
 use crate::discovery::{Discovery, DiscoveryKind};
 use crate::error::JoinError;
+use crate::explain::ServeVerdict;
 #[cfg(all(test, not(feature = "sim")))]
 use crate::hlc::Hlc;
 use crate::membership::{CacheModes, Membership, Peer};
@@ -56,6 +57,7 @@ use crate::store::{
     BucketDigest, BucketLen, BucketPart, BucketPartDigests, KeyVersion, Mode, PartId, PartMask,
     Shard, ShardOps, chunk_records_for_snapshot,
 };
+use crate::verdict;
 use crate::wire::{self, Msg, WireRecord};
 
 /// The cluster's type-erased cache registry: `cache name -> Arc<dyn ShardOps>`.
@@ -964,6 +966,21 @@ impl ClusterRequestHandler {
     }
 }
 
+/// The reply [`ClusterRequestHandler::fetch`] sends for `verdict`: `rec`,
+/// the record it holds for the key, when serving it, and `local_hash`, its
+/// own view hash, when the asker's view is stale. Pure; unit tested
+/// directly.
+fn serve_reply(verdict: ServeVerdict, rec: Option<WireRecord>, local_hash: u64) -> FetchServe {
+    match verdict {
+        ServeVerdict::Serve => FetchServe::Found(rec),
+        ServeVerdict::Miss => FetchServe::Found(None),
+        ServeVerdict::Stale => FetchServe::Stale {
+            responder_view_hash: local_hash,
+        },
+        ServeVerdict::DeclineDistrusted | ServeVerdict::DeclineCold => FetchServe::Unavailable,
+    }
+}
+
 impl RequestHandler for ClusterRequestHandler {
     fn snapshot_available(&self, cache: SmolStr) -> bool {
         self.warmth.is_warm(&cache)
@@ -1082,29 +1099,24 @@ impl RequestHandler for ClusterRequestHandler {
                 return FetchServe::Unavailable;
             };
             let part = PartId::of_key(&key);
-            // An unverified part (warm-reloaded or regained, not yet
-            // checked against a live co-owner) answers Unavailable even on
-            // a hit: it may hold a record a co-owner deleted while this
-            // node was down or not an owner.
-            if shard.is_unverified_part(part) {
-                return FetchServe::Unavailable;
-            }
-            // A held record is an answer whatever the two views say: it is
-            // what a local `get` here would return. Only a miss depends on
-            // this node being a current, warm owner of the part.
-            if let Some(rec) = shard.records_for(vec![key]).await.into_iter().next() {
-                return FetchServe::Found(Some(rec));
-            }
-            if local_hash != view_hash {
-                return FetchServe::Stale {
-                    responder_view_hash: local_hash,
-                };
-            }
-            if shard.is_cold_part(part) {
-                // Owned but not yet pulled: a miss here is not an answer.
-                return FetchServe::Unavailable;
-            }
-            FetchServe::Found(None)
+            // Both marks are read before the record, so a pull landing
+            // during the read cannot clear a cold mark this answer then
+            // trusts. A distrusted part reads nothing: it declines even a
+            // hit.
+            let distrusted = shard.is_unverified_part(part);
+            let cold = shard.is_cold_part(part);
+            let rec = if distrusted {
+                None
+            } else {
+                shard.records_for(vec![key]).await.into_iter().next()
+            };
+            let verdict = verdict::fetch_serve_verdict(verdict::ServeInputs {
+                distrusted,
+                served: rec.is_some(),
+                views_match: local_hash == view_hash,
+                cold,
+            });
+            serve_reply(verdict, rec, local_hash)
         })
     }
 
@@ -4964,6 +4976,111 @@ mod tests {
         );
 
         cluster.shutdown().await;
+    }
+
+    #[test]
+    fn serve_reply_maps_each_verdict() {
+        let rec = WireRecord {
+            key: Bytes::from_static(b"k"),
+            value: None,
+            ver: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                node: NodeId::from(1u64),
+            },
+            expires_at_ms: None,
+        };
+        assert!(matches!(
+            serve_reply(ServeVerdict::Serve, Some(rec.clone()), 7),
+            FetchServe::Found(Some(served)) if served == rec
+        ));
+        assert!(matches!(
+            serve_reply(ServeVerdict::Miss, None, 7),
+            FetchServe::Found(None)
+        ));
+        assert!(matches!(
+            serve_reply(ServeVerdict::Stale, None, 7),
+            FetchServe::Stale {
+                responder_view_hash: 7
+            }
+        ));
+        for declined in [ServeVerdict::DeclineDistrusted, ServeVerdict::DeclineCold] {
+            assert!(matches!(
+                serve_reply(declined, Some(rec.clone()), 7),
+                FetchServe::Unavailable
+            ));
+        }
+    }
+
+    /// A responder with `shard` registered under `name`, and nothing else.
+    fn handler_for(name: &SmolStr, shard: Arc<dyn ShardOps>) -> ClusterRequestHandler {
+        let shards: ShardRegistry = Arc::new(RwLock::new(HashMap::from([(name.clone(), shard)])));
+        ClusterRequestHandler {
+            shards,
+            warmth: Arc::new(Warmth::default()),
+            ae_part_min_bucket: ClusterConfig::default().ae_part_min_bucket,
+            ae_sketch_min_bucket: ClusterConfig::default().ae_sketch_min_bucket,
+            ae_sketch_cells: ClusterConfig::default().ae_sketch_cells,
+            rebalance_chunk_bytes: ClusterConfig::default().rebalance_chunk_bytes_value(),
+        }
+    }
+
+    /// The responder over every residency state a read tells apart, on an
+    /// equal and an unequal view hash, against the rule it wrote inline
+    /// before the verdicts: distrust declines even a held record, a held
+    /// record in a resident part is served whatever the views say, a view
+    /// mismatch then answers stale, a cold part declines, and only a warm
+    /// part's miss is definitive.
+    #[tokio::test]
+    async fn the_fetch_responder_follows_its_serve_rule_over_every_residency_state() {
+        use crate::store::read_cases::{case_shard, every_read_case};
+        let name = SmolStr::new("serve-cases");
+        for case in every_read_case() {
+            let built = case_shard(&name, &case).await;
+            let local_hash = built.view.view_hash();
+            let handler = handler_for(&name, Arc::new(built.shard));
+            for views_match in [true, false] {
+                let asked_hash = if views_match {
+                    local_hash
+                } else {
+                    local_hash ^ 1
+                };
+                let reply = handler
+                    .fetch(name.clone(), built.key_bytes.clone(), asked_hash)
+                    .await;
+                let expected = if case.distrusted() {
+                    "unavailable"
+                } else if case.served() {
+                    "found"
+                } else if !views_match {
+                    "stale"
+                } else if case.cold() {
+                    "unavailable"
+                } else {
+                    "miss"
+                };
+                let got = match &reply {
+                    FetchServe::Unavailable => "unavailable",
+                    FetchServe::Found(Some(rec)) => {
+                        assert_eq!(rec.key, built.key_bytes, "{case:?}");
+                        assert_eq!(
+                            rec.value.is_some(),
+                            case.live(),
+                            "the held record is served as held: {case:?}"
+                        );
+                        "found"
+                    }
+                    FetchServe::Found(None) => "miss",
+                    FetchServe::Stale {
+                        responder_view_hash,
+                    } => {
+                        assert_eq!(*responder_view_hash, local_hash, "{case:?}");
+                        "stale"
+                    }
+                };
+                assert_eq!(got, expected, "{case:?} views_match={views_match}");
+            }
+        }
     }
 
     /// A hit in an unverified bucket answers `Unavailable`, never the

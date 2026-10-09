@@ -41,6 +41,7 @@ use crate::store::{
     ConflictResolver, Event, Lifetime, LoadError, Loader, LocalRearm, LwwResolver, Mode,
     RefreshRequest, Shard, ShardOps, Sourced, Ttl, Weigher, encode_key, now_ms, refresh_permille,
 };
+use crate::verdict;
 use crate::wire::WireRecord;
 
 /// Builds a [`Cache`]: own-and-return, per house style.
@@ -1692,19 +1693,10 @@ where
         attempts: &mut u32,
     ) -> Result<OwnerAnswer<V>, CacheError> {
         let part = PartId::of_key(key_bytes);
-        // An unverified part (warm-reloaded or regained, not yet checked
-        // against a live co-owner) counts as not owned here: it can hold a
-        // record a co-owner deleted while this node was down or not an owner.
         let self_node = self.cluster.node_id();
-        if view.owns(part) && !self.shard.is_unverified_part(part) {
-            let value = self.shard.get(key).await;
-            // A miss in a part not yet pulled from a co-owner is not an
-            // answer: its previous owner can still hold the record through
-            // the disown grace, so only another owner's warm copy answers.
-            if value.is_some() || !self.shard.is_cold_part(part) {
-                span.record("owner", tracing::field::display(self_node));
-                return Ok(OwnerAnswer::Local(value));
-            }
+        if let Some(value) = self.local_answer(key, &view, part).await {
+            span.record("owner", tracing::field::display(self_node));
+            return Ok(OwnerAnswer::Local(value));
         }
 
         let cache_name = SmolStr::new(self.shard.name());
@@ -1740,12 +1732,9 @@ where
                         && fresh.view_hash() != view.view_hash()
                     {
                         view = fresh;
-                        if view.owns(part) && !self.shard.is_unverified_part(part) {
-                            let value = self.shard.get(key).await;
-                            if value.is_some() || !self.shard.is_cold_part(part) {
-                                span.record("owner", tracing::field::display(self_node));
-                                return Ok(OwnerAnswer::Local(value));
-                            }
+                        if let Some(value) = self.local_answer(key, &view, part).await {
+                            span.record("owner", tracing::field::display(self_node));
+                            return Ok(OwnerAnswer::Local(value));
                         }
                         owners = other_owners(&view, part, self_node);
                         owner_idx = 0;
@@ -1769,6 +1758,27 @@ where
             }
         }
         Err(CacheError::FetchUnavailable { cache: cache_name })
+    }
+
+    /// This node's own answer to a fetch of `key` in `part` under `view`:
+    /// `Some` with the value, or with `None` for a warm miss, when this
+    /// node's copy answers, by [`verdict::local_verdict`]; `None` when only
+    /// another owner's copy does. A distrusted part (warm-reloaded or
+    /// regained, not yet checked against a live co-owner) can hold a record
+    /// a co-owner deleted while this node was down or not an owner, and a
+    /// cold part's miss says nothing while its previous owner can still
+    /// hold the record through the disown grace. The part's marks are read
+    /// before the record, so a pull landing during the read cannot clear a
+    /// cold mark the decision then trusts.
+    async fn local_answer(&self, key: &K, view: &OwnershipView, part: PartId) -> Option<Option<V>> {
+        let residency = self.shard.residency_of(view, part);
+        if !verdict::reads_local(&residency) {
+            return None;
+        }
+        let value = self.shard.get(key).await;
+        verdict::local_verdict(&residency, value.is_some())
+            .answers()
+            .then_some(value)
     }
 
     /// The live owners of `key`'s part, in rendezvous score order.
@@ -4479,6 +4489,151 @@ mod tests {
         a.shutdown().await;
     }
 
+    /// A `Mode::Distributed` cache of `cluster`'s whose shard decides under
+    /// `view`, with its residency set to mark parts in.
+    fn cache_under_view(
+        cluster: &Cluster,
+        name: &str,
+        view: &Arc<crate::ownership::OwnershipView>,
+    ) -> (Cache<u32, String>, Arc<crate::ownership::ResidencySet>) {
+        let owners = std::num::NonZeroU8::MIN;
+        let (tracker, tx) = crate::ownership::OwnershipTracker::seed(
+            cluster.node_id(),
+            &[],
+            &std::collections::HashMap::new(),
+            &SmolStr::new(name),
+            owners,
+        );
+        tx.send(Arc::clone(view)).expect("receiver alive");
+        let residency = Arc::new(crate::ownership::ResidencySet::new());
+        let shard = Shard::<u32, String>::new(
+            SmolStr::new(name),
+            Mode::distributed(),
+            cluster.node_id(),
+            u64::MAX,
+            None,
+            None,
+        )
+        .with_ownership(tracker, Arc::clone(&residency));
+        let cache = Cache {
+            shard: Arc::new(shard),
+            cluster: cluster.clone(),
+            cancel: CancellationToken::new(),
+            tasks: TaskTracker::new(),
+        };
+        (cache, residency)
+    }
+
+    /// `owner_answer`'s second local branch: a fetch that set out under a
+    /// view where `b` owns the key's part, answered `Stale` by `b`, finds
+    /// this node's view moved to one where it owns the part itself and
+    /// decides under that view by the same verdict as the first branch: a
+    /// warm part answers its own hit or miss, while a cold or stale one
+    /// asks the other owners, here none.
+    #[tokio::test]
+    async fn owner_answer_decides_locally_under_a_view_that_moved_during_the_fetch() {
+        let name = "owner-answer-moved-view";
+        let a = Cluster::builder(name)
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node a builds");
+        let b = Cluster::builder(name)
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node b builds");
+        let cache_b = b
+            .cache::<u32, String>(name)
+            .mode(Mode::distributed())
+            .open()
+            .await
+            .expect("b opens alone");
+        let peer_b = b.local_peer();
+        a.mesh().update_peers(vec![peer_b.clone()]);
+
+        let owners = std::num::NonZeroU8::MIN;
+        let old = Arc::new(crate::ownership::OwnershipView::compute(
+            a.node_id(),
+            vec![a.node_id(), peer_b.node],
+            owners,
+        ));
+        let fresh = Arc::new(crate::ownership::OwnershipView::compute(
+            a.node_id(),
+            vec![a.node_id()],
+            owners,
+        ));
+        let keys = (2..1_000_000u32)
+            .filter(|key| !old.owns(PartId::of_key(&encode_key(key).expect("u32 encodes"))));
+        let [missing, held, cold, stale] = keys.take(4).collect::<Vec<_>>()[..] else {
+            panic!("b owns some parts of the old view");
+        };
+
+        let (cache_a, residency) = cache_under_view(&a, name, &fresh);
+        let held_bytes = encode_key(&held).expect("u32 encodes");
+        ShardOps::apply_remote_batch(
+            cache_a.shard.as_ref(),
+            vec![WireRecord {
+                key: held_bytes,
+                value: Some(bytes::Bytes::from(
+                    postcard::to_stdvec(&"mine".to_string()).expect("string encodes"),
+                )),
+                ver: crate::hlc::Hlc {
+                    wall_ms: crate::store::now_ms(),
+                    logical: 0,
+                    node: a.node_id(),
+                },
+                expires_at_ms: None,
+            }],
+        )
+        .await;
+        let part_of = |key: u32| PartId::of_key(&encode_key(&key).expect("u32 encodes"));
+        residency.mark_cold(&[part_of(cold)]);
+        residency.mark_stale(&[part_of(stale)]);
+
+        let answer = |key: u32| {
+            let cache_a = &cache_a;
+            let old = Arc::clone(&old);
+            async move {
+                let mut attempts = 0;
+                let answer = cache_a
+                    .owner_answer(
+                        &key,
+                        &encode_key(&key).expect("u32 encodes"),
+                        old,
+                        &tracing::Span::none(),
+                        &mut attempts,
+                    )
+                    .await;
+                (answer, attempts)
+            }
+        };
+        let (got, attempts) = answer(missing).await;
+        assert!(
+            matches!(got, Ok(OwnerAnswer::Local(None))),
+            "a warm miss answers"
+        );
+        assert_eq!(attempts, 1, "b, asked once, answered stale");
+        let (got, _) = answer(held).await;
+        assert!(
+            matches!(got, Ok(OwnerAnswer::Local(Some(ref value))) if value == "mine"),
+            "a warm hit answers"
+        );
+        for key in [cold, stale] {
+            let (got, _) = answer(key).await;
+            assert!(
+                matches!(got, Err(CacheError::FetchUnavailable { .. })),
+                "a cold or stale part asks the other owners, of which there are none"
+            );
+        }
+
+        cache_b.close().await;
+        b.shutdown().await;
+        a.shutdown().await;
+    }
+
     #[tokio::test]
     async fn fetch_returns_fetch_unavailable_when_every_owner_is_down() {
         // `a`'s failure detector never drops `b` or `c` here. Once it drops
@@ -5219,6 +5374,55 @@ mod tests {
                 "{outcome} with {attempts} owner requests is timed iff it asked an owner"
             );
         }
+    }
+
+    /// `owner_answer`'s local branch over every residency state a read
+    /// tells apart, in front of owners no node can reach: it answers from
+    /// this node's copy iff the part is owned and trusted and the read hits
+    /// or the part is warm (the rule it wrote inline before the verdicts),
+    /// and otherwise asks the owners and finds none.
+    #[tokio::test]
+    async fn the_owner_loop_reads_locally_by_the_read_rule_over_every_residency_state() {
+        use crate::store::read_cases::{case_shard, every_read_case};
+        let solo = Cluster::builder("cache-it-read-cases")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node builds");
+        for case in every_read_case() {
+            let built = case_shard("read-cases", &case).await;
+            let cache = Cache {
+                shard: Arc::new(built.shard),
+                cluster: solo.clone(),
+                cancel: CancellationToken::new(),
+                tasks: TaskTracker::new(),
+            };
+            let mut attempts = 0;
+            let answer = cache
+                .owner_answer(
+                    &built.key,
+                    &built.key_bytes,
+                    Arc::clone(&built.view),
+                    &tracing::Span::none(),
+                    &mut attempts,
+                )
+                .await;
+            let answers = case.owns && !case.distrusted() && (case.live() || !case.cold());
+            match answer {
+                Ok(OwnerAnswer::Local(value)) => {
+                    assert!(answers, "answered locally: {case:?}");
+                    assert_eq!(value.is_some(), case.live(), "{case:?}");
+                }
+                Err(CacheError::FetchUnavailable { .. }) => {
+                    assert!(!answers, "asked the owners: {case:?}");
+                }
+                Ok(OwnerAnswer::Remote(_)) | Err(_) => {
+                    panic!("no owner can answer: {case:?}");
+                }
+            }
+        }
+        solo.shutdown().await;
     }
 
     /// Through `Cache::fetch`: a fetch answered without asking an owner is

@@ -3,6 +3,18 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **A fetch no longer vouches for a miss read before a pull landed.** In
+  `Mode::Distributed`, an owner's fetch, its re-arm through `expire`,
+  `touch` or `persist`, and its answer to a peer's fetch checked the key's
+  part for a cold mark only after reading the record. A pull that applied
+  its records and cleared the mark in between left the read answering
+  `None` as definitive for a key the pull had just brought in. Each now
+  reads the part's marks before the record.
+
 ## [0.6.6] – 2026-10-09
 
 ### Fixed

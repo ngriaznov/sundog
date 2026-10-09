@@ -27,10 +27,12 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::config::ClusterConfig;
 use crate::error::{CacheError, CodecError};
+use crate::explain::{LocalRead, Residency};
 use crate::hlc::{Hlc, HlcClock};
 use crate::net::REPLICATE_BATCH_COUNT;
 use crate::node::NodeId;
 use crate::ownership::{Granularity, OwnershipTracker, OwnershipView, ResidencySet};
+use crate::verdict;
 use crate::wire::{self, MAX_FRAME, WireRecord};
 
 mod engine;
@@ -2671,7 +2673,29 @@ where
     /// which stays strict current-view ownership.
     fn is_resident_part(residency: &(Arc<OwnershipView>, Arc<ResidencySet>), part: PartId) -> bool {
         let (view, res) = residency;
-        view.owns(part) || res.is_releasing(part)
+        verdict::resident(view.owns(part), res.is_releasing(part))
+    }
+
+    /// This shard's residency marks for `part`, with ownership taken from
+    /// `view`, the view a read decides under. A shard with no residency
+    /// set, one not in `Mode::Distributed`, reports ownership alone.
+    pub(crate) fn residency_of(&self, view: &OwnershipView, part: PartId) -> Residency {
+        let owns = view.owns(part);
+        self.residency
+            .as_ref()
+            .map_or(Residency::new(owns), |residency| {
+                residency.residency_of(part, owns, std::time::Instant::now())
+            })
+    }
+
+    /// [`Shard::residency_of`] under this shard's current view. A shard not
+    /// in `Mode::Distributed` owns every part.
+    pub(crate) fn current_residency(&self, part: PartId) -> Residency {
+        self.ownership
+            .as_ref()
+            .map_or(Residency::new(true), |tracker| {
+                self.residency_of(&tracker.current(), part)
+            })
     }
 
     /// Whether any part of `bucket` is resident; see
@@ -3378,15 +3402,17 @@ where
         let key_bytes = encode_key(key)?;
         let hash = engine::hash_key_bytes(key_bytes.as_ref());
         let part = PartId::of_key(key_bytes.as_ref());
-        if self
-            .ownership
-            .as_ref()
-            .is_some_and(|tracker| !tracker.current().owns(part))
-            || ShardOps::is_unverified_part(self, part)
-        {
+        if !verdict::reads_local(&self.current_residency(part)) {
             return Ok(LocalRearm::NotHeld);
         }
         self.wait_for_fan_out_room().await;
+        // Read again past the wait and before the record, so the decision
+        // sees ownership as it is now, and a pull landing during the read
+        // cannot clear a cold mark the decision then trusts.
+        let residency = self.current_residency(part);
+        if !verdict::reads_local(&residency) {
+            return Ok(LocalRearm::NotHeld);
+        }
         let resident = self
             .engine
             .record_for(key_bytes.as_ref(), self.now_ms())
@@ -3399,10 +3425,9 @@ where
             None => self.read_spilled_for_rearm(key_bytes.as_ref(), hash).await,
         };
         let Some((base_ver, value, encoded)) = base else {
-            return Ok(if ShardOps::is_cold_part(self, part) {
-                LocalRearm::NotHeld
-            } else {
-                LocalRearm::Absent
+            return Ok(match verdict::local_verdict(&residency, false) {
+                LocalRead::Miss => LocalRearm::Absent,
+                _ => LocalRearm::NotHeld,
             });
         };
         let expires_at_ms = self.deadline_for(lifetime);
@@ -5067,6 +5092,8 @@ where
         Box::pin(async move { removed })
     }
 
+    // `Residency::cold` is the same rule over one read of every mark; this
+    // reads only the marks it needs, for the per-part loops that call it.
     fn is_cold_part(&self, part: PartId) -> bool {
         self.residency.as_ref().is_some_and(|residency| {
             residency.is_cold(part)
@@ -5078,6 +5105,7 @@ where
         })
     }
 
+    // `Residency::distrusted` is the same rule over one read of every mark.
     fn is_unverified_part(&self, part: PartId) -> bool {
         self.residency
             .as_ref()
@@ -7173,6 +7201,135 @@ mod tests {
         );
         let drained = s.fan_out_queue().drain();
         assert!(drained.is_empty(), "{drained:?}");
+    }
+
+    /// `Shard::residency_of` over every residency state a read tells
+    /// apart: it reports each mark the case set, and its derived `cold`,
+    /// `distrusted` and `resident` equal what `ShardOps::is_cold_part`,
+    /// `ShardOps::is_unverified_part` and the `records_for` guard say.
+    /// `current_residency` follows the tracker's view as it moves.
+    #[tokio::test]
+    async fn residency_of_matches_the_single_mark_readers_over_every_residency_state() {
+        for case in read_cases::every_read_case() {
+            let built = read_cases::case_shard("residency-cases", &case).await;
+            let r = built.shard.residency_of(&built.view, built.part);
+            assert_eq!(
+                (r.owns, r.cold_marked, r.unsettled, r.stale, r.unverified),
+                (
+                    case.owns,
+                    case.cold_marked,
+                    case.unsettled,
+                    case.stale,
+                    case.unverified
+                ),
+                "{case:?}"
+            );
+            assert_eq!(r.releasing_for.is_some(), case.releasing, "{case:?}");
+            assert_eq!(
+                r.cold(),
+                ShardOps::is_cold_part(&built.shard, built.part),
+                "{case:?}"
+            );
+            assert_eq!(
+                r.distrusted(),
+                ShardOps::is_unverified_part(&built.shard, built.part),
+                "{case:?}"
+            );
+            assert_eq!(
+                r.resident(),
+                Shard::<u32, String>::is_resident_part(
+                    &(Arc::clone(&built.view), Arc::clone(&built.residency)),
+                    built.part
+                ),
+                "{case:?}"
+            );
+            let current = built.shard.current_residency(built.part);
+            assert_eq!(
+                Residency {
+                    releasing_for: current.releasing_for.map(|_| Duration::ZERO),
+                    ..current
+                },
+                Residency {
+                    releasing_for: r.releasing_for.map(|_| Duration::ZERO),
+                    ..r
+                },
+                "the same marks under the tracker's own view, the grace measured later: {case:?}"
+            );
+        }
+
+        let built = read_cases::case_shard(
+            "residency-moves",
+            &read_cases::ReadCase {
+                owns: false,
+                cold_marked: false,
+                unsettled: false,
+                stale: false,
+                unverified: false,
+                releasing: false,
+                held: read_cases::Held::Nothing,
+            },
+        )
+        .await;
+        assert!(!built.shard.current_residency(built.part).owns);
+        let solo = Arc::new(OwnershipView::compute(
+            NodeId::from(1u64),
+            vec![NodeId::from(1u64)],
+            NonZeroU8::MIN,
+        ));
+        built
+            .view_tx
+            .send(solo)
+            .expect("the tracker holds a receiver");
+        assert!(
+            built.shard.current_residency(built.part).owns,
+            "current_residency reads the view the tracker holds now"
+        );
+    }
+
+    #[test]
+    fn residency_of_a_shard_without_a_residency_set_reports_ownership_only() {
+        let s = shard::<u32, String>(1);
+        let part = PartId::of_key(&key_bytes(&1u32));
+        assert_eq!(s.current_residency(part), Residency::new(true));
+        let other = OwnershipView::compute(
+            NodeId::from(2u64),
+            vec![NodeId::from(1u64), NodeId::from(2u64)],
+            NonZeroU8::MIN,
+        );
+        assert_eq!(
+            s.residency_of(&other, part),
+            Residency::new(other.owns(part)),
+            "ownership comes from the view passed in"
+        );
+    }
+
+    /// `rearm_local` over every residency state a read tells apart: the
+    /// local copy answers iff the part is owned and trusted and the read
+    /// hits or the part is warm (the rule `owner_answer` and `rearm_local`
+    /// wrote inline before the verdicts), re-arming a live entry and
+    /// reporting a warm miss absent; every other state is the owners'.
+    #[tokio::test]
+    async fn rearm_local_follows_the_read_rule_over_every_residency_state() {
+        for case in read_cases::every_read_case() {
+            let built = read_cases::case_shard("rearm-cases", &case).await;
+            let answers = case.owns && !case.distrusted() && (case.live() || !case.cold());
+            let expected = if !answers {
+                LocalRearm::NotHeld
+            } else if case.live() {
+                LocalRearm::Rearmed
+            } else {
+                LocalRearm::Absent
+            };
+            assert_eq!(
+                built
+                    .shard
+                    .rearm_local(&built.key, Lifetime::Unbounded)
+                    .await
+                    .expect("rearm"),
+                expected,
+                "{case:?}"
+            );
+        }
     }
 
     /// An owned part not yet pulled cannot vouch for a miss, so a re-arm
@@ -12889,6 +13046,8 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod read_cases;
 #[cfg(test)]
 pub(crate) mod test_support;
 
