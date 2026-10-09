@@ -1878,15 +1878,17 @@ fn should_shrink_stripe(len: usize, capacity: usize) -> bool {
 
 /// [`Engine::enforce_capacity`]'s stop rule once one pass evicted nothing:
 /// whether to return immediately, rather than pay for
-/// [`Engine::evict_one_scanning`]'s full-stripe scan, and instead let the
-/// flusher's own installs bring `pending_spill_weight` down on their own.
-/// `true` whenever `pending_spill_weight` is still positive: some hand-off
-/// is in flight, and it will resolve, install or abandon, shortly with no
-/// further eviction needed on this call's part. `false` once it is back to
-/// zero, this loop's ordinary cue to fall back to the scan exactly as it
-/// always has, spill tier configured or not. Pure; unit tested directly.
-fn defer_to_flusher(pending_spill_weight: u64) -> bool {
-    pending_spill_weight > 0
+/// [`Engine::evict_one_scanning`]'s scan across stripes, and instead let
+/// the flusher's own installs bring `pending_spill_weight` down on their
+/// own. `true` only while some hand-off is in flight and `total_weight`,
+/// the resident weight no hand-off covers, is already within `limit`: the
+/// installs alone then bring the cache within it, with no further eviction
+/// needed on this call's part. `false` otherwise, this loop's cue to fall
+/// back to the scan, spill tier configured or not: a cache still over
+/// `limit` without its hand-offs stays over it after they install. Pure;
+/// unit tested directly.
+fn defer_to_flusher(total_weight: u64, pending_spill_weight: u64, limit: u64) -> bool {
+    pending_spill_weight > 0 && total_weight <= limit
 }
 
 /// [`Engine::enforce_capacity_with_reservation`]'s stop rule after a batch
@@ -4115,13 +4117,12 @@ where
     /// resident until the flusher's install resolves it, so
     /// `pending_spill_weight` is what keeps that still-resident RAM
     /// counting against the cap in the meantime. When a pass evicts
-    /// nothing and some hand-off is still pending, [`defer_to_flusher`]
-    /// has this return rather than pay for
-    /// [`Engine::evict_one_scanning`]'s full-stripe scan, trusting the
-    /// flusher's own installs to bring `pending_spill_weight` back down
-    /// shortly with no further eviction needed. With nothing pending, the
-    /// scan runs exactly as it always has, spill tier configured or not. A
-    /// thin wrapper, `reservation: None`, over
+    /// nothing, some hand-off is still pending and `total_weight` alone is
+    /// within the cap, [`defer_to_flusher`] has this return rather than pay
+    /// for [`Engine::evict_one_scanning`]'s scan across stripes: the
+    /// flusher's own installs bring the cache within the cap with no
+    /// further eviction needed. Otherwise the scan runs, spill tier
+    /// configured or not. A thin wrapper, `reservation: None`, over
     /// [`Engine::enforce_capacity_with_reservation`].
     pub(crate) fn enforce_capacity(&self, start_bucket: usize, now_ms: u64) {
         let _ = self.enforce_capacity_with_reservation(start_bucket, None, now_ms);
@@ -4144,6 +4145,21 @@ where
     pub(crate) fn enforce_capacity_with_reservation(
         &self,
         start_bucket: usize,
+        reservation: Option<&mut Reservation<'_>>,
+        now_ms: u64,
+    ) -> u64 {
+        self.evict_down_to(self.max_capacity, start_bucket, reservation, now_ms)
+    }
+
+    /// [`Engine::enforce_capacity_with_reservation`]'s loop, evicting until
+    /// `total_weight` plus `pending_spill_weight` is within `limit`, at
+    /// most `max_capacity`. [`Engine::promote_locked`] passes the cap less
+    /// the weight it is about to reinstall, to make that room first. A
+    /// no-op when `max_capacity` is [`u64::MAX`].
+    fn evict_down_to(
+        &self,
+        limit: u64,
+        start_bucket: usize,
         mut reservation: Option<&mut Reservation<'_>>,
         now_ms: u64,
     ) -> u64 {
@@ -4155,10 +4171,10 @@ where
             let total = self.total_weight.load(Ordering::Relaxed);
             let pending = self.pending_spill_weight_or_zero();
             let current = total.saturating_add(pending);
-            if current <= self.max_capacity {
+            if current <= limit {
                 return 0;
             }
-            let over_by = current - self.max_capacity;
+            let over_by = current - limit;
             let batch_outcome = self.evict_batch_sampled_with_reservation(
                 bucket,
                 over_by,
@@ -4169,14 +4185,14 @@ where
                 let total = self.total_weight.load(Ordering::Relaxed);
                 let pending = self.pending_spill_weight_or_zero();
                 let current = total.saturating_add(pending);
-                return deficit_once_still_over_capacity(
-                    current,
-                    self.max_capacity,
-                    batch_outcome.deficit,
-                );
+                return deficit_once_still_over_capacity(current, limit, batch_outcome.deficit);
             }
             if batch_outcome.made_no_progress() {
-                if defer_to_flusher(self.pending_spill_weight_or_zero()) {
+                if defer_to_flusher(
+                    self.total_weight.load(Ordering::Relaxed),
+                    self.pending_spill_weight_or_zero(),
+                    limit,
+                ) {
                     return 0;
                 }
                 match self.evict_one_scanning_with_reservation(
@@ -4897,11 +4913,19 @@ where
     /// or a version change since the disk read started means the
     /// promotion is a silent no-op. The caller's read already succeeded
     /// independently of this; only the RAM reinstall is skipped. Decodes
-    /// `key` from `key_bytes` for the one weigher call this makes. Adds the
-    /// freshly weighed entry's weight back to `total_weight`. **Never touches the digest or
-    /// `live_count`**: same key, same `ver`, same fingerprint, so nothing
-    /// about the entry's replicated identity changes. Also decrements
-    /// `sundog_spill_entries{cache}`, the mirror of
+    /// `key` from `key_bytes` for the one weigher call this makes.
+    ///
+    /// Makes room first: while the entry is still spilled, and so never an
+    /// eviction candidate, [`Engine::evict_down_to`] evicts down to
+    /// `max_capacity` less the entry's weight, then the entry's weight goes
+    /// back to `total_weight`. A read of a spilled key therefore never
+    /// holds more than the cap in RAM, and never evicts the entry it reads.
+    /// An entry heavier than the whole cap stays on disk
+    /// ([`promotion_fits`]).
+    ///
+    /// **Never touches the digest or `live_count`**: same key, same `ver`,
+    /// same fingerprint, so nothing about the entry's replicated identity
+    /// changes. Also decrements `sundog_spill_entries{cache}`, the mirror of
     /// `SpillSink::install`'s increment, since a resident entry is not
     /// counted among currently-spilled entries. Returns whether it
     /// promoted.
@@ -4913,26 +4937,33 @@ where
         read_ver: Hlc,
         value: &V,
         encoded: &Bytes,
+        now_ms: u64,
     ) -> bool {
         let bucket = stripe_index_from_hash(hash);
-        let mut stripe = self.stripes[bucket].write();
-        let stored_tombstone_ver = stripe.tombstones.get(key_bytes).map(|t| t.ver);
-        let Some(live) = stripe
-            .live
-            .find_mut(hash, |l| record_key(&l.record) == key_bytes)
-        else {
-            return false;
-        };
-        if !spilled_is_current(stored_tombstone_ver, Some(live.ver()), read_ver) {
-            return false;
-        }
-        if !matches!(live.state, EntryState::Spilled(_)) {
-            // Already resident: a racing promotion, or a fresh write that
-            // happens to share this version, got there first.
+        if !spilled_and_current(&self.stripes[bucket].read(), key_bytes, hash, read_ver) {
             return false;
         }
         let key: K = decode_key(key_bytes);
         let weight = self.weigher.as_ref().map_or(1, |w| w(&key, value));
+        if !promotion_fits(weight, self.max_capacity) {
+            return false;
+        }
+        let _ = self.evict_down_to(
+            self.max_capacity.saturating_sub(u64::from(weight)),
+            bucket,
+            None,
+            now_ms,
+        );
+        let mut stripe = self.stripes[bucket].write();
+        // Rechecked under the write lock: a write, removal or racing
+        // promotion may have landed while the room was made.
+        if !spilled_and_current(&stripe, key_bytes, hash, read_ver) {
+            return false;
+        }
+        let live = stripe
+            .live
+            .find_mut(hash, |l| record_key(&l.record) == key_bytes)
+            .expect("invariant: spilled_and_current found it under this same lock");
         set_record(
             live,
             build_resident_record(key_bytes, encoded.as_ref()),
@@ -4946,6 +4977,33 @@ where
         self.note_spill_departure(true);
         true
     }
+}
+
+/// Whether `stripe` holds `key_bytes` spilled at `read_ver` with no newer
+/// tombstone: the entry [`Engine::promote_locked`] may still reinstall.
+#[cfg(feature = "spill")]
+fn spilled_and_current<K, V>(
+    stripe: &Stripe<K, V>,
+    key_bytes: &[u8],
+    hash: u64,
+    read_ver: Hlc,
+) -> bool {
+    let stored_tombstone_ver = stripe.tombstones.get(key_bytes).map(|t| t.ver);
+    stripe
+        .live
+        .find(hash, |l| record_key(&l.record) == key_bytes)
+        .is_some_and(|live| {
+            spilled_is_current(stored_tombstone_ver, Some(live.ver()), read_ver)
+                && matches!(live.state, EntryState::Spilled(_))
+        })
+}
+
+/// Whether an entry of `weight` may come back into RAM under
+/// `max_capacity`: never one heavier than the whole cap, which no eviction
+/// makes room for. Pure; unit tested directly.
+#[cfg(feature = "spill")]
+const fn promotion_fits(weight: u32, max_capacity: u64) -> bool {
+    (weight as u64) <= max_capacity
 }
 
 /// The engine-side callback surface [`SpillTier`]'s flusher drives, so
@@ -7659,16 +7717,34 @@ mod tests {
     }
 
     #[test]
-    fn defer_to_flusher_true_only_while_pending_spill_weight_is_positive() {
+    fn defer_to_flusher_only_while_the_hand_offs_alone_hold_the_cache_over_its_limit() {
         assert!(
-            !defer_to_flusher(0),
+            !defer_to_flusher(10, 0, 10),
             "nothing pending: enforce_capacity's ordinary scanning fallback runs"
         );
         assert!(
-            defer_to_flusher(1),
-            "anything still pending: trust the flusher rather than scan every stripe"
+            defer_to_flusher(10, 1, 10),
+            "within the limit once the pending hand-off installs: trust the flusher"
         );
-        assert!(defer_to_flusher(u64::MAX));
+        assert!(defer_to_flusher(0, u64::MAX, 0));
+        assert!(
+            !defer_to_flusher(11, 1, 10),
+            "still over the limit after every pending hand-off installs: keep evicting"
+        );
+        assert!(!defer_to_flusher(u64::MAX, u64::MAX, 10));
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn promotion_fits_any_entry_no_heavier_than_the_whole_cap() {
+        assert!(promotion_fits(1, 1));
+        assert!(promotion_fits(0, 0));
+        assert!(promotion_fits(u32::MAX, u64::MAX));
+        assert!(
+            !promotion_fits(2, 1),
+            "no eviction makes room for an entry heavier than the whole cap"
+        );
+        assert!(!promotion_fits(u32::MAX, u64::from(u32::MAX) - 1));
     }
 
     #[test]
@@ -9220,6 +9296,7 @@ mod tests {
                 ver,
                 &"restored".to_string(),
                 &Bytes::from(postcard::to_stdvec(&"restored".to_string()).expect("string encodes")),
+                0,
             );
             assert!(
                 promoted,
@@ -9263,7 +9340,7 @@ mod tests {
             );
             let restored = "r".repeat(100);
             let encoded = Bytes::from(postcard::to_stdvec(&restored).expect("string encodes"));
-            assert!(engine.promote_locked(kb.as_ref(), hash, ver, &restored, &encoded));
+            assert!(engine.promote_locked(kb.as_ref(), hash, ver, &restored, &encoded, 0));
             assert_eq!(
                 engine.resident_bytes(),
                 Some(ENTRY_OVERHEAD_BYTES + (1 + kb.len() + encoded.len()) as u64),
@@ -9298,6 +9375,7 @@ mod tests {
                 ver,
                 &"stale-read".to_string(),
                 &Bytes::from_static(b"stale"),
+                0,
             );
             assert!(
                 !promoted,
@@ -9328,6 +9406,7 @@ mod tests {
                 ver,
                 &"restored".to_string(),
                 &Bytes::from(postcard::to_stdvec(&"restored".to_string()).expect("string encodes")),
+                0,
             );
             assert!(promoted);
 
@@ -9470,6 +9549,7 @@ mod tests {
                 ver,
                 &"restored".to_string(),
                 &Bytes::from(postcard::to_stdvec(&"restored".to_string()).expect("string encodes")),
+                0,
             ));
 
             let digest_before = engine.digests();

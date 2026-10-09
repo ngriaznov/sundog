@@ -2993,7 +2993,10 @@ where
     /// counts `sundog_spill_reads_total{cache,outcome}` accordingly. A hit
     /// counts `outcome = "hit"` and, iff it flips the entry back to
     /// residency, `sundog_spill_promotions_total{cache}`; a tombstone or a
-    /// newer write racing the disk read means it does not. No lock or
+    /// newer write racing the disk read means it does not, and neither
+    /// does an entry heavier than the whole `max_capacity`. The promotion
+    /// evicts colder entries first, so RAM stays within the cap (see
+    /// [`engine::Engine::promote_locked`]). No lock or
     /// permit is ever held across more than one `.await` point at a time,
     /// and no stripe lock is ever held across the disk read.
     #[cfg(feature = "spill")]
@@ -3010,7 +3013,7 @@ where
         let (ver, value, encoded) = self.read_spilled_by_bytes(key_bytes, hash).await?;
         if self
             .engine
-            .promote_locked(key_bytes, hash, ver, &value, &encoded)
+            .promote_locked(key_bytes, hash, ver, &value, &encoded, self.now_ms())
             && let Some(spill_read) = self.spill_read.get()
         {
             spill_read.promotions.increment(1);
@@ -12456,6 +12459,152 @@ mod tests {
                 took < Duration::from_secs(2),
                 "the batch ends its retries at once, took {took:?} of its 5s budget"
             );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A read that promotes a spilled entry back to RAM makes room for
+        /// it first, through `get` and through `get_or_load`'s spilled-key
+        /// arm alike: reading every key of a shard spilled far past its cap
+        /// leaves at most the cap resident, every key still live, no loader
+        /// called, and the last key read in RAM. With 1024 stripes and a
+        /// cap of four, each key is alone in its stripe, so a pass that
+        /// sampled the promoted entry's own stripe after reinstalling it
+        /// would evict that entry straight back to disk.
+        #[tokio::test]
+        async fn reading_spilled_keys_keeps_the_shard_within_its_cap() {
+            const KEYS: u32 = 24;
+            const CAP: u32 = 4;
+            let (shard, dir) = spill_shard("promote-within-cap", u64::from(CAP));
+            shard
+                .insert_many((0..KEYS).map(|k| (k, format!("value-{k}"))))
+                .await
+                .expect("insert_many");
+            let resident = |shard: &Shard<u32, String>| {
+                (0..KEYS).filter(|k| shard.get_sync(k).is_some()).count()
+            };
+            assert!(
+                poll_until(POLL_TIMEOUT, || resident(&shard) <= CAP as usize).await,
+                "the writes spill all but the cap"
+            );
+
+            let loads = AtomicUsize::new(0);
+            for k in 0..KEYS {
+                let value = if k % 2 == 0 {
+                    shard.get(&k).await
+                } else {
+                    shard
+                        .get_or_load(&k, async |_| {
+                            loads.fetch_add(1, Ordering::Relaxed);
+                            Ok::<_, std::io::Error>(String::new())
+                        })
+                        .await
+                        .ok()
+                };
+                assert_eq!(value, Some(format!("value-{k}")), "key {k} reads back");
+            }
+            assert_eq!(
+                loads.load(Ordering::Relaxed),
+                0,
+                "every key reads back off disk"
+            );
+            assert!(
+                poll_until(POLL_TIMEOUT, || resident(&shard) <= CAP as usize).await,
+                "reads leave at most the cap resident, {} of {KEYS} are",
+                resident(&shard)
+            );
+            let (live, weight) = shard.engine.debug_totals();
+            assert_eq!(
+                live,
+                u64::from(KEYS),
+                "every key stays live, in RAM or on disk"
+            );
+            assert!(
+                weight <= u64::from(CAP),
+                "resident weight {weight} is within the cap"
+            );
+            assert!(
+                shard.get_sync(&(KEYS - 1)).is_some(),
+                "the last key read stays in RAM"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A spilled entry heavier than the whole cap reads back off disk
+        /// on every read and stays there: no eviction makes room for it,
+        /// so reinstalling it would leave the shard over its cap.
+        #[tokio::test]
+        async fn a_spilled_entry_heavier_than_the_cap_reads_from_disk_and_stays_there() {
+            const CAP: u64 = 10;
+            let dir = temp_dir("oversize-promotion");
+            let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("oversize-promotion"),
+                Mode::Local,
+                NodeId::from(1u64),
+                CAP,
+                None,
+                None,
+            )
+            .with_weigher(|_key: &u32, value: &String| {
+                u32::try_from(value.len()).unwrap_or(u32::MAX)
+            })
+            .with_spill(&cfg)
+            .expect("tier opens");
+            let big = "x".repeat(64);
+            shard.insert(1, big.clone()).await.expect("insert");
+            assert!(
+                poll_until(POLL_TIMEOUT, || shard.get_sync(&1).is_none()).await,
+                "the write spills the entry heavier than the cap"
+            );
+            for read in 1..=3 {
+                assert_eq!(shard.get(&1).await, Some(big.clone()), "read {read}");
+                assert!(
+                    shard.get_sync(&1).is_none(),
+                    "read {read} leaves the entry on disk"
+                );
+            }
+            assert_eq!(shard.engine.debug_totals(), (1, 0));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A write burst far past the cap settles within it once the
+        /// flusher installs its hand-offs: an eviction pass that found
+        /// nothing to evict leaves the rest to the flusher only when the
+        /// hand-offs in flight are all that hold the shard over its cap.
+        #[tokio::test]
+        async fn a_write_burst_past_the_cap_settles_within_it() {
+            const KEYS: u32 = 8_000;
+            const CAP: u64 = 2_000;
+            let dir = temp_dir("write-burst-within-cap");
+            let cfg = SpillConfig::new(&dir, 4 << 20).region_bytes(256 * 1024);
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("write-burst-within-cap"),
+                Mode::Local,
+                NodeId::from(1u64),
+                CAP,
+                None,
+                None,
+            )
+            .with_spill(&cfg)
+            .expect("tier opens");
+            shard
+                .insert_many((0..KEYS).map(|k| (k, format!("value-{k}"))))
+                .await
+                .expect("insert_many");
+            let resident = || -> u64 {
+                (0..KEYS)
+                    .filter(|k| shard.get_sync(k).is_some())
+                    .map(|_| 1)
+                    .sum()
+            };
+            assert!(
+                poll_until(POLL_TIMEOUT, || resident() <= CAP).await,
+                "the burst settles within the cap, {} of {KEYS} resident",
+                resident()
+            );
+            let (live, weight) = shard.engine.debug_totals();
+            assert_eq!(live, u64::from(KEYS), "every key stays live");
+            assert!(weight <= CAP, "resident weight {weight} is within the cap");
             let _ = std::fs::remove_dir_all(&dir);
         }
 
