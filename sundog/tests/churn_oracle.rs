@@ -10,6 +10,10 @@
 //! answers a reader whose view has not caught up. Once every view agrees, a
 //! deleted key never reads back.
 //!
+//! The first violations carry the reading node's `Cache::explain` of
+//! the key, taken right after the read, and a `settle` that times
+//! out prints the same account for its first wrong reads.
+//!
 //! The churn schedule's delays come from a seed, printed on failure and
 //! overridden with `SUNDOG_ORACLE_SEED`; `SUNDOG_ORACLE_RUNS` runs that many
 //! seeds in a row.
@@ -28,6 +32,15 @@ use common::fast_config;
 const CLUSTER: &str = "it-churn-oracle";
 const CACHE: &str = "oracle";
 const KEYS: u32 = 400;
+
+/// Violations the oracle keeps. A later one counts as a read and is dropped.
+const MAX_VIOLATIONS: usize = 50;
+
+/// How many of the first violations carry the reading node's explanation.
+const EXPLAINED_VIOLATIONS: usize = 5;
+
+/// How many of the first wrong reads a [`settle_to`] timeout explains.
+const EXPLAINED_UNSETTLED: usize = 3;
 
 /// What a read of `key` must answer once written: `None` for the keys the
 /// setup deletes, every fifth.
@@ -107,34 +120,115 @@ fn views_agree(before: &[Vec<NodeId>], after: &[Vec<NodeId>]) -> bool {
         .all(|owners| before.first().is_some_and(|first| owners == first))
 }
 
-/// Checks one read of `key` from `node` against the oracle. `settled` is
-/// whether every live view named the same owners around the read.
-fn judge(
+/// What the oracle makes of one read.
+#[derive(Debug, PartialEq, Eq)]
+enum Judgement {
+    /// The read answers what the oracle expects.
+    Correct,
+    /// The read answers `CacheError::FetchUnavailable`, which is allowed.
+    Unavailable,
+    /// A deleted key's old value while the views disagree about its owners:
+    /// allowed staleness.
+    Stale,
+    /// The read breaks the contract, for the reason named.
+    Violation(&'static str),
+}
+
+/// Classifies one read against `want`, the oracle's answer for its key.
+/// `settled` is whether every live view named the same owners around the
+/// read.
+fn classify(
+    read: &Result<Option<String>, CacheError>,
+    want: Option<&str>,
+    settled: bool,
+) -> Judgement {
+    match (read, want) {
+        (Ok(got), want) if got.as_deref() == want => Judgement::Correct,
+        (Err(CacheError::FetchUnavailable { .. }), _) => Judgement::Unavailable,
+        (Ok(Some(_)), None) if !settled => Judgement::Stale,
+        (Ok(Some(_)), None) => {
+            Judgement::Violation("a deleted key came back once every view agreed")
+        }
+        (Ok(None), Some(_)) => Judgement::Violation("a miss for a key a live node holds"),
+        (Ok(_), _) => Judgement::Violation("a wrong value"),
+        (Err(_), _) => Judgement::Violation("an unexpected error"),
+    }
+}
+
+/// The members' owner sets from [`owner_sets`] as `[id id] [id id]`, one
+/// bracket per member in the order the reader lists them, each id in the hex
+/// an explanation prints.
+fn show_owners(views: &[Vec<NodeId>]) -> String {
+    views
+        .iter()
+        .map(|owners| {
+            let ids: Vec<String> = owners.iter().map(ToString::to_string).collect();
+            format!("[{}]", ids.join(" "))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `cache`'s [`Cache::explain`] of a read of `key`, as text for a failure
+/// message, every line after the first indented under its label.
+async fn explained(cache: &Cache<u32, String>, key: u32) -> String {
+    match cache.explain(&key).await {
+        Ok(explanation) => explanation.to_string().replace('\n', "\n   "),
+        Err(error) => format!("not available: {error}"),
+    }
+}
+
+/// Checks one read of `key` from `node`, a member whose cache is `cache`,
+/// against the oracle. `before` and `after` are the live members' owner sets
+/// for the key around the read; the read is settled when they all name the
+/// same owners.
+///
+/// The first [`EXPLAINED_VIOLATIONS`] violations also record both owner sets
+/// and `cache`'s explanation of the key, taken after the read. Only that path
+/// awaits: every read the oracle accepts, and every violation past the first
+/// few, returns on the first poll, so the reader's schedule is the one it has
+/// without explanations.
+async fn judge(
     findings: &Findings,
     node: &str,
+    cache: &Cache<u32, String>,
     key: u32,
     read: &Result<Option<String>, CacheError>,
-    settled: bool,
+    before: &[Vec<NodeId>],
+    after: &[Vec<NodeId>],
 ) {
     findings.reads.fetch_add(1, Ordering::Relaxed);
-    let verdict = match (read, expected(key)) {
-        (Ok(got), want) if *got == want => return,
-        (Err(CacheError::FetchUnavailable { .. }), _) => {
+    let verdict = match classify(read, expected(key).as_deref(), views_agree(before, after)) {
+        Judgement::Correct => return,
+        Judgement::Unavailable => {
             findings.unavailable.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        (Ok(Some(_)), None) if !settled => {
+        Judgement::Stale => {
             findings.stale.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        (Ok(Some(_)), None) => "a deleted key came back once every view agreed",
-        (Ok(None), Some(_)) => "a miss for a key a live node holds",
-        (Ok(_), _) => "a wrong value",
-        (Err(_), _) => "an unexpected error",
+        Judgement::Violation(verdict) => verdict,
     };
+    // The lock decides and is released before the await below: a `std` guard
+    // held across it would make the reader's future not `Send`.
+    let explain = {
+        let violations = findings.violations.lock().expect("unpoisoned");
+        if violations.len() >= MAX_VIOLATIONS {
+            return;
+        }
+        violations.len() < EXPLAINED_VIOLATIONS
+    };
+    let mut lines = vec![format!("{node}/k{key}: {verdict}: {read:?}")];
+    if explain {
+        let explanation = explained(cache, key).await;
+        lines.push(format!("owners before the read: {}", show_owners(before)));
+        lines.push(format!("owners after the read: {}", show_owners(after)));
+        lines.push(format!("explained after the read: {explanation}"));
+    }
     let mut violations = findings.violations.lock().expect("unpoisoned");
-    if violations.len() < 50 {
-        violations.push(format!("{node}/k{key}: {verdict}: {read:?}"));
+    if violations.len() < MAX_VIOLATIONS {
+        violations.push(lines.join("\n "));
     }
 }
 
@@ -157,15 +251,49 @@ async fn settle(live: &Live, what: &str) {
     settle_to(live, what, Settled::Placed).await;
 }
 
+/// A read [`settle_to`] found wrong: the member that made it, that member's
+/// cache, the key, and what went wrong: `owner-lacks-copy`, or what the fetch
+/// answered (`value`, `miss`, `unavailable`, `error`).
+struct Wrong<'a> {
+    name: &'static str,
+    cache: &'a Cache<u32, String>,
+    key: u32,
+    kind: &'static str,
+}
+
+/// The panic message of a [`settle_to`] that timed out after `what`: the
+/// wrong reads per node and kind, tallied, then the first
+/// [`EXPLAINED_UNSETTLED`] of them with their cache's explanation of the key,
+/// taken after the timeout.
+async fn never_settled(what: &str, wrong: &[Wrong<'_>]) -> String {
+    let mut tally: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for entry in wrong {
+        *tally
+            .entry(format!("{}:{}", entry.name, entry.kind))
+            .or_default() += 1;
+    }
+    let mut lines = vec![format!(
+        "never settled after {what}: wrong reads per node and kind {tally:?}"
+    )];
+    for entry in wrong.iter().take(EXPLAINED_UNSETTLED) {
+        let explanation = explained(entry.cache, entry.key).await;
+        lines.push(format!(
+            "{}/k{} ({}), explained after the timeout: {explanation}",
+            entry.name, entry.key, entry.kind
+        ));
+    }
+    lines.join("\n ")
+}
+
 /// Waits until every live member answers every key as the oracle expects
 /// and, for [`Settled::Placed`], every current owner of a present key holds
 /// it locally. On timeout, panics with what each member still gets wrong,
-/// tallied.
+/// tallied, and the first few wrong reads explained.
 async fn settle_to(live: &Live, what: &str, level: Settled) {
     let members = live.lock().expect("unpoisoned").clone();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
-        let mut wrong: Vec<String> = Vec::new();
+        let mut wrong: Vec<Wrong<'_>> = Vec::new();
         for (name, node, cache) in &members {
             for key in 0..KEYS {
                 if level == Settled::Placed
@@ -173,7 +301,12 @@ async fn settle_to(live: &Live, what: &str, level: Settled) {
                     && members[0].2.owners_of(&key).contains(node)
                     && cache.get(&key).await != expected(key)
                 {
-                    wrong.push(format!("{name}:owner-lacks-copy"));
+                    wrong.push(Wrong {
+                        name,
+                        cache,
+                        key,
+                        kind: "owner-lacks-copy",
+                    });
                 }
                 let read = cache.fetch(&key).await;
                 if read.as_ref().ok() != Some(&expected(key)) {
@@ -183,7 +316,12 @@ async fn settle_to(live: &Live, what: &str, level: Settled) {
                         Err(CacheError::FetchUnavailable { .. }) => "unavailable",
                         Err(_) => "error",
                     };
-                    wrong.push(format!("{name}:{kind}"));
+                    wrong.push(Wrong {
+                        name,
+                        cache,
+                        key,
+                        kind,
+                    });
                 }
             }
         }
@@ -192,12 +330,8 @@ async fn settle_to(live: &Live, what: &str, level: Settled) {
             return;
         }
         if tokio::time::Instant::now() >= deadline {
-            let mut tally: std::collections::BTreeMap<String, usize> =
-                std::collections::BTreeMap::new();
-            for entry in wrong {
-                *tally.entry(entry).or_default() += 1;
-            }
-            panic!("never settled after {what}: wrong reads per node and kind {tally:?}");
+            let report = never_settled(what, &wrong).await;
+            panic!("{report}");
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -241,7 +375,7 @@ async fn run(seed: u64) {
                         let before = owner_sets(&members, key);
                         let read = cache.fetch(&key).await;
                         let after = owner_sets(&members, key);
-                        judge(&findings, name, key, &read, views_agree(&before, &after));
+                        judge(&findings, name, cache, key, &read, &before, &after).await;
                     }
                     // A fetch served from a local copy completes without
                     // awaiting anything, so once every member holds every
@@ -346,4 +480,226 @@ fn views_agree_only_when_every_view_names_the_same_owners_before_and_after() {
         !views_agree(&[ab.clone(), ab.clone()], &[vec![b, c], vec![b, c]]),
         "the views moved during the read, even though they agree after it"
     );
+}
+
+#[test]
+fn classify_allows_unavailable_and_unsettled_stale_reads_and_flags_every_other_wrong_answer() {
+    type Read = Result<Option<String>, CacheError>;
+    let value = |text: &str| -> Read { Ok(Some(text.to_owned())) };
+    let miss = || -> Read { Ok(None) };
+    let unavailable = || -> Read {
+        Err(CacheError::FetchUnavailable {
+            cache: CACHE.into(),
+        })
+    };
+    let closed = || -> Read {
+        Err(CacheError::Closed {
+            cache: CACHE.into(),
+        })
+    };
+    let came_back = "a deleted key came back once every view agreed";
+    let missed = "a miss for a key a live node holds";
+    // (read, what the oracle expects, whether the views agreed, judgement)
+    let cases = [
+        (value("v1"), Some("v1"), true, Judgement::Correct),
+        (value("v1"), Some("v1"), false, Judgement::Correct),
+        (miss(), None, true, Judgement::Correct),
+        (miss(), None, false, Judgement::Correct),
+        (unavailable(), Some("v1"), true, Judgement::Unavailable),
+        (unavailable(), None, false, Judgement::Unavailable),
+        (value("v5"), None, false, Judgement::Stale),
+        (value("v5"), None, true, Judgement::Violation(came_back)),
+        (miss(), Some("v1"), true, Judgement::Violation(missed)),
+        (miss(), Some("v1"), false, Judgement::Violation(missed)),
+        (
+            value("v2"),
+            Some("v1"),
+            true,
+            Judgement::Violation("a wrong value"),
+        ),
+        (
+            value("v2"),
+            Some("v1"),
+            false,
+            Judgement::Violation("a wrong value"),
+        ),
+        (
+            closed(),
+            Some("v1"),
+            true,
+            Judgement::Violation("an unexpected error"),
+        ),
+        (
+            closed(),
+            None,
+            false,
+            Judgement::Violation("an unexpected error"),
+        ),
+    ];
+    for (read, want, settled, judgement) in cases {
+        assert_eq!(
+            classify(&read, want, settled),
+            judgement,
+            "{read:?} against {want:?}, views agreed: {settled}"
+        );
+    }
+}
+
+#[test]
+fn owner_sets_show_as_one_bracket_per_member_in_the_hex_an_explanation_prints() {
+    let (a, b, c) = (NodeId::from(1), NodeId::from(2), NodeId::from(3));
+    assert_eq!(
+        show_owners(&[vec![a, b], vec![a, c]]),
+        "[0000000000000001 0000000000000002] [0000000000000001 0000000000000003]"
+    );
+    assert_eq!(show_owners(&[vec![b]]), "[0000000000000002]");
+    assert_eq!(show_owners(&[vec![], vec![c]]), "[] [0000000000000003]");
+    assert_eq!(show_owners(&[]), "");
+}
+
+/// A violation the oracle records carries the reading node's own account of
+/// the key, taken after the read: the key's part, the owners the node names,
+/// its residency marks, and what its copy holds, which here contradicts the
+/// fabricated miss. The two owner sets sit above it in the node's hex ids.
+#[tokio::test]
+async fn a_violation_is_reported_with_its_explanation() {
+    let solo = join("solo", &[]).await;
+    let node = solo.cluster.node_id();
+    let key = 7;
+    solo.cache
+        .insert(key, expected(key).expect("key 7 is not deleted"))
+        .await
+        .expect("insert");
+    assert_eq!(
+        solo.cache.owners_of(&key),
+        vec![node],
+        "a solo node owns every key alone"
+    );
+    let part = solo.cache.explain(&key).await.expect("u32 encodes").part;
+    let views = owner_sets(&[("solo", node, solo.cache.clone())], key);
+
+    // The oracle expects "v7"; a miss breaks the contract whatever the views
+    // say.
+    let findings = Findings::default();
+    judge(
+        &findings,
+        "solo",
+        &solo.cache,
+        key,
+        &Ok(None),
+        &views,
+        &views,
+    )
+    .await;
+
+    let violations = findings.violations.lock().expect("unpoisoned").clone();
+    assert_eq!(violations.len(), 1, "one wrong read, one violation");
+    let text = &violations[0];
+    assert!(
+        text.starts_with("solo/k7: a miss for a key a live node holds: Ok(None)\n "),
+        "{text}"
+    );
+    for expected_text in [
+        format!("owners before the read: [{node}]\n"),
+        format!("owners after the read: [{node}]\n"),
+        format!("explained after the read: cache {CACHE} on node {node}, "),
+        format!("part {}/{}, at ", part.bucket(), part.part()),
+        format!("owners: {node}\n"),
+        "residency: owned\n".to_owned(),
+        "local: live ".to_owned(),
+        "source: this node, hit".to_owned(),
+    ] {
+        assert!(text.contains(&expected_text), "{expected_text:?} in {text}");
+    }
+    assert_eq!(findings.reads.load(Ordering::Relaxed), 1);
+
+    solo.cluster.shutdown().await;
+}
+
+/// The oracle keeps its first fifty violations and explains only the first
+/// five: the sixth is the one-line form, and a violation past the fiftieth is
+/// counted as a read and dropped.
+#[tokio::test]
+async fn only_the_first_five_violations_are_explained_and_only_the_first_fifty_are_kept() {
+    let solo = join("solo", &[]).await;
+    let views = owner_sets(&[("solo", solo.cluster.node_id(), solo.cache.clone())], 7);
+
+    // Every key reads a value the oracle never expects: a wrong value for a
+    // key it holds, a resurrection for a deleted key once the views agree.
+    let findings = Findings::default();
+    let wrong = Ok(Some("wrong".to_owned()));
+    for key in 0..60 {
+        judge(&findings, "solo", &solo.cache, key, &wrong, &views, &views).await;
+    }
+
+    let violations = findings.violations.lock().expect("unpoisoned").clone();
+    assert_eq!(violations.len(), 50, "the list is capped");
+    assert_eq!(findings.reads.load(Ordering::Relaxed), 60);
+    for (index, text) in violations.iter().enumerate() {
+        assert!(
+            text.starts_with(&format!("solo/k{index}: ")),
+            "violations keep the order they happened in: {text}"
+        );
+        assert_eq!(
+            text.contains("explained after the read"),
+            index < 5,
+            "violation {index}: {text}"
+        );
+        assert_eq!(text.contains('\n'), index < 5, "violation {index}: {text}");
+    }
+
+    solo.cluster.shutdown().await;
+}
+
+/// A `settle_to` that times out reports every wrong read tallied by node and
+/// kind, and explains the first three through their own caches; a fourth
+/// wrong read is tallied and not explained.
+#[tokio::test]
+async fn a_timeout_tallies_every_wrong_read_and_explains_the_first_three() {
+    let solo = join("solo", &[]).await;
+    let node = solo.cluster.node_id();
+    let wrong: Vec<Wrong<'_>> = [
+        (0, "miss"),
+        (1, "miss"),
+        (2, "owner-lacks-copy"),
+        (3, "value"),
+        (4, "miss"),
+    ]
+    .into_iter()
+    .map(|(key, kind)| Wrong {
+        name: "solo",
+        cache: &solo.cache,
+        key,
+        kind,
+    })
+    .collect();
+
+    let report = never_settled("a fixture", &wrong).await;
+
+    assert!(
+        report.starts_with(
+            "never settled after a fixture: wrong reads per node and kind \
+             {\"solo:miss\": 3, \"solo:owner-lacks-copy\": 1, \"solo:value\": 1}\n "
+        ),
+        "{report}"
+    );
+    assert_eq!(report.matches("explained after the timeout").count(), 3);
+    for (key, kind) in [(0, "miss"), (1, "miss"), (2, "owner-lacks-copy")] {
+        assert!(
+            report.contains(&format!(
+                "solo/k{key} ({kind}), explained after the timeout: "
+            )),
+            "{report}"
+        );
+    }
+    assert!(!report.contains("solo/k3 "), "{report}");
+    assert_eq!(
+        report
+            .matches(&format!("cache {CACHE} on node {node}, "))
+            .count(),
+        3,
+        "each explanation comes from the cache that read"
+    );
+
+    solo.cluster.shutdown().await;
 }
