@@ -530,7 +530,11 @@ where
 
     /// Answers each of `todo` from the cache where it can, and otherwise
     /// joins the load in flight for it or starts one, stamped now. Returns
-    /// the loads this call starts and every load the call waits on.
+    /// the loads this call starts and every load the call waits on. Each
+    /// started load's guard stays armed until every key is claimed: a later
+    /// key's spilled read is a point where this future can be dropped, and
+    /// dropping it there frees the in-flight entries already started
+    /// instead of leaving their waiters on a load that never runs.
     #[cfg_attr(
         not(feature = "spill"),
         allow(
@@ -546,6 +550,8 @@ where
     ) -> (Vec<Queued<K, V>>, Vec<Wait<K, V>>) {
         let mut owned = Vec::new();
         let mut waits = Vec::with_capacity(todo.len());
+        #[cfg(feature = "spill")]
+        let mut armed = Vec::new();
         for (key, key_bytes, hash) in todo {
             let now = self.now_ms();
             if let Some(value) = self.read_resident(&key, key_bytes.as_ref(), hash, now) {
@@ -591,7 +597,7 @@ where
                             found.insert(key, value);
                             continue;
                         }
-                        guard.complete();
+                        armed.push(guard);
                     }
                     let slot = Arc::new(OnceLock::new());
                     let done = inflight.subscribe();
@@ -611,6 +617,10 @@ where
                     });
                 }
             }
+        }
+        #[cfg(feature = "spill")]
+        for guard in armed {
+            guard.complete();
         }
         (owned, waits)
     }

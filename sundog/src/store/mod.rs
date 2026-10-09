@@ -12731,6 +12731,68 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        /// A `load_many` dropped while it waits to read a later key's
+        /// spilled value frees the in-flight entries of the keys it already
+        /// claimed: a later load of such a key runs rather than join a load
+        /// that never ends.
+        #[tokio::test]
+        async fn a_load_many_dropped_mid_claim_frees_the_keys_it_claimed() {
+            let dir = temp_dir("load-many-dropped-mid-claim");
+            let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("load-many-dropped-mid-claim"),
+                Mode::Local,
+                NodeId::from(1u64),
+                1,
+                None,
+                None,
+            )
+            .with_loader(crate::store::load::Loader::batch(
+                |keys: Vec<u32>| async move {
+                    Ok::<_, std::io::Error>(
+                        keys.into_iter()
+                            .map(|key| (key, format!("loaded-{key}")))
+                            .collect::<HashMap<_, _>>(),
+                    )
+                },
+            ))
+            .with_spill(&cfg)
+            .expect("tier opens");
+            shard.insert(2, "two".to_string()).await.expect("insert 2");
+            shard
+                .insert(3, "three".to_string())
+                .await
+                .expect("insert 3");
+            assert!(
+                poll_until(POLL_TIMEOUT, || {
+                    shard.get_sync(&2).is_none() || shard.get_sync(&3).is_none()
+                })
+                .await,
+                "one of the two keys spills under the one-entry cap"
+            );
+            let spilled = if shard.get_sync(&2).is_none() { 2 } else { 3 };
+
+            let semaphore = Arc::clone(&shard.spill_read.get().expect("a spill tier").semaphore);
+            let permits = u32::try_from(semaphore.available_permits()).expect("a small count");
+            let held = semaphore
+                .acquire_many_owned(permits)
+                .await
+                .expect("the read semaphore is open");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), shard.load_many([1, spilled]))
+                    .await
+                    .is_err(),
+                "the call claims key 1, then waits on the held read permits for the spilled key"
+            );
+            drop(held);
+
+            let loaded = tokio::time::timeout(Duration::from_secs(5), shard.load(&1))
+                .await
+                .expect("a later load of the claimed key runs rather than hang");
+            assert_eq!(loaded.expect("load"), Some("loaded-1".to_string()));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         /// A write burst far past the cap settles within it once the
         /// flusher installs its hand-offs: an eviction pass that found
         /// nothing to evict leaves the rest to the flusher only when the

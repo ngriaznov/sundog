@@ -30,11 +30,17 @@ All notable changes to this project are documented in this file. Format follows
   installs alone bring the cache within the cap. They do only when the
   weight still resident outside those hand-offs is already within it, or
   when the tier refused the pass's victim, most often for a full flush
-  queue; otherwise
-  the cache stayed over the cap until the next write: an 8,000-key
-  `insert_many` into a cache capped at 2,000 left 2,241 resident. The pass
-  now leaves the rest to the flusher only in those two cases, and evicts on
-  otherwise.
+  queue; otherwise the cache stayed over the cap until the next write: an
+  8,000-key `insert_many` into a cache capped at 2,000 left 2,241 resident.
+  The pass now leaves the rest to the flusher only in those two cases, and
+  evicts on otherwise.
+- **A `load_many` dropped mid-claim no longer strands its keys.** With
+  `spill` and a registered loader, a `load_many` dropped while it waited to
+  read one key's spilled value off disk, by a timeout or a cancelled
+  caller, left every key it had already claimed for loading registered as
+  in flight with no load to run: each later `load`, `load_many` or
+  `get_or_load` of such a key waited forever. The claim now frees those
+  keys when it is dropped.
 
 ## [0.6.5] – 2026-10-08
 
