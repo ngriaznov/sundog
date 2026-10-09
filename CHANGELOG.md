@@ -15,16 +15,22 @@ All notable changes to this project are documented in this file. Format follows
   evicts colder entries to make room before the entry returns to RAM,
   while the entry is still on disk and so never its own victim, and claims
   that room atomically, so concurrent reads never take the same room
-  twice. A read that finds no room, behind a flush queue too full to take
-  a victim or for an entry heavier than the whole cap, answers from disk
-  and leaves the entry there; concurrent `get_or_load` and `load_many`
-  calls of such a key still share one disk read.
+  twice. A read that finds no room answers from disk and leaves the entry
+  there: an entry heavier than the whole cap, or, in `Mode::Replicated` and
+  `Mode::Distributed`, whose tier keeps a victim resident when its flush
+  queue is full, a read behind a full queue. A `Local` or `Invalidation`
+  cache drops that victim, as a single write's eviction does, and the read
+  promotes. Concurrent `get_or_load` and `load_many` calls of a spilled
+  key share one disk read whether or not it promotes, and a call that
+  joins after the key was removed, overwritten or expired reads again
+  rather than answer the old value.
 - **A write burst past `max_capacity` settles within it.** With `spill`, an
   eviction pass that found nothing to evict returned whenever a hand-off to
   the flusher was still in flight, on the premise that the flusher's
   installs alone bring the cache within the cap. They do only when the
   weight still resident outside those hand-offs is already within it, or
-  when the pass found its victim refused by a full flush queue; otherwise
+  when the tier refused the pass's victim, most often for a full flush
+  queue; otherwise
   the cache stayed over the cap until the next write: an 8,000-key
   `insert_many` into a cache capped at 2,000 left 2,241 resident. The pass
   now leaves the rest to the flusher only in those two cases, and evicts on

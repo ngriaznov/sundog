@@ -573,14 +573,21 @@ where
                             hash,
                             Arc::clone(&inflight),
                         );
-                        if let Some(value) =
+                        if let Some((ver, value)) =
                             self.get_spilled_by_bytes(key_bytes.as_ref(), hash).await
                         {
                             self.hits.increment(1);
                             // Joined waiters answer with the value, promoted
-                            // back to RAM or not.
-                            let _ = inflight.value.set(value.clone());
-                            drop(guard);
+                            // back to RAM or not, iff the key still holds it.
+                            self.engine.finish_spilled_read(
+                                &key_bytes,
+                                hash,
+                                &inflight,
+                                ver,
+                                value.clone(),
+                                self.now_ms(),
+                            );
+                            guard.complete();
                             found.insert(key, value);
                             continue;
                         }

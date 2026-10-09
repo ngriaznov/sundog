@@ -592,8 +592,9 @@ pub(crate) struct Inflight<V> {
     pub(crate) error: OnceLock<Arc<dyn std::error::Error + Send + Sync>>,
     /// Set iff the fill finished without storing its value, because the
     /// shard sat at its memory ceiling or an invalidation landed during the
-    /// load, or once the owner read the key's spilled value off disk: a
-    /// joined waiter returns this value instead of loading again.
+    /// load, or once the owner read the key's spilled value off disk and
+    /// the key still held it ([`Engine::finish_spilled_read`]): a joined
+    /// waiter returns this value instead of loading again.
     pub(crate) value: OnceLock<V>,
     /// Set when an invalidation for the key lands while the load runs. The
     /// loader may have read the source before the change the invalidation
@@ -1880,16 +1881,17 @@ fn should_shrink_stripe(len: usize, capacity: usize) -> bool {
 /// [`Engine::enforce_capacity`]'s stop rule once one pass evicted nothing:
 /// whether to return immediately, rather than pay for
 /// [`Engine::evict_one_scanning`]'s scan across stripes, and leave the rest
-/// to the flusher. Only ever `true` while some hand-off is in flight, and
-/// then in either of two cases: the pass `refused` a victim, which with a
-/// hand-off in flight is the flush queue being full, so every other
-/// stripe's victim would be refused too until the flusher drains it; or
-/// `total_weight`, the resident weight no hand-off covers, is already
-/// within `limit`, so the installs alone bring the cache within it. `false`
-/// otherwise, this loop's cue to fall back to the scan, spill tier
-/// configured or not: a cache still over `limit` without its hand-offs, and
-/// with room in its queue, stays over it after they install. Pure; unit
-/// tested directly.
+/// to the flusher and later passes. Only ever `true` while some hand-off is
+/// in flight, and then in either of two cases: the tier `refused` the
+/// pass's victim, most often because the flush queue is full, which
+/// refuses every other stripe's victim alike until the flusher drains it;
+/// or `total_weight`, the resident weight no hand-off covers, is already
+/// within `limit`, so the installs alone bring the cache within it. A
+/// refusal particular to its victim, a record larger than a region or than
+/// the queue's free bytes, stops the pass as well. `false` otherwise, this
+/// loop's cue to fall back to the scan, spill tier configured or not: a
+/// cache still over `limit` without its hand-offs stays over it after they
+/// install. Pure; unit tested directly.
 fn defer_to_flusher(
     refused: bool,
     total_weight: u64,
@@ -1944,9 +1946,9 @@ struct EvictOutcome {
     /// than spin retrying an exhausted budget.
     deficit: u64,
     /// Whether this pass left a victim resident because the spill tier
-    /// refused its hand-off ([`VictimOutcome::Deferred`]). With a hand-off
-    /// in flight, that refusal is the flush queue being full, which every
-    /// other stripe's victim would meet too.
+    /// refused its hand-off ([`VictimOutcome::Deferred`]): a full flush
+    /// queue, a record larger than a region or than the queue's free bytes,
+    /// or a closed tier.
     refused: bool,
 }
 
@@ -3984,7 +3986,7 @@ where
     /// reports [`EvictOutcome::deficit`]: one reservation covers every
     /// stripe, so a deficit in one is a deficit in all. Stops early too,
     /// `Some` with no progress, at a victim refused while a hand-off is in
-    /// flight: the flush queue is full for every stripe alike.
+    /// flight, the case [`defer_to_flusher`] leaves to the flusher.
     fn evict_one_scanning_with_reservation(
         &self,
         bucket: usize,
@@ -3999,8 +4001,8 @@ where
                     reservation.as_deref_mut(),
                     now_ms,
                 );
-                let queue_full = outcome.refused && self.pending_spill_weight_or_zero() > 0;
-                (!outcome.made_no_progress() || outcome.deficit > 0 || queue_full)
+                let refused_while_busy = outcome.refused && self.pending_spill_weight_or_zero() > 0;
+                (!outcome.made_no_progress() || outcome.deficit > 0 || refused_while_busy)
                     .then_some(outcome)
             })
     }
@@ -4151,11 +4153,11 @@ where
     /// counting against the cap in the meantime. When a pass evicts nothing
     /// while some hand-off is still pending, [`defer_to_flusher`] has this
     /// return rather than pay for [`Engine::evict_one_scanning`]'s scan
-    /// across stripes, if the pass found its victim refused by a full flush
-    /// queue or `total_weight` alone is within the cap: either way only the
-    /// flusher's own installs make further progress. Otherwise the scan
-    /// runs, spill tier configured or not, and stops early at a victim a
-    /// full flush queue refuses. A thin wrapper, `reservation: None`, over
+    /// across stripes, if the tier refused the pass's victim, most often
+    /// for a full flush queue, or `total_weight` alone is within the cap.
+    /// Otherwise the scan runs, spill tier configured or not, and stops
+    /// early at a victim refused while a hand-off is in flight. A thin
+    /// wrapper, `reservation: None`, over
     /// [`Engine::enforce_capacity_with_reservation`].
     pub(crate) fn enforce_capacity(&self, start_bucket: usize, now_ms: u64) {
         let _ = self.enforce_capacity_with_reservation(start_bucket, None, now_ms);
@@ -4236,8 +4238,8 @@ where
                 ) {
                     None => return 0,
                     Some(outcome) if outcome.deficit > 0 => return outcome.deficit,
-                    // The scan stopped at a victim the busy flush queue
-                    // refused.
+                    // The scan stopped at a victim refused while a hand-off
+                    // is in flight.
                     Some(outcome) if outcome.made_no_progress() => return 0,
                     Some(_) => {}
                 }
@@ -4896,6 +4898,42 @@ where
         inflight.finish();
     }
 
+    /// Ends `inflight` once its owner read the key's spilled value, `value`
+    /// at `read_ver`, off disk: under one stripe write lock, hands `value`
+    /// to every joined waiter iff the key still holds `read_ver`, spilled
+    /// or promoted back, with no tombstone and unexpired at `now_ms`, and
+    /// removes the in-flight entry. A removal, expiry or newer write since
+    /// the read leaves the waiters to read again, so a call that joins
+    /// after it never answers the old value: the check and the removal
+    /// share the lock every join takes.
+    #[cfg(feature = "spill")]
+    pub(crate) fn finish_spilled_read(
+        &self,
+        key_bytes: &Bytes,
+        hash: u64,
+        inflight: &Inflight<V>,
+        read_ver: Hlc,
+        value: V,
+        now_ms: u64,
+    ) {
+        let bucket = stripe_index_from_hash(hash);
+        let mut stripe = self.stripes[bucket].write();
+        let stored_tombstone_ver = stripe.tombstones.get(key_bytes.as_ref()).map(|t| t.ver);
+        let current = stripe
+            .live
+            .find(hash, |l| record_key(&l.record) == key_bytes.as_ref())
+            .is_some_and(|live| {
+                spilled_is_current(stored_tombstone_ver, Some(live.ver()), read_ver)
+                    && !self.is_absent(live, key_bytes.as_ref(), &stripe.long_ttl, now_ms)
+            });
+        if current {
+            let _ = inflight.value.set(value);
+        }
+        stripe.inflight.remove(key_bytes.as_ref());
+        drop(stripe);
+        inflight.finish();
+    }
+
     /// Records a loader run whose value is not stored: removes the
     /// `inflight` entry and hands `value` to every joined waiter.
     pub(crate) fn finish_uncached(
@@ -4959,10 +4997,13 @@ where
     /// ([`claimed_total`]), claimed atomically so concurrent promotions
     /// never take the same room twice. Without room, the read stands and
     /// the entry stays on disk: an entry heavier than the whole cap
-    /// ([`promotion_fits`]), a flush queue too busy to take a victim, or a
-    /// concurrent promotion that claimed the room first. A promotion
-    /// therefore never takes `total_weight` past the cap, and never evicts
-    /// the entry it reads.
+    /// ([`promotion_fits`]), a keep-resident tier (`Mode::Replicated`,
+    /// `Mode::Distributed`) refusing every victim, most often for a full
+    /// flush queue, or a concurrent promotion that claimed the room first.
+    /// A tier that is not keep-resident drops a victim its full queue
+    /// refuses, as a single write's eviction does, so the room is made. A
+    /// promotion therefore never takes `total_weight` past the cap, and
+    /// never evicts the entry it reads.
     ///
     /// **Never touches the digest or `live_count`**: same key, same `ver`,
     /// same fingerprint, so nothing about the entry's replicated identity
@@ -4998,9 +5039,26 @@ where
         if !self.claim_weight(weight) {
             return false;
         }
+        self.reinstall_claimed(key_bytes, hash, read_ver, weight, encoded)
+    }
+
+    /// [`Engine::promote_locked`]'s last step, once `weight` is claimed in
+    /// `total_weight`: rechecks under the write lock that the key is still
+    /// spilled at `read_ver`, since a write, removal or racing promotion
+    /// may have landed while the room was made, and reinstalls it resident
+    /// at `weight`. A failed recheck gives the claim back and returns
+    /// `false`.
+    #[cfg(feature = "spill")]
+    fn reinstall_claimed(
+        &self,
+        key_bytes: &[u8],
+        hash: u64,
+        read_ver: Hlc,
+        weight: u32,
+        encoded: &Bytes,
+    ) -> bool {
+        let bucket = stripe_index_from_hash(hash);
         let mut stripe = self.stripes[bucket].write();
-        // Rechecked under the write lock: a write, removal or racing
-        // promotion may have landed while the room was made.
         if !spilled_and_current(&stripe, key_bytes, hash, read_ver) {
             drop(stripe);
             self.total_weight
@@ -9180,6 +9238,125 @@ mod tests {
             }
         }
 
+        /// [`spilled_read_in_flight`]'s engine, key bytes, hash, the
+        /// owner's in-flight entry and the joined waiter's receiver.
+        type SpilledReadInFlight = (
+            Engine<u32, String>,
+            Bytes,
+            u64,
+            Arc<Inflight<String>>,
+            watch::Receiver<bool>,
+        );
+
+        /// An engine holding key 7 spilled at `hlc(10, 1)`, unexpiring or
+        /// expiring at `expires_at_ms`, with an in-flight read of it that
+        /// one owner registered and one waiter joined.
+        fn spilled_read_in_flight(expires_at_ms: Option<u64>) -> SpilledReadInFlight {
+            let engine = engine_u32_string(u64::MAX, None);
+            let kb = key_bytes(7);
+            let hash = hash_key_bytes(kb.as_ref());
+            engine.debug_insert_spilled(&kb, hlc(10, 1), expires_at_ms, loc(0, 0, 10, 0), 0);
+            let JoinOutcome::Owner(inflight) = engine.miss_or_join(&kb, hash, 1) else {
+                panic!("a spilled key's first miss owns the read");
+            };
+            let JoinOutcome::Join(_, done) = engine.miss_or_join(&kb, hash, 1) else {
+                panic!("a second miss joins the read in flight");
+            };
+            (engine, kb, hash, inflight, done)
+        }
+
+        #[test]
+        fn a_spilled_read_hands_its_value_to_waiters_while_the_key_still_holds_it() {
+            let (engine, kb, hash, inflight, done) = spilled_read_in_flight(None);
+            engine.finish_spilled_read(&kb, hash, &inflight, hlc(10, 1), "v".to_string(), 2);
+            assert_eq!(inflight.value.get(), Some(&"v".to_string()));
+            assert!(*done.borrow(), "every waiter wakes");
+            assert!(
+                matches!(engine.miss_or_join(&kb, hash, 3), JoinOutcome::Owner(_)),
+                "the in-flight entry is gone"
+            );
+        }
+
+        #[test]
+        fn a_spilled_read_hands_nothing_to_waiters_once_the_key_moved_on() {
+            // Removed after the read.
+            let (engine, kb, hash, inflight, done) = spilled_read_in_flight(None);
+            tombstone(&engine, 7, kb.clone(), hlc(11, 1), 2);
+            engine.finish_spilled_read(&kb, hash, &inflight, hlc(10, 1), "v".to_string(), 2);
+            assert_eq!(
+                inflight.value.get(),
+                None,
+                "a removal leaves waiters to read again"
+            );
+            assert!(*done.borrow());
+
+            // Overwritten after the read.
+            let (engine, kb, hash, inflight, _done) = spilled_read_in_flight(None);
+            let _ = put(
+                &engine,
+                7,
+                kb.clone(),
+                "newer".to_string(),
+                hlc(11, 1),
+                None,
+                2,
+            );
+            engine.finish_spilled_read(&kb, hash, &inflight, hlc(10, 1), "v".to_string(), 2);
+            assert_eq!(
+                inflight.value.get(),
+                None,
+                "a newer write leaves waiters to read again"
+            );
+
+            // Expired after the read.
+            let (engine, kb, hash, inflight, _done) = spilled_read_in_flight(Some(20));
+            engine.finish_spilled_read(&kb, hash, &inflight, hlc(10, 1), "v".to_string(), 30);
+            assert_eq!(
+                inflight.value.get(),
+                None,
+                "an expiry leaves waiters to read again"
+            );
+            assert!(
+                matches!(engine.miss_or_join(&kb, hash, 31), JoinOutcome::Owner(_)),
+                "the in-flight entry is gone either way"
+            );
+        }
+
+        #[test]
+        fn a_claimed_promotion_that_fails_its_recheck_gives_the_claim_back() {
+            let engine = engine_u32_string(100, None);
+            let kb = key_bytes(7);
+            let hash = hash_key_bytes(kb.as_ref());
+            let encoded =
+                Bytes::from(postcard::to_stdvec(&"v".to_string()).expect("string encodes"));
+            engine.debug_insert_spilled(&kb, hlc(10, 1), None, loc(0, 0, 10, 0), 0);
+            tombstone(&engine, 7, kb.clone(), hlc(11, 1), 1);
+
+            assert!(engine.claim_weight(1));
+            assert_eq!(engine.debug_totals().1, 1, "the claim counts at once");
+            assert!(
+                !engine.reinstall_claimed(kb.as_ref(), hash, hlc(10, 1), 1, &encoded),
+                "a removal since the read fails the recheck"
+            );
+            assert_eq!(
+                engine.debug_totals().1,
+                0,
+                "the failed recheck gives the claim back"
+            );
+
+            let kb = key_bytes(8);
+            let hash = hash_key_bytes(kb.as_ref());
+            engine.debug_insert_spilled(&kb, hlc(10, 1), None, loc(0, 0, 10, 0), 0);
+            assert!(engine.claim_weight(1));
+            assert!(engine.reinstall_claimed(kb.as_ref(), hash, hlc(10, 1), 1, &encoded));
+            assert_eq!(engine.debug_totals().1, 1, "a reinstall keeps its claim");
+            assert_eq!(
+                engine.get(&8, 2),
+                Some("v".to_string()),
+                "and the entry is resident"
+            );
+        }
+
         #[test]
         fn release_buckets_decrements_the_spilled_entries_gauge_for_a_departing_spilled_entry() {
             let engine = engine_u32_string(u64::MAX, None);
@@ -11114,6 +11291,44 @@ mod tests {
                     engine.get(&stuck, 3),
                     Some("y".repeat(200)),
                     "the stuck entry stays resident"
+                );
+
+                tier.resume_flusher();
+                drop(engine);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// A pass that starts on an empty stripe scans on to the stripe
+            /// whose victim the full queue refuses, and stops there: the
+            /// queue would refuse every other stripe's victim too, so
+            /// scanning all 1024 stripes, or sampling more of them, would
+            /// buy nothing.
+            #[test]
+            fn the_scan_stops_at_a_victim_the_full_queue_refuses() {
+                let (engine, tier, dir, stuck) = engine_with_a_full_queue("scan-refusal-stop", 50);
+                let stuck_bucket =
+                    stripe_index_from_hash(hash_key_bytes(key_bytes(stuck).as_ref()));
+                let start = (stuck_bucket + BUCKET_COUNT - 1) % BUCKET_COUNT;
+                let locks_before = engine.debug_eviction_lock_acquisitions();
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                let enforcing = Arc::clone(&engine);
+                std::thread::spawn(move || {
+                    enforcing.enforce_capacity(start, 2);
+                    let _ = done_tx.send(());
+                });
+                assert!(
+                    done_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+                    "enforce_capacity returns rather than loop over the refusal"
+                );
+                let locks = engine.debug_eviction_lock_acquisitions() - locks_before;
+                assert!(
+                    locks <= 4,
+                    "the pass and its scan stop at the refused victim, took {locks} stripe locks"
+                );
+                assert_eq!(
+                    engine.debug_totals().1,
+                    200,
+                    "the refused victim stays resident"
                 );
 
                 tier.resume_flusher();

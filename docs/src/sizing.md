@@ -98,8 +98,10 @@ A spilled entry keeps its slot, its index entry and its key in RAM, plus
 a 16-byte row in the reverse index of the region that holds its value. A
 read of a spilled entry reads the value back and promotes the entry into
 RAM, evicting colder entries first so RAM stays within `max_capacity`. A
-read that finds no room, behind a full flush queue or for an entry heavier
-than the whole cap, answers from disk and leaves the entry there.
+read that finds no room answers from disk and leaves the entry there: an
+entry heavier than the whole cap, or, in a `Replicated` or `Distributed`
+cache, a read behind a full flush queue, which keeps every victim
+resident.
 
 `SpillConfig::new(dir, capacity_bytes)` bounds the disk, and
 `capacity_bytes` must hold at least two regions of `region_bytes`, 64 MiB
