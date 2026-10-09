@@ -88,6 +88,7 @@ pub use config::ClusterConfig;
 pub use config::TlsConfig;
 pub use discovery::Discovery;
 pub use error::{CacheError, CodecError, JoinError, RemoteLoaderError};
+pub use explain::ReadExplanation;
 pub use hlc::{Hlc, HlcClock};
 pub use node::{NodeId, NodeName};
 pub use store::crdt;

@@ -931,10 +931,10 @@ async fn serve_ae_digest(
     send_batch_or_cancelled(framed, &replies, cancel).await
 }
 
-/// Serves a `Fetch`: answers with the responder's record (or a definitive
-/// miss), or declines with `StaleView` if its own view has diverged from
-/// the requester's. Always followed by [`Msg::ReqDone`], so the connection
-/// stays poolable.
+/// Serves a `Fetch`: answers with the responder's record or a definitive
+/// miss, with `StaleView` when it holds no record and its own view differs
+/// from the requester's, or with `FetchDeclined`. Always followed by
+/// [`Msg::ReqDone`], so the connection stays poolable.
 async fn serve_fetch(
     framed: &mut PeerFramed,
     cache: SmolStr,

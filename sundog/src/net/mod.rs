@@ -422,12 +422,14 @@ pub(crate) enum FetchOutcome {
     /// The responder answered: `Some` record, or `None` for a definitive
     /// miss.
     Found(Option<WireRecord>),
-    /// The responder's own view hash differs from the request's; it
-    /// declined rather than risk answering against a stale owner set.
+    /// The responder holds no record and its own view hash differs from
+    /// the request's; it declined rather than risk a miss against a stale
+    /// owner set.
     Stale { responder_view_hash: u64 },
-    /// The responder declined without answering: it cannot vouch for a miss
-    /// (a bucket it owns but has not pulled yet, or a cache it does not
-    /// have open). The requester moves on to the next owner.
+    /// The responder declined without answering: it cannot vouch for the
+    /// key (a cache it does not have open as a distribution-mode cache, a
+    /// part it distrusts, or a cold part with no record). The requester
+    /// moves on to the next owner.
     Declined,
 }
 
@@ -468,14 +470,17 @@ pub(crate) enum AeRoundOutcome {
 
 /// A [`RequestHandler`]'s answer to a [`crate::wire::Msg::Fetch`].
 pub(crate) enum FetchServe {
-    /// The responder currently owns the bucket: `Some` record, or `None`
-    /// for a definitive miss.
+    /// `Some` record held in a part the responder owns or is releasing,
+    /// whatever the views say, or `None` for a definitive miss on an equal
+    /// view hash in a warm part.
     Found(Option<WireRecord>),
-    /// The responder's own view hash differs from the requester's.
+    /// The responder holds no record and its own view hash differs from
+    /// the requester's.
     Stale { responder_view_hash: u64 },
-    /// The named cache is not open here, or not a distribution-mode cache:
+    /// The named cache is not open here or not a distribution-mode cache,
     /// the same "unknown cache degrades gracefully" shape every other
-    /// method on this trait already has.
+    /// method on this trait already has, or the key's part is distrusted,
+    /// or cold with no record.
     Unavailable,
 }
 
@@ -3421,6 +3426,14 @@ mod tests {
         }
     }
 
+    /// The kind of a [`CodecError::Io`]; any other error shape fails the test.
+    fn io_kind(err: &CodecError) -> io::ErrorKind {
+        let CodecError::Io(source) = err else {
+            panic!("expected a CodecError::Io, got {err:?}");
+        };
+        source.kind()
+    }
+
     #[tokio::test]
     async fn fetch_returns_the_responders_record_when_found() {
         let rec = sample_record(1);
@@ -3632,10 +3645,92 @@ mod tests {
                 1,
             )
             .await;
-        assert!(
-            result.is_err(),
-            "a peer that does not speak PROTOCOL_DISTRIBUTED must never be dialed for a fetch"
+        let err = result.expect_err(
+            "a peer that does not speak PROTOCOL_DISTRIBUTED must never be dialed for a fetch",
         );
+        assert_eq!(
+            io_kind(&err),
+            io::ErrorKind::Unsupported,
+            "the refusal is the kind that marks an owner too old for a distribution-mode fetch"
+        );
+    }
+
+    /// A fetch to a node the peer table does not hold fails before any dial
+    /// with a `CodecError::Io` of kind `NotFound`, the kind `Cache::explain`
+    /// reports as an owner that is not a member.
+    #[tokio::test]
+    async fn fetch_to_an_unknown_peer_fails_with_not_found() {
+        let (mesh, _inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+
+        let err = mesh
+            .fetch(
+                NodeId::from(42),
+                SmolStr::new("users"),
+                Bytes::from_static(b"k1"),
+                1,
+            )
+            .await
+            .expect_err("a node outside the peer table is never dialed for a fetch");
+        assert_eq!(
+            io_kind(&err),
+            io::ErrorKind::NotFound,
+            "an unknown owner is told apart from an unreachable one"
+        );
+        mesh.shutdown().await;
+    }
+
+    /// A fetch to a peer that accepts and never answers gives up on the mesh's
+    /// own request timeout with a `CodecError::Io` of kind `TimedOut`, the
+    /// kind `Cache::explain` reports as an owner that timed out.
+    #[tokio::test]
+    async fn fetch_times_out_with_the_mesh_backstop_kind() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("listener has a local addr");
+        let stalled_peer = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept");
+                // Every connection reads and never answers, whether it is the
+                // persistent writer's or the fetch's: the failure mode
+                // `REQUEST_TIMEOUT` bounds.
+                tokio::spawn(async move {
+                    let mut framed = LengthDelimitedCodec::builder()
+                        .max_frame_length(MAX_FRAME)
+                        .new_framed(stream);
+                    while framed.next().await.is_some() {}
+                });
+            }
+        });
+
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![peer_at(NodeId::from(1), addr)]);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            with_request_timeout(
+                Duration::from_millis(100),
+                client.fetch(
+                    NodeId::from(1),
+                    SmolStr::new("users"),
+                    Bytes::from_static(b"k1"),
+                    1,
+                ),
+            ),
+        )
+        .await
+        .expect(
+            "fetch must give up on its own short request timeout, well inside this generous \
+             outer bound, not hang forever",
+        );
+        let err = result.expect_err("a peer that never answers yields no reply");
+        assert_eq!(
+            io_kind(&err),
+            io::ErrorKind::TimedOut,
+            "the mesh's request timeout surfaces as the TimedOut kind"
+        );
+        client.shutdown().await;
+        stalled_peer.abort();
     }
 
     #[tokio::test]

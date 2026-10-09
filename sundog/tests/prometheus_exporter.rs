@@ -153,6 +153,8 @@ fn keys_in_one_bucket(count: usize) -> Vec<u32> {
 /// gets, one filling `get_or_load`, one hit `get_or_load`, two
 /// `contains_key` checks, one `get_or_insert_with` miss and hit, and four
 /// concurrent `get_or_load`s of one key: hits=3+1+1+3=8, misses=2+1+1+1=5.
+/// It ends with `explain` of a live, a missing and a filled key, which moves
+/// neither total and counts no fetch.
 async fn count_hits_and_misses(cluster: &Cluster) {
     let counted = cluster
         .cache::<u32, String>("counted")
@@ -211,6 +213,17 @@ async fn count_hits_and_misses(cluster: &Cluster) {
     }))
     .await;
     assert!(loads.iter().all(|value| value == "joined"));
+
+    // `explain` is not a read: it counts no hit, miss or fetch, so the totals
+    // pinned in the scrape stay exact and `counted` exports no fetch series.
+    for (key, returns_value) in [(1, true), (3, false), (5, true)] {
+        let explanation = counted.explain(&key).await.expect("explains");
+        assert_eq!(
+            explanation.source.returns_value(),
+            returns_value,
+            "{explanation}"
+        );
+    }
 }
 
 /// Drives `sundog_read_duration_seconds{cache="timed-reads",outcome}`: on a
@@ -296,6 +309,11 @@ async fn loader_calls_pin_metric(cluster: &Cluster) {
     );
     assert_eq!(cache.load(&1).await.expect("load"), Some("v1".to_string()));
     assert_eq!(cache.load(&11).await.expect("load"), None);
+    // `explain` loads nothing: a held key and a key the source lacks leave
+    // the two loader calls the scrape pins.
+    for key in [1, 11] {
+        cache.explain(&key).await.expect("explains");
+    }
 }
 
 /// Drives `sundog_refreshes_total{cache, outcome}` on a `Mode::Local` cache
@@ -335,6 +353,12 @@ async fn refresh_outcomes_pin_metrics(cluster: &Cluster) {
         3
     );
     tokio::time::sleep(Duration::from_millis(550)).await;
+    // The keys are past their refresh point: `explain` of each asks for no
+    // reload, so the call and outcome counts the scrape pins hold and the
+    // reads below stay the only ones that ask.
+    for key in [2, 3, 5] {
+        cache.explain(&key).await.expect("explains");
+    }
     for (expected_calls, key) in [(2, 2u32), (3, 3), (4, 5)] {
         assert!(cache.get(&key).await.is_some(), "key {key} is still live");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -1057,6 +1081,15 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         Some(5.0),
         "expected 5 misses on the 'counted' cache; got body:\n{body}"
     );
+    // `explain` of `counted` counts no fetch: the cache never fetches, so it
+    // exports neither a fetch count nor a fetch timing.
+    for metric in ["sundog_fetch_total", "sundog_fetch_duration_seconds_count"] {
+        assert_eq!(
+            scraped_metric_value(&body, metric, &[("cache", "counted")]),
+            None,
+            "explain counts no fetch on the 'counted' cache; got body:\n{body}"
+        );
+    }
     for outcome in ["hit", "miss"] {
         let labels = [("cache", "timed-reads"), ("outcome", outcome)];
         let timed = scraped_metric_value(&body, "sundog_read_duration_seconds_count", &labels);

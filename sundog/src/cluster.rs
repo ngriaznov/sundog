@@ -5083,6 +5083,42 @@ mod tests {
         }
     }
 
+    /// `verdict::serves_peers`, what `Cache::explain` reports this node
+    /// answers a peer, over every residency state a read tells apart: the
+    /// responder's reply to a fetch sent with an equal view hash.
+    #[tokio::test]
+    async fn serves_peers_is_the_responders_answer_on_an_equal_view_hash() {
+        use crate::explain::ServeVerdict;
+        use crate::store::read_cases::{case_shard, every_read_case};
+        let name = SmolStr::new("serves-peers-cases");
+        for case in every_read_case() {
+            let built = case_shard(&name, &case).await;
+            let shard = Arc::new(built.shard);
+            let predicted = verdict::serves_peers(
+                &shard.residency_of(&built.view, built.part),
+                &shard.local_record(&built.key_bytes).1,
+            );
+            let handler = handler_for(&name, Arc::clone(&shard) as Arc<dyn ShardOps>);
+            let reply = handler
+                .fetch(
+                    name.clone(),
+                    built.key_bytes.clone(),
+                    built.view.view_hash(),
+                )
+                .await;
+            let answered = match reply {
+                FetchServe::Found(Some(_)) => ServeVerdict::Serve,
+                FetchServe::Found(None) => ServeVerdict::Miss,
+                FetchServe::Stale { .. } => ServeVerdict::Stale,
+                FetchServe::Unavailable => match predicted {
+                    ServeVerdict::DeclineDistrusted | ServeVerdict::DeclineCold => predicted,
+                    _ => panic!("declined where explain predicts {predicted:?}: {case:?}"),
+                },
+            };
+            assert_eq!(answered, predicted, "{case:?}");
+        }
+    }
+
     /// A hit in an unverified bucket answers `Unavailable`, never the
     /// record itself, as if this responder held nothing at all.
     #[cfg(feature = "spill")]

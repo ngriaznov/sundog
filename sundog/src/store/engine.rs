@@ -48,6 +48,7 @@ use tokio::sync::watch;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::error::CodecError;
+use crate::explain::{Lapse, LocalRecord};
 use crate::hlc::Hlc;
 use crate::node::NodeId;
 use crate::wire::WireRecord;
@@ -1867,6 +1868,16 @@ fn absent_at<K, V>(
     false
 }
 
+/// Why an entry [`absent_at`] reports absent no longer reads: its expiry
+/// passed at `now_ms`, or else it went idle. Pure; unit tested directly.
+fn lapse_cause(expires_at_ms: Option<u64>, now_ms: u64) -> Lapse {
+    if expires_at_ms.is_some_and(|expires| now_ms >= expires) {
+        Lapse::Expired
+    } else {
+        Lapse::Idle
+    }
+}
+
 /// [`Engine::compact`]'s paced shrink-pass rule: `true` once a stripe's
 /// live count `len` sits at or below an eighth of its slab `capacity`,
 /// the point past which the arena wastes at least seven times what it
@@ -2873,6 +2884,39 @@ where
             live.ver(),
             decode_expiry(live.wall_ms, live.expiry, key_bytes, &stripe.long_ttl),
         ))
+    }
+
+    /// What this engine stores for `key_bytes` at `now_ms`: a tombstone,
+    /// a live entry resident or spilled, an entry a read no longer returns
+    /// and a sweep has not reclaimed, or nothing. One stripe read lock, no
+    /// recency touch, no value decode, no disk read.
+    pub(crate) fn inspect(&self, key_bytes: &[u8], now_ms: u64) -> LocalRecord {
+        let hash = hash_key_bytes(key_bytes);
+        let stripe = self.stripes[stripe_index_from_hash(hash)].read();
+        if let Some(t) = stripe.tombstones.get(key_bytes) {
+            return LocalRecord::Tombstone { version: t.ver };
+        }
+        let Some(live) = stripe
+            .live
+            .find(hash, |l| record_key(&l.record) == key_bytes)
+        else {
+            return LocalRecord::Absent;
+        };
+        let version = live.ver();
+        let expires_at_ms = decode_expiry(live.wall_ms, live.expiry, key_bytes, &stripe.long_ttl);
+        if self.is_absent(live, key_bytes, &stripe.long_ttl, now_ms) {
+            LocalRecord::Lapsed {
+                version,
+                expires_at_ms,
+                cause: lapse_cause(expires_at_ms, now_ms),
+            }
+        } else {
+            LocalRecord::Live {
+                version,
+                expires_at_ms,
+                spilled: is_spilled(live),
+            }
+        }
     }
 
     /// Registers a reload of a key that may still hold a live entry, for
@@ -5926,6 +5970,194 @@ mod tests {
 
     fn remaining(ms: u64) -> Ttl {
         Ttl::Remaining(Duration::from_millis(ms))
+    }
+
+    #[test]
+    fn lapse_cause_prefers_expiry_and_defaults_to_idle() {
+        assert_eq!(lapse_cause(Some(100), 100), Lapse::Expired);
+        assert_eq!(lapse_cause(Some(100), 101), Lapse::Expired);
+        assert_eq!(
+            lapse_cause(Some(101), 100),
+            Lapse::Idle,
+            "an entry absent before its expiry went idle"
+        );
+        assert_eq!(lapse_cause(None, 100), Lapse::Idle);
+    }
+
+    /// One engine holding each kind of record [`Engine::inspect`] tells
+    /// apart at `now`: key 1 live with no TTL, 2 live with a TTL, 3 live
+    /// past the inline deadline range, 4 expired and not swept, 5 a
+    /// tombstone; 6 is never written.
+    fn engine_with_every_record(now: u64) -> (Engine<u32, String>, u64) {
+        let engine = engine_u32_string(u64::MAX, None);
+        let far = 1_000 + u64::from(u32::MAX) * 2;
+        for (key, expires_at_ms) in [
+            (1, None),
+            (2, Some(7_000)),
+            (3, Some(far)),
+            (4, Some(1_500)),
+        ] {
+            put(
+                &engine,
+                key,
+                key_bytes(key),
+                format!("v{key}"),
+                hlc(1_000, 1),
+                expires_at_ms,
+                now,
+            );
+        }
+        tombstone(&engine, 5u32, key_bytes(5), hlc(1_200, 2), now);
+        (engine, far)
+    }
+
+    #[test]
+    fn inspect_reports_absent_tombstone_live_and_lapsed() {
+        let now = 2_000;
+        let (engine, far) = engine_with_every_record(now);
+        let inspect = |key: u32, at: u64| engine.inspect(key_bytes(key).as_ref(), at);
+        let live = |expires_at_ms| LocalRecord::Live {
+            version: hlc(1_000, 1),
+            expires_at_ms,
+            spilled: false,
+        };
+        assert_eq!(inspect(1, now), live(None));
+        assert_eq!(inspect(2, now), live(Some(7_000)));
+        assert_eq!(
+            inspect(3, now),
+            live(Some(far)),
+            "a deadline past the inline range is read from the long-TTL table"
+        );
+        assert_eq!(
+            inspect(4, now),
+            LocalRecord::Lapsed {
+                version: hlc(1_000, 1),
+                expires_at_ms: Some(1_500),
+                cause: Lapse::Expired,
+            }
+        );
+        assert_eq!(
+            inspect(5, now),
+            LocalRecord::Tombstone {
+                version: hlc(1_200, 2)
+            }
+        );
+        assert_eq!(inspect(6, now), LocalRecord::Absent);
+        assert_eq!(
+            inspect(2, 7_000),
+            LocalRecord::Lapsed {
+                version: hlc(1_000, 1),
+                expires_at_ms: Some(7_000),
+                cause: Lapse::Expired,
+            },
+            "an expiry equal to now has passed"
+        );
+
+        engine.sweep(now);
+        assert_eq!(
+            inspect(4, now),
+            LocalRecord::Absent,
+            "a swept expired entry is gone"
+        );
+        assert_eq!(inspect(1, now), live(None), "the sweep keeps a live entry");
+    }
+
+    #[test]
+    fn inspect_agrees_with_record_for_and_lifetime_of() {
+        let now = 2_000;
+        let (engine, _) = engine_with_every_record(now);
+        for key in 1..=6 {
+            let kb = key_bytes(key);
+            let hash = hash_key_bytes(kb.as_ref());
+            let inspected = engine.inspect(kb.as_ref(), now);
+            let record = engine.record_for(kb.as_ref(), now);
+            assert_eq!(inspected.is_held(), record.is_some(), "key {key}");
+            let lifetime = engine.lifetime_of(kb.as_ref(), hash, now);
+            assert_eq!(inspected.is_live(), lifetime.is_some(), "key {key}");
+            match inspected {
+                LocalRecord::Live {
+                    version,
+                    expires_at_ms,
+                    ..
+                } => {
+                    assert_eq!(lifetime, Some((version, expires_at_ms)), "key {key}");
+                    let record = record.expect("a live entry has a record");
+                    assert_eq!(
+                        (record.ver, record.expires_at_ms),
+                        (version, expires_at_ms),
+                        "key {key}"
+                    );
+                }
+                LocalRecord::Tombstone { version } => {
+                    assert_eq!(record.map(|r| r.ver), Some(version), "key {key}");
+                }
+                LocalRecord::Absent | LocalRecord::Lapsed { .. } => {}
+            }
+        }
+    }
+
+    /// `last_access_ms` of key `key`'s live entry.
+    fn last_access(engine: &Engine<u32, String>, key: u32) -> u32 {
+        let kb = key_bytes(key);
+        let stripe = engine
+            .stripe_lock(stripe_index_from_hash(hash_key_bytes(kb.as_ref())))
+            .read();
+        stripe
+            .live
+            .iter()
+            .find(|live| record_key(&live.record) == kb.as_ref())
+            .expect("the entry is present")
+            .last_access_ms
+            .load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn inspect_reports_an_idle_entry_lapsed_and_never_resets_the_idle_clock() {
+        let engine = engine_u32_string(10, Some(Duration::from_millis(100)));
+        put(
+            &engine,
+            1u32,
+            key_bytes(1),
+            "idle".to_string(),
+            hlc(0, 1),
+            None,
+            0,
+        );
+        put(
+            &engine,
+            2u32,
+            key_bytes(2),
+            "both".to_string(),
+            hlc(0, 1),
+            Some(120),
+            0,
+        );
+        let inspect = |key: u32, at: u64| engine.inspect(key_bytes(key).as_ref(), at);
+        assert!(inspect(1, 90).is_live());
+        assert_eq!(last_access(&engine, 1), 0, "an inspect is no access");
+        assert_eq!(
+            engine.get(&1, 140),
+            None,
+            "idle since the write at 0, not the inspect at 90"
+        );
+        assert_eq!(
+            inspect(1, 140),
+            LocalRecord::Lapsed {
+                version: hlc(0, 1),
+                expires_at_ms: None,
+                cause: Lapse::Idle,
+            }
+        );
+        assert_eq!(
+            inspect(2, 140),
+            LocalRecord::Lapsed {
+                version: hlc(0, 1),
+                expires_at_ms: Some(120),
+                cause: Lapse::Expired,
+            },
+            "an entry both idle and expired reads expired"
+        );
+        assert_eq!(last_access(&engine, 2), 0);
     }
 
     #[test]
@@ -9505,6 +9737,31 @@ mod tests {
                 JoinOutcome::Hit(_) => panic!("a spilled entry has no resident value to hit on"),
                 JoinOutcome::Owner(_) | JoinOutcome::Join(..) => {}
             }
+        }
+
+        #[test]
+        fn inspect_reports_a_spilled_entry_and_leaves_it_spilled() {
+            let engine = Engine::<u32, String>::new(10, None, None, None);
+            let kb = key_bytes(1);
+            let hash = hash_key_bytes(kb.as_ref());
+            let ver = hlc(1, 1);
+            let l = loc(2, 8, 4, 1);
+            engine.debug_insert_spilled(&kb, ver, Some(5_000), l, 0);
+
+            assert_eq!(
+                engine.inspect(kb.as_ref(), 100),
+                LocalRecord::Live {
+                    version: ver,
+                    expires_at_ms: Some(5_000),
+                    spilled: true,
+                }
+            );
+            assert_eq!(last_access(&engine, 1), 0, "an inspect is no access");
+            assert_eq!(
+                engine.spilled_loc(kb.as_ref(), hash, 100),
+                Some((ver, l)),
+                "the entry stays spilled at the same location"
+            );
         }
 
         #[test]

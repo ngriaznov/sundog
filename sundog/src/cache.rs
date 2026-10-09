@@ -29,6 +29,7 @@ use crate::cluster::Cluster;
 use crate::cluster::anti_entropy;
 use crate::config::ClusterConfig;
 use crate::error::{CacheError, RemoteLoaderError};
+use crate::explain::{self, DistributedRead, OwnerProbe, ReadExplanation, ReadSource, Reads};
 use crate::net::{FetchOutcome, LoadOutcome};
 use crate::node::NodeId;
 use crate::ownership::{OwnershipTracker, OwnershipView, ResidencySet};
@@ -748,17 +749,28 @@ fn record_fetch_outcome(
 /// expiry client-side (defense in depth against the responder's own expiry
 /// sweep lagging) and treating a tombstone or undecodable value as a miss.
 fn decode_live_value<V: DeserializeOwned>(rec: &WireRecord) -> Option<V> {
-    if rec.is_tombstone() {
-        return None;
-    }
-    if let Some(expires_at_ms) = rec.expires_at_ms
-        && expires_at_ms <= now_ms()
-    {
+    if explain::dead_record(rec, now_ms()).is_some() {
         return None;
     }
     rec.value
         .as_deref()
         .and_then(|bytes| postcard::from_bytes::<V>(bytes).ok())
+}
+
+/// What a [`Cache::fetch`] makes of an owner's record at `now_ms`, the
+/// judgement [`decode_live_value`] makes, named.
+fn record_reads<V: DeserializeOwned>(rec: &WireRecord, now_ms: u64) -> Reads {
+    explain::dead_record(rec, now_ms).unwrap_or_else(|| {
+        if rec
+            .value
+            .as_deref()
+            .is_some_and(|bytes| postcard::from_bytes::<V>(bytes).is_ok())
+        {
+            Reads::Value
+        } else {
+            Reads::Undecodable
+        }
+    })
 }
 
 /// The handles `attach_ownership` produces for a `Mode::Distributed` cache
@@ -1619,6 +1631,8 @@ where
     /// from a genuine miss, which returns `Ok(None)`.
     /// An owner whose ownership view differs from this node's is retried
     /// with a short jittered backoff before the next owner is tried.
+    /// [`Cache::explain`] shows how a fetch of a key decides, without
+    /// fetching it.
     pub async fn fetch(&self, key: &K) -> Result<Option<V>, CacheError> {
         let span = tracing::debug_span!(
             "sundog.fetch",
@@ -1793,6 +1807,116 @@ where
             return Vec::new();
         };
         view.owners_of(PartId::of_key(&key_bytes)).to_vec()
+    }
+
+    /// Why a read of `key` answers what it answers on this node: what this
+    /// node stores for the key and, on a [`Mode::Distributed`] cache, this
+    /// node's residency marks for the key's part, what its own copy makes
+    /// of a [`Cache::fetch`], what it answers a peer's fetch, what each
+    /// other owner answers, and where a fetch takes its answer.
+    ///
+    /// It is not a read. It calls no get, fetch or loader, counts no hit,
+    /// miss, fetch or loader metric, opens no `sundog.fetch` span, touches
+    /// no idle timer, takes no TTL, starts no refresh and promotes no
+    /// spilled entry. A spilled entry is reported from its pointer, without
+    /// a disk read.
+    ///
+    /// The explanation is a snapshot taken in order: the ownership view,
+    /// the residency marks, the local record, then the other owners. Each
+    /// other owner is asked at once with the fetch a [`Cache::fetch`]
+    /// sends, under the same view hash, each bounded by
+    /// `ClusterConfig::fetch_timeout` and never retried, so the call
+    /// returns within about one `fetch_timeout`. Each probe costs a request
+    /// and may dial a connection; an owner holding the key spilled reads it
+    /// from disk to answer. [`DistributedRead::view_moved_to`] reports a
+    /// view that changed during the probes.
+    ///
+    /// [`ReadExplanation::source`] predicts a fetch from these answers: a
+    /// fetch also retries an owner with a stale view, and its owners can
+    /// change their state between the probe and the fetch. A
+    /// [`ProbeAnswer::Declined`](crate::explain::ProbeAnswer::Declined)
+    /// covers every reason an owner declines, and an owner's
+    /// [`ProbeAnswer::Held`](crate::explain::ProbeAnswer::Held) record does
+    /// not show its part is warm.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::Codec`] if `key` fails to encode. An owner that
+    /// declines or gives no answer is part of the explanation, not an
+    /// error.
+    pub async fn explain(&self, key: &K) -> Result<ReadExplanation, CacheError> {
+        let key_bytes = encode_key(key)?;
+        let part = PartId::of_key(&key_bytes);
+        let node = self.cluster.node_id();
+        let view = self.shard.ownership_view();
+        let residency = view
+            .as_ref()
+            .map(|view| self.shard.residency_of(view, part));
+        let (at_ms, local) = self.shard.local_record(&key_bytes);
+        let mut explanation = ReadExplanation {
+            cache: SmolStr::new(self.shard.name()),
+            node,
+            mode: self.shard.mode(),
+            part,
+            at_ms,
+            local,
+            source: ReadSource::Local {
+                hit: local.is_live(),
+            },
+            distributed: None,
+        };
+        let (Some(view), Some(residency)) = (view, residency) else {
+            return Ok(explanation);
+        };
+        let local_read = verdict::local_verdict(&residency, local.is_live());
+        let view_hash = view.view_hash();
+        let probes = futures::future::join_all(
+            other_owners(&view, part, node)
+                .into_iter()
+                .map(|owner| self.probe_owner(owner, &key_bytes, view_hash, at_ms)),
+        )
+        .await;
+        explanation.source = verdict::read_source(local_read, &probes);
+        explanation.distributed = Some(DistributedRead {
+            view_hash,
+            view_moved_to: self
+                .shard
+                .ownership_view_hash()
+                .filter(|hash| *hash != view_hash),
+            owners: view.owners_of(part).to_vec(),
+            residency,
+            local_read,
+            serves_peers: verdict::serves_peers(&residency, &local),
+            probes,
+        });
+        Ok(explanation)
+    }
+
+    /// `owner`'s answer to the fetch [`Cache::fetch`] sends it for
+    /// `key_bytes` under `view_hash`, bounded by `fetch_timeout`, with its
+    /// record judged at `at_ms`.
+    async fn probe_owner(
+        &self,
+        owner: NodeId,
+        key_bytes: &bytes::Bytes,
+        view_hash: u64,
+        at_ms: u64,
+    ) -> OwnerProbe {
+        let reply = tokio::time::timeout(
+            self.cluster.config().fetch_timeout,
+            self.cluster.mesh().fetch(
+                owner,
+                SmolStr::new(self.shard.name()),
+                key_bytes.clone(),
+                view_hash,
+            ),
+        )
+        .await
+        .ok();
+        OwnerProbe {
+            node: owner,
+            answer: explain::classify_probe(reply, |rec| record_reads::<V>(rec, at_ms)),
+        }
     }
 
     /// Reads whether `key` has a live entry, honoring expiry, without cloning
@@ -2291,6 +2415,9 @@ mod tests {
     use super::*;
     use crate::cluster::Cluster;
     use crate::cluster::test_support::wait_until;
+    use crate::explain::{
+        LocalRead, LocalRecord, ProbeAnswer, ProbedRecord, Residency, ServeVerdict, Unreached,
+    };
     use crate::store::bucket_of;
     use crate::store::crdt::{PnCounter, PnCounterResolver};
 
@@ -2323,6 +2450,44 @@ mod tests {
         socket
             .local_addr()
             .expect("a freshly bound udp socket reports a local address")
+    }
+
+    /// `record_reads` names what `decode_live_value` makes of a fetched
+    /// record: a value exactly when it decodes one, and otherwise why not.
+    #[test]
+    fn record_reads_names_what_decode_live_value_makes_of_a_record() {
+        let now = now_ms();
+        let value = |v: &str| Some(bytes::Bytes::from(postcard::to_stdvec(v).expect("encodes")));
+        let record = |value: Option<bytes::Bytes>, expires_at_ms: Option<u64>| WireRecord {
+            key: bytes::Bytes::from_static(b"k"),
+            value,
+            ver: crate::hlc::Hlc {
+                wall_ms: 1,
+                logical: 0,
+                node: NodeId::from(1u64),
+            },
+            expires_at_ms,
+        };
+        let hour = 3_600_000;
+        let cases = [
+            (record(value("v"), None), Reads::Value),
+            (record(value("v"), Some(now + hour)), Reads::Value),
+            (record(value("v"), Some(now - hour)), Reads::Expired),
+            (record(None, None), Reads::Deleted),
+            (record(None, Some(now - hour)), Reads::Deleted),
+            (
+                record(Some(bytes::Bytes::from_static(&[0xff])), None),
+                Reads::Undecodable,
+            ),
+        ];
+        for (rec, reads) in cases {
+            assert_eq!(record_reads::<String>(&rec, now), reads, "{rec:?}");
+            assert_eq!(
+                decode_live_value::<String>(&rec).is_some(),
+                reads == Reads::Value,
+                "{rec:?}"
+            );
+        }
     }
 
     #[test]
@@ -4489,13 +4654,34 @@ mod tests {
         a.shutdown().await;
     }
 
+    /// A one-node cluster named `name` on `config`, with no seeds and no
+    /// peers, for a hand-built cache to read through.
+    async fn solo_cluster(name: &str, config: ClusterConfig) -> Cluster {
+        Cluster::builder(name)
+            .seeds(std::iter::empty())
+            .config(config)
+            .build()
+            .await
+            .expect("node builds")
+    }
+
+    /// The part `key`'s encoding falls in.
+    fn part_of(key: u32) -> PartId {
+        PartId::of_key(&encode_key(&key).expect("u32 encodes"))
+    }
+
     /// A `Mode::Distributed` cache of `cluster`'s whose shard decides under
-    /// `view`, with its residency set to mark parts in.
-    fn cache_under_view(
+    /// `view`, with its residency set to mark parts in and the sender its
+    /// tracker reads, to publish a further view through.
+    fn cache_publishing_views(
         cluster: &Cluster,
         name: &str,
         view: &Arc<crate::ownership::OwnershipView>,
-    ) -> (Cache<u32, String>, Arc<crate::ownership::ResidencySet>) {
+    ) -> (
+        Cache<u32, String>,
+        Arc<crate::ownership::ResidencySet>,
+        watch::Sender<Arc<crate::ownership::OwnershipView>>,
+    ) {
         let owners = std::num::NonZeroU8::MIN;
         let (tracker, tx) = crate::ownership::OwnershipTracker::seed(
             cluster.node_id(),
@@ -4521,6 +4707,31 @@ mod tests {
             cancel: CancellationToken::new(),
             tasks: TaskTracker::new(),
         };
+        (cache, residency, tx)
+    }
+
+    /// `cache`'s explanation of `key`, and its `Mode::Distributed` half
+    /// split out of it.
+    async fn explain_distributed(
+        cache: &Cache<u32, String>,
+        key: u32,
+    ) -> (ReadExplanation, DistributedRead) {
+        let explanation = cache.explain(&key).await.expect("u32 encodes");
+        let read = explanation
+            .distributed
+            .clone()
+            .expect("a distributed cache explains its distribution");
+        (explanation, read)
+    }
+
+    /// A `Mode::Distributed` cache of `cluster`'s whose shard decides under
+    /// `view`, with its residency set to mark parts in.
+    fn cache_under_view(
+        cluster: &Cluster,
+        name: &str,
+        view: &Arc<crate::ownership::OwnershipView>,
+    ) -> (Cache<u32, String>, Arc<crate::ownership::ResidencySet>) {
+        let (cache, residency, _view_tx) = cache_publishing_views(cluster, name, view);
         (cache, residency)
     }
 
@@ -4631,6 +4842,427 @@ mod tests {
 
         cache_b.close().await;
         b.shutdown().await;
+        a.shutdown().await;
+    }
+
+    /// The owners an explanation lists are the ones `Cache::owners_of`
+    /// returns, and its probes ask every owner but this node, in the same
+    /// rank order, whether this node ranks first, second or not at all
+    /// among the owners; no probe ever names this node. A node that owns the
+    /// key's part warm and holds the key reads it from its own copy.
+    #[tokio::test]
+    async fn explain_orders_owners_like_owners_of_and_never_probes_this_node() {
+        let name = "explain-owner-order";
+        let a = solo_cluster(name, loopback_config()).await;
+        let me = a.node_id();
+        // Three nodes no mesh member answers for: every probe is unreached.
+        let others: Vec<NodeId> = (1..=3u64).map(|n| NodeId::from(u64::MAX - n)).collect();
+        let view = Arc::new(OwnershipView::compute(me, others, Mode::DEFAULT_OWNERS));
+        let (cache, _residency) = cache_under_view(&a, name, &view);
+
+        let mut ranks = HashSet::new();
+        let mut against_id_order = false;
+        for key in 0..200u32 {
+            let (_, read) = explain_distributed(&cache, key).await;
+            let owners = cache.owners_of(&key);
+            assert_eq!(read.owners, owners, "key {key}");
+            let rank = owners.iter().position(|owner| *owner == me);
+            let expected = match rank {
+                Some(0) => vec![owners[1]],
+                Some(1) => vec![owners[0]],
+                None => owners.clone(),
+                Some(rank) => panic!("rank {rank} among two owners"),
+            };
+            let probed: Vec<NodeId> = read.probes.iter().map(|probe| probe.node).collect();
+            assert_eq!(probed, expected, "key {key}");
+            assert!(
+                read.probes
+                    .iter()
+                    .all(|probe| probe.answer == ProbeAnswer::Unreached(Unreached::NotAMember)),
+                "key {key}: no mesh member answers"
+            );
+            ranks.insert(rank);
+            against_id_order |= probed.len() == 2 && probed[0] > probed[1];
+        }
+        assert_eq!(
+            ranks,
+            HashSet::from([Some(0), Some(1), None]),
+            "the keys rank this node first, second and not at all"
+        );
+        assert!(
+            against_id_order,
+            "probes follow rendezvous rank, which is not node id order"
+        );
+
+        let key = (0..200u32)
+            .find(|key| cache.owners_of(key).contains(&me))
+            .expect("this node owns some of the keys");
+        let record = test_record(key, "held", me);
+        let version = record.ver;
+        ShardOps::apply_remote_batch(cache.shard.as_ref(), vec![record]).await;
+        let (explanation, read) = explain_distributed(&cache, key).await;
+        assert_eq!(explanation.cache.as_str(), name);
+        assert_eq!(explanation.node, me);
+        assert_eq!(explanation.mode, Mode::distributed());
+        assert_eq!(explanation.part, part_of(key));
+        assert_eq!(
+            explanation.local,
+            LocalRecord::Live {
+                version,
+                expires_at_ms: None,
+                spilled: false
+            }
+        );
+        assert!(read.residency.owns);
+        assert_eq!(read.local_read, LocalRead::Hit);
+        assert_eq!(explanation.source, ReadSource::Local { hit: true });
+        assert_eq!(read.serves_peers, ServeVerdict::Serve);
+
+        a.shutdown().await;
+    }
+
+    /// The view an explanation's probes set out under is the view it reports
+    /// its owners, marks and verdicts for, and `view_moved_to` names the view
+    /// the tracker holds once the probes return: published while a probe is
+    /// pending, it moves the report's last word and nothing before it. An
+    /// explanation taken after the move reports no move.
+    #[tokio::test]
+    async fn explain_reports_a_moved_view() {
+        use crate::net::test_support::peer_at;
+        let name = "explain-moved-view";
+        let config = loopback_config().with(|c| c.fetch_timeout = Duration::from_millis(300));
+        let a = solo_cluster(name, config).await;
+        let me = a.node_id();
+        // The cluster republishes its empty peer list the first time its
+        // background tasks are polled, which would remove the peer below.
+        tokio::task::yield_now().await;
+        let silent = NodeId::from(u64::MAX);
+        a.mesh()
+            .update_peers(vec![peer_at(silent, silent_peer_addr().await)]);
+
+        // Under `old` this node and the silent peer own every part; under
+        // `moved` another node owns about half of them.
+        let other = NodeId::from(u64::MAX - 1);
+        let old = Arc::new(OwnershipView::compute(
+            me,
+            vec![silent],
+            Mode::DEFAULT_OWNERS,
+        ));
+        let moved = Arc::new(OwnershipView::compute(me, vec![other], NonZeroU8::MIN));
+        assert_ne!(old.view_hash(), moved.view_hash());
+        let key = (0..1_000_000u32)
+            .find(|key| !moved.owns(part_of(*key)))
+            .expect("the other node owns some parts");
+        let (cache, _residency, view_tx) = cache_publishing_views(&a, name, &old);
+
+        let mut explain = std::pin::pin!(cache.explain(&key));
+        assert!(
+            futures::poll!(explain.as_mut()).is_pending(),
+            "the silent owner holds the probe open"
+        );
+        view_tx
+            .send(Arc::clone(&moved))
+            .expect("the tracker holds a receiver");
+        let explanation = explain.await.expect("u32 encodes");
+        let read = explanation
+            .distributed
+            .expect("a distributed cache explains its distribution");
+        assert_eq!(read.view_hash, old.view_hash());
+        assert_eq!(read.view_moved_to, Some(moved.view_hash()));
+        assert_eq!(read.owners, old.owners_of(part_of(key)));
+        assert!(read.residency.owns, "owned under the view the probes used");
+        assert_eq!(read.local_read, LocalRead::Miss);
+        assert_eq!(
+            read.probes,
+            vec![OwnerProbe {
+                node: silent,
+                answer: ProbeAnswer::Unreached(Unreached::TimedOut),
+            }]
+        );
+        assert_eq!(explanation.source, ReadSource::Local { hit: false });
+
+        let (explanation, read) = explain_distributed(&cache, key).await;
+        assert_eq!(read.view_hash, moved.view_hash());
+        assert_eq!(read.view_moved_to, None);
+        assert_eq!(read.owners, vec![other]);
+        assert!(!read.residency.owns);
+        assert_eq!(read.local_read, LocalRead::NotOwner);
+        assert_eq!(explanation.source, ReadSource::Unavailable);
+
+        a.shutdown().await;
+    }
+
+    /// A part this node owns since the last settled view and has not pulled
+    /// reads cold before rebalance marks it: `unsettled` and `owns`, so
+    /// `implicitly_cold`. `mark_cold` makes it `cold_marked`, which is no
+    /// longer implicit, and `mark_serving` clears both. A cold part answers
+    /// a missing key `ColdMiss`, a warm one `Miss`, and the entry it holds
+    /// is a `Hit` in either state.
+    #[tokio::test]
+    async fn explain_reports_implicit_then_marked_then_no_cold() {
+        let name = "explain-cold-marks";
+        let a = solo_cluster(name, loopback_config()).await;
+        let me = a.node_id();
+        // The last settled view owns about half the parts; the view the
+        // cache decides under owns them all.
+        let settled = OwnershipView::compute(me, vec![NodeId::from(u64::MAX)], NonZeroU8::MIN);
+        let now = Arc::new(OwnershipView::compute(me, vec![me], NonZeroU8::MIN));
+        let (cache, residency) = cache_under_view(&a, name, &now);
+        residency.settle(&settled);
+
+        let mut unsettled = (0..1_000_000u32).filter(|key| !settled.owns(part_of(*key)));
+        let missing = unsettled.next().expect("the settled view lacks some parts");
+        let held = unsettled
+            .find(|key| part_of(*key) != part_of(missing))
+            .expect("the settled view lacks parts of two kinds");
+        ShardOps::apply_remote_batch(cache.shard.as_ref(), vec![test_record(held, "held", me)])
+            .await;
+
+        let implicit = Residency {
+            owns: true,
+            releasing_for: None,
+            cold_marked: false,
+            unsettled: true,
+            unverified: false,
+            stale: false,
+        };
+        let (explanation, read) = explain_distributed(&cache, missing).await;
+        assert_eq!(read.residency, implicit);
+        assert!(read.residency.implicitly_cold() && read.residency.cold());
+        assert_eq!(read.local_read, LocalRead::ColdMiss);
+        assert_eq!(
+            explanation.source,
+            ReadSource::Unavailable,
+            "no other owner can vouch for the miss"
+        );
+        assert_eq!(read.serves_peers, ServeVerdict::DeclineCold);
+
+        let parts = [part_of(missing), part_of(held)];
+        residency.mark_cold(&parts);
+        let (_, read) = explain_distributed(&cache, missing).await;
+        assert_eq!(
+            read.residency,
+            Residency {
+                cold_marked: true,
+                ..implicit
+            }
+        );
+        assert!(read.residency.cold() && !read.residency.implicitly_cold());
+        assert_eq!(read.local_read, LocalRead::ColdMiss);
+        let (explanation, read) = explain_distributed(&cache, held).await;
+        assert!(read.residency.cold());
+        assert_eq!(read.local_read, LocalRead::Hit);
+        assert_eq!(explanation.source, ReadSource::Local { hit: true });
+        assert_eq!(read.serves_peers, ServeVerdict::Serve);
+
+        residency.mark_serving(&parts);
+        let (explanation, read) = explain_distributed(&cache, missing).await;
+        assert_eq!(read.residency, Residency::new(true));
+        assert!(!read.residency.cold() && !read.residency.implicitly_cold());
+        assert_eq!(read.local_read, LocalRead::Miss);
+        assert_eq!(explanation.source, ReadSource::Local { hit: false });
+        assert_eq!(read.serves_peers, ServeVerdict::Miss);
+        let (explanation, read) = explain_distributed(&cache, held).await;
+        assert_eq!(read.residency, Residency::new(true));
+        assert_eq!(read.local_read, LocalRead::Hit);
+        assert_eq!(explanation.source, ReadSource::Local { hit: true });
+
+        a.shutdown().await;
+    }
+
+    /// A part this node no longer owns but holds through its disown grace
+    /// is `releasing_for` some time and not owned: this node's own read of
+    /// it is `NotOwner`, yet it serves the record it holds to a peer, which
+    /// it does not once the part is outside the grace.
+    #[tokio::test]
+    async fn explain_reports_a_releasing_node() {
+        let name = "explain-releasing";
+        let a = solo_cluster(name, loopback_config()).await;
+        let me = a.node_id();
+        let phantom = NodeId::from(u64::MAX);
+        let owned = Arc::new(OwnershipView::compute(me, vec![me], NonZeroU8::MIN));
+        let shared = Arc::new(OwnershipView::compute(me, vec![phantom], NonZeroU8::MIN));
+        let (cache, residency, view_tx) = cache_publishing_views(&a, name, &owned);
+        let key = (0..1_000_000u32)
+            .find(|key| !shared.owns(part_of(*key)))
+            .expect("the phantom owns some parts");
+        // The record lands while this node owns its part, then the part moves.
+        ShardOps::apply_remote_batch(cache.shard.as_ref(), vec![test_record(key, "held", me)])
+            .await;
+        view_tx
+            .send(Arc::clone(&shared))
+            .expect("the tracker holds a receiver");
+
+        let (explanation, read) = explain_distributed(&cache, key).await;
+        assert!(
+            explanation.local.is_live(),
+            "the record outlives the ownership"
+        );
+        assert_eq!(read.residency, Residency::new(false));
+        assert_eq!(read.local_read, LocalRead::NotOwner);
+        assert_eq!(
+            read.serves_peers,
+            ServeVerdict::Miss,
+            "outside the grace the held record is not served"
+        );
+
+        residency.mark_releasing(&[part_of(key)]);
+        let (explanation, read) = explain_distributed(&cache, key).await;
+        assert!(read.residency.releasing_for.is_some());
+        assert!(!read.residency.owns && read.residency.resident());
+        assert_eq!(
+            Residency {
+                releasing_for: None,
+                ..read.residency
+            },
+            Residency::new(false)
+        );
+        assert_eq!(read.local_read, LocalRead::NotOwner);
+        assert_eq!(read.serves_peers, ServeVerdict::Serve);
+        assert_eq!(read.owners, vec![phantom]);
+        assert_eq!(
+            read.probes,
+            vec![OwnerProbe {
+                node: phantom,
+                answer: ProbeAnswer::Unreached(Unreached::NotAMember),
+            }]
+        );
+        assert_eq!(explanation.source, ReadSource::Unavailable);
+
+        a.shutdown().await;
+    }
+
+    /// Outside `Mode::Distributed` an explanation has no distribution. It
+    /// names the cache, this node, the mode, the key's part and the cache's
+    /// clock reading, and its source is this node's own copy: a write reads
+    /// `Live`, a key never written `Absent`, and a removed one a `Tombstone`
+    /// newer than the write, in every mode.
+    #[tokio::test]
+    async fn explain_in_local_invalidation_and_replicated_modes_has_no_distribution() {
+        let cluster = solo_cluster("cache-it-explain-modes", loopback_config()).await;
+        for (mode, name) in [
+            (Mode::Local, "explain-mode-local"),
+            (Mode::Invalidation, "explain-mode-invalidation"),
+            (Mode::Replicated, "explain-mode-replicated"),
+        ] {
+            let cache = cluster
+                .cache::<u32, String>(name)
+                .mode(mode)
+                .open()
+                .await
+                .expect("opens alone");
+            cache.insert(1, "one".to_string()).await.expect("insert");
+
+            let before = now_ms();
+            let live = cache.explain(&1).await.expect("u32 encodes");
+            let after = now_ms();
+            assert_eq!(live.cache.as_str(), name);
+            assert_eq!(live.node, cluster.node_id(), "{mode:?}");
+            assert_eq!(live.mode, mode);
+            assert_eq!(live.part, part_of(1), "{mode:?}");
+            assert!((before..=after).contains(&live.at_ms), "{mode:?}: {live:?}");
+            let LocalRecord::Live {
+                version: written,
+                expires_at_ms: None,
+                spilled: false,
+                ..
+            } = live.local
+            else {
+                panic!("{mode:?}: an inserted key is live: {live:?}");
+            };
+            assert_eq!(live.source, ReadSource::Local { hit: true }, "{mode:?}");
+            assert_eq!(live.distributed, None, "{mode:?}");
+
+            let absent = cache.explain(&2).await.expect("u32 encodes");
+            assert_eq!(absent.local, LocalRecord::Absent, "{mode:?}");
+            assert_eq!(absent.source, ReadSource::Local { hit: false }, "{mode:?}");
+            assert_eq!(absent.distributed, None, "{mode:?}");
+
+            cache.remove(&1).await.expect("remove");
+            let removed = cache.explain(&1).await.expect("u32 encodes");
+            let LocalRecord::Tombstone {
+                version: deleted, ..
+            } = removed.local
+            else {
+                panic!("{mode:?}: a removed key leaves a tombstone: {removed:?}");
+            };
+            assert!(deleted > written, "{mode:?}");
+            assert_eq!(removed.source, ReadSource::Local { hit: false }, "{mode:?}");
+            assert_eq!(removed.distributed, None, "{mode:?}");
+
+            cache.close().await;
+        }
+        cluster.shutdown().await;
+    }
+
+    /// A key type whose `Serialize` always fails, to reach `explain`'s
+    /// encode error.
+    #[derive(Clone, Hash, PartialEq, Eq, serde::Deserialize)]
+    struct Unencodable;
+
+    impl Serialize for Unencodable {
+        fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("this key never encodes"))
+        }
+    }
+
+    /// A key that fails to encode makes `explain` fail with a codec error,
+    /// in a `Mode::Distributed` cache before any owner is asked and in a
+    /// `Mode::Local` one alike.
+    #[tokio::test]
+    async fn explain_of_a_key_that_fails_to_encode_is_a_codec_error() {
+        let cluster = solo_cluster("cache-it-explain-codec", loopback_config()).await;
+        for (mode, name) in [
+            (Mode::Local, "explain-codec-local"),
+            (Mode::distributed(), "explain-codec-distributed"),
+        ] {
+            let cache = cluster
+                .cache::<Unencodable, String>(name)
+                .mode(mode)
+                .open()
+                .await
+                .expect("opens alone");
+            let result = cache.explain(&Unencodable).await;
+            assert!(
+                matches!(result, Err(CacheError::Codec(_))),
+                "{mode:?}: {result:?}"
+            );
+            cache.close().await;
+        }
+        cluster.shutdown().await;
+    }
+
+    /// `Cache::explain`'s future is `Send`, so a caller can hold it across a
+    /// thread hop or spawn it: checked on a distributed cache, whose
+    /// explanation awaits its probes.
+    #[tokio::test]
+    async fn explain_future_is_send() {
+        fn assert_send<T: Send>(_: &T) {}
+
+        let name = "explain-send";
+        let a = solo_cluster(name, loopback_config()).await;
+        let phantom = NodeId::from(u64::MAX);
+        let view = Arc::new(OwnershipView::compute(
+            a.node_id(),
+            vec![phantom],
+            Mode::DEFAULT_OWNERS,
+        ));
+        let (cache, _residency) = cache_under_view(&a, name, &view);
+        let key = 7u32;
+
+        let future = cache.explain(&key);
+        assert_send(&future);
+        let direct = future.await.expect("u32 encodes");
+        let spawned = tokio::spawn({
+            let cache = cache.clone();
+            async move { cache.explain(&key).await }
+        })
+        .await
+        .expect("the task finishes")
+        .expect("u32 encodes");
+        assert_eq!(spawned.part, direct.part);
+        assert_eq!(spawned.local, direct.local);
+
         a.shutdown().await;
     }
 
@@ -5339,6 +5971,39 @@ mod tests {
         values
     }
 
+    /// [`drained`]'s map: per `(name, cache, outcome)`, a counter's value or a
+    /// histogram's sample count.
+    type Series = std::collections::BTreeMap<(String, String, String), u64>;
+
+    /// The series a read moves: hit and miss counts, sampled read timings,
+    /// fetch counts and timings, and loader calls.
+    const READ_SERIES: [&str; 6] = [
+        "sundog_cache_hits_total",
+        "sundog_cache_misses_total",
+        "sundog_read_duration_seconds",
+        "sundog_fetch_total",
+        "sundog_fetch_duration_seconds",
+        "sundog_loader_calls_total",
+    ];
+
+    /// [`drained`] restricted to [`READ_SERIES`]. A call drains every series,
+    /// so each reports what ran since the one before.
+    fn read_series(snapshotter: &metrics_util::debugging::Snapshotter) -> Series {
+        drained(snapshotter)
+            .into_iter()
+            .filter(|((name, ..), _)| READ_SERIES.contains(&name.as_str()))
+            .collect()
+    }
+
+    /// The value of the series `name` of `cache` under `outcome` in `series`,
+    /// 0 when it has none.
+    fn series_count(series: &Series, name: &str, cache: &str, outcome: &str) -> u64 {
+        series
+            .get(&(name.to_owned(), cache.to_owned(), outcome.to_owned()))
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Each call under its own cache label, so the test sees which calls
     /// are timed, not only how many per outcome.
     #[test]
@@ -5425,6 +6090,160 @@ mod tests {
         solo.shutdown().await;
     }
 
+    /// Asserts `local` is what a shard holding `held` stores for the case
+    /// key.
+    fn assert_stores(held: crate::store::read_cases::Held, local: &LocalRecord) {
+        use crate::store::read_cases::Held;
+        match held {
+            Held::Nothing => assert_eq!(*local, LocalRecord::Absent),
+            Held::Live => assert!(
+                matches!(
+                    local,
+                    LocalRecord::Live {
+                        expires_at_ms: None,
+                        spilled: false,
+                        ..
+                    }
+                ),
+                "{local:?}"
+            ),
+            Held::Tombstone => assert!(matches!(local, LocalRecord::Tombstone { .. }), "{local:?}"),
+        }
+    }
+
+    /// Asserts `marks` are the residency marks `case` set, a running disown
+    /// grace counting as set whatever time it has run.
+    fn assert_marks_of_case(case: crate::store::read_cases::ReadCase, marks: Residency) {
+        assert_eq!(
+            Residency {
+                releasing_for: None,
+                ..marks
+            },
+            Residency {
+                owns: case.owns,
+                releasing_for: None,
+                cold_marked: case.cold_marked,
+                unsettled: case.unsettled,
+                unverified: case.unverified,
+                stale: case.stale,
+            },
+            "{case:?}"
+        );
+        assert_eq!(marks.releasing_for.is_some(), case.releasing, "{case:?}");
+    }
+
+    /// What a node in `case`'s state answers a peer's fetch sent with an
+    /// equal view hash: distrust declines even a held record, a held record
+    /// in a resident part is served, a cold part declines, and only a warm
+    /// part's miss is definitive.
+    fn serve_rule(case: crate::store::read_cases::ReadCase) -> ServeVerdict {
+        if case.distrusted() {
+            ServeVerdict::DeclineDistrusted
+        } else if case.served() {
+            ServeVerdict::Serve
+        } else if case.cold() {
+            ServeVerdict::DeclineCold
+        } else {
+            ServeVerdict::Miss
+        }
+    }
+
+    /// `Cache::explain` against `Cache::fetch` over every residency state a
+    /// read tells apart, in front of an owner no node can reach. The marks
+    /// it reports are the ones the case set and the ones the shard reads
+    /// itself; its local read is the verdict those marks give and answers
+    /// iff the part is owned and trusted and the read hits or the part is
+    /// warm; it predicts what this node answers a peer; the one owner is
+    /// unreached; and the source it names is the one the fetch takes its
+    /// answer from.
+    #[tokio::test]
+    async fn explain_agrees_with_fetch_over_every_residency_state() {
+        use crate::store::read_cases::{case_shard, every_read_case};
+        let solo = solo_cluster("cache-it-explain-read-cases", loopback_config()).await;
+        let (n1, n2) = (NodeId::from(1u64), NodeId::from(2u64));
+        for case in every_read_case() {
+            let built = case_shard("explain-cases", &case).await;
+            let cache = Cache {
+                shard: Arc::new(built.shard),
+                cluster: solo.clone(),
+                cancel: CancellationToken::new(),
+                tasks: TaskTracker::new(),
+            };
+            let explanation = cache.explain(&built.key).await.expect("u32 encodes");
+            let read = explanation
+                .distributed
+                .clone()
+                .expect("a distributed cache explains its distribution");
+
+            assert_eq!(explanation.cache.as_str(), "explain-cases");
+            assert_eq!(explanation.node, solo.node_id());
+            assert_eq!(
+                explanation.mode,
+                Mode::Distributed {
+                    owners: NonZeroU8::MIN
+                }
+            );
+            assert_eq!(explanation.part, built.part);
+            assert_stores(case.held, &explanation.local);
+
+            assert_eq!(read.view_hash, built.view.view_hash(), "{case:?}");
+            assert_eq!(read.view_moved_to, None, "{case:?}");
+            let owner = if case.owns { n1 } else { n2 };
+            assert_eq!(read.owners, vec![owner], "{case:?}");
+            assert_eq!(read.owners, cache.owners_of(&built.key), "{case:?}");
+
+            let direct = cache.shard.residency_of(&built.view, built.part);
+            assert_marks_of_case(case, read.residency);
+            assert_marks_of_case(case, direct);
+            assert_eq!(
+                Residency {
+                    releasing_for: None,
+                    ..read.residency
+                },
+                Residency {
+                    releasing_for: None,
+                    ..direct
+                },
+                "{case:?}"
+            );
+            assert_eq!(
+                read.local_read,
+                verdict::local_verdict(&direct, case.live()),
+                "{case:?}"
+            );
+            let answers = case.owns && !case.distrusted() && (case.live() || !case.cold());
+            assert_eq!(read.local_read.answers(), answers, "{case:?}");
+            assert_eq!(read.serves_peers, serve_rule(case), "{case:?}");
+            assert_eq!(
+                read.probes,
+                vec![OwnerProbe {
+                    node: owner,
+                    answer: ProbeAnswer::Unreached(Unreached::NotAMember),
+                }],
+                "{case:?}"
+            );
+            let source = if answers {
+                ReadSource::Local { hit: case.live() }
+            } else {
+                ReadSource::Unavailable
+            };
+            assert_eq!(explanation.source, source, "{case:?}");
+
+            let fetched = cache.fetch(&built.key).await;
+            match (explanation.source, &fetched) {
+                (ReadSource::Local { hit: true }, Ok(Some(value))) => {
+                    assert_eq!(value, "held", "{case:?}");
+                }
+                (ReadSource::Local { hit: false }, Ok(None))
+                | (ReadSource::Unavailable, Err(CacheError::FetchUnavailable { .. })) => {}
+                (source, fetched) => {
+                    panic!("{case:?}: explain says {source:?}, fetch returns {fetched:?}");
+                }
+            }
+        }
+        solo.shutdown().await;
+    }
+
     /// Through `Cache::fetch`: a fetch answered without asking an owner is
     /// counted and not timed, on a cache with no ownership view and on a
     /// `Mode::Distributed` key this node owns warm; a fetch that asks an
@@ -5486,6 +6305,838 @@ mod tests {
         assert_eq!(cache_a.fetch(&remote).await.expect("fetch"), None);
         assert_eq!(fetched("cache-it-fetch-timed", "miss"), (Some(1), Some(1)));
         shut_down_all(nodes).await;
+    }
+
+    /// `explain` of a `Mode::Local` cache counts no read: over a live key, a
+    /// deleted key and a key never written it moves no hit, miss, read
+    /// timing, fetch or loader series and creates none, where a `get` and a
+    /// `fetch` of the same cache move them.
+    #[tokio::test]
+    async fn explain_does_not_move_a_read_metric_on_a_local_cache() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let name = "explain-quiet-local";
+        let cluster = Cluster::builder("cache-it-explain-quiet-local")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node builds");
+        let cache = cluster
+            .cache::<u32, String>(name)
+            .mode(Mode::Local)
+            .loader(|key: u32| async move { Ok::<_, SourceDown>(Some(format!("v{key}"))) })
+            .open()
+            .await
+            .expect("opens");
+        cache.insert(1, "live".to_string()).await.expect("insert");
+        cache.insert(2, "gone".to_string()).await.expect("insert");
+        cache.remove(&2).await.expect("remove");
+
+        assert_eq!(cache.get(&1).await, Some("live".to_string()));
+        assert_eq!(cache.get(&3).await, None);
+        assert_eq!(
+            cache.fetch(&1).await.expect("fetch"),
+            Some("live".to_string())
+        );
+        let read = read_series(&snapshotter);
+        assert_eq!(series_count(&read, "sundog_cache_hits_total", name, ""), 2);
+        assert_eq!(
+            series_count(&read, "sundog_cache_misses_total", name, ""),
+            1
+        );
+        assert_eq!(series_count(&read, "sundog_fetch_total", name, "local"), 1);
+
+        let before = read_series(&snapshotter);
+        for (key, returns_value) in [(1, true), (2, false), (3, false)] {
+            let explanation = cache.explain(&key).await.expect("explains");
+            assert_eq!(
+                explanation.source.returns_value(),
+                returns_value,
+                "{explanation}"
+            );
+            assert!(explanation.distributed.is_none());
+        }
+        assert_eq!(
+            read_series(&snapshotter),
+            before,
+            "explain moves no read series and creates none"
+        );
+
+        assert_eq!(cache.get(&1).await, Some("live".to_string()));
+        assert_eq!(
+            series_count(
+                &read_series(&snapshotter),
+                "sundog_cache_hits_total",
+                name,
+                ""
+            ),
+            1,
+            "a read after the explanations counts as it always does"
+        );
+        cluster.shutdown().await;
+    }
+
+    /// `explain` of a `Mode::Distributed` cache asks the owners and still
+    /// counts no read: over a key this node owns and a key it does not, each
+    /// stored and never written, asked of every node, it moves no hit, miss,
+    /// read timing, fetch, fetch timing or loader series, where the `fetch`
+    /// of the same four keys moves them.
+    #[tokio::test]
+    async fn explain_does_not_move_a_read_metric_on_a_distributed_cache() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let name = "cache-it-explain-quiet";
+        let log = LoadLog::default();
+        let nodes = three_loading_nodes(name, Mode::distributed(), &log, None).await;
+        let (a, cache_a) = &nodes[0];
+        let owned: Vec<u32> = (0..10_000u32)
+            .filter(|key| cache_a.owners_of(key).contains(&a.node_id()))
+            .take(2)
+            .collect();
+        let remote: Vec<u32> = (0..10_000u32)
+            .filter(|key| !cache_a.owners_of(key).contains(&a.node_id()))
+            .take(2)
+            .collect();
+        let [owned_stored, owned_absent] = owned[..] else {
+            panic!("a owns some parts of a three-node view");
+        };
+        let [remote_stored, remote_absent] = remote[..] else {
+            panic!("a does not own some parts of a three-node view");
+        };
+        let keys = [owned_stored, owned_absent, remote_stored, remote_absent];
+        let is_stored = |key: u32| key == owned_stored || key == remote_stored;
+        for key in keys {
+            wait_for_warm_owners(&nodes, key).await;
+        }
+        for key in [owned_stored, remote_stored] {
+            cache_a
+                .insert(key, format!("v{key}"))
+                .await
+                .expect("insert");
+            let holders: Vec<&Cache<u32, String>> = cache_a
+                .owners_of(&key)
+                .into_iter()
+                .map(|owner| cache_of(&nodes, owner))
+                .collect();
+            wait_for_local_record(&holders, key, LocalRecord::is_live).await;
+        }
+
+        for key in keys {
+            assert_eq!(
+                cache_a.fetch(&key).await.expect("fetch"),
+                is_stored(key).then(|| format!("v{key}"))
+            );
+        }
+        let fetched = read_series(&snapshotter);
+        let count = |series: &str, outcome: &str| series_count(&fetched, series, name, outcome);
+        assert_eq!(count("sundog_fetch_total", "remote"), 1);
+        assert_eq!(count("sundog_fetch_total", "miss"), 1);
+        assert_eq!(count("sundog_fetch_total", "local"), 2);
+        assert_eq!(count("sundog_fetch_duration_seconds", "remote"), 1);
+        assert_eq!(count("sundog_fetch_duration_seconds", "miss"), 1);
+        assert_eq!(count("sundog_fetch_duration_seconds", "local"), 0);
+        assert_eq!(count("sundog_cache_hits_total", ""), 1);
+        assert_eq!(count("sundog_cache_misses_total", ""), 1);
+
+        let before = read_series(&snapshotter);
+        for (_, cache) in &nodes {
+            for key in keys {
+                let explanation = cache.explain(&key).await.expect("explains");
+                assert_eq!(
+                    explanation.source.returns_value(),
+                    is_stored(key),
+                    "{explanation}"
+                );
+            }
+        }
+        let asked = cache_a.explain(&remote_stored).await.expect("explains");
+        let read = asked
+            .distributed
+            .as_ref()
+            .expect("a Distributed cache explains its fetch");
+        assert_eq!(read.probes.len(), 2, "explain asks both owners: {asked}");
+        assert_eq!(
+            read_series(&snapshotter),
+            before,
+            "explain moves no read series and creates none"
+        );
+        assert!(
+            log.lock().expect("log lock").is_empty(),
+            "explain calls no loader: {:?}",
+            log.lock().expect("log lock")
+        );
+        shut_down_all(nodes).await;
+    }
+
+    /// `explain` of a key the source holds and no cache stores calls no
+    /// loader and stores nothing: every node still misses the key afterwards,
+    /// where `Cache::load` of it calls the first owner's loader once and the
+    /// owners keep the value.
+    #[tokio::test]
+    async fn explain_does_not_load_or_fill_a_missing_key() {
+        let log = LoadLog::default();
+        let nodes =
+            three_loading_nodes("cache-it-explain-no-load", Mode::distributed(), &log, None).await;
+        let (a, cache_a) = &nodes[0];
+        let key = (0..10_000u32)
+            .find(|key| !cache_a.owners_of(key).contains(&a.node_id()))
+            .expect("a key a does not own");
+        let owners = cache_a.owners_of(&key);
+        wait_until(
+            Duration::from_secs(10),
+            "every node agrees on the key's owners",
+            async || {
+                nodes
+                    .iter()
+                    .all(|(_, cache)| cache.owners_of(&key) == owners)
+            },
+        )
+        .await;
+        wait_for_warm_owners(&nodes, key).await;
+
+        for (_, cache) in &nodes {
+            let explanation = cache.explain(&key).await.expect("explains");
+            assert_eq!(explanation.local, LocalRecord::Absent);
+            assert!(
+                !explanation.source.returns_value(),
+                "no cache stores the key: {explanation}"
+            );
+        }
+        assert!(
+            log.lock().expect("log lock").is_empty(),
+            "explain calls no loader: {:?}",
+            log.lock().expect("log lock")
+        );
+        for (_, cache) in &nodes {
+            assert_eq!(cache.get(&key).await, None, "explain stores nothing");
+            assert_eq!(cache.keys(), Vec::<u32>::new(), "explain fills no key");
+        }
+        assert_eq!(cache_a.fetch(&key).await.expect("fetch"), None);
+        assert!(
+            log.lock().expect("log lock").is_empty(),
+            "a fetch loads nothing either"
+        );
+
+        assert_eq!(
+            cache_a.load(&key).await.expect("load"),
+            Some(format!("v{key}"))
+        );
+        assert_eq!(
+            log.lock().expect("log lock").clone(),
+            vec![(owners[0], vec![key])],
+            "the key's first owner runs the one load"
+        );
+        wait_until(
+            Duration::from_secs(10),
+            "both owners hold the loaded value",
+            async || {
+                let mut held = 0;
+                for (cluster, cache) in &nodes {
+                    if owners.contains(&cluster.node_id()) && cache.get(&key).await.is_some() {
+                        held += 1;
+                    }
+                }
+                held == 2
+            },
+        )
+        .await;
+        shut_down_all(nodes).await;
+    }
+
+    /// `explain` opens no `sundog.fetch` span: not for a key this node owns,
+    /// a key it asks the owners for, or a cache with no ownership view,
+    /// where the `fetch` of the same three keys opens one each.
+    #[tokio::test]
+    async fn explain_does_not_open_a_fetch_span() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let spans = FetchSpans::default();
+        let _guard = crate::cluster::test_support::scoped_subscriber(
+            tracing_subscriber::registry().with(spans.clone()),
+        );
+        let log = LoadLog::default();
+        let nodes =
+            three_loading_nodes("cache-it-explain-no-span", Mode::distributed(), &log, None).await;
+        let (a, cache_a) = &nodes[0];
+        let plain = a
+            .cache::<u32, String>("cache-it-explain-no-span-plain")
+            .mode(Mode::Local)
+            .open()
+            .await
+            .expect("opens");
+        let local = (0..10_000u32)
+            .find(|key| cache_a.owners_of(key).contains(&a.node_id()))
+            .expect("a key a owns");
+        let remote = (0..10_000u32)
+            .find(|key| !cache_a.owners_of(key).contains(&a.node_id()))
+            .expect("a key a does not own");
+        wait_for_warm_owners(&nodes, local).await;
+        wait_for_warm_owners(&nodes, remote).await;
+        let fetch_spans = || {
+            spans
+                .0
+                .lock()
+                .expect("spans lock")
+                .iter()
+                .filter(|(span, _)| *span == "sundog.fetch")
+                .count()
+        };
+
+        let before = fetch_spans();
+        for key in [local, remote] {
+            cache_a.explain(&key).await.expect("explains");
+        }
+        plain.explain(&1).await.expect("explains");
+        assert_eq!(fetch_spans(), before, "explain opens no fetch span");
+
+        for key in [local, remote] {
+            cache_a.fetch(&key).await.expect("fetch");
+        }
+        plain.fetch(&1).await.expect("fetch");
+        assert_eq!(
+            fetch_spans(),
+            before + 3,
+            "a fetch opens one span, on this node and on its owners alike"
+        );
+        shut_down_all(nodes).await;
+    }
+
+    /// A loopback address that accepts every connection and answers none: an
+    /// owner that is up and silent.
+    async fn silent_peer_addr() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind an ephemeral loopback tcp port for a silent peer");
+        let addr = listener
+            .local_addr()
+            .expect("a freshly bound tcp listener reports a local address");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        addr
+    }
+
+    /// Three `Mode::distributed()` nodes of `name` and two keys the first node
+    /// does not own, whose two owners hold their parts warm under one view on
+    /// every node. Anti-entropy is effectively off, so nothing repairs a copy
+    /// a test drops by hand, and the failure detector never drops a crashed
+    /// node from a view.
+    async fn explain_nodes(name: &'static str) -> (Vec<(Cluster, Cache<u32, String>)>, [u32; 2]) {
+        let mut config = loopback_config().with(|c| {
+            c.ae_interval = Duration::from_secs(3600);
+            c.phi_threshold = 1_000.0;
+        });
+        config.tombstone_ttl = config.bucket_release_window();
+        let (a, b, c) = three_node_distributed_with(name, config).await;
+        let nodes = vec![a, b, c];
+        wait_for_full_views(&nodes).await;
+        let asker = nodes[0].0.node_id();
+        let keys: Vec<u32> = (0..100_000u32)
+            .filter(|key| !nodes[0].1.owners_of(key).contains(&asker))
+            .take(2)
+            .collect();
+        let [first, second] = keys[..] else {
+            panic!("the first node owns only some parts of a three-node view");
+        };
+        for key in [first, second] {
+            wait_for_warm_owners(&nodes, key).await;
+        }
+        (nodes, [first, second])
+    }
+
+    /// The cache `node` runs in `nodes`.
+    fn cache_of(nodes: &[(Cluster, Cache<u32, String>)], node: NodeId) -> &Cache<u32, String> {
+        &nodes
+            .iter()
+            .find(|(cluster, _)| cluster.node_id() == node)
+            .expect("the node is one of the cluster's")
+            .1
+    }
+
+    /// Waits until every cache of `caches` stores `key` as `want` says,
+    /// read from its engine: a tombstone is invisible to `Cache::get`.
+    async fn wait_for_local_record(
+        caches: &[&Cache<u32, String>],
+        key: u32,
+        want: fn(&LocalRecord) -> bool,
+    ) {
+        let key_bytes = encode_key(&key).expect("u32 encodes");
+        wait_until(
+            Duration::from_secs(10),
+            "every cache stores the key as wanted",
+            async || {
+                caches
+                    .iter()
+                    .all(|cache| want(&cache.shard.local_record(&key_bytes).1))
+            },
+        )
+        .await;
+    }
+
+    /// Crashes `node`'s cluster and drops it from `nodes`.
+    async fn crash_node(nodes: &mut Vec<(Cluster, Cache<u32, String>)>, node: NodeId) {
+        let at = nodes
+            .iter()
+            .position(|(cluster, _)| cluster.node_id() == node)
+            .expect("the node is one of the cluster's");
+        let (cluster, _) = nodes.remove(at);
+        cluster.crash().await;
+    }
+
+    /// `explanation`'s distributed half, after checking it against `cache`:
+    /// its owners are the ones `Cache::owners_of` returns for `key`, and its
+    /// probes ask every owner but `cache`'s own node, in that order.
+    fn distributed_of<'a>(
+        cache: &Cache<u32, String>,
+        key: u32,
+        explanation: &'a ReadExplanation,
+    ) -> &'a DistributedRead {
+        let read = explanation
+            .distributed
+            .as_ref()
+            .expect("a Distributed cache explains its fetch");
+        let owners = cache.owners_of(&key);
+        assert_eq!(
+            read.owners, owners,
+            "the explanation names the owners owners_of does"
+        );
+        let me = cache.cluster.node_id();
+        let others: Vec<NodeId> = owners.into_iter().filter(|owner| *owner != me).collect();
+        let probed: Vec<NodeId> = read.probes.iter().map(|probe| probe.node).collect();
+        assert_eq!(
+            probed, others,
+            "the probes ask every other owner, in owners order"
+        );
+        read
+    }
+
+    /// Each probe's answer, in probe order.
+    fn answers_of(read: &DistributedRead) -> Vec<ProbeAnswer> {
+        read.probes.iter().map(|probe| probe.answer).collect()
+    }
+
+    /// The record `probe` reports its owner sending.
+    fn held_record(probe: &OwnerProbe) -> ProbedRecord {
+        match probe.answer {
+            ProbeAnswer::Held(record) => record,
+            other => panic!("owner {} sends its record, answered {other:?}", probe.node),
+        }
+    }
+
+    /// The record every probe of `read` reports sent, in probe order.
+    fn held_records(read: &DistributedRead) -> Vec<ProbedRecord> {
+        read.probes.iter().map(held_record).collect()
+    }
+
+    /// Asserts a fetch of `key` on `cache` returns what `explanation.source`
+    /// predicts: a value for a source that returns one, `None` for one that
+    /// does not, and `FetchUnavailable` for no source.
+    async fn assert_fetch_returns_source(
+        cache: &Cache<u32, String>,
+        key: u32,
+        explanation: &ReadExplanation,
+    ) {
+        let fetched = cache.fetch(&key).await;
+        match (explanation.source, fetched) {
+            (
+                ReadSource::Local { hit: true } | ReadSource::Owner { hit: true, .. },
+                Ok(Some(_)),
+            )
+            | (ReadSource::Local { hit: false } | ReadSource::Owner { hit: false, .. }, Ok(None))
+            | (ReadSource::Unavailable, Err(CacheError::FetchUnavailable { .. })) => {}
+            (source, fetched) => panic!("explained {source:?} for key {key}, fetched {fetched:?}"),
+        }
+    }
+
+    /// A key a node does not own, probed through every state its two owners
+    /// hold it in: a live entry reads as a value on both under one version, a
+    /// delete reads as `Deleted` on both under a newer one, and a key never
+    /// written is a miss on both. The asking node holds nothing, so its own
+    /// copy never answers, and each source is what a fetch returns.
+    #[tokio::test]
+    async fn explain_probe_reports_a_value_a_tombstone_and_a_miss() {
+        let (nodes, [key, absent]) = explain_nodes("cache-it-explain-probe-answers").await;
+        let cache_a = &nodes[0].1;
+        let owners = cache_a.owners_of(&key);
+        let (first, second) = (cache_of(&nodes, owners[0]), cache_of(&nodes, owners[1]));
+
+        first.insert(key, "one".to_string()).await.expect("insert");
+        wait_for_local_record(&[first, second], key, LocalRecord::is_live).await;
+        let explanation = cache_a.explain(&key).await.expect("explains");
+        let read = distributed_of(cache_a, key, &explanation);
+        assert_eq!(
+            explanation.local,
+            LocalRecord::Absent,
+            "the asking node does not own the key's part"
+        );
+        assert_eq!(read.local_read, LocalRead::NotOwner);
+        let live = held_records(read);
+        assert!(
+            live.iter()
+                .all(|record| record.reads == Reads::Value && record.expires_at_ms.is_none()),
+            "both owners hold a value without an expiry: {live:?}"
+        );
+        assert_eq!(live[0].version, live[1].version, "one write, one version");
+        assert_eq!(
+            explanation.source,
+            ReadSource::Owner {
+                node: owners[0],
+                hit: true
+            },
+            "the first owner probed answers"
+        );
+        assert_fetch_returns_source(cache_a, key, &explanation).await;
+
+        first.remove(&key).await.expect("remove");
+        wait_for_local_record(&[first, second], key, |record| {
+            matches!(record, LocalRecord::Tombstone { .. })
+        })
+        .await;
+        let explanation = cache_a.explain(&key).await.expect("explains");
+        let read = distributed_of(cache_a, key, &explanation);
+        let dead = held_records(read);
+        assert!(
+            dead.iter().all(|record| record.reads == Reads::Deleted),
+            "both owners send a tombstone, which reads as no value: {dead:?}"
+        );
+        assert_eq!(dead[0].version, dead[1].version, "one delete, one version");
+        assert!(
+            dead[0].version > live[0].version,
+            "the delete is newer than the write it removes"
+        );
+        assert_eq!(
+            explanation.source,
+            ReadSource::Owner {
+                node: owners[0],
+                hit: false
+            }
+        );
+        assert_fetch_returns_source(cache_a, key, &explanation).await;
+
+        let explanation = cache_a.explain(&absent).await.expect("explains");
+        let read = distributed_of(cache_a, absent, &explanation);
+        assert_eq!(
+            answers_of(read),
+            [ProbeAnswer::Miss, ProbeAnswer::Miss],
+            "warm owners on one view agree a key never written is a miss"
+        );
+        assert_eq!(
+            explanation.source,
+            ReadSource::Owner {
+                node: read.owners[0],
+                hit: false
+            }
+        );
+        assert_fetch_returns_source(cache_a, absent, &explanation).await;
+
+        shut_down_all(nodes).await;
+    }
+
+    /// An owner whose copy of the part is cold and holds no record declines,
+    /// and so does one that holds the record in a part it distrusts (owned
+    /// again after a loss): the fetch moves past the first and is
+    /// unavailable once both decline. Each owner's own explanation names the
+    /// verdict the asking node saw as its answer.
+    #[tokio::test]
+    async fn explain_probe_reports_a_cold_owner_and_a_distrusted_owner_as_declined() {
+        let (nodes, [key, _]) = explain_nodes("cache-it-explain-probe-declines").await;
+        let cache_a = &nodes[0].1;
+        let owners = cache_a.owners_of(&key);
+        let (cold, distrusted) = (cache_of(&nodes, owners[0]), cache_of(&nodes, owners[1]));
+        cold.insert(key, "held".to_string()).await.expect("insert");
+        wait_for_local_record(&[cold, distrusted], key, LocalRecord::is_live).await;
+        let part = PartId::of_key(&encode_key(&key).expect("u32 encodes"));
+
+        cold.invalidate_local(&key).await;
+        cold.shard
+            .residency()
+            .expect("the owner is distributed")
+            .mark_cold(&[part]);
+        let explanation = cache_a.explain(&key).await.expect("explains");
+        let read = distributed_of(cache_a, key, &explanation);
+        assert_eq!(
+            read.probes[0].answer,
+            ProbeAnswer::Declined,
+            "a cold part's miss says nothing"
+        );
+        assert_eq!(held_record(&read.probes[1]).reads, Reads::Value);
+        assert_eq!(
+            explanation.source,
+            ReadSource::Owner {
+                node: owners[1],
+                hit: true
+            },
+            "the fetch moves past a decline to the next owner"
+        );
+        assert_fetch_returns_source(cache_a, key, &explanation).await;
+        let own = cold.explain(&key).await.expect("explains");
+        let own_read = distributed_of(cold, key, &own);
+        assert!(own_read.residency.cold_marked);
+        assert_eq!(own_read.local_read, LocalRead::ColdMiss);
+        assert_eq!(own_read.serves_peers, ServeVerdict::DeclineCold);
+
+        distrusted
+            .shard
+            .residency()
+            .expect("the owner is distributed")
+            .mark_stale(&[part]);
+        let explanation = cache_a.explain(&key).await.expect("explains");
+        let read = distributed_of(cache_a, key, &explanation);
+        assert_eq!(
+            answers_of(read),
+            [ProbeAnswer::Declined, ProbeAnswer::Declined],
+            "a distrusted part declines even the record it holds"
+        );
+        assert_eq!(explanation.source, ReadSource::Unavailable);
+        assert_fetch_returns_source(cache_a, key, &explanation).await;
+        let own = distrusted.explain(&key).await.expect("explains");
+        assert!(own.local.is_live(), "the declining owner still holds it");
+        let own_read = distributed_of(distrusted, key, &own);
+        assert!(own_read.residency.stale);
+        assert_eq!(own_read.local_read, LocalRead::Distrusted);
+        assert_eq!(own_read.serves_peers, ServeVerdict::DeclineDistrusted);
+
+        shut_down_all(nodes).await;
+    }
+
+    /// An owner whose node crashed gives no answer, while the other owner
+    /// still answers: the view keeps naming the crashed owner, the fetch
+    /// moves past it, and the source is the second owner.
+    #[tokio::test]
+    async fn explain_probe_reports_a_crashed_owner_as_unreached() {
+        let (mut nodes, [key, _]) = explain_nodes("cache-it-explain-probe-crashed").await;
+        let owners = nodes[0].1.owners_of(&key);
+        let (crashed, survivor) = (owners[0], cache_of(&nodes, owners[1]));
+        survivor
+            .insert(key, "value".to_string())
+            .await
+            .expect("insert");
+        wait_for_local_record(
+            &[cache_of(&nodes, crashed), survivor],
+            key,
+            LocalRecord::is_live,
+        )
+        .await;
+
+        crash_node(&mut nodes, crashed).await;
+        let cache_a = &nodes[0].1;
+        let explanation = cache_a.explain(&key).await.expect("explains");
+        let read = distributed_of(cache_a, key, &explanation);
+        assert!(
+            matches!(
+                read.probes[0].answer,
+                ProbeAnswer::Unreached(Unreached::Io(_))
+            ),
+            "a crashed owner's connection fails: {:?}",
+            read.probes[0].answer
+        );
+        assert_eq!(held_record(&read.probes[1]).reads, Reads::Value);
+        assert_eq!(
+            explanation.source,
+            ReadSource::Owner {
+                node: owners[1],
+                hit: true
+            }
+        );
+        assert_fetch_returns_source(cache_a, key, &explanation).await;
+
+        shut_down_all(nodes).await;
+    }
+
+    /// An owner that holds no record and runs another ownership view answers
+    /// `StaleView` with its own view hash, which a fetch counts as no answer,
+    /// while an owner that holds the record sends it whatever its view.
+    #[tokio::test]
+    async fn explain_probe_reports_an_owner_on_another_view_as_stale_view() {
+        let name = "cache-it-explain-probe-stale-view";
+        let mut config = loopback_config();
+        config.fetch_timeout = Duration::from_millis(300);
+        let a = Cluster::builder(name)
+            .seeds(std::iter::empty())
+            .config(config)
+            .build()
+            .await
+            .expect("node a builds");
+        let b = Cluster::builder(name)
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node b builds");
+        let cache_b = b
+            .cache::<u32, String>(name)
+            .mode(Mode::distributed())
+            .open()
+            .await
+            .expect("b opens alone");
+        let peer_b = b.local_peer();
+        a.mesh().update_peers(vec![peer_b.clone()]);
+
+        // a's view ranks a and b, b's ranks b alone: the hashes differ.
+        let view = Arc::new(OwnershipView::compute(
+            a.node_id(),
+            vec![a.node_id(), peer_b.node],
+            NonZeroU8::MIN,
+        ));
+        let part_of = |key: &u32| PartId::of_key(&encode_key(key).expect("u32 encodes"));
+        let [missing, stored] = (0..1_000_000u32)
+            .filter(|key| !view.owns(part_of(key)))
+            .take(2)
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("b owns some parts of the view");
+        };
+        cache_b
+            .insert(stored, "stored".to_string())
+            .await
+            .expect("b owns every part while alone");
+        let (cache_a, _residency) = cache_under_view(&a, name, &view);
+
+        let explanation = cache_a.explain(&missing).await.expect("explains");
+        let read = distributed_of(&cache_a, missing, &explanation);
+        let ProbeAnswer::StaleView {
+            responder_view_hash,
+        } = read.probes[0].answer
+        else {
+            panic!("b runs another view, answered {:?}", read.probes[0].answer);
+        };
+        assert_ne!(responder_view_hash, read.view_hash);
+        assert_eq!(
+            Some(responder_view_hash),
+            cache_b.shard.ownership_view_hash(),
+            "the answer carries the owner's own view hash"
+        );
+        assert!(!read.probes[0].answer.answers());
+        assert_eq!(read.view_moved_to, None);
+        assert_eq!(
+            explanation.source,
+            ReadSource::Unavailable,
+            "a stale view counts as no answer"
+        );
+        assert_fetch_returns_source(&cache_a, missing, &explanation).await;
+
+        let explanation = cache_a.explain(&stored).await.expect("explains");
+        let read = distributed_of(&cache_a, stored, &explanation);
+        assert_eq!(
+            held_record(&read.probes[0]).reads,
+            Reads::Value,
+            "a held record is sent whatever the two views say"
+        );
+        assert_eq!(
+            explanation.source,
+            ReadSource::Owner {
+                node: peer_b.node,
+                hit: true
+            }
+        );
+        assert_fetch_returns_source(&cache_a, stored, &explanation).await;
+
+        cache_b.close().await;
+        b.shutdown().await;
+        a.shutdown().await;
+    }
+
+    /// With both owners of a key crashed and the asking node's view still
+    /// naming them, no probe answers: the source is unavailable and a fetch
+    /// returns `FetchUnavailable`.
+    #[tokio::test]
+    async fn explain_predicts_unavailable_when_every_owner_is_down() {
+        let (mut nodes, [key, _]) = explain_nodes("cache-it-explain-all-owners-down").await;
+        let owners = nodes[0].1.owners_of(&key);
+        cache_of(&nodes, owners[0])
+            .insert(key, "value".to_string())
+            .await
+            .expect("insert");
+        wait_for_local_record(
+            &[cache_of(&nodes, owners[0]), cache_of(&nodes, owners[1])],
+            key,
+            LocalRecord::is_live,
+        )
+        .await;
+
+        for owner in &owners {
+            crash_node(&mut nodes, *owner).await;
+        }
+        let cache_a = &nodes[0].1;
+        let explanation = cache_a.explain(&key).await.expect("explains");
+        let read = distributed_of(cache_a, key, &explanation);
+        assert!(
+            read.probes
+                .iter()
+                .all(|probe| matches!(probe.answer, ProbeAnswer::Unreached(Unreached::Io(_)))),
+            "no crashed owner answers: {:?}",
+            answers_of(read)
+        );
+        assert_eq!(explanation.local, LocalRecord::Absent);
+        assert_eq!(explanation.source, ReadSource::Unavailable);
+        assert_fetch_returns_source(cache_a, key, &explanation).await;
+
+        shut_down_all(nodes).await;
+    }
+
+    /// The owners are asked at once: two owners that accept a connection and
+    /// never answer both read `TimedOut`, and the call returns after about
+    /// one `fetch_timeout`, not one per owner.
+    #[tokio::test]
+    async fn explain_probes_the_owners_at_once() {
+        use crate::net::test_support::peer_at;
+
+        let name = "cache-it-explain-probe-at-once";
+        let fetch_timeout = Duration::from_millis(500);
+        let a = Cluster::builder(name)
+            .seeds(std::iter::empty())
+            .config(ClusterConfig {
+                fetch_timeout,
+                ..loopback_config()
+            })
+            .build()
+            .await
+            .expect("node a builds");
+        let silent = [NodeId::from(0xb), NodeId::from(0xc)];
+        let addrs = [silent_peer_addr().await, silent_peer_addr().await];
+        // The cluster republishes its empty peer list once, when its mesh
+        // task first runs: let that happen before the peers are injected.
+        tokio::task::yield_now().await;
+        a.mesh().update_peers(vec![
+            peer_at(silent[0], addrs[0]),
+            peer_at(silent[1], addrs[1]),
+        ]);
+        let view = Arc::new(OwnershipView::compute(
+            a.node_id(),
+            vec![a.node_id(), silent[0], silent[1]],
+            NonZeroU8::new(2).expect("nonzero"),
+        ));
+        let key = (0..1_000_000u32)
+            .find(|key| !view.owns(PartId::of_key(&encode_key(key).expect("u32 encodes"))))
+            .expect("a owns only some parts of a three-node view");
+        let (cache_a, _residency) = cache_under_view(&a, name, &view);
+
+        let started = Instant::now();
+        let explanation = cache_a.explain(&key).await.expect("explains");
+        let elapsed = started.elapsed();
+        let read = distributed_of(&cache_a, key, &explanation);
+        assert_eq!(
+            answers_of(read),
+            [ProbeAnswer::Unreached(Unreached::TimedOut); 2],
+            "both owners accept the connection and never answer"
+        );
+        assert!(
+            elapsed >= fetch_timeout,
+            "each probe waits out the fetch timeout: {elapsed:?}"
+        );
+        assert!(
+            elapsed < 2 * fetch_timeout,
+            "the owners are asked at once, not one after the other: {elapsed:?}"
+        );
+        assert_eq!(explanation.source, ReadSource::Unavailable);
+        assert_fetch_returns_source(&cache_a, key, &explanation).await;
+
+        a.shutdown().await;
     }
 
     #[tokio::test]
@@ -5792,6 +7443,75 @@ mod tests {
         .await;
         assert_eq!(
             log.lock().expect("log lock")[first],
+            (owners[0], vec![key]),
+            "the first owner reloads"
+        );
+        shut_down_all(nodes).await;
+    }
+
+    /// `explain` inside a key's refresh window is not a read: asked of every
+    /// node, the owners that hold the entry and the non-owner whose `fetch`
+    /// hints the owner included, it queues no reload and no loader runs,
+    /// where the `fetch` of the same key right after asks for one.
+    #[tokio::test]
+    async fn explain_does_not_start_a_refresh_inside_the_refresh_window() {
+        let log = LoadLog::default();
+        let nodes = refreshing_nodes(
+            "cache-it-explain-refresh",
+            Mode::distributed(),
+            3,
+            LONG_REFRESH,
+            &log,
+        )
+        .await;
+        let (a, cache_a) = &nodes[0];
+        let key = (0..10_000u32)
+            .find(|key| !cache_a.owners_of(key).contains(&a.node_id()))
+            .expect("a key a does not own");
+        let owners = cache_a.owners_of(&key);
+        wait_until(
+            Duration::from_secs(10),
+            "every node agrees on the key's owners",
+            async || {
+                nodes
+                    .iter()
+                    .all(|(_, cache)| cache.owners_of(&key) == owners)
+            },
+        )
+        .await;
+        assert!(cache_a.load(&key).await.expect("load").is_some());
+        let loaded = log.lock().expect("log lock").len();
+        wait_for_local_record(
+            &[cache_of(&nodes, owners[0]), cache_of(&nodes, owners[1])],
+            key,
+            LocalRecord::is_live,
+        )
+        .await;
+
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        for (_, cache) in &nodes {
+            let explanation = cache.explain(&key).await.expect("explains");
+            assert!(
+                explanation.source.returns_value(),
+                "the entry is live: {explanation}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            log.lock().expect("log lock").len(),
+            loaded,
+            "explain asks for no reload"
+        );
+
+        assert!(cache_a.fetch(&key).await.expect("fetch").is_some());
+        wait_until(
+            Duration::from_secs(5),
+            "the first owner reloads the key a non-owner read",
+            async || log.lock().expect("log lock").len() > loaded,
+        )
+        .await;
+        assert_eq!(
+            log.lock().expect("log lock")[loaded],
             (owners[0], vec![key]),
             "the first owner reloads"
         );

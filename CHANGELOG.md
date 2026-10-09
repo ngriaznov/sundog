@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`Cache::explain` shows why a read of a key answers what it answers.**
+  It reports what this node stores for the key and, in
+  `Mode::Distributed`, the key's part and owners, this node's residency
+  marks for the part, what its own copy makes of a fetch, what it answers
+  a peer's fetch, each other owner's answer, and where a fetch takes its
+  answer. It is not a read: it moves no metric, opens no span, touches no
+  idle timer, starts no refresh or load and promotes no spilled entry. Each
+  owner is asked with the fetch a read already sends, so an owner on the
+  previous release answers it. The `explain` module holds the report's
+  types, and `ReadExplanation` is re-exported at the crate root.
+
 ### Fixed
 
 - **A fetch no longer vouches for a miss read before a pull landed.** In

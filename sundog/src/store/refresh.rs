@@ -383,6 +383,7 @@ mod tests {
     use smol_str::SmolStr;
 
     use super::*;
+    use crate::explain::LocalRecord;
     use crate::node::NodeId;
     use crate::store::{Event, Loader, Mode};
 
@@ -476,6 +477,56 @@ mod tests {
             0,
             "reads never wait on a reload"
         );
+    }
+
+    /// `local_record` is not a read: inside an entry's refresh window it
+    /// queues no reload and calls no loader, where a `get` of the same entry
+    /// asks for one, and a key the shard lacks is neither loaded nor stored,
+    /// where a `load` of it calls the loader.
+    #[tokio::test]
+    async fn local_record_in_the_refresh_window_asks_for_no_reload() {
+        let clock = Arc::new(AtomicU64::new(T0));
+        let calls = Arc::new(AtomicU64::new(0));
+        let s = refreshing_shard(&clock, &calls, Source::Holds);
+        let mut requests = s.take_refresh_requests().expect("refresh-ahead is on");
+        s.insert(1, "a".to_string()).await.expect("insert");
+        let held = encode_key(&1u32).expect("encodes");
+        let lacking = encode_key(&2u32).expect("encodes");
+
+        clock.store(T0 + 9_000, Ordering::SeqCst);
+        let (at_ms, record) = s.local_record(&held);
+        assert_eq!(at_ms, T0 + 9_000);
+        assert!(
+            matches!(
+                record,
+                LocalRecord::Live {
+                    expires_at_ms: Some(expires),
+                    ..
+                } if expires == T0 + 10_000
+            ),
+            "{record:?}"
+        );
+        assert!(
+            requests.try_recv().is_err(),
+            "inspecting an entry past its refresh point asks for no reload"
+        );
+        assert_eq!(s.local_record(&lacking).1, LocalRecord::Absent);
+        assert!(requests.try_recv().is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no loader call");
+        assert_eq!(s.keys(), vec![1], "the missing key is not stored");
+
+        assert_eq!(s.get(&1).await, Some("a".to_string()));
+        let request = requests
+            .try_recv()
+            .expect("a due read asks, so the inspections did not claim the version");
+        assert_eq!(request.key, 1);
+        assert!(!request.hinted);
+        assert_eq!(
+            s.load(&2).await.expect("load"),
+            Some("v2.1".to_string()),
+            "a load of the lacking key calls the loader"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

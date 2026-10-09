@@ -103,13 +103,6 @@ pub(crate) struct CaseShard {
     pub(crate) shard: Shard<u32, String>,
     pub(crate) residency: Arc<ResidencySet>,
     pub(crate) key: u32,
-    #[cfg_attr(
-        feature = "sim",
-        allow(
-            dead_code,
-            reason = "the owner loop's and responder's tests are not built under sim"
-        )
-    )]
     pub(crate) key_bytes: Bytes,
     pub(crate) part: PartId,
     /// The view the shard decides under: node 1 among nodes 1 and 2.

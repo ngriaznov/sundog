@@ -3,9 +3,12 @@
 //! ([`local_verdict`]), and what this node answers a peer's `Fetch`
 //! ([`fetch_serve_verdict`]). `Cache`'s owner loop, `Shard::rearm_local`
 //! and the cluster's fetch responder decide through them, each from one
-//! [`Residency`] read before the record is.
+//! [`Residency`] read before the record is, and `Cache::explain` reports
+//! them.
 
-use crate::explain::{LocalRead, Residency, ServeVerdict};
+use crate::explain::{
+    LocalRead, LocalRecord, OwnerProbe, ProbeAnswer, ReadSource, Reads, Residency, ServeVerdict,
+};
 
 /// Whether a part's records are served to peers: owned, or mid disown
 /// grace. Pure; unit tested directly.
@@ -70,6 +73,46 @@ pub(crate) const fn fetch_serve_verdict(inputs: ServeInputs) -> ServeVerdict {
         ServeVerdict::DeclineCold
     } else {
         ServeVerdict::Miss
+    }
+}
+
+/// What this node answers a peer's `Fetch` sent with an equal view hash,
+/// for a part with `residency` holding `local`: [`fetch_serve_verdict`]
+/// with the record served exactly when `records_for` sends one, a held
+/// record in a resident part. Pure; unit tested directly.
+pub(crate) const fn serves_peers(residency: &Residency, local: &LocalRecord) -> ServeVerdict {
+    fetch_serve_verdict(ServeInputs {
+        distrusted: residency.distrusted(),
+        served: residency.resident() && local.is_held(),
+        views_match: true,
+        cold: residency.cold(),
+    })
+}
+
+/// Where a fetch takes its answer, given what this node's copy makes of it
+/// and each other owner's answer in rendezvous order: the local copy when
+/// it answers, else the first owner whose answer a fetch takes, else none.
+/// A stale view counts as no answer. Pure; unit tested directly.
+pub(crate) fn read_source(local: LocalRead, probes: &[OwnerProbe]) -> ReadSource {
+    match local {
+        LocalRead::Hit => ReadSource::Local { hit: true },
+        LocalRead::Miss => ReadSource::Local { hit: false },
+        LocalRead::NotOwner | LocalRead::Distrusted | LocalRead::ColdMiss => probes
+            .iter()
+            .find_map(|probe| match probe.answer {
+                ProbeAnswer::Held(rec) => Some(ReadSource::Owner {
+                    node: probe.node,
+                    hit: rec.reads == Reads::Value,
+                }),
+                ProbeAnswer::Miss => Some(ReadSource::Owner {
+                    node: probe.node,
+                    hit: false,
+                }),
+                ProbeAnswer::StaleView { .. }
+                | ProbeAnswer::Declined
+                | ProbeAnswer::Unreached(_) => None,
+            })
+            .unwrap_or(ReadSource::Unavailable),
     }
 }
 
@@ -379,6 +422,138 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn probe(node: u64, answer: ProbeAnswer) -> OwnerProbe {
+        OwnerProbe {
+            node: crate::node::NodeId::from(node),
+            answer,
+        }
+    }
+
+    fn held(reads: Reads) -> ProbeAnswer {
+        ProbeAnswer::Held(crate::explain::ProbedRecord {
+            version: crate::hlc::Hlc {
+                wall_ms: 1,
+                logical: 0,
+                node: crate::node::NodeId::from(9u64),
+            },
+            expires_at_ms: None,
+            reads,
+        })
+    }
+
+    #[test]
+    fn read_source_takes_the_local_copy_then_the_first_answering_owner() {
+        use crate::explain::Unreached;
+        let owner = |node: u64, hit: bool| ReadSource::Owner {
+            node: crate::node::NodeId::from(node),
+            hit,
+        };
+        let probes = [
+            probe(2, ProbeAnswer::Declined),
+            probe(3, held(Reads::Value)),
+            probe(4, ProbeAnswer::Miss),
+        ];
+        assert_eq!(
+            read_source(LocalRead::Hit, &probes),
+            ReadSource::Local { hit: true },
+            "a local answer ignores the owners"
+        );
+        assert_eq!(
+            read_source(LocalRead::Miss, &probes),
+            ReadSource::Local { hit: false }
+        );
+        for local in [
+            LocalRead::NotOwner,
+            LocalRead::Distrusted,
+            LocalRead::ColdMiss,
+        ] {
+            assert_eq!(read_source(local, &probes), owner(3, true), "{local:?}");
+            assert_eq!(
+                read_source(local, &[]),
+                ReadSource::Unavailable,
+                "no other owner, as for a cold sole owner: {local:?}"
+            );
+        }
+        assert_eq!(
+            read_source(
+                LocalRead::NotOwner,
+                &[
+                    probe(
+                        2,
+                        ProbeAnswer::StaleView {
+                            responder_view_hash: 5
+                        }
+                    ),
+                    probe(3, ProbeAnswer::Unreached(Unreached::TimedOut)),
+                ]
+            ),
+            ReadSource::Unavailable,
+            "a stale view and an unreached owner are no answer"
+        );
+        assert_eq!(
+            read_source(
+                LocalRead::NotOwner,
+                &[probe(2, held(Reads::Deleted)), probe(3, held(Reads::Value))]
+            ),
+            owner(2, false),
+            "the first owner's tombstone is the answer, a miss"
+        );
+        for reads in [Reads::Expired, Reads::Undecodable] {
+            assert_eq!(
+                read_source(LocalRead::ColdMiss, &[probe(2, held(reads))]),
+                owner(2, false),
+                "{reads:?}"
+            );
+        }
+        assert_eq!(
+            read_source(LocalRead::ColdMiss, &[probe(4, ProbeAnswer::Miss)]),
+            owner(4, false)
+        );
+    }
+
+    #[test]
+    fn serves_peers_is_the_handler_verdict_for_an_equal_hash() {
+        use crate::explain::Lapse;
+        let version = crate::hlc::Hlc {
+            wall_ms: 1,
+            logical: 0,
+            node: crate::node::NodeId::from(9u64),
+        };
+        let records = [
+            LocalRecord::Absent,
+            LocalRecord::Tombstone { version },
+            LocalRecord::Live {
+                version,
+                expires_at_ms: None,
+                spilled: true,
+            },
+            LocalRecord::Lapsed {
+                version,
+                expires_at_ms: Some(1),
+                cause: Lapse::Expired,
+            },
+        ];
+        let mut seen = HashSet::new();
+        for r in every_residency() {
+            for local in records {
+                let verdict = serves_peers(&r, &local);
+                seen.insert(format!("{verdict:?}"));
+                assert_eq!(
+                    verdict,
+                    fetch_serve_verdict(ServeInputs {
+                        distrusted: r.distrusted(),
+                        served: r.resident() && local.is_held(),
+                        views_match: true,
+                        cold: r.cold(),
+                    }),
+                    "{r:?} {local:?}"
+                );
+                assert_ne!(verdict, ServeVerdict::Stale, "an equal hash is never stale");
+            }
+        }
+        assert_eq!(seen.len(), 4, "every verdict but Stale occurs: {seen:?}");
     }
 
     #[test]

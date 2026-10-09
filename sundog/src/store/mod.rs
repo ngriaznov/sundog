@@ -27,7 +27,7 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::config::ClusterConfig;
 use crate::error::{CacheError, CodecError};
-use crate::explain::{LocalRead, Residency};
+use crate::explain::{LocalRead, LocalRecord, Residency};
 use crate::hlc::{Hlc, HlcClock};
 use crate::net::REPLICATE_BATCH_COUNT;
 use crate::node::NodeId;
@@ -2688,6 +2688,14 @@ where
             })
     }
 
+    /// What this shard stores for `key_bytes`, judged at this shard's clock,
+    /// with that clock reading: no recency touch, no disk read, no
+    /// promotion, no load and no metric. Not gated on ownership.
+    pub(crate) fn local_record(&self, key_bytes: &[u8]) -> (u64, LocalRecord) {
+        let at_ms = self.now_ms();
+        (at_ms, self.engine.inspect(key_bytes, at_ms))
+    }
+
     /// [`Shard::residency_of`] under this shard's current view. A shard not
     /// in `Mode::Distributed` owns every part.
     pub(crate) fn current_residency(&self, part: PartId) -> Residency {
@@ -2996,7 +3004,8 @@ where
     /// the stored value. This asks about the entry as written, not against
     /// some other deadline; no read method here takes a TTL argument. An
     /// existence check, not a read: it moves neither
-    /// `sundog_cache_hits_total` nor `sundog_cache_misses_total`. A
+    /// `sundog_cache_hits_total` nor `sundog_cache_misses_total`, though it
+    /// restarts the entry's `tti` idle clock as a read does. A
     /// currently-spilled entry counts as present with zero disk reads:
     /// existence doesn't need the value bytes.
     pub async fn contains_key(&self, key: &K) -> bool {
@@ -3370,8 +3379,9 @@ where
 
     /// The remaining lifetime of `key`'s live entry in this shard, resident
     /// or spilled, with no disk read and no recency touch. `None` when no
-    /// live entry is here. Reads the TTL only: a `tti` idle timeout is not
-    /// reflected.
+    /// live entry is here, an entry idle past `tti` included. The lifetime
+    /// is the TTL's alone: a `tti` idle timeout that ends the entry sooner
+    /// is not reflected.
     #[must_use]
     pub fn ttl_of(&self, key: &K) -> Option<Ttl> {
         let key_bytes = encode_key(key).ok()?;
@@ -7283,6 +7293,170 @@ mod tests {
         assert!(
             built.shard.current_residency(built.part).owns,
             "current_residency reads the view the tracker holds now"
+        );
+    }
+
+    /// `local_record` under an injected clock: a live entry with its TTL,
+    /// a tombstone, a key never written, and the live entry once the clock
+    /// passes its expiry, each with the version and expiry `records_for`
+    /// sends.
+    #[tokio::test]
+    async fn local_record_reports_live_tombstone_lapsed_and_absent() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let fake_now = Arc::new(AtomicU64::new(1_000));
+        let reader = Arc::clone(&fake_now);
+        let s = Shard::<u32, String>::new(
+            SmolStr::new("test"),
+            Mode::Replicated,
+            NodeId::from(1),
+            10_000,
+            Some(Duration::from_millis(100)),
+            None,
+        )
+        .with_clock(Arc::new(move || reader.load(Ordering::SeqCst)));
+        s.insert(1, "a".into()).await.expect("insert");
+        s.insert(2, "b".into()).await.expect("insert");
+        s.remove(&2).await.expect("remove");
+
+        let records = ShardOps::records_for(&s, vec![key_bytes(&1u32), key_bytes(&2u32)]).await;
+        let (live, deleted) = (&records[0], &records[1]);
+        assert_eq!(
+            s.local_record(&key_bytes(&1u32)),
+            (
+                1_000,
+                LocalRecord::Live {
+                    version: live.ver,
+                    expires_at_ms: Some(1_100),
+                    spilled: false,
+                }
+            )
+        );
+        assert_eq!(live.expires_at_ms, Some(1_100));
+        assert_eq!(
+            s.local_record(&key_bytes(&2u32)).1,
+            LocalRecord::Tombstone {
+                version: deleted.ver
+            }
+        );
+        assert_eq!(s.local_record(&key_bytes(&3u32)).1, LocalRecord::Absent);
+
+        fake_now.store(1_300, Ordering::SeqCst);
+        assert_eq!(
+            s.local_record(&key_bytes(&1u32)),
+            (
+                1_300,
+                LocalRecord::Lapsed {
+                    version: live.ver,
+                    expires_at_ms: Some(1_100),
+                    cause: crate::explain::Lapse::Expired,
+                }
+            ),
+            "judged at the shard's clock"
+        );
+    }
+
+    /// `local_record` reports what the shard holds whatever its residency:
+    /// it is not gated on ownership.
+    #[tokio::test]
+    async fn local_record_reports_the_held_record_over_every_residency_state() {
+        for case in read_cases::every_read_case() {
+            let built = read_cases::case_shard("local-record-cases", &case).await;
+            let record = built.shard.local_record(&built.key_bytes).1;
+            match case.held {
+                read_cases::Held::Nothing => assert_eq!(record, LocalRecord::Absent, "{case:?}"),
+                read_cases::Held::Live => assert!(record.is_live(), "{case:?}: {record:?}"),
+                read_cases::Held::Tombstone => assert!(
+                    matches!(record, LocalRecord::Tombstone { .. }),
+                    "{case:?}: {record:?}"
+                ),
+            }
+        }
+    }
+
+    /// `local_record` is not a read: it counts no hit, miss or timed read,
+    /// and it leaves an entry's `tti` idle clock where the last real access
+    /// put it. Of two entries written together under a 100ms `tti`, the one
+    /// inspected at 90ms is idle at 150ms and the one read at 90ms still
+    /// reads.
+    #[tokio::test]
+    async fn local_record_is_not_a_read() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let fake_now = Arc::new(AtomicU64::new(1_000));
+        let reader = Arc::clone(&fake_now);
+        let s = Shard::<u32, String>::new(
+            SmolStr::new("local-record-not-a-read"),
+            Mode::Replicated,
+            NodeId::from(1),
+            10_000,
+            None,
+            Some(Duration::from_millis(100)),
+        )
+        .with_clock(Arc::new(move || reader.load(Ordering::SeqCst)));
+        // Hits, misses and timed reads counted since the last call: a
+        // snapshot drains the histograms.
+        let reads = || {
+            let (mut hits, mut misses, mut timed) = (0, 0, 0);
+            for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+                match (key.key().name(), value) {
+                    ("sundog_cache_hits_total", DebugValue::Counter(n)) => hits += n,
+                    ("sundog_cache_misses_total", DebugValue::Counter(n)) => misses += n,
+                    ("sundog_read_duration_seconds", DebugValue::Histogram(v)) => {
+                        timed += v.len();
+                    }
+                    _ => {}
+                }
+            }
+            (hits, misses, timed)
+        };
+        s.insert(1, "inspected".into()).await.expect("insert");
+        s.insert(2, "read".into()).await.expect("insert");
+        s.insert(3, "deleted".into()).await.expect("insert");
+        s.remove(&3).await.expect("remove");
+
+        fake_now.store(1_090, Ordering::SeqCst);
+        let (at_ms, live) = s.local_record(&key_bytes(&1u32));
+        assert_eq!(at_ms, 1_090, "judged at the shard's clock");
+        assert!(live.is_live(), "{live:?}");
+        assert!(matches!(
+            s.local_record(&key_bytes(&3u32)).1,
+            LocalRecord::Tombstone { .. }
+        ));
+        assert_eq!(s.local_record(&key_bytes(&9u32)).1, LocalRecord::Absent);
+        assert_eq!(reads(), (0, 0, 0), "an inspection counts no read");
+
+        assert_eq!(s.get(&2).await, Some("read".to_string()));
+        fake_now.store(1_150, Ordering::SeqCst);
+        assert_eq!(
+            s.get(&1).await,
+            None,
+            "idle since its write at 1000: the inspection at 1090 was no access"
+        );
+        assert_eq!(
+            s.get(&2).await,
+            Some("read".to_string()),
+            "idle only since its read at 1090"
+        );
+        let (hits, misses, _) = reads();
+        assert_eq!(
+            (hits, misses),
+            (2, 1),
+            "the reads count, the inspections did not"
+        );
+        assert!(
+            matches!(
+                s.local_record(&key_bytes(&1u32)).1,
+                LocalRecord::Lapsed {
+                    cause: crate::explain::Lapse::Idle,
+                    ..
+                }
+            ),
+            "the unread entry reports lapsed for idleness"
         );
     }
 
@@ -11764,6 +11938,42 @@ mod tests {
             } else {
                 (shard, 2, "two".to_string(), 1, "one".to_string(), dir)
             }
+        }
+
+        /// `local_record` of a spilled key reports it from its pointer: no
+        /// spill read is counted, and the entry stays spilled, so
+        /// `get_sync` still misses it.
+        #[tokio::test]
+        async fn local_record_of_a_spilled_key_reads_no_disk_and_does_not_promote() {
+            use metrics_util::debugging::DebuggingRecorder;
+            let (shard, spilled_key, _spilled_value, resident_key, _resident_value, dir) =
+                shard_with_one_spilled_entry("local-record-spilled").await;
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let (spilled, resident) = metrics::with_local_recorder(&recorder, || {
+                (
+                    shard.local_record(&key_bytes(&spilled_key)).1,
+                    shard.local_record(&key_bytes(&resident_key)).1,
+                )
+            });
+            assert!(
+                matches!(spilled, LocalRecord::Live { spilled: true, .. }),
+                "{spilled:?}"
+            );
+            assert!(
+                matches!(resident, LocalRecord::Live { spilled: false, .. }),
+                "{resident:?}"
+            );
+            assert!(
+                snapshotter.snapshot().into_vec().is_empty(),
+                "no metric moves"
+            );
+            assert_eq!(
+                shard.get_sync(&spilled_key),
+                None,
+                "the key is still spilled"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         #[tokio::test]
