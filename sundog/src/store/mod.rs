@@ -2992,13 +2992,14 @@ where
     /// mismatch, or a postcard decode failure. Each of the latter three
     /// counts `sundog_spill_reads_total{cache,outcome}` accordingly. A hit
     /// counts `outcome = "hit"` and, iff it flips the entry back to
-    /// residency, `sundog_spill_promotions_total{cache}`; a tombstone or a
-    /// newer write racing the disk read means it does not, and neither
-    /// does an entry heavier than the whole `max_capacity`. The promotion
-    /// evicts colder entries first, so RAM stays within the cap (see
-    /// [`engine::Engine::promote_locked`]). No lock or
-    /// permit is ever held across more than one `.await` point at a time,
-    /// and no stripe lock is ever held across the disk read.
+    /// residency, `sundog_spill_promotions_total{cache}`. The promotion
+    /// evicts colder entries to make room within `max_capacity` first, and
+    /// does not happen without room: a tombstone or a newer write racing
+    /// the disk read, a flush queue too full to take a victim, or an entry
+    /// heavier than the whole cap leaves the entry on disk (see
+    /// [`engine::Engine::promote_locked`]). No lock or permit is ever held
+    /// across more than one `.await` point at a time, and no stripe lock is
+    /// ever held across the disk read.
     #[cfg(feature = "spill")]
     async fn get_spilled(&self, key: &K) -> Option<V> {
         let key_bytes = encode_key(key).ok()?;
@@ -3172,14 +3173,14 @@ where
                     // before ever calling `loader`: a burst of concurrent
                     // misses collapses to at most one spilled-key read, the
                     // same way it already collapses to at most one `loader`
-                    // call. Dropping `guard` unfinished, instead of calling
-                    // `guard.complete()`, removes the in-flight entry and
-                    // wakes every joined waiter as an early-dropped loader
-                    // future would, so they re-check the fast path above
-                    // and see the resident promoted value.
+                    // call. The value goes on the in-flight entry before
+                    // `guard` drops unfinished, which removes that entry and
+                    // wakes every joined waiter: each answers with the value
+                    // whether or not the read promoted it back to RAM.
                     #[cfg(feature = "spill")]
                     if let Some(value) = self.get_spilled_by_bytes(key_bytes.as_ref(), hash).await {
                         self.hits.increment(1);
+                        let _ = inflight.value.set(value.clone());
                         drop(guard);
                         return Ok(value);
                     }
@@ -12567,6 +12568,76 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        /// Concurrent `get_or_load` calls of a spilled key that its read
+        /// cannot promote, one heavier than the whole cap, still collapse
+        /// to one disk read: the owner hands the value to every joined
+        /// waiter instead of leaving each to read the disk again.
+        #[tokio::test]
+        async fn concurrent_loads_of_an_unpromotable_spilled_key_read_the_disk_once() {
+            use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+            const CALLS: usize = 16;
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let dir = temp_dir("unpromotable-single-flight");
+            let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("unpromotable-single-flight"),
+                Mode::Local,
+                NodeId::from(1u64),
+                10,
+                None,
+                None,
+            )
+            .with_weigher(|_key: &u32, value: &String| {
+                u32::try_from(value.len()).unwrap_or(u32::MAX)
+            })
+            .with_spill(&cfg)
+            .expect("tier opens");
+            let big = "x".repeat(64);
+            shard.insert(1, big.clone()).await.expect("insert");
+            assert!(
+                poll_until(POLL_TIMEOUT, || shard.get_sync(&1).is_none()).await,
+                "the write spills the entry heavier than the cap"
+            );
+            let _ = snapshotter.snapshot();
+
+            let loads = AtomicUsize::new(0);
+            let answers = futures::future::join_all((0..CALLS).map(|_| {
+                shard.get_or_load(&1, async |_| {
+                    loads.fetch_add(1, Ordering::Relaxed);
+                    Ok::<_, std::io::Error>(String::new())
+                })
+            }))
+            .await;
+            assert!(
+                answers
+                    .iter()
+                    .all(|answer| answer.as_ref().ok() == Some(&big)),
+                "every call answers the spilled value"
+            );
+            assert_eq!(loads.load(Ordering::Relaxed), 0, "no call runs the loader");
+            let disk_hits: u64 = snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .filter(|(key, ..)| {
+                    key.key().name() == "sundog_spill_reads_total"
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "outcome" && label.value() == "hit")
+                })
+                .map(|(.., value)| match value {
+                    DebugValue::Counter(n) => n,
+                    _ => 0,
+                })
+                .sum();
+            assert_eq!(disk_hits, 1, "{CALLS} concurrent loads read the disk once");
+            assert!(shard.get_sync(&1).is_none(), "the entry stays on disk");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         /// A write burst far past the cap settles within it once the
         /// flusher installs its hand-offs: an eviction pass that found
         /// nothing to evict leaves the rest to the flusher only when the
@@ -12576,7 +12647,11 @@ mod tests {
             const KEYS: u32 = 8_000;
             const CAP: u64 = 2_000;
             let dir = temp_dir("write-burst-within-cap");
-            let cfg = SpillConfig::new(&dir, 4 << 20).region_bytes(256 * 1024);
+            // Generous past the 2s default, so a contended CI disk slows the
+            // burst rather than dropping a victim at its reservation wait.
+            let cfg = SpillConfig::new(&dir, 4 << 20)
+                .region_bytes(256 * 1024)
+                .spill_wait_timeout(Duration::from_secs(20));
             let shard = Shard::<u32, String>::new(
                 SmolStr::new("write-burst-within-cap"),
                 Mode::Local,

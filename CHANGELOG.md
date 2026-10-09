@@ -8,21 +8,26 @@ All notable changes to this project are documented in this file. Format follows
 ### Fixed
 
 - **A read of a spilled entry keeps RAM within `max_capacity`.** With
-  `spill`, a `get` or `get_or_load` that read a spilled entry back off disk
-  returned it to RAM and evicted nothing, so reads of spilled keys grew RAM
-  past the cap until the next write: reading every key of an 8,000-key
-  cache capped at 2,000 left all 8,000 resident. A read now evicts down to
-  the cap less the entry's weight before the entry returns to RAM, while
-  the entry is still on disk and so never its own victim. An entry heavier
-  than the whole cap reads from disk and stays there.
+  `spill`, a `get`, `get_or_load` or `load_many` that read a spilled entry
+  back off disk returned it to RAM and evicted nothing, so reads of spilled
+  keys grew RAM past the cap until the next write: reading every key of an
+  8,000-key cache capped at 2,000 left all 8,000 resident. A read now
+  evicts colder entries to make room before the entry returns to RAM,
+  while the entry is still on disk and so never its own victim, and claims
+  that room atomically, so concurrent reads never take the same room
+  twice. A read that finds no room, behind a flush queue too full to take
+  a victim or for an entry heavier than the whole cap, answers from disk
+  and leaves the entry there; concurrent `get_or_load` and `load_many`
+  calls of such a key still share one disk read.
 - **A write burst past `max_capacity` settles within it.** With `spill`, an
   eviction pass that found nothing to evict returned whenever a hand-off to
   the flusher was still in flight, on the premise that the flusher's
   installs alone bring the cache within the cap. They do only when the
-  weight still resident outside those hand-offs is already within it;
-  otherwise the cache stayed over the cap until the next write: an
-  8,000-key `insert_many` into a cache capped at 2,000 left 2,241 resident.
-  The pass now leaves the rest to the flusher only then, and evicts on
+  weight still resident outside those hand-offs is already within it, or
+  when the pass found its victim refused by a full flush queue; otherwise
+  the cache stayed over the cap until the next write: an 8,000-key
+  `insert_many` into a cache capped at 2,000 left 2,241 resident. The pass
+  now leaves the rest to the flusher only in those two cases, and evicts on
   otherwise.
 
 ## [0.6.5] – 2026-10-08

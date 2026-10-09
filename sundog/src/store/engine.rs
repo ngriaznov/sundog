@@ -592,7 +592,8 @@ pub(crate) struct Inflight<V> {
     pub(crate) error: OnceLock<Arc<dyn std::error::Error + Send + Sync>>,
     /// Set iff the fill finished without storing its value, because the
     /// shard sat at its memory ceiling or an invalidation landed during the
-    /// load: a joined waiter returns this value instead of loading again.
+    /// load, or once the owner read the key's spilled value off disk: a
+    /// joined waiter returns this value instead of loading again.
     pub(crate) value: OnceLock<V>,
     /// Set when an invalidation for the key lands while the load runs. The
     /// loader may have read the source before the change the invalidation
@@ -1878,28 +1879,34 @@ fn should_shrink_stripe(len: usize, capacity: usize) -> bool {
 
 /// [`Engine::enforce_capacity`]'s stop rule once one pass evicted nothing:
 /// whether to return immediately, rather than pay for
-/// [`Engine::evict_one_scanning`]'s scan across stripes, and instead let
-/// the flusher's own installs bring `pending_spill_weight` down on their
-/// own. `true` only while some hand-off is in flight and `total_weight`,
-/// the resident weight no hand-off covers, is already within `limit`: the
-/// installs alone then bring the cache within it, with no further eviction
-/// needed on this call's part. `false` otherwise, this loop's cue to fall
-/// back to the scan, spill tier configured or not: a cache still over
-/// `limit` without its hand-offs stays over it after they install. Pure;
-/// unit tested directly.
-fn defer_to_flusher(total_weight: u64, pending_spill_weight: u64, limit: u64) -> bool {
-    pending_spill_weight > 0 && total_weight <= limit
+/// [`Engine::evict_one_scanning`]'s scan across stripes, and leave the rest
+/// to the flusher. Only ever `true` while some hand-off is in flight, and
+/// then in either of two cases: the pass `refused` a victim, which with a
+/// hand-off in flight is the flush queue being full, so every other
+/// stripe's victim would be refused too until the flusher drains it; or
+/// `total_weight`, the resident weight no hand-off covers, is already
+/// within `limit`, so the installs alone bring the cache within it. `false`
+/// otherwise, this loop's cue to fall back to the scan, spill tier
+/// configured or not: a cache still over `limit` without its hand-offs, and
+/// with room in its queue, stays over it after they install. Pure; unit
+/// tested directly.
+fn defer_to_flusher(
+    refused: bool,
+    total_weight: u64,
+    pending_spill_weight: u64,
+    limit: u64,
+) -> bool {
+    pending_spill_weight > 0 && (refused || total_weight <= limit)
 }
 
-/// [`Engine::enforce_capacity_with_reservation`]'s stop rule after a batch
-/// reports a nonzero [`EvictOutcome::deficit`]: `0` once `current`
-/// (weight read fresh after the batch) has already dropped to
-/// `max_capacity` or under, `deficit` unchanged otherwise. A concurrent
-/// flusher install or another victim's success can already satisfy
-/// `current` even though `deficit` alone still looks owed. Pure; unit
-/// tested directly.
-fn deficit_once_still_over_capacity(current: u64, max_capacity: u64, deficit: u64) -> u64 {
-    if current <= max_capacity { 0 } else { deficit }
+/// [`Engine::evict_down_to`]'s stop rule after a batch reports a nonzero
+/// [`EvictOutcome::deficit`]: `0` once `current` (weight read fresh after
+/// the batch) has already dropped to `limit` or under, `deficit` unchanged
+/// otherwise. A concurrent flusher install or another victim's success can
+/// already satisfy `current` even though `deficit` alone still looks owed.
+/// Pure; unit tested directly.
+fn deficit_once_still_over_capacity(current: u64, limit: u64, deficit: u64) -> u64 {
+    if current <= limit { 0 } else { deficit }
 }
 
 /// How many of `sampled_weights` (coldest first) one lock hold evicts: the
@@ -1936,6 +1943,11 @@ struct EvictOutcome {
     /// tells [`Engine::enforce_capacity_with_reservation`] to stop rather
     /// than spin retrying an exhausted budget.
     deficit: u64,
+    /// Whether this pass left a victim resident because the spill tier
+    /// refused its hand-off ([`VictimOutcome::Deferred`]). With a hand-off
+    /// in flight, that refusal is the flush queue being full, which every
+    /// other stripe's victim would meet too.
+    refused: bool,
 }
 
 impl EvictOutcome {
@@ -3919,6 +3931,7 @@ where
                 EvictOutcome {
                     removed_weight: u64::from(weight),
                     deficit: 0,
+                    refused: false,
                 }
             }
             #[cfg(feature = "spill")]
@@ -3931,14 +3944,19 @@ where
                 EvictOutcome {
                     removed_weight: u64::from(weight),
                     deficit: 0,
+                    refused: false,
                 }
             }
             #[cfg(feature = "spill")]
-            VictimOutcome::Deferred => EvictOutcome::default(),
+            VictimOutcome::Deferred => EvictOutcome {
+                refused: true,
+                ..EvictOutcome::default()
+            },
             #[cfg(feature = "spill")]
             VictimOutcome::PendingReservation(deficit) => EvictOutcome {
                 removed_weight: 0,
                 deficit: u64::from(deficit),
+                refused: false,
             },
             VictimOutcome::Vanished => EvictOutcome::default(),
         }
@@ -3964,7 +3982,9 @@ where
     /// candidate stripe's scan, so the same budget carries across every
     /// stripe visited. Stops early, `Some`, the first time a candidate
     /// reports [`EvictOutcome::deficit`]: one reservation covers every
-    /// stripe, so a deficit in one is a deficit in all.
+    /// stripe, so a deficit in one is a deficit in all. Stops early too,
+    /// `Some` with no progress, at a victim refused while a hand-off is in
+    /// flight: the flush queue is full for every stripe alike.
     fn evict_one_scanning_with_reservation(
         &self,
         bucket: usize,
@@ -3979,7 +3999,9 @@ where
                     reservation.as_deref_mut(),
                     now_ms,
                 );
-                (!outcome.made_no_progress() || outcome.deficit > 0).then_some(outcome)
+                let queue_full = outcome.refused && self.pending_spill_weight_or_zero() > 0;
+                (!outcome.made_no_progress() || outcome.deficit > 0 || queue_full)
+                    .then_some(outcome)
             })
     }
 
@@ -4043,6 +4065,14 @@ where
             )
         )]
         let mut deficit = 0u64;
+        #[cfg_attr(
+            not(feature = "spill"),
+            allow(
+                unused_mut,
+                reason = "only VictimOutcome::Deferred, spill-only, ever sets this"
+            )
+        )]
+        let mut refused = false;
         #[cfg(feature = "spill")]
         let mut pending_spills: Vec<SpillJob> = Vec::new();
         #[cfg(feature = "spill")]
@@ -4065,7 +4095,7 @@ where
                     pending_spills.push(job);
                 }
                 #[cfg(feature = "spill")]
-                VictimOutcome::Deferred => {}
+                VictimOutcome::Deferred => refused = true,
                 #[cfg(feature = "spill")]
                 VictimOutcome::PendingReservation(bytes) => {
                     deficit += u64::from(bytes);
@@ -4099,6 +4129,7 @@ where
         EvictOutcome {
             removed_weight,
             deficit,
+            refused,
         }
     }
 
@@ -4107,22 +4138,24 @@ where
     /// `start_bucket` then pseudo-random stripes, until it is back under
     /// the cap, up to [`EVICTION_BATCH`] entries per lock hold. A random
     /// probe that lands on an empty stripe falls back to a scan for the next
-    /// non-empty one, so the loop ends only under the cap or with nothing
-    /// left to evict. Never holds two stripe locks at once; a no-op when
-    /// `max_capacity` is [`u64::MAX`].
+    /// non-empty one, so the loop ends under the cap, with nothing left to
+    /// evict, or with the rest left to the flusher, as below. Never holds
+    /// two stripe locks at once; a no-op when `max_capacity` is
+    /// [`u64::MAX`].
     ///
     /// The over-cap check weighs `total_weight` plus `pending_spill_weight`:
     /// a spill hand-off zeroes and frees its victim's weight from
     /// `total_weight` the instant it commits, but the victim stays fully
     /// resident until the flusher's install resolves it, so
     /// `pending_spill_weight` is what keeps that still-resident RAM
-    /// counting against the cap in the meantime. When a pass evicts
-    /// nothing, some hand-off is still pending and `total_weight` alone is
-    /// within the cap, [`defer_to_flusher`] has this return rather than pay
-    /// for [`Engine::evict_one_scanning`]'s scan across stripes: the
-    /// flusher's own installs bring the cache within the cap with no
-    /// further eviction needed. Otherwise the scan runs, spill tier
-    /// configured or not. A thin wrapper, `reservation: None`, over
+    /// counting against the cap in the meantime. When a pass evicts nothing
+    /// while some hand-off is still pending, [`defer_to_flusher`] has this
+    /// return rather than pay for [`Engine::evict_one_scanning`]'s scan
+    /// across stripes, if the pass found its victim refused by a full flush
+    /// queue or `total_weight` alone is within the cap: either way only the
+    /// flusher's own installs make further progress. Otherwise the scan
+    /// runs, spill tier configured or not, and stops early at a victim a
+    /// full flush queue refuses. A thin wrapper, `reservation: None`, over
     /// [`Engine::enforce_capacity_with_reservation`].
     pub(crate) fn enforce_capacity(&self, start_bucket: usize, now_ms: u64) {
         let _ = self.enforce_capacity_with_reservation(start_bucket, None, now_ms);
@@ -4189,6 +4222,7 @@ where
             }
             if batch_outcome.made_no_progress() {
                 if defer_to_flusher(
+                    batch_outcome.refused,
                     self.total_weight.load(Ordering::Relaxed),
                     self.pending_spill_weight_or_zero(),
                     limit,
@@ -4202,6 +4236,9 @@ where
                 ) {
                     None => return 0,
                     Some(outcome) if outcome.deficit > 0 => return outcome.deficit,
+                    // The scan stopped at a victim the busy flush queue
+                    // refused.
+                    Some(outcome) if outcome.made_no_progress() => return 0,
                     Some(_) => {}
                 }
             }
@@ -4917,11 +4954,15 @@ where
     ///
     /// Makes room first: while the entry is still spilled, and so never an
     /// eviction candidate, [`Engine::evict_down_to`] evicts down to
-    /// `max_capacity` less the entry's weight, then the entry's weight goes
-    /// back to `total_weight`. A read of a spilled key therefore never
-    /// holds more than the cap in RAM, and never evicts the entry it reads.
-    /// An entry heavier than the whole cap stays on disk
-    /// ([`promotion_fits`]).
+    /// `max_capacity` less the entry's weight. The entry's weight then goes
+    /// back to `total_weight` only if it fits within the cap
+    /// ([`claimed_total`]), claimed atomically so concurrent promotions
+    /// never take the same room twice. Without room, the read stands and
+    /// the entry stays on disk: an entry heavier than the whole cap
+    /// ([`promotion_fits`]), a flush queue too busy to take a victim, or a
+    /// concurrent promotion that claimed the room first. A promotion
+    /// therefore never takes `total_weight` past the cap, and never evicts
+    /// the entry it reads.
     ///
     /// **Never touches the digest or `live_count`**: same key, same `ver`,
     /// same fingerprint, so nothing about the entry's replicated identity
@@ -4954,10 +4995,16 @@ where
             None,
             now_ms,
         );
+        if !self.claim_weight(weight) {
+            return false;
+        }
         let mut stripe = self.stripes[bucket].write();
         // Rechecked under the write lock: a write, removal or racing
         // promotion may have landed while the room was made.
         if !spilled_and_current(&stripe, key_bytes, hash, read_ver) {
+            drop(stripe);
+            self.total_weight
+                .fetch_sub(u64::from(weight), Ordering::Relaxed);
             return false;
         }
         let live = stripe
@@ -4972,15 +5019,37 @@ where
         live.state = EntryState::Resident;
         live.weight = weight;
         drop(stripe);
-        self.total_weight
-            .fetch_add(u64::from(weight), Ordering::Relaxed);
         self.note_spill_departure(true);
         true
     }
+
+    /// Adds `weight` to `total_weight` iff the sum stays within
+    /// `max_capacity` ([`claimed_total`]), as one atomic step, so
+    /// concurrent [`Engine::promote_locked`] calls never claim the same
+    /// room twice. Returns whether it claimed.
+    #[cfg(feature = "spill")]
+    fn claim_weight(&self, weight: u32) -> bool {
+        let mut total = self.total_weight.load(Ordering::Relaxed);
+        loop {
+            let Some(claimed) = claimed_total(total, weight, self.max_capacity) else {
+                return false;
+            };
+            match self.total_weight.compare_exchange_weak(
+                total,
+                claimed,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => total = actual,
+            }
+        }
+    }
 }
 
-/// Whether `stripe` holds `key_bytes` spilled at `read_ver` with no newer
-/// tombstone: the entry [`Engine::promote_locked`] may still reinstall.
+/// Whether `stripe` holds `key_bytes` spilled at `read_ver` with no
+/// tombstone for the key: the entry [`Engine::promote_locked`] may still
+/// reinstall.
 #[cfg(feature = "spill")]
 fn spilled_and_current<K, V>(
     stripe: &Stripe<K, V>,
@@ -5004,6 +5073,16 @@ fn spilled_and_current<K, V>(
 #[cfg(feature = "spill")]
 const fn promotion_fits(weight: u32, max_capacity: u64) -> bool {
     (weight as u64) <= max_capacity
+}
+
+/// `total` with a promoted entry's `weight` added, iff the sum stays
+/// within `max_capacity`: [`Engine::promote_locked`]'s claim on the room it
+/// made. Pure; unit tested directly.
+#[cfg(feature = "spill")]
+fn claimed_total(total: u64, weight: u32, max_capacity: u64) -> Option<u64> {
+    total
+        .checked_add(u64::from(weight))
+        .filter(|&sum| sum <= max_capacity)
 }
 
 /// The engine-side callback surface [`SpillTier`]'s flusher drives, so
@@ -7717,21 +7796,45 @@ mod tests {
     }
 
     #[test]
-    fn defer_to_flusher_only_while_the_hand_offs_alone_hold_the_cache_over_its_limit() {
+    fn defer_to_flusher_only_while_a_hand_off_is_in_flight_and_eviction_cannot_help() {
         assert!(
-            !defer_to_flusher(10, 0, 10),
+            !defer_to_flusher(false, 10, 0, 10),
             "nothing pending: enforce_capacity's ordinary scanning fallback runs"
         );
         assert!(
-            defer_to_flusher(10, 1, 10),
+            !defer_to_flusher(true, 11, 0, 10),
+            "a refusal with nothing pending is no full queue: scan for another victim"
+        );
+        assert!(
+            defer_to_flusher(false, 10, 1, 10),
             "within the limit once the pending hand-off installs: trust the flusher"
         );
-        assert!(defer_to_flusher(0, u64::MAX, 0));
+        assert!(defer_to_flusher(false, 0, u64::MAX, 0));
         assert!(
-            !defer_to_flusher(11, 1, 10),
+            !defer_to_flusher(false, 11, 1, 10),
             "still over the limit after every pending hand-off installs: keep evicting"
         );
-        assert!(!defer_to_flusher(u64::MAX, u64::MAX, 10));
+        assert!(!defer_to_flusher(false, u64::MAX, u64::MAX, 10));
+        assert!(
+            defer_to_flusher(true, 11, 1, 10),
+            "a victim refused while a hand-off is in flight: the queue is full for every stripe"
+        );
+        assert!(defer_to_flusher(true, u64::MAX, u64::MAX, 0));
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn claimed_total_adds_a_weight_only_within_the_cap() {
+        assert_eq!(claimed_total(3, 1, 4), Some(4));
+        assert_eq!(claimed_total(0, 0, 0), Some(0));
+        assert_eq!(
+            claimed_total(4, 1, 4),
+            None,
+            "no room left: the entry stays on disk"
+        );
+        assert_eq!(claimed_total(0, 5, 4), None);
+        assert_eq!(claimed_total(u64::MAX, 1, u64::MAX), None, "never wraps");
+        assert_eq!(claimed_total(u64::MAX - 1, 1, u64::MAX), Some(u64::MAX));
     }
 
     #[cfg(feature = "spill")]
@@ -8919,6 +9022,7 @@ mod tests {
             !EvictOutcome {
                 removed_weight: 1,
                 deficit: 0,
+                refused: false,
             }
             .made_no_progress()
         );
@@ -10764,7 +10868,8 @@ mod tests {
 
                 // The public entry point sees the same combined accounting
                 // and returns immediately: nothing left to evict in this
-                // bucket, and pending_spill_weight is still positive.
+                // bucket, and total_weight alone is within the cap, so the
+                // pending hand-off's install is all that is left.
                 engine.enforce_capacity(bucket, 2);
 
                 // Once the flusher is allowed to run, the one queued job
@@ -10889,9 +10994,17 @@ mod tests {
                 }
 
                 // The public entry point sees the same combined accounting,
-                // finds no further progress to make while a hand-off is
-                // still pending, and returns rather than spin.
+                // finds its victim refused by the full queue while a
+                // hand-off is pending, and returns after that one stripe
+                // rather than scan every other stripe for a victim the
+                // queue would refuse too.
+                let locks_before = engine.debug_eviction_lock_acquisitions();
                 engine.enforce_capacity(bucket, 2);
+                assert!(
+                    engine.debug_eviction_lock_acquisitions() - locks_before <= 2,
+                    "a full queue ends the pass at once, took {} stripe locks",
+                    engine.debug_eviction_lock_acquisitions() - locks_before
+                );
                 assert_eq!(
                     engine.debug_totals().1,
                     200,
@@ -10910,6 +11023,152 @@ mod tests {
                 );
 
                 let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// An engine capped at `cap` under a length weigher, over a
+            /// keep-resident tier whose one-record flush queue holds a
+            /// hand-off the paused flusher never writes, and one resident
+            /// 200-byte entry that no eviction can move while the queue
+            /// stays full. Returns the engine, its tier, the scratch
+            /// directory and the stuck entry's key.
+            fn engine_with_a_full_queue(
+                label: &str,
+                cap: u64,
+            ) -> (
+                Arc<Engine<u32, String>>,
+                Arc<SpillTier>,
+                std::path::PathBuf,
+                u32,
+            ) {
+                let dir = temp_dir(label);
+                let cfg = SpillConfig::new(&dir, 1 << 20)
+                    .region_bytes(4096)
+                    .flush_queue_bytes(300);
+                let tier = Arc::new(SpillTier::open(&cfg, label).expect("tier opens"));
+                tier.set_keep_resident_when_refused(true);
+                tier.pause_flusher();
+                let weigher: Weigher<u32, String> =
+                    Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
+                let engine = Engine::<u32, String>::new(cap, None, Some(weigher), None);
+                engine.set_spill(Arc::clone(&tier));
+                let engine = Arc::new(engine);
+                tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
+
+                let _ = put(
+                    &engine,
+                    1,
+                    key_bytes(1),
+                    "x".repeat(200),
+                    hlc(1, 1),
+                    None,
+                    0,
+                );
+                let first = stripe_index_from_hash(hash_key_bytes(key_bytes(1).as_ref()));
+                engine.evict_one_sampled(first, 1);
+                assert_eq!(
+                    engine.debug_pending_spill_weight(),
+                    200,
+                    "the first entry's hand-off fills the queue"
+                );
+                let _ = put(
+                    &engine,
+                    2,
+                    key_bytes(2),
+                    "y".repeat(200),
+                    hlc(2, 1),
+                    None,
+                    1,
+                );
+                assert_eq!(engine.debug_totals().1, 200);
+                (engine, tier, dir, 2)
+            }
+
+            /// A spilled entry `key` with nothing resident for it, as a
+            /// flusher install leaves one, and its encoded `value`.
+            fn spilled_entry(engine: &Engine<u32, String>, key: u32, value: &str) -> Bytes {
+                engine.debug_insert_spilled(
+                    &key_bytes(key),
+                    hlc(10, 1),
+                    None,
+                    super::loc(0, 0, 10, 0),
+                    2,
+                );
+                Bytes::from(postcard::to_stdvec(&value.to_string()).expect("string encodes"))
+            }
+
+            /// With no room to make, a full flush queue holding the only
+            /// resident entry in place, a promotion leaves the read's entry
+            /// on disk rather than take RAM past the cap.
+            #[test]
+            fn a_promotion_with_no_room_to_make_leaves_the_entry_on_disk() {
+                let (engine, tier, dir, stuck) = engine_with_a_full_queue("promote-no-room", 50);
+                let value = "z".repeat(10);
+                let encoded = spilled_entry(&engine, 7, &value);
+                let kb = key_bytes(7);
+                let hash = hash_key_bytes(kb.as_ref());
+
+                assert!(!engine.promote_locked(kb.as_ref(), hash, hlc(10, 1), &value, &encoded, 3));
+                assert!(is_spilled(&engine, &kb), "the read's entry stays on disk");
+                assert_eq!(engine.debug_totals().1, 200, "total_weight is unchanged");
+                assert_eq!(
+                    engine.get(&stuck, 3),
+                    Some("y".repeat(200)),
+                    "the stuck entry stays resident"
+                );
+
+                tier.resume_flusher();
+                drop(engine);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// Two promotions racing for the one free slot under the cap,
+            /// with nothing evictable to make more: exactly one claims it,
+            /// and `total_weight` lands on the cap, never past it.
+            #[test]
+            fn concurrent_promotions_never_claim_the_same_room_twice() {
+                const ROUNDS: u32 = 50;
+                for round in 0..ROUNDS {
+                    let (engine, tier, dir, _) =
+                        engine_with_a_full_queue(&format!("promote-race-{round}"), 210);
+                    let value = "z".repeat(10);
+                    let encoded = spilled_entry(&engine, 7, &value);
+                    let _ = spilled_entry(&engine, 8, &value);
+                    let barrier = Arc::new(std::sync::Barrier::new(2));
+                    let promoted: Vec<bool> = [7u32, 8]
+                        .into_iter()
+                        .map(|key| {
+                            let engine = Arc::clone(&engine);
+                            let barrier = Arc::clone(&barrier);
+                            let (value, encoded) = (value.clone(), encoded.clone());
+                            std::thread::spawn(move || {
+                                let kb = key_bytes(key);
+                                let hash = hash_key_bytes(kb.as_ref());
+                                barrier.wait();
+                                engine.promote_locked(
+                                    kb.as_ref(),
+                                    hash,
+                                    hlc(10, 1),
+                                    &value,
+                                    &encoded,
+                                    3,
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .map(|handle| handle.join().expect("the promoting thread finishes"))
+                        .collect();
+                    assert_eq!(
+                        promoted.iter().filter(|&&won| won).count(),
+                        1,
+                        "round {round}: exactly one promotion claims the slot, got {promoted:?}"
+                    );
+                    assert_eq!(engine.debug_totals().1, 210, "round {round}: at the cap");
+
+                    tier.resume_flusher();
+                    drop(engine);
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
             }
 
             #[test]
@@ -11336,8 +11595,9 @@ mod tests {
                      physically delete the leftover victim, not leave max_capacity exceeded \
                      forever because a reservation retry gave up on it"
                 );
-                // keys[0]'s pending hand-off makes defer_to_flusher stop
-                // this fallback early instead of scanning further.
+                // The fallback stops once keys[0]'s pending hand-off is all
+                // that holds the engine over its cap, or nothing is left to
+                // evict.
                 let (_, total_after_fallback) = engine.debug_totals();
                 assert!(
                     total_after_fallback < 60,

@@ -577,6 +577,9 @@ where
                             self.get_spilled_by_bytes(key_bytes.as_ref(), hash).await
                         {
                             self.hits.increment(1);
+                            // Joined waiters answer with the value, promoted
+                            // back to RAM or not.
+                            let _ = inflight.value.set(value.clone());
                             drop(guard);
                             found.insert(key, value);
                             continue;

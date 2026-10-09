@@ -64,7 +64,13 @@ async fn reading_every_spilled_key_keeps_the_cache_within_max_capacity() {
         .cache::<u32, String>("spill-reads")
         .mode(Mode::Local)
         .max_capacity(MAX_CAPACITY)
-        .spill(SpillConfig::new(&dir, 4 * 1024 * 1024).region_bytes(256 * 1024))
+        // Generous past the 2s default, so a contended CI disk slows the
+        // burst rather than dropping a victim at its reservation wait.
+        .spill(
+            SpillConfig::new(&dir, 4 * 1024 * 1024)
+                .region_bytes(256 * 1024)
+                .spill_wait_timeout(Duration::from_secs(20)),
+        )
         .open()
         .await
         .expect("cache opens");
