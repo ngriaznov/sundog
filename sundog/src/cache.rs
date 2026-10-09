@@ -5544,6 +5544,13 @@ mod tests {
     /// Every loader call any node made: the node and the keys, sorted.
     type LoadLog = Arc<std::sync::Mutex<Vec<(NodeId, Vec<u32>)>>>;
 
+    /// How long a test waits for a three-node `Mode::Distributed` cluster
+    /// to converge: views, loader adverts, and owners warming their parts.
+    /// Each node's ownership views cost seconds of CPU in a debug build, so
+    /// several such tests sharing a slow runner take well past ten seconds
+    /// to warm; a wait returns as soon as its condition holds.
+    const CONVERGE: Duration = Duration::from_secs(30);
+
     /// Three nodes with `name` open under `mode`, each with a batch loader
     /// that records its calls in `log`, takes 300ms, and holds `v{key}` for
     /// every key; the loader on the node at index `fails` returns an error
@@ -5558,7 +5565,10 @@ mod tests {
     ) -> Vec<(Cluster, Cache<u32, String>)> {
         let mut nodes: Vec<(Cluster, Cache<u32, String>)> = Vec::new();
         for index in 0..3 {
-            let builder = Cluster::builder(name).config(loopback_config());
+            // Every owner here stays up: a longer fetch timeout lets one
+            // whose runtime is busy computing views still answer.
+            let builder = Cluster::builder(name)
+                .config(loopback_config().with(|c| c.fetch_timeout = Duration::from_secs(5)));
             let cluster = match nodes.first() {
                 None => builder.seeds(std::iter::empty()),
                 Some((seed, _)) => builder.seeds([seed.local_gossip_addr()]),
@@ -5594,7 +5604,7 @@ mod tests {
             nodes.push((cluster, cache));
         }
         wait_until(
-            Duration::from_secs(10),
+            CONVERGE,
             "every node sees the other two advertise a loader",
             async || {
                 nodes
@@ -5613,7 +5623,7 @@ mod tests {
     /// in its own task, so seeing every loader says nothing about the view.
     async fn wait_for_full_views(nodes: &[(Cluster, Cache<u32, String>)]) {
         wait_until(
-            Duration::from_secs(10),
+            CONVERGE,
             "every node's ownership view ranks every node",
             async || {
                 nodes.iter().all(|(_, cache)| {
@@ -5678,7 +5688,7 @@ mod tests {
         let part = PartId::of_key(&encode_key(&key).expect("u32 encodes"));
         let owners = nodes[0].1.owners_of(&key);
         wait_until(
-            Duration::from_secs(10),
+            CONVERGE,
             "every owner holds the key's part warm",
             async || {
                 nodes
@@ -5813,20 +5823,16 @@ mod tests {
             .insert(present, "here".to_owned())
             .await
             .expect("insert");
-        wait_until(
-            Duration::from_secs(10),
-            "the first owner holds the key",
-            async || {
-                nodes
-                    .iter()
-                    .find(|(cluster, _)| cluster.node_id() == first_owner)
-                    .expect("the owner is a node")
-                    .1
-                    .get(&present)
-                    .await
-                    .is_some()
-            },
-        )
+        wait_until(CONVERGE, "the first owner holds the key", async || {
+            nodes
+                .iter()
+                .find(|(cluster, _)| cluster.node_id() == first_owner)
+                .expect("the owner is a node")
+                .1
+                .get(&present)
+                .await
+                .is_some()
+        })
         .await;
         assert_eq!(
             cache_a.fetch(&present).await.expect("fetch"),
@@ -5839,11 +5845,9 @@ mod tests {
         assert_eq!(spans.last(), fields(absent_owner, "miss", 1));
 
         let part = PartId::of_key(&encode_key(&local_key).expect("u32 encodes"));
-        wait_until(
-            Duration::from_secs(10),
-            "a holds the local key's part warm",
-            async || !cache_a.shard.is_cold_part(part),
-        )
+        wait_until(CONVERGE, "a holds the local key's part warm", async || {
+            !cache_a.shard.is_cold_part(part)
+        })
         .await;
         assert_eq!(cache_a.fetch(&local_key).await.expect("fetch"), None);
         assert_eq!(spans.last(), fields(a.node_id(), "local", 0));
@@ -5913,6 +5917,9 @@ mod tests {
         let local = (0..10_000u32)
             .find(|key| cache_a.owners_of(key).contains(&a.node_id()))
             .expect("a key a owns");
+        // A fetch answers `FetchUnavailable` while every owner is cold.
+        wait_for_warm_owners(&nodes, remote).await;
+        wait_for_warm_owners(&nodes, local).await;
         cache_a
             .insert(remote, "there".to_owned())
             .await
@@ -6288,11 +6295,9 @@ mod tests {
             .find(|key| cache_a.owners_of(key).contains(&a.node_id()))
             .expect("a key a owns");
         let part = PartId::of_key(&encode_key(&local).expect("u32 encodes"));
-        wait_until(
-            Duration::from_secs(10),
-            "a holds the owned key's part warm",
-            async || !cache_a.shard.is_cold_part(part),
-        )
+        wait_until(CONVERGE, "a holds the owned key's part warm", async || {
+            !cache_a.shard.is_cold_part(part)
+        })
         .await;
         let remote = (0..10_000u32)
             .find(|key| !cache_a.owners_of(key).contains(&a.node_id()))
@@ -6485,7 +6490,7 @@ mod tests {
             .expect("a key a does not own");
         let owners = cache_a.owners_of(&key);
         wait_until(
-            Duration::from_secs(10),
+            CONVERGE,
             "every node agrees on the key's owners",
             async || {
                 nodes
@@ -6528,19 +6533,15 @@ mod tests {
             vec![(owners[0], vec![key])],
             "the key's first owner runs the one load"
         );
-        wait_until(
-            Duration::from_secs(10),
-            "both owners hold the loaded value",
-            async || {
-                let mut held = 0;
-                for (cluster, cache) in &nodes {
-                    if owners.contains(&cluster.node_id()) && cache.get(&key).await.is_some() {
-                        held += 1;
-                    }
+        wait_until(CONVERGE, "both owners hold the loaded value", async || {
+            let mut held = 0;
+            for (cluster, cache) in &nodes {
+                if owners.contains(&cluster.node_id()) && cache.get(&key).await.is_some() {
+                    held += 1;
                 }
-                held == 2
-            },
-        )
+            }
+            held == 2
+        })
         .await;
         shut_down_all(nodes).await;
     }
@@ -7157,7 +7158,7 @@ mod tests {
             .expect("a key a does not own");
         let owners = cache_a.owners_of(&key);
         wait_until(
-            Duration::from_secs(10),
+            CONVERGE,
             "every node agrees on the key's owners",
             async || {
                 nodes
@@ -7166,6 +7167,8 @@ mod tests {
             },
         )
         .await;
+        // A cold owner declines a load, which then runs on the next owner.
+        wait_for_warm_owners(&nodes, key).await;
 
         assert_eq!(
             cache_a.load(&key).await.expect("load"),
@@ -7177,19 +7180,15 @@ mod tests {
             "the key's first owner runs the one load"
         );
         assert_eq!(cache_a.get(&key).await, None, "a non-owner keeps no copy");
-        wait_until(
-            Duration::from_secs(10),
-            "both owners hold the loaded value",
-            async || {
-                let mut held = 0;
-                for (cluster, cache) in &nodes {
-                    if owners.contains(&cluster.node_id()) && cache.get(&key).await.is_some() {
-                        held += 1;
-                    }
+        wait_until(CONVERGE, "both owners hold the loaded value", async || {
+            let mut held = 0;
+            for (cluster, cache) in &nodes {
+                if owners.contains(&cluster.node_id()) && cache.get(&key).await.is_some() {
+                    held += 1;
                 }
-                held == 2
-            },
-        )
+            }
+            held == 2
+        })
         .await;
         assert_eq!(
             cache_a.load(&key).await.expect("load"),
@@ -7428,7 +7427,7 @@ mod tests {
             .expect("a key a does not own");
         let owners = cache_a.owners_of(&key);
         wait_until(
-            Duration::from_secs(10),
+            CONVERGE,
             "every node agrees on the key's owners",
             async || {
                 nodes
@@ -7477,7 +7476,7 @@ mod tests {
             .expect("a key a does not own");
         let owners = cache_a.owners_of(&key);
         wait_until(
-            Duration::from_secs(10),
+            CONVERGE,
             "every node agrees on the key's owners",
             async || {
                 nodes
