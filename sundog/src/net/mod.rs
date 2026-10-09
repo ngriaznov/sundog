@@ -422,14 +422,15 @@ pub(crate) enum FetchOutcome {
     /// The responder answered: `Some` record, or `None` for a definitive
     /// miss.
     Found(Option<WireRecord>),
-    /// The responder holds no record and its own view hash differs from
-    /// the request's; it declined rather than risk a miss against a stale
-    /// owner set.
+    /// The responder holds no record in a part it trusts and its own view
+    /// hash differs from the request's; it declined rather than risk a
+    /// miss against a stale owner set.
     Stale { responder_view_hash: u64 },
     /// The responder declined without answering: it cannot vouch for the
     /// key (a cache it does not have open as a distribution-mode cache, a
-    /// part it distrusts, or a cold part with no record). The requester
-    /// moves on to the next owner.
+    /// part it distrusts whatever the views say, or a cold part with no
+    /// record on an equal view hash). The requester moves on to the next
+    /// owner.
     Declined,
 }
 
@@ -474,13 +475,14 @@ pub(crate) enum FetchServe {
     /// whatever the views say, or `None` for a definitive miss on an equal
     /// view hash in a warm part.
     Found(Option<WireRecord>),
-    /// The responder holds no record and its own view hash differs from
-    /// the requester's.
+    /// The responder holds no record in a part it trusts and its own view
+    /// hash differs from the requester's.
     Stale { responder_view_hash: u64 },
     /// The named cache is not open here or not a distribution-mode cache,
     /// the same "unknown cache degrades gracefully" shape every other
-    /// method on this trait already has, or the key's part is distrusted,
-    /// or cold with no record.
+    /// method on this trait already has, or the key's part is distrusted
+    /// whatever the views say, or cold with no record on an equal view
+    /// hash.
     Unavailable,
 }
 

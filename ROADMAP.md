@@ -66,8 +66,8 @@ bounded per-part ring of residency events (gained, dropped, marked cold,
 pulled from a donor, settled), off by default or sampled. An observer
 would read the same request.
 
-**Trigger:** an operator asking why a read missed, with nothing to read but
-counters.
+**Trigger:** an operator who reads a `Cache::explain` explanation and still
+cannot tell why an owner declined or which pull last touched a part.
 
 ### A live cluster view
 

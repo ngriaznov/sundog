@@ -1817,8 +1817,8 @@ where
     ///
     /// It is not a read. It calls no get, fetch or loader, counts no hit,
     /// miss, fetch or loader metric, opens no `sundog.fetch` span, touches
-    /// no idle timer, takes no TTL, starts no refresh and promotes no
-    /// spilled entry. A spilled entry is reported from its pointer, without
+    /// no idle timer of this node's copy, takes no TTL, starts no refresh
+    /// and promotes no spilled entry. A spilled entry is reported from its pointer, without
     /// a disk read.
     ///
     /// The explanation is a snapshot taken in order: the ownership view,
@@ -1826,9 +1826,9 @@ where
     /// other owner is asked at once with the fetch a [`Cache::fetch`]
     /// sends, under the same view hash, each bounded by
     /// `ClusterConfig::fetch_timeout` and never retried, so the call
-    /// returns within about one `fetch_timeout`. Each probe costs a request
-    /// and may dial a connection; an owner holding the key spilled reads it
-    /// from disk to answer. [`DistributedRead::view_moved_to`] reports a
+    /// returns within about one `fetch_timeout`. Each probe costs a request,
+    /// may dial a connection and counts as wire traffic on both nodes; an
+    /// owner holding the key spilled reads it from disk to answer. [`DistributedRead::view_moved_to`] reports a
     /// view that changed during the probes.
     ///
     /// [`ReadExplanation::source`] predicts a fetch from these answers: a
@@ -6044,8 +6044,7 @@ mod tests {
     /// `owner_answer`'s local branch over every residency state a read
     /// tells apart, in front of owners no node can reach: it answers from
     /// this node's copy iff the part is owned and trusted and the read hits
-    /// or the part is warm (the rule it wrote inline before the verdicts),
-    /// and otherwise asks the owners and finds none.
+    /// or the part is warm, and otherwise asks the owners and finds none.
     #[tokio::test]
     async fn the_owner_loop_reads_locally_by_the_read_rule_over_every_residency_state() {
         use crate::store::read_cases::{case_shard, every_read_case};

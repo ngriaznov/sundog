@@ -153,8 +153,9 @@ normal; rising steadily means gossip is not converging.
 ### Explaining one read
 
 `Cache::explain(&key)` says why a read of one key answers what it answers
-on this node. It is not a read: it moves no metric, opens no span, touches
-no idle timer, starts no refresh or load, and promotes no spilled entry.
+on this node. It is not a read: it counts no hit, miss, fetch or loader
+metric, opens no span, touches no idle timer on this node, starts no
+refresh or load, and promotes no spilled entry.
 Its `Display` form is a few lines to paste into an incident note.
 
 Every explanation names the cache, this node, the mode, the key's part and
@@ -168,9 +169,10 @@ cache, `distributed` adds:
   `owners_of` returns them, under the view `view_hash` names.
   `view_moved_to` is set when this node's view changed while the owners
   were asked.
-- `residency`: this node's marks for the part. `cold_marked` and
-  `unsettled` (owned, not yet pulled since the last settled view) make a
-  local miss say nothing. `unverified` (replayed from disk at a warm
+- `residency`: this node's marks for the part. `cold_marked`, and
+  `unsettled` on an owned part (outside the last settled view and not
+  pulled since), make a local miss say nothing; every part this node does
+  not own reads `unsettled` once a view has settled. `unverified` (replayed from disk at a warm
   reopen) and `stale` (regained with a copy from owning it before) make a
   local hit untrusted. `releasing_for` is how long this node has kept a
   part it no longer owns.
@@ -182,9 +184,9 @@ cache, `distributed` adds:
 | Answer | Meaning |
 |---|---|
 | `Held` | The owner sends its record. `reads` says what a fetch makes of it: `Value`, or a miss for `Deleted`, `Expired` or `Undecodable`. A held record is sent whatever the views say, so it does not show the owner's part is warm. |
-| `Miss` | The owner holds nothing, on an equal view, in a warm part: a definitive miss. |
-| `StaleView` | The owner holds nothing and its view differs. A fetch retries it; the explanation counts it as no answer. |
-| `Declined` | The owner cannot vouch for the key: the cache is not open there, or its copy of the part is unverified, stale, or cold with no record. |
+| `Miss` | The owner holds nothing, on an equal view, in a trusted warm part: a definitive miss. |
+| `StaleView` | The owner holds nothing in a part it trusts and its view differs. A fetch retries it; the explanation counts it as no answer. |
+| `Declined` | The owner cannot vouch for the key: the cache is not open there, its copy of the part is unverified or stale whatever the views say, or the part is cold with no record on an equal view. |
 | `Unreached` | No answer: `NotAMember` of the mesh, `ProtocolTooOld`, `TimedOut` within `fetch_timeout`, an `Io` error, or a `Codec` error. |
 
 `source` is `Local` when `local_read` answers, else the first owner whose
@@ -193,9 +195,11 @@ probe is `Held` or `Miss`, else `Unavailable`, which a fetch reports as
 
 The owners are asked at once, each bounded by `fetch_timeout` and never
 retried, so the call returns within about one `fetch_timeout`. Each probe
-is a request and may dial a connection, and an owner holding the key
-spilled reads it from disk to answer: `explain` is for an operator's
-question, not a request path.
+is an ordinary fetch request: it may dial a connection, it counts in
+`sundog_frames_sent_total` and `sundog_bytes_sent_total` on both nodes,
+and an owner holding the key spilled reads it from disk to answer and
+counts that read in `sundog_spill_reads_total`. `explain` is for an
+operator's question, not a request path.
 
 What it cannot say: why an owner declined, which pull or anti-entropy
 round last touched the part, or whether a `Held` owner's copy is current.

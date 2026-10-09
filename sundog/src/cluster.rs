@@ -5026,8 +5026,8 @@ mod tests {
     }
 
     /// The responder over every residency state a read tells apart, on an
-    /// equal and an unequal view hash, against the rule it wrote inline
-    /// before the verdicts: distrust declines even a held record, a held
+    /// equal and an unequal view hash, against its serve rule written out
+    /// longhand: distrust declines even a held record, a held
     /// record in a resident part is served whatever the views say, a view
     /// mismatch then answers stale, a cold part declines, and only a warm
     /// part's miss is definitive.
@@ -5081,6 +5081,158 @@ mod tests {
                 assert_eq!(got, expected, "{case:?} views_match={views_match}");
             }
         }
+    }
+
+    /// A shard whose `records_for` lets a pull land right after its read:
+    /// once the inner shard's records are read, the pull's record is
+    /// applied and `part` marked serving, as a pull applies its records and
+    /// then clears the part's cold mark. Every other method the fetch
+    /// responder does not call panics.
+    struct PullDuringRead {
+        inner: Arc<Shard<u32, String>>,
+        residency: Arc<crate::ownership::ResidencySet>,
+        part: PartId,
+        pulled: WireRecord,
+    }
+
+    impl ShardOps for PullDuringRead {
+        fn apply_remote(&self, _rec: WireRecord) -> BoxFuture<'_, ()> {
+            unimplemented!("the fetch responder never applies")
+        }
+
+        fn apply_remote_batch(&self, _recs: Vec<WireRecord>) -> BoxFuture<'_, ()> {
+            unimplemented!("the fetch responder never applies")
+        }
+
+        fn invalidate(&self, _key: Bytes, _ver: Hlc) -> BoxFuture<'_, ()> {
+            unimplemented!("the fetch responder never invalidates")
+        }
+
+        fn digests(&self) -> BoxFuture<'_, Vec<BucketDigest>> {
+            unimplemented!("the fetch responder never reads digests")
+        }
+
+        fn bucket_entries(&self, _bucket: u16) -> BoxFuture<'_, Vec<KeyVersion>> {
+            unimplemented!("the fetch responder never lists a bucket")
+        }
+
+        fn entries_for_buckets(
+            &self,
+            _buckets: Vec<u16>,
+        ) -> BoxFuture<'_, crate::store::BucketEntries> {
+            unimplemented!("the fetch responder never lists a bucket")
+        }
+
+        fn bucket_lens(&self, _buckets: Vec<u16>) -> BoxFuture<'_, Vec<BucketLen>> {
+            unimplemented!("the fetch responder never counts a bucket")
+        }
+
+        fn part_digests(&self, _buckets: Vec<u16>) -> BoxFuture<'_, Vec<BucketPartDigests>> {
+            unimplemented!("the fetch responder never reads digests")
+        }
+
+        fn entries_for_parts(
+            &self,
+            _parts: Vec<BucketPart>,
+        ) -> BoxFuture<'_, crate::store::PartEntries> {
+            unimplemented!("the fetch responder never lists a part")
+        }
+
+        fn records_for(&self, keys: Vec<Bytes>) -> BoxFuture<'_, Vec<WireRecord>> {
+            Box::pin(async move {
+                let read = ShardOps::records_for(self.inner.as_ref(), keys).await;
+                ShardOps::apply_remote_batch(self.inner.as_ref(), vec![self.pulled.clone()]).await;
+                self.residency.mark_serving(&[self.part]);
+                read
+            })
+        }
+
+        fn snapshot_chunks(&self) -> BoxStream<'static, Vec<WireRecord>> {
+            unimplemented!("the fetch responder never snapshots")
+        }
+
+        fn gc_tombstones(&self, _any_member_absent: bool) -> BoxFuture<'_, ()> {
+            unimplemented!("the fetch responder never collects tombstones")
+        }
+
+        fn run_pending_tasks(&self) -> BoxFuture<'_, ()> {
+            unimplemented!("the fetch responder never sweeps")
+        }
+
+        fn ownership_view_hash(&self) -> Option<u64> {
+            ShardOps::ownership_view_hash(self.inner.as_ref())
+        }
+
+        fn is_cold_part(&self, part: PartId) -> bool {
+            ShardOps::is_cold_part(self.inner.as_ref(), part)
+        }
+
+        fn is_unverified_part(&self, part: PartId) -> bool {
+            ShardOps::is_unverified_part(self.inner.as_ref(), part)
+        }
+    }
+
+    /// The responder reads a part's marks before its record: a pull that
+    /// lands its record and clears the part's cold mark after the
+    /// responder read a miss leaves that miss undefinitive, so the responder
+    /// declines, and a fetch after the pull is served the pulled record.
+    #[tokio::test]
+    async fn the_fetch_responder_reads_the_cold_mark_before_the_record() {
+        use crate::store::read_cases::{Held, ReadCase, case_shard};
+        let name = SmolStr::new("serve-pull-during-read");
+        let built = case_shard(
+            &name,
+            &ReadCase {
+                owns: true,
+                cold_marked: true,
+                unsettled: false,
+                stale: false,
+                unverified: false,
+                releasing: false,
+                held: Held::Nothing,
+            },
+        )
+        .await;
+        let pulled = WireRecord {
+            key: built.key_bytes.clone(),
+            value: Some(Bytes::from(
+                postcard::to_stdvec(&"pulled".to_string()).expect("a string encodes"),
+            )),
+            ver: Hlc {
+                wall_ms: crate::store::now_ms(),
+                logical: 1,
+                node: NodeId::from(2u64),
+            },
+            expires_at_ms: None,
+        };
+        let inner = Arc::new(built.shard);
+        let handler = handler_for(
+            &name,
+            Arc::new(PullDuringRead {
+                inner: Arc::clone(&inner),
+                residency: Arc::clone(&built.residency),
+                part: built.part,
+                pulled: pulled.clone(),
+            }),
+        );
+        let hash = built.view.view_hash();
+
+        let reply = handler
+            .fetch(name.clone(), built.key_bytes.clone(), hash)
+            .await;
+        assert!(
+            matches!(reply, FetchServe::Unavailable),
+            "a miss read while the part was cold is no answer"
+        );
+        assert!(!ShardOps::is_cold_part(inner.as_ref(), built.part));
+
+        let reply = handler_for(&name, inner)
+            .fetch(name.clone(), built.key_bytes.clone(), hash)
+            .await;
+        assert!(
+            matches!(reply, FetchServe::Found(Some(ref rec)) if *rec == pulled),
+            "the pulled record is served once it landed"
+        );
     }
 
     /// `verdict::serves_peers`, what `Cache::explain` reports this node

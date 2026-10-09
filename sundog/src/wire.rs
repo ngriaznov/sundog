@@ -307,18 +307,19 @@ pub enum Msg {
         view_hash: u64,
     },
     /// Answers [`Msg::Fetch`]: the record the responder holds for `key` in
-    /// a part it owns or is releasing, sent whatever the two views say, or
-    /// `None` for a definitive miss, sent only on an equal view hash and a
-    /// warm part. With no record and a view hash that differs from the
-    /// request's, the responder sends [`Msg::StaleView`] instead.
+    /// a trusted part it owns or is releasing, sent whatever the two views
+    /// say, or `None` for a definitive miss, sent only on an equal view
+    /// hash and a warm part. With no record in a trusted part and a view
+    /// hash that differs from the request's, the responder sends
+    /// [`Msg::StaleView`] instead.
     FetchReply { rec: Option<WireRecord> },
     /// Declines a [`Msg::Fetch`] without answering it: the responder cannot
     /// vouch for the key, because it does not have `cache` open as a
     /// distribution-mode cache, its copy of the key's part is unverified or
-    /// stale, or the part is cold and it holds no record. Distinct from a
-    /// [`Msg::FetchReply`] carrying `None`, which is a definitive miss; the
-    /// requester moves on to its next candidate owner. Introduced in
-    /// protocol 3.
+    /// stale whatever the views say, or the part is cold and it holds no
+    /// record on an equal view hash. Distinct from a [`Msg::FetchReply`]
+    /// carrying `None`, which is a definitive miss; the requester moves on
+    /// to its next candidate owner. Introduced in protocol 3.
     FetchDeclined { cache: SmolStr },
     /// Anti-entropy round, step 1, distribution-mode: like [`Msg::AeDigest`],
     /// but scoped to the sender's own owned buckets and carrying its

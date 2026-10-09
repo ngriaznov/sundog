@@ -2673,7 +2673,7 @@ where
     /// which stays strict current-view ownership.
     fn is_resident_part(residency: &(Arc<OwnershipView>, Arc<ResidencySet>), part: PartId) -> bool {
         let (view, res) = residency;
-        verdict::resident(view.owns(part), res.is_releasing(part))
+        verdict::resident(view.owns(part), || res.is_releasing(part))
     }
 
     /// This shard's residency marks for `part`, with ownership taken from
@@ -7479,8 +7479,7 @@ mod tests {
 
     /// `rearm_local` over every residency state a read tells apart: the
     /// local copy answers iff the part is owned and trusted and the read
-    /// hits or the part is warm (the rule `owner_answer` and `rearm_local`
-    /// wrote inline before the verdicts), re-arming a live entry and
+    /// hits or the part is warm, re-arming a live entry and
     /// reporting a warm miss absent; every other state is the owners'.
     #[tokio::test]
     async fn rearm_local_follows_the_read_rule_over_every_residency_state() {
@@ -7509,6 +7508,68 @@ mod tests {
     /// An owned part not yet pulled cannot vouch for a miss, so a re-arm
     /// that finds nothing there leaves the key to the other owners, while
     /// a copy it does hold re-arms here.
+    /// `rearm_local` reads the part's residency again once its fan-out wait
+    /// ends: a part this node owned when the re-arm began and gave up while
+    /// it waited for backlog room is not re-armed from its copy.
+    #[tokio::test]
+    async fn rearm_local_decides_under_the_view_past_its_fan_out_wait() {
+        use read_cases::{Held, ReadCase};
+        let built = read_cases::case_shard(
+            "rearm-past-the-wait",
+            &ReadCase {
+                owns: true,
+                cold_marked: false,
+                unsettled: false,
+                stale: false,
+                unverified: false,
+                releasing: false,
+                held: Held::Live,
+            },
+        )
+        .await;
+        let s = built
+            .shard
+            .with_fan_out_backlog_capacity(1)
+            .with_fan_out_wait_timeout(Duration::from_secs(10));
+        let queue = s.fan_out_queue();
+        let n1 = NodeId::from(1u64);
+        let elsewhere = (0..u32::MAX)
+            .find(|k| !built.view.owns(PartId::of_key(&key_bytes(k))))
+            .expect("node 2 owns some parts");
+        s.insert(elsewhere, "forwarded".to_string())
+            .await
+            .expect("a forward fills the backlog");
+        assert_eq!(queue.len(), 1);
+
+        let rearm = s.rearm_local(&built.key, Lifetime::Unbounded);
+        tokio::pin!(rearm);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut rearm)
+                .await
+                .is_err(),
+            "the re-arm waits for backlog room"
+        );
+        let moved = (3..u64::MAX)
+            .map(|last| {
+                OwnershipView::compute(n1, (2..=last).map(NodeId::from).collect(), NonZeroU8::MIN)
+            })
+            .find(|view| !view.owns(built.part))
+            .expect("enough other nodes take the part from node 1");
+        built
+            .view_tx
+            .send(Arc::new(moved))
+            .expect("the tracker holds a receiver");
+        queue.drain();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), &mut rearm)
+                .await
+                .expect("the re-arm proceeds once the backlog drains")
+                .expect("re-arms"),
+            LocalRearm::NotHeld,
+            "the part moved during the wait: its owners re-arm it"
+        );
+    }
+
     #[tokio::test]
     async fn a_rearm_in_a_cold_owned_part_answers_only_from_a_copy_it_holds() {
         let self_node = NodeId::from(1);
@@ -11941,21 +12002,36 @@ mod tests {
         }
 
         /// `local_record` of a spilled key reports it from its pointer: no
-        /// spill read is counted, and the entry stays spilled, so
-        /// `get_sync` still misses it.
+        /// spill read is counted or timed, and the entry stays spilled, so
+        /// `get_sync` still misses it; a `get` of it then reads it from disk
+        /// and is counted.
         #[tokio::test]
         async fn local_record_of_a_spilled_key_reads_no_disk_and_does_not_promote() {
-            use metrics_util::debugging::DebuggingRecorder;
-            let (shard, spilled_key, _spilled_value, resident_key, _resident_value, dir) =
-                shard_with_one_spilled_entry("local-record-spilled").await;
+            use metrics_util::debugging::{DebugValue, DebuggingRecorder};
             let recorder = DebuggingRecorder::new();
             let snapshotter = recorder.snapshotter();
-            let (spilled, resident) = metrics::with_local_recorder(&recorder, || {
-                (
-                    shard.local_record(&key_bytes(&spilled_key)).1,
-                    shard.local_record(&key_bytes(&resident_key)).1,
-                )
-            });
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let (shard, spilled_key, spilled_value, resident_key, _resident_value, dir) =
+                shard_with_one_spilled_entry("local-record-spilled").await;
+            // Disk reads counted and timed since the last call: a snapshot
+            // drains both.
+            let reads = || {
+                let (mut counted, mut timed) = (0, 0);
+                for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+                    match (key.key().name(), value) {
+                        ("sundog_spill_reads_total", DebugValue::Counter(n)) => counted += n,
+                        ("sundog_spill_read_duration_seconds", DebugValue::Histogram(v)) => {
+                            timed += v.len();
+                        }
+                        _ => {}
+                    }
+                }
+                (counted, timed)
+            };
+            assert_eq!(reads(), (0, 0));
+
+            let spilled = shard.local_record(&key_bytes(&spilled_key)).1;
+            let resident = shard.local_record(&key_bytes(&resident_key)).1;
             assert!(
                 matches!(spilled, LocalRecord::Live { spilled: true, .. }),
                 "{spilled:?}"
@@ -11964,15 +12040,15 @@ mod tests {
                 matches!(resident, LocalRecord::Live { spilled: false, .. }),
                 "{resident:?}"
             );
-            assert!(
-                snapshotter.snapshot().into_vec().is_empty(),
-                "no metric moves"
-            );
+            assert_eq!(reads(), (0, 0), "no disk read");
             assert_eq!(
                 shard.get_sync(&spilled_key),
                 None,
                 "the key is still spilled"
             );
+
+            assert_eq!(shard.get(&spilled_key).await, Some(spilled_value));
+            assert_eq!(reads(), (1, 1), "a get of it reads the disk");
             let _ = std::fs::remove_dir_all(&dir);
         }
 

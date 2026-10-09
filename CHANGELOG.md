@@ -12,10 +12,11 @@ All notable changes to this project are documented in this file. Format follows
   `Mode::Distributed`, the key's part and owners, this node's residency
   marks for the part, what its own copy makes of a fetch, what it answers
   a peer's fetch, each other owner's answer, and where a fetch takes its
-  answer. It is not a read: it moves no metric, opens no span, touches no
-  idle timer, starts no refresh or load and promotes no spilled entry. Each
-  owner is asked with the fetch a read already sends, so an owner on the
-  previous release answers it. The `explain` module holds the report's
+  answer. It is not a read: it counts no hit, miss, fetch or loader
+  metric, opens no span, touches no idle timer on this node, starts no
+  refresh or load and promotes no spilled entry. Each owner is asked with
+  the fetch a read already sends, so an owner on the previous release
+  answers it, and the probe counts as wire traffic on both nodes. The `explain` module holds the report's
   types, and `ReadExplanation` is re-exported at the crate root.
 
 ### Fixed

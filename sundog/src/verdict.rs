@@ -1,19 +1,21 @@
 //! The read decisions a `Mode::Distributed` fetch makes, written once:
 //! what this node's own copy of a key's part makes of a read
 //! ([`local_verdict`]), and what this node answers a peer's `Fetch`
-//! ([`fetch_serve_verdict`]). `Cache`'s owner loop, `Shard::rearm_local`
-//! and the cluster's fetch responder decide through them, each from one
-//! [`Residency`] read before the record is, and `Cache::explain` reports
-//! them.
+//! ([`fetch_serve_verdict`]). `Cache`'s owner loop and `Shard::rearm_local`
+//! decide through [`local_verdict`] from one [`Residency`] read before the
+//! record, the cluster's fetch responder decides through
+//! [`fetch_serve_verdict`] from the part's marks read before the record,
+//! and `Cache::explain` reports both.
 
 use crate::explain::{
     LocalRead, LocalRecord, OwnerProbe, ProbeAnswer, ReadSource, Reads, Residency, ServeVerdict,
 };
 
 /// Whether a part's records are served to peers: owned, or mid disown
-/// grace. Pure; unit tested directly.
-pub(crate) const fn resident(owns: bool, releasing: bool) -> bool {
-    owns || releasing
+/// grace. `releasing` runs only for a part not owned, so an owned part
+/// never reads the grace marks. Pure; unit tested directly.
+pub(crate) fn resident(owns: bool, releasing: impl FnOnce() -> bool) -> bool {
+    owns || releasing()
 }
 
 /// What this node's copy makes of a read of a key in a part with
@@ -40,7 +42,8 @@ pub(crate) const fn reads_local(residency: &Residency) -> bool {
     local_verdict(residency, true).answers()
 }
 
-/// [`fetch_serve_verdict`]'s inputs, each read before the record is.
+/// [`fetch_serve_verdict`]'s inputs: the part's marks, read before the
+/// record, and whether the record read found one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(
     clippy::struct_excessive_bools,
@@ -123,18 +126,17 @@ mod tests {
 
     use super::*;
 
-    /// The read and serve rules as `fcac7a0` wrote them inline, transcribed
-    /// literally so the extracted verdicts are checked against the code
-    /// they replace. Not to be edited to match a later change.
+    /// The read and serve rules written out longhand as plain boolean
+    /// conditions, apart from `Residency` and the verdict types, so the
+    /// tests compare two writings of each rule.
     #[allow(
         clippy::fn_params_excessive_bools,
-        reason = "each parameter is one of the inline code's conditions"
+        reason = "each parameter is one of the rule's conditions"
     )]
     mod legacy {
-        /// `cache.rs:1699-1707` (`owner_answer`'s two local branches) and
-        /// `store/mod.rs:3381-3407` (`rearm_local`): the local copy answers
-        /// iff the part is owned and trusted and the read hit or the part
-        /// is warm.
+        /// The read rule of the owner loop and `rearm_local`: the local copy
+        /// answers iff the part is owned and trusted and the read hit or the
+        /// part is warm.
         pub(super) fn answers_locally(
             owns: bool,
             unverified: bool,
@@ -144,8 +146,8 @@ mod tests {
             owns && !unverified && (live || !cold)
         }
 
-        /// What `ClusterRequestHandler::fetch` (`cluster.rs:1089-1107`)
-        /// returned, past its no-shard and not-distributed checks.
+        /// What the fetch responder replies, past its no-shard and
+        /// not-distributed checks.
         #[derive(Debug, PartialEq, Eq)]
         pub(super) enum Reply {
             Unavailable,
@@ -175,17 +177,17 @@ mod tests {
             Reply::FoundNone
         }
 
-        /// `ShardOps::is_cold_part` (`store/mod.rs:5070-5079`).
+        /// `ShardOps::is_cold_part`'s rule.
         pub(super) fn is_cold(cold_marked: bool, unsettled: bool, owns: bool) -> bool {
             cold_marked || (unsettled && owns)
         }
 
-        /// `ResidencySet::is_unverified` (`ownership.rs:945-947`).
+        /// `ResidencySet::is_unverified`'s rule.
         pub(super) fn is_unverified(unverified: bool, stale: bool) -> bool {
             unverified || stale
         }
 
-        /// `Shard::is_resident_part` (`store/mod.rs:2672-2675`).
+        /// `Shard::is_resident_part`'s rule.
         pub(super) fn is_resident(owns: bool, releasing: bool) -> bool {
             owns || releasing
         }
@@ -211,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn residency_derivations_match_the_pre_extraction_definitions() {
+    fn residency_derivations_match_the_longhand_definitions() {
         for r in every_residency() {
             assert_eq!(
                 r.cold(),
@@ -246,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn local_verdict_matches_the_pre_extraction_read_rule() {
+    fn local_verdict_matches_the_longhand_read_rule() {
         let mut seen = HashSet::new();
         for r in every_residency() {
             for live in [false, true] {
@@ -323,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_serve_verdict_matches_the_pre_extraction_handler() {
+    fn fetch_serve_verdict_matches_the_longhand_handler() {
         let mut seen = HashSet::new();
         for inputs in every_serve_input() {
             let verdict = fetch_serve_verdict(inputs);
@@ -413,13 +415,18 @@ mod tests {
     }
 
     #[test]
-    fn resident_is_owns_or_releasing() {
+    fn resident_is_owns_or_releasing_and_reads_the_grace_only_when_not_owned() {
         for owns in [false, true] {
             for releasing in [false, true] {
+                let mut asked = false;
                 assert_eq!(
-                    resident(owns, releasing),
+                    resident(owns, || {
+                        asked = true;
+                        releasing
+                    }),
                     legacy::is_resident(owns, releasing)
                 );
+                assert_eq!(asked, !owns, "owns={owns}");
             }
         }
     }

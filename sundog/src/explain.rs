@@ -35,9 +35,11 @@ pub struct Residency {
     /// Whether rebalance marked the part cold: owned, not yet pulled from a
     /// co-owner.
     pub cold_marked: bool,
-    /// Whether the part is owned since the last settled view without a
-    /// pull or verification since, the window between a published view
-    /// and rebalance marking its gained parts cold.
+    /// Whether the part lies outside the last settled view and no pull or
+    /// verification has served it since. Every part this node does not own
+    /// reads unsettled once a view has settled; for an owned part it is
+    /// the window between a published view and rebalance marking its
+    /// gained parts cold.
     pub unsettled: bool,
     /// Whether a warm spill-tier reopen replayed the part from disk with no
     /// co-owner check yet.
@@ -121,22 +123,28 @@ impl LocalRead {
 
 /// What this node answers a peer's `Fetch` for a key of a
 /// `Mode::Distributed` cache.
+///
+/// The verdicts are decided in order: distrust declines whatever the views
+/// say, a held record is sent whatever the views say, a view hash that
+/// differs is then stale, and only on an equal view hash does a cold part
+/// decline and a warm one answer a definitive miss.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ServeVerdict {
-    /// Sends the record it holds, live or a tombstone, whatever the two
-    /// views say.
+    /// Sends the record it holds, live or a tombstone, in a trusted part,
+    /// whatever the two views say.
     Serve,
-    /// Holds no record and the asker's view differs from this node's: the
-    /// asker refreshes its view and asks again.
+    /// Holds no record in a trusted part and the asker's view differs from
+    /// this node's: the asker refreshes its view and asks again.
     Stale,
-    /// Holds no record, on an equal view, in a warm part: a definitive
-    /// miss.
+    /// Holds no record, on an equal view, in a trusted warm part: a
+    /// definitive miss.
     Miss,
-    /// Declines: the part is distrusted, so even a held record is not sent.
+    /// Declines: the part is distrusted, so even a held record is not
+    /// sent, whatever the views say.
     DeclineDistrusted,
-    /// Declines: the part is cold and holds no record, so a miss says
-    /// nothing.
+    /// Declines: the part is cold and holds no record, on an equal view, so
+    /// a miss says nothing.
     DeclineCold,
 }
 
@@ -276,18 +284,20 @@ pub enum ProbeAnswer {
     /// views say, and from a part the owner is releasing, so this does not
     /// show the owner's part is warm.
     Held(ProbedRecord),
-    /// It holds no record, on an equal view, in a warm part: a definitive
-    /// miss.
+    /// It holds no record, on an equal view, in a trusted warm part: a
+    /// definitive miss.
     Miss,
-    /// It holds no record and its view differs from this node's. A fetch
-    /// retries it; the explanation counts it as no answer.
+    /// It holds no record in a part it trusts and its view differs from
+    /// this node's. A fetch retries it; the explanation counts it as no
+    /// answer.
     #[non_exhaustive]
     StaleView {
         /// The owner's view hash.
         responder_view_hash: u64,
     },
     /// It declines: the cache is not open there or not `Mode::Distributed`,
-    /// or its copy of the part is distrusted, or cold with no record.
+    /// or its copy of the part is distrusted whatever the views say, or
+    /// cold with no record on an equal view.
     Declined,
     /// It gives no answer.
     Unreached(Unreached),
