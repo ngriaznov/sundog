@@ -903,10 +903,12 @@ async fn anti_entropy_repairs_a_dropped_key_at_sketch_scale() {
 /// listing. n2 cold-joins and warms first, so both replicas start
 /// byte-identical; dropping one key locally on n2 then leaves exactly one
 /// bucket, and within it one part, mismatched. The repair's shape is read
-/// off both nodes' `sundog_ae_parts_total` outcomes summed, since either
-/// node's round may find the gap first and the initiator counts it: one
-/// `listing` and no `sketch` or `fallback`, with no bucket-level sketch
-/// either: n1's wire
+/// off both nodes' `sundog_ae_parts_total` outcomes summed, since each node
+/// runs its own rounds and the initiator counts a listing: one `listing`
+/// from whichever node's round finds the gap first, and a second when the
+/// other node's round also compares before the first round's repair lands,
+/// with no `sketch` or `fallback` and no bucket-level sketch either: n1's
+/// wire
 /// bytes over the same window also carry its own rounds' 3 KB digests,
 /// so they are printed for reference, not asserted on. The baseline is
 /// read after [`wait_for_quiescent_netstats`]: n2's local count reaches
@@ -967,17 +969,25 @@ async fn anti_entropy_repairs_a_dropped_key_through_part_digests() {
     let bytes_for_repair = bytes_after - bytes_before;
     println!("part-digest repair: n1 sent {frames_for_repair} frames / {bytes_for_repair} bytes");
     let outcomes_after = ae_outcomes_on_both(&n1, &n2).await;
+    let repair = outcomes_after.zip_with(outcomes_before, |after, before| after - before);
     assert_eq!(
-        outcomes_after.zip_with(outcomes_before, |after, before| after - before),
         AeOutcomes {
-            listing: 1,
+            listing: 0,
+            ..repair
+        },
+        AeOutcomes {
+            listing: 0,
             sketch: 0,
             fallback: 0,
             bucket_sketches: 0
         },
-        "the repair lists exactly the one part the dropped key falls into, whichever node's \
-         round finds the gap: the mismatched bucket answers with part digests, not a bucket \
-         sketch or a full listing"
+        "the mismatched bucket answers with part digests, never a bucket sketch or a full \
+         listing: {repair:?}"
+    );
+    assert!(
+        (1..=2).contains(&repair.listing),
+        "each node's round that finds the gap before the repair lands lists the one part the \
+         dropped key falls into, once: {repair:?}"
     );
     assert_eq!(n2.get(TARGET_KEY).await, Ok(Some(TARGET_VALUE.to_string())));
 
