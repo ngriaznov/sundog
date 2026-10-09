@@ -66,7 +66,9 @@ and otherwise asks the owners in order, returning `Ok(None)` for a real
 miss or `CacheError::FetchUnavailable` when no owner answers within
 `fetch_timeout`, or while the part is still cold on every owner that
 answers. A part is cold on its new owner until the owner has pulled it,
-a few seconds after a membership change. `owners_of` reports a key's owners.
+a few seconds after a membership change. `owners_of` reports a key's owners,
+and `explain` shows how a read of a key decides on this node and what each
+owner answers.
 
 ```rust
 {{#include ../cookbook/src/deploy.rs:distributed}}

@@ -150,6 +150,59 @@ whether a node's `sundog_owned_parts` dropped to 0 after a restart.
 `sundog_stale_view_total` rising briefly during a membership change is
 normal; rising steadily means gossip is not converging.
 
+### Explaining one read
+
+`Cache::explain(&key)` says why a read of one key answers what it answers
+on this node. It is not a read: it moves no metric, opens no span, touches
+no idle timer, starts no refresh or load, and promotes no spilled entry.
+Its `Display` form is a few lines to paste into an incident note.
+
+Every explanation names the cache, this node, the mode, the key's part and
+what this node stores for the key (`local`): `Absent`, a `Tombstone`, a
+`Live` entry (`spilled` when its value is on disk), or a `Lapsed` entry a
+read no longer returns because it `Expired` or went `Idle`, not yet swept.
+`source` predicts where a `fetch` takes its answer. In a `Distributed`
+cache, `distributed` adds:
+
+- `owners`: the key's owners in the order `fetch` asks them, as
+  `owners_of` returns them, under the view `view_hash` names.
+  `view_moved_to` is set when this node's view changed while the owners
+  were asked.
+- `residency`: this node's marks for the part. `cold_marked` and
+  `unsettled` (owned, not yet pulled since the last settled view) make a
+  local miss say nothing. `unverified` (replayed from disk at a warm
+  reopen) and `stale` (regained with a copy from owning it before) make a
+  local hit untrusted. `releasing_for` is how long this node has kept a
+  part it no longer owns.
+- `local_read`: what this node's copy makes of a fetch. `Hit` and `Miss`
+  answer here; `NotOwner`, `Distrusted` and `ColdMiss` ask the owners.
+- `serves_peers`: what this node answers another node's fetch.
+- `probes`: each other owner's answer to the fetch a read sends:
+
+| Answer | Meaning |
+|---|---|
+| `Held` | The owner sends its record. `reads` says what a fetch makes of it: `Value`, or a miss for `Deleted`, `Expired` or `Undecodable`. A held record is sent whatever the views say, so it does not show the owner's part is warm. |
+| `Miss` | The owner holds nothing, on an equal view, in a warm part: a definitive miss. |
+| `StaleView` | The owner holds nothing and its view differs. A fetch retries it; the explanation counts it as no answer. |
+| `Declined` | The owner cannot vouch for the key: the cache is not open there, or its copy of the part is unverified, stale, or cold with no record. |
+| `Unreached` | No answer: `NotAMember` of the mesh, `ProtocolTooOld`, `TimedOut` within `fetch_timeout`, an `Io` error, or a `Codec` error. |
+
+`source` is `Local` when `local_read` answers, else the first owner whose
+probe is `Held` or `Miss`, else `Unavailable`, which a fetch reports as
+`CacheError::FetchUnavailable`.
+
+The owners are asked at once, each bounded by `fetch_timeout` and never
+retried, so the call returns within about one `fetch_timeout`. Each probe
+is a request and may dial a connection, and an owner holding the key
+spilled reads it from disk to answer: `explain` is for an operator's
+question, not a request path.
+
+What it cannot say: why an owner declined, which pull or anti-entropy
+round last touched the part, or whether a `Held` owner's copy is current.
+The marks and records are read one after another, not atomically, so a
+membership change during the call can show a state from either side of
+it.
+
 ### Records are refused for clock skew
 
 `sundog_clock_skew_rejected_total` rises, and the node logs one warning

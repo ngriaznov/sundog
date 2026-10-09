@@ -56,14 +56,15 @@ answers, and the observer then dials nodes, which it does not do today.
 
 ### Explaining a read
 
-When a read answers a miss or `FetchUnavailable`, nothing says why. The
-answer depends on which nodes this node's view names as owners, whether its
-copy of the key's part is cold, unverified, stale or releasing, which pull
-or anti-entropy round last touched that part, and which owner answered.
-`Cache::explain(&key)` returns that record. A bounded per-part ring of
-residency events (gained, dropped, marked cold, pulled from a donor,
-settled) feeds it, off by default or sampled, and one request asks each
-owner for its own side. An observer would read the same request.
+`Cache::explain(&key)` reports this node's view of a read: the key's
+owners, this node's residency marks and record, and each other owner's
+answer to the fetch a read sends. It cannot say why an owner declines:
+that takes a request asking each owner for its own marks, with a protocol
+bump and a responder that answers it only to a peer speaking it. Nor can
+it say which pull or anti-entropy round last touched a part: that takes a
+bounded per-part ring of residency events (gained, dropped, marked cold,
+pulled from a donor, settled), off by default or sampled. An observer
+would read the same request.
 
 **Trigger:** an operator asking why a read missed, with nothing to read but
 counters.
