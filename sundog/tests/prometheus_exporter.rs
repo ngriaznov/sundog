@@ -1034,7 +1034,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
                     "sundog_spill_writes_total",
                     &[("cache", "spilled")],
                 )
-                .is_some())
+                .is_some_and(|writes| writes >= 2.0))
         {
             break body;
         }
@@ -1305,8 +1305,9 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     {
         assert_eq!(
             scraped_metric_value(&body, "sundog_spill_writes_total", &[("cache", "spilled")]),
-            Some(1.0),
-            "expected exactly one spill install; got body:\n{body}"
+            Some(2.0),
+            "expected exactly two spill installs, the second making room for the promotion; \
+             got body:\n{body}"
         );
         assert_eq!(
             scraped_metric_value(
@@ -1347,9 +1348,9 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         );
         assert_eq!(
             scraped_metric_value(&body, "sundog_spill_entries", &[("cache", "spilled")]),
-            Some(0.0),
-            "the promoted key is resident again, so zero currently-spilled entries remain; \
-             got body:\n{body}"
+            Some(1.0),
+            "the promoted key is resident again and the key spilled to make room for it is \
+             on disk, so one currently-spilled entry remains; got body:\n{body}"
         );
 
         // An overwrite of a spilled key decrements sundog_spill_entries the
@@ -1717,7 +1718,10 @@ fn fresh_spill_dir(label: &str) -> std::path::PathBuf {
 async fn spill_writes_and_promotes_pin_metrics(cluster: &Cluster) -> Vec<std::path::PathBuf> {
     let mut dirs = Vec::new();
 
-    // --- "spilled": one eviction-to-spill, one disk-read promotion. ---
+    // --- "spilled": two evictions to spill, one disk-read promotion. The
+    // read of the spilled key makes room for it under the one-entry cap by
+    // spilling the other key first, so two writes land and one entry stays
+    // on disk. ---
     let dir = fresh_spill_dir("promote");
     let cfg = sundog::SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
     let cache = cluster
@@ -1741,8 +1745,14 @@ async fn spill_writes_and_promotes_pin_metrics(cluster: &Cluster) -> Vec<std::pa
         2u32
     };
 
-    // One promotion: a single disk read of the spilled key.
+    // One promotion: a single disk read of the spilled key, which spills
+    // the other key to make room.
     let _ = cache.get(&spilled_key).await;
+    let other_key = 3 - spilled_key;
+    common::eventually(Duration::from_secs(5), || async {
+        cache.get_sync(&other_key).is_none()
+    })
+    .await;
     dirs.push(dir);
 
     // --- "spill-overwrite": an overwrite of a currently-spilled key must

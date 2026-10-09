@@ -2920,8 +2920,9 @@ where
     /// `sundog_cache_misses_total{cache}` on `None`. On a `feature = "spill"`
     /// build, a RAM miss that turns out to be a currently-spilled entry is
     /// read back off disk behind the tier's read semaphore, via
-    /// `spawn_blocking`, and, on success, promoted back to residency under
-    /// a fresh stripe write lock; either way it still counts as a hit. See
+    /// `spawn_blocking`, and promoted back to residency under a fresh
+    /// stripe write lock when room within `max_capacity` can be made;
+    /// either way it still counts as a hit. See
     /// the store module's docs and [`Shard::get_sync`], which never does
     /// this. About one read in 256 on each thread is timed into
     /// `sundog_read_duration_seconds{cache,outcome}`, at a stride drawn
@@ -2950,7 +2951,8 @@ where
     /// documented behavioral difference between the sync and async twins:
     /// the RAM-only synchronous path never touches disk, so it cannot read a
     /// value that has moved there. Use [`Shard::get`] to read a spilled
-    /// value; it also promotes the entry back to residency on success. Timed
+    /// value; it also promotes the entry back to residency when there is
+    /// room. Timed
     /// into `sundog_read_duration_seconds` on the same per-thread sample.
     #[must_use]
     pub fn get_sync(&self, key: &K) -> Option<V> {
@@ -2992,30 +2994,38 @@ where
     /// mismatch, or a postcard decode failure. Each of the latter three
     /// counts `sundog_spill_reads_total{cache,outcome}` accordingly. A hit
     /// counts `outcome = "hit"` and, iff it flips the entry back to
-    /// residency, `sundog_spill_promotions_total{cache}`; a tombstone or a
-    /// newer write racing the disk read means it does not. No lock or
-    /// permit is ever held across more than one `.await` point at a time,
-    /// and no stripe lock is ever held across the disk read.
+    /// residency, `sundog_spill_promotions_total{cache}`. The promotion
+    /// evicts colder entries to make room within `max_capacity` first, and
+    /// does not happen without room: a tombstone or a newer write racing
+    /// the disk read, a `Mode::Replicated` or `Mode::Distributed` tier whose
+    /// full flush queue keeps every victim resident, or an entry heavier
+    /// than the whole cap leaves the entry on disk (see
+    /// [`engine::Engine::promote_locked`]). No lock or permit is ever held
+    /// across more than one `.await` point at a time, and no stripe lock is
+    /// ever held across the disk read.
     #[cfg(feature = "spill")]
     async fn get_spilled(&self, key: &K) -> Option<V> {
         let key_bytes = encode_key(key).ok()?;
         let hash = engine::hash_key_bytes(key_bytes.as_ref());
-        self.get_spilled_by_bytes(key_bytes.as_ref(), hash).await
+        self.get_spilled_by_bytes(key_bytes.as_ref(), hash)
+            .await
+            .map(|(_, value)| value)
     }
 
     /// [`Shard::get_spilled`] for a caller that already has `key_bytes` and
-    /// its hash, such as [`Shard::get_or_load`]'s owner arm.
+    /// its hash, such as [`Shard::get_or_load`]'s owner arm, with the
+    /// version the value was spilled at.
     #[cfg(feature = "spill")]
-    async fn get_spilled_by_bytes(&self, key_bytes: &[u8], hash: u64) -> Option<V> {
+    async fn get_spilled_by_bytes(&self, key_bytes: &[u8], hash: u64) -> Option<(Hlc, V)> {
         let (ver, value, encoded) = self.read_spilled_by_bytes(key_bytes, hash).await?;
         if self
             .engine
-            .promote_locked(key_bytes, hash, ver, &value, &encoded)
+            .promote_locked(key_bytes, hash, ver, &value, &encoded, self.now_ms())
             && let Some(spill_read) = self.spill_read.get()
         {
             spill_read.promotions.increment(1);
         }
-        Some(value)
+        Some((ver, value))
     }
 
     /// Reads the key's currently spilled value off disk, without promoting
@@ -3169,15 +3179,24 @@ where
                     // before ever calling `loader`: a burst of concurrent
                     // misses collapses to at most one spilled-key read, the
                     // same way it already collapses to at most one `loader`
-                    // call. Dropping `guard` unfinished, instead of calling
-                    // `guard.complete()`, removes the in-flight entry and
-                    // wakes every joined waiter as an early-dropped loader
-                    // future would, so they re-check the fast path above
-                    // and see the resident promoted value.
+                    // call. Ending the in-flight entry hands the value to
+                    // every joined waiter, promoted back to RAM or not, iff
+                    // the key still holds it; a removal, expiry or newer
+                    // write since the read leaves them to read again.
                     #[cfg(feature = "spill")]
-                    if let Some(value) = self.get_spilled_by_bytes(key_bytes.as_ref(), hash).await {
+                    if let Some((ver, value)) =
+                        self.get_spilled_by_bytes(key_bytes.as_ref(), hash).await
+                    {
                         self.hits.increment(1);
-                        drop(guard);
+                        self.engine.finish_spilled_read(
+                            &key_bytes,
+                            hash,
+                            &inflight,
+                            ver,
+                            value.clone(),
+                            self.now_ms(),
+                        );
+                        guard.complete();
                         return Ok(value);
                     }
                     // Stamped before the loader runs, so a write or removal
@@ -12456,6 +12475,366 @@ mod tests {
                 took < Duration::from_secs(2),
                 "the batch ends its retries at once, took {took:?} of its 5s budget"
             );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A read that promotes a spilled entry back to RAM makes room for
+        /// it first, through `get` and through `get_or_load`'s spilled-key
+        /// arm alike: reading every key of a shard spilled far past its cap
+        /// leaves at most the cap resident, every key still live, no loader
+        /// called, and the last key read in RAM. With 1024 stripes and a
+        /// cap of four, each key is alone in its stripe, so a pass that
+        /// sampled the promoted entry's own stripe after reinstalling it
+        /// would evict that entry straight back to disk.
+        #[tokio::test]
+        async fn reading_spilled_keys_keeps_the_shard_within_its_cap() {
+            const KEYS: u32 = 24;
+            const CAP: u32 = 4;
+            let (shard, dir) = spill_shard("promote-within-cap", u64::from(CAP));
+            shard
+                .insert_many((0..KEYS).map(|k| (k, format!("value-{k}"))))
+                .await
+                .expect("insert_many");
+            let resident = |shard: &Shard<u32, String>| {
+                (0..KEYS).filter(|k| shard.get_sync(k).is_some()).count()
+            };
+            assert!(
+                poll_until(POLL_TIMEOUT, || resident(&shard) <= CAP as usize).await,
+                "the writes spill all but the cap"
+            );
+
+            let loads = AtomicUsize::new(0);
+            for k in 0..KEYS {
+                let value = if k % 2 == 0 {
+                    shard.get(&k).await
+                } else {
+                    shard
+                        .get_or_load(&k, async |_| {
+                            loads.fetch_add(1, Ordering::Relaxed);
+                            Ok::<_, std::io::Error>(String::new())
+                        })
+                        .await
+                        .ok()
+                };
+                assert_eq!(value, Some(format!("value-{k}")), "key {k} reads back");
+            }
+            assert_eq!(
+                loads.load(Ordering::Relaxed),
+                0,
+                "every key reads back off disk"
+            );
+            assert!(
+                poll_until(POLL_TIMEOUT, || resident(&shard) <= CAP as usize).await,
+                "reads leave at most the cap resident, {} of {KEYS} are",
+                resident(&shard)
+            );
+            let (live, weight) = shard.engine.debug_totals();
+            assert_eq!(
+                live,
+                u64::from(KEYS),
+                "every key stays live, in RAM or on disk"
+            );
+            assert!(
+                weight <= u64::from(CAP),
+                "resident weight {weight} is within the cap"
+            );
+            assert!(
+                shard.get_sync(&(KEYS - 1)).is_some(),
+                "the last key read stays in RAM"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A spilled entry heavier than the whole cap reads back off disk
+        /// on every read and stays there: no eviction makes room for it,
+        /// so reinstalling it would leave the shard over its cap.
+        #[tokio::test]
+        async fn a_spilled_entry_heavier_than_the_cap_reads_from_disk_and_stays_there() {
+            const CAP: u64 = 10;
+            let dir = temp_dir("oversize-promotion");
+            let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("oversize-promotion"),
+                Mode::Local,
+                NodeId::from(1u64),
+                CAP,
+                None,
+                None,
+            )
+            .with_weigher(|_key: &u32, value: &String| {
+                u32::try_from(value.len()).unwrap_or(u32::MAX)
+            })
+            .with_spill(&cfg)
+            .expect("tier opens");
+            let big = "x".repeat(64);
+            shard.insert(1, big.clone()).await.expect("insert");
+            assert!(
+                poll_until(POLL_TIMEOUT, || shard.get_sync(&1).is_none()).await,
+                "the write spills the entry heavier than the cap"
+            );
+            for read in 1..=3 {
+                assert_eq!(shard.get(&1).await, Some(big.clone()), "read {read}");
+                assert!(
+                    shard.get_sync(&1).is_none(),
+                    "read {read} leaves the entry on disk"
+                );
+            }
+            assert_eq!(shard.engine.debug_totals(), (1, 0));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Concurrent `get_or_load` calls of a spilled key that its read
+        /// cannot promote, one heavier than the whole cap, still collapse
+        /// to one disk read: the owner hands the value to every joined
+        /// waiter instead of leaving each to read the disk again.
+        #[tokio::test]
+        async fn concurrent_loads_of_an_unpromotable_spilled_key_read_the_disk_once() {
+            use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+            const CALLS: usize = 16;
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let dir = temp_dir("unpromotable-single-flight");
+            let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("unpromotable-single-flight"),
+                Mode::Local,
+                NodeId::from(1u64),
+                10,
+                None,
+                None,
+            )
+            .with_weigher(|_key: &u32, value: &String| {
+                u32::try_from(value.len()).unwrap_or(u32::MAX)
+            })
+            .with_spill(&cfg)
+            .expect("tier opens");
+            let big = "x".repeat(64);
+            shard.insert(1, big.clone()).await.expect("insert");
+            assert!(
+                poll_until(POLL_TIMEOUT, || shard.get_sync(&1).is_none()).await,
+                "the write spills the entry heavier than the cap"
+            );
+            let _ = snapshotter.snapshot();
+
+            let loads = AtomicUsize::new(0);
+            let answers = futures::future::join_all((0..CALLS).map(|_| {
+                shard.get_or_load(&1, async |_| {
+                    loads.fetch_add(1, Ordering::Relaxed);
+                    Ok::<_, std::io::Error>(String::new())
+                })
+            }))
+            .await;
+            assert!(
+                answers
+                    .iter()
+                    .all(|answer| answer.as_ref().ok() == Some(&big)),
+                "every call answers the spilled value"
+            );
+            assert_eq!(loads.load(Ordering::Relaxed), 0, "no call runs the loader");
+            let disk_hits: u64 = snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .filter(|(key, ..)| {
+                    key.key().name() == "sundog_spill_reads_total"
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "outcome" && label.value() == "hit")
+                })
+                .map(|(.., value)| match value {
+                    DebugValue::Counter(n) => n,
+                    _ => 0,
+                })
+                .sum();
+            assert_eq!(disk_hits, 1, "{CALLS} concurrent loads read the disk once");
+            assert!(shard.get_sync(&1).is_none(), "the entry stays on disk");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// `load_many`'s counterpart of
+        /// [`concurrent_loads_of_an_unpromotable_spilled_key_read_the_disk_once`]:
+        /// concurrent calls of a spilled key too heavy to promote share the
+        /// owner's one disk read and never reach the loader.
+        #[tokio::test]
+        async fn concurrent_load_manys_of_an_unpromotable_spilled_key_read_the_disk_once() {
+            use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+            const CALLS: usize = 16;
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let dir = temp_dir("unpromotable-load-many");
+            let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+            let loads = Arc::new(AtomicUsize::new(0));
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("unpromotable-load-many"),
+                Mode::Local,
+                NodeId::from(1u64),
+                10,
+                None,
+                None,
+            )
+            .with_weigher(|_key: &u32, value: &String| {
+                u32::try_from(value.len()).unwrap_or(u32::MAX)
+            })
+            .with_loader(crate::store::load::Loader::batch({
+                let loads = Arc::clone(&loads);
+                move |_keys: Vec<u32>| {
+                    loads.fetch_add(1, Ordering::Relaxed);
+                    async { Ok::<_, std::io::Error>(HashMap::new()) }
+                }
+            }))
+            .with_spill(&cfg)
+            .expect("tier opens");
+            let big = "x".repeat(64);
+            shard.insert(1, big.clone()).await.expect("insert");
+            assert!(
+                poll_until(POLL_TIMEOUT, || shard.get_sync(&1).is_none()).await,
+                "the write spills the entry heavier than the cap"
+            );
+            let _ = snapshotter.snapshot();
+
+            let answers =
+                futures::future::join_all((0..CALLS).map(|_| shard.load_many([1u32]))).await;
+            assert!(
+                answers.iter().all(
+                    |answer| answer.as_ref().ok().and_then(|found| found.get(&1)) == Some(&big)
+                ),
+                "every call answers the spilled value"
+            );
+            assert_eq!(
+                loads.load(Ordering::Relaxed),
+                0,
+                "no call reaches the loader"
+            );
+            let disk_hits: u64 = snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .filter(|(key, ..)| {
+                    key.key().name() == "sundog_spill_reads_total"
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "outcome" && label.value() == "hit")
+                })
+                .map(|(.., value)| match value {
+                    DebugValue::Counter(n) => n,
+                    _ => 0,
+                })
+                .sum();
+            assert_eq!(
+                disk_hits, 1,
+                "{CALLS} concurrent load_manys read the disk once"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A `load_many` dropped while it waits to read a later key's
+        /// spilled value frees the in-flight entries of the keys it already
+        /// claimed: a later load of such a key runs rather than join a load
+        /// that never ends.
+        #[tokio::test]
+        async fn a_load_many_dropped_mid_claim_frees_the_keys_it_claimed() {
+            let dir = temp_dir("load-many-dropped-mid-claim");
+            let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("load-many-dropped-mid-claim"),
+                Mode::Local,
+                NodeId::from(1u64),
+                1,
+                None,
+                None,
+            )
+            .with_loader(crate::store::load::Loader::batch(
+                |keys: Vec<u32>| async move {
+                    Ok::<_, std::io::Error>(
+                        keys.into_iter()
+                            .map(|key| (key, format!("loaded-{key}")))
+                            .collect::<HashMap<_, _>>(),
+                    )
+                },
+            ))
+            .with_spill(&cfg)
+            .expect("tier opens");
+            shard.insert(2, "two".to_string()).await.expect("insert 2");
+            shard
+                .insert(3, "three".to_string())
+                .await
+                .expect("insert 3");
+            assert!(
+                poll_until(POLL_TIMEOUT, || {
+                    shard.get_sync(&2).is_none() || shard.get_sync(&3).is_none()
+                })
+                .await,
+                "one of the two keys spills under the one-entry cap"
+            );
+            let spilled = if shard.get_sync(&2).is_none() { 2 } else { 3 };
+
+            let semaphore = Arc::clone(&shard.spill_read.get().expect("a spill tier").semaphore);
+            let permits = u32::try_from(semaphore.available_permits()).expect("a small count");
+            let held = semaphore
+                .acquire_many_owned(permits)
+                .await
+                .expect("the read semaphore is open");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), shard.load_many([1, spilled]))
+                    .await
+                    .is_err(),
+                "the call claims key 1, then waits on the held read permits for the spilled key"
+            );
+            drop(held);
+
+            let loaded = tokio::time::timeout(Duration::from_secs(5), shard.load(&1))
+                .await
+                .expect("a later load of the claimed key runs rather than hang");
+            assert_eq!(loaded.expect("load"), Some("loaded-1".to_string()));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A write burst far past the cap settles within it once the
+        /// flusher installs its hand-offs: an eviction pass that found
+        /// nothing to evict leaves the rest to the flusher only when the
+        /// hand-offs in flight are all that hold the shard over its cap.
+        #[tokio::test]
+        async fn a_write_burst_past_the_cap_settles_within_it() {
+            const KEYS: u32 = 8_000;
+            const CAP: u64 = 2_000;
+            let dir = temp_dir("write-burst-within-cap");
+            // Generous past the 2s default, so a contended CI disk slows the
+            // burst rather than dropping a victim at its reservation wait.
+            let cfg = SpillConfig::new(&dir, 4 << 20)
+                .region_bytes(256 * 1024)
+                .spill_wait_timeout(Duration::from_secs(20));
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("write-burst-within-cap"),
+                Mode::Local,
+                NodeId::from(1u64),
+                CAP,
+                None,
+                None,
+            )
+            .with_spill(&cfg)
+            .expect("tier opens");
+            shard
+                .insert_many((0..KEYS).map(|k| (k, format!("value-{k}"))))
+                .await
+                .expect("insert_many");
+            let resident = || -> u64 {
+                (0..KEYS)
+                    .filter(|k| shard.get_sync(k).is_some())
+                    .map(|_| 1)
+                    .sum()
+            };
+            assert!(
+                poll_until(POLL_TIMEOUT, || resident() <= CAP).await,
+                "the burst settles within the cap, {} of {KEYS} resident",
+                resident()
+            );
+            let (live, weight) = shard.engine.debug_totals();
+            assert_eq!(live, u64::from(KEYS), "every key stays live");
+            assert!(weight <= CAP, "resident weight {weight} is within the cap");
             let _ = std::fs::remove_dir_all(&dir);
         }
 

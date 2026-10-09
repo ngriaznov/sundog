@@ -49,10 +49,13 @@ cache needs a tier to take a `max_capacity` at all.
 | `spill_wait_timeout` | 2 s | how long eviction waits for queue room |
 | `warm_reopen` | off | whether a clean close checkpoints the tier for a fast restart |
 
-When the flusher falls behind, eviction waits up to `spill_wait_timeout`
-for queue room. A `Local` or `Invalidation` cache then evicts the entry
-outright. A `Replicated` cache keeps it resident for a later pass instead,
-since deleting it locally would only have anti-entropy pull it back.
+When the flusher falls behind, a batch write's eviction waits up to
+`spill_wait_timeout` for queue room; a single write's or a read's takes
+room only when it is free. A `Local` or `Invalidation` cache then evicts
+the entry outright. A `Replicated` cache keeps it resident for a later
+pass instead, since deleting it locally would only have anti-entropy pull
+it back, and a read of a spilled key behind that full queue answers from
+disk.
 
 ### Warm reopen
 
