@@ -37,4 +37,4 @@
 
 
 
- 1-4 view  ↑↓ select  ⏎ node  c cache  f filter  t gone  p freeze  a anim  ? help  q quit
+ 1-4 view  ↑↓ select  ⏎ node  c cache  f filter  t gone  e explain  p freeze  a anim  ? help  q quit

@@ -1,5 +1,6 @@
 //! The footer: key hints for the view on screen, and the demo keys at the
-//! right in demo mode.
+//! right in demo mode. A row too narrow for every hint drops them from the
+//! end of the list, ahead of `? help` and `q quit`, which always stay.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -42,12 +43,22 @@ pub fn hints(view: View) -> Vec<(&'static str, &'static str)> {
             ("t", "gone"),
         ],
     };
-    hints.extend([("p", "freeze"), ("a", "anim"), ("?", "help"), ("q", "quit")]);
+    hints.extend([
+        ("e", "explain"),
+        ("p", "freeze"),
+        ("a", "anim"),
+        ("?", "help"),
+        ("q", "quit"),
+    ]);
     hints
 }
 
+/// The hints at the end of the list that stay on screen whatever the width:
+/// `? help` and `q quit`.
+const KEPT: usize = 2;
+
 /// The shortened hints of a narrow screen.
-const NARROW: &str = "1-4 ↑↓ ⏎ ? q";
+const NARROW: &str = "1-4 ↑↓ ⏎ e ? q";
 
 /// The demo keys.
 const DEMO: [(&str, &str); 4] = [
@@ -73,7 +84,10 @@ pub fn render(scene: &Scene<'_>, area: Rect, buf: &mut Buffer) {
             0
         };
         let room = width.saturating_sub(demo_width + 2);
-        spans.extend(keycap::keycap_spans(keycap::fit(&all, room), look.mode));
+        spans.extend(keycap::keycap_spans(
+            &keycap::fit_keeping(&all, KEPT, room),
+            look.mode,
+        ));
         if demo {
             let used = width_of(&spans);
             let mut tail = vec![look.span("demo: ", super::look::Token::Muted)];
@@ -127,8 +141,16 @@ mod tests {
         let text = footer(&app, LayoutKind::Full, 140);
         assert_eq!(
             text,
-            " 1-4 view  ↑↓ select  ⏎ node  c cache  f filter  t gone  p freeze  a anim  ? help  q quit"
+            " 1-4 view  ↑↓ select  ⏎ node  c cache  f filter  t gone  e explain  p freeze  a anim  ? help  q quit"
         );
+    }
+
+    #[test]
+    fn the_overview_footer_lists_explain() {
+        let hints = hints(View::Overview);
+        let explain = hints.iter().position(|hint| *hint == ("e", "explain"));
+        let freeze = hints.iter().position(|hint| *hint == ("p", "freeze"));
+        assert_eq!(explain.map(|at| at + 1), freeze, "{hints:?}");
     }
 
     #[test]
@@ -138,6 +160,7 @@ mod tests {
             assert_eq!(hints.last(), Some(&("q", "quit")), "{view:?}");
             assert!(hints.contains(&("?", "help")));
             assert!(hints.contains(&("1-4", "view")));
+            assert!(hints.contains(&("e", "explain")), "{view:?}");
         }
         assert!(hints(View::Node).contains(&("r", "raw")));
         assert!(hints(View::Timeline).contains(&("G", "live")));
@@ -146,16 +169,52 @@ mod tests {
     #[test]
     fn a_narrow_footer_shortens_to_the_bare_keys() {
         let app = App::new(AppConfig::default());
-        assert_eq!(footer(&app, LayoutKind::Narrow, 80), " 1-4 ↑↓ ⏎ ? q");
+        assert_eq!(footer(&app, LayoutKind::Narrow, 80), " 1-4 ↑↓ ⏎ e ? q");
     }
 
     #[test]
-    fn hints_that_do_not_fit_are_dropped_from_the_end() {
+    fn the_narrow_footer_lists_e() {
+        assert!(NARROW.split(' ').any(|key| key == "e"), "{NARROW}");
+    }
+
+    #[test]
+    fn hints_that_do_not_fit_are_dropped_before_the_kept_tail() {
         let app = App::new(AppConfig::default());
         let text = footer(&app, LayoutKind::Compact, 40);
-        assert!(text.starts_with(" 1-4 view  ↑↓ select"), "{text}");
-        assert!(!text.contains("quit"), "{text}");
+        assert_eq!(text, " 1-4 view  ↑↓ select  ? help  q quit");
         assert!(text.chars().count() <= 40);
+        let wide = footer(&app, LayoutKind::Compact, 60);
+        assert!(wide.starts_with(" 1-4 view  ↑↓ select  ⏎ node"), "{wide}");
+        assert!(wide.ends_with("  ? help  q quit"), "{wide}");
+        assert!(!wide.contains("anim") && !wide.contains("freeze"), "{wide}");
+    }
+
+    #[test]
+    fn quit_stays_visible_in_demo_at_140_and_at_width_100() {
+        let demo = App::new(AppConfig {
+            demo: true,
+            ..AppConfig::default()
+        });
+        let text = footer(&demo, LayoutKind::Full, 140);
+        assert!(
+            text.contains("e explain  p freeze  ? help  q quit"),
+            "{text}"
+        );
+        assert!(text.ends_with("demo: S spawn  K kill  L leave  R restart"));
+        assert!(!text.contains("a anim"), "{text}");
+        let plain = App::new(AppConfig::default());
+        let text = footer(&plain, LayoutKind::Compact, 100);
+        assert!(
+            text.contains("e explain  p freeze  ? help  q quit"),
+            "{text}"
+        );
+        assert!(!text.contains("a anim"), "{text}");
+        for width in [100, 120, 140] {
+            for app in [&demo, &plain] {
+                let text = footer(app, LayoutKind::Compact, width);
+                assert!(text.contains("? help  q quit"), "{width}: {text}");
+            }
+        }
     }
 
     #[test]

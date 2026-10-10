@@ -1,0 +1,40 @@
+ ●•• sundog lens  fixture   ● 5 live  ◐ 1 leaving  ✖ 1 down  ○ 1 left   proto 7   observer 127.0.0.1:41733 · 0 anon          ⠋ 00:01:21 UTC
+  1 Overview   2 Caches   3 Node   4 Timeline                               metrics 6/6 · 1 s     it · part view 5d69e3db ↻ settling 71.0 s
+╭ Members · gossip ──────────────────────────────────────────────────────── 8 seen ╮╭ Throughput · metrics ────────────────────────────────╮
+│   NODE      GOSSIP          UP    P  CACHES   SHARE it          PEERS      OPS/S ││ 4.46k ops/s ▼3%   hit 55.1%   tx 15.9 MB/s           │
+│▌● n1 1d4f   127.0.0.11:7946 01:20 7  D R R R  ━━━┊────  39.9% ✓ 5/5   ⣾⣿⣿⣿   874 ││                                         ⢀⣀⣀⣀⣀⣀⡀      │
+│ ● n2 204f   127.0.0.12:7946 01:20 7  D R R R  ━━━┊────  40.0% ✓ 5/5   ⣿⣿⣿⣿   925 ││                        ⣀⣠⣶⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣶ │
+│ ● n3 234╭ Explain a read · it · computed · asked ──────────────────────────────────────────────────────────────────────────────╮⣿⣿⣿⣿⣿⣿⣿⣿ │
+│ ● n4 264│ key    k1▌                                                                                                           │⣿⣿⣿⣿⣿⣿⣿⣿ │
+│ ● n5 294│        "k1" as String · 3 bytes 02 6b 31                                                                             │⣿⣿⣿⣿⣿⣿⣿⣿ │
+│ ◐ n6 2c4│        other key types land on other parts: prefix uint: int: hex: str:                                              │⣿⣿⣿⣿⣿⣿⣿⣿ │
+│ ✖ n7 2f4│ part   966/29 · bucket 966, part 29                                                                                  │⣿⣿⣿⣿⣿⣿⣿⣿ │
+│ ○ n8 324│ view   5d69e3db · k=2 · ranks parts · ↻ settling 71.0 s                                                              │⣿⣿⣿⣿⣿⣿⣿⣿ │
+│         │ owner  1 ◆ n3 234f  live  first owner: a fetch asks it first                                                         │⣿⣿⣿⣿⣿⣿⣿⣿ │
+│         │        2   n5 294f  live                                                                                             │⣿⣿⣿⣿⣿⣿⣿⣿ │
+│         │                                                                                                                      │──── now │
+│         │ ✔ 5 nodes agree, the lens computes the same · asked 3.0 s ago                                                        │         │
+╰─────────│ NODE   OWNS  LOCAL                     READ          SERVES                 SOURCE         PROBES                    │─────────╯
+╭ Ownershi│ ▌ n1   no    absent                    not an owner  miss                   n3 hit         n3 held · n5 held         │ed ↻ 4/5 ╮
+│ ▀▀▀▀▀▀▀▀│   n2   no    absent                    not an owner  miss                   n3 hit         n3 held · n5 held         │✓        │
+│ ▀▀▀▀▀▀▀▀│   n3   yes   live · expires in 38.1 s  hit           serves                 this node hit  n5 held                   │✓        │
+│ ▀▀▀▀▀▀▀▀│   n4   no    absent                    not an owner  miss                   n3 hit         n3 held · n5 held         │↻ 25,304 │
+│ ▀▀▀▀▀▀▀▀│   n5   yes   live · expires in 38.1 s  hit           serves                 this node hit  n3 held                   │✓        │
+│ ▀▀▀▀▀▀▀▀│                                                                                                                      │✓        │
+│ ▀▀▀▀▀▀▀▀│ n1 in detail                                                                                                         │         │
+│ ▀▀▀▀▀▀▀▀│   record  absent                                                                                                     │%        │
+│ ▀▀▀▀▀▀▀▀│   marks   does not own the part · none                                                                               │         │
+╰─────────│   reads   own copy: not an owner · serves peers: miss                                                                │─────────╯
+╭ Events ─│   view    5d69e3dbbfa02966                                                                                           │─────────╮
+│ 00:00:21│   source  the first owner to answer is n3: a hit                                                                     │         │
+│ 00:00:21│   probes  n3 held · 1760054300112.3@n3 · expires in 38.1 s · a read gets a value                                     │         │
+│ 00:00:21│           n5 held · 1760054300112.3@n3 · expires in 38.1 s · a read gets a value                                     │         │
+│ 00:00:21│                                                                                                                      │         │
+│ 00:00:21│ Enter ask  ↑↓ node  Ctrl-U clear  Esc close                                                                          │         │
+│ 00:00:21╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯· err 0% │
+│ 00:00:20  ✔ SETTLED  it settled in 10.0 s                                        ││ ⇄ rebal in ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀  out ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀        │
+│ 00:00:10  ⇄ VIEW     it bf0b7189 → 5d69e3db · 48,957 parts move · n7 −16.5k      ││                                                      │
+│ 00:00:10  ✔ SETTLED  it settled in 5.0 s                                         ││                                                      │
+│ 00:00:10  ○ LEFT     n8 324f  gone after its departure                           ││                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────╯╰──────────────────────────────────────────────────────╯
+ 1-4 view  ↑↓ select  ⏎ node  c cache  f filter  t gone  e explain  p freeze  a anim  ? help  q quit

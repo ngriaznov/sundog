@@ -66,6 +66,7 @@ pub fn app_config(args: &WatchArgs, look: Look) -> AppConfig {
         cluster: args.cluster.clone(),
         seeds: args.seeds.iter().map(ToString::to_string).collect(),
         observer: None,
+        control: None,
     }
 }
 
@@ -499,6 +500,7 @@ mod tests {
         assert!(!config.anim);
         assert!(!config.demo);
         assert_eq!(config.scrape_interval, None);
+        assert_eq!(config.control, None, "watch knows no control ports");
     }
 
     #[test]
@@ -561,6 +563,34 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), FleetCmd::Spawn);
         // Without a channel the request is dropped, not an error.
         assert!(handle_event(&key('S'), &mut app, &model, None).dirty);
+    }
+
+    #[test]
+    fn the_explain_request_reaches_the_fleet_channel() {
+        let model = crate::model::testkit::fixture_model(Instant::now());
+        let template = crate::source::targets::UrlTemplate::parse("{ip}:{gossip_port+134}")
+            .expect("the template parses");
+        let mut app = App::new(AppConfig {
+            control: Some(template),
+            ..AppConfig::default()
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for typed in [key('e'), key('k'), key('1')] {
+            let pass = handle_event(&typed, &mut app, &model, Some(&tx));
+            assert!(pass.dirty && !pass.quit);
+        }
+        assert!(rx.try_recv().is_err(), "typing asks nobody");
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let pass = handle_event(&enter, &mut app, &model, Some(&tx));
+        assert!(pass.dirty && !pass.quit);
+        let FleetCmd::Explain(request) = rx.try_recv().expect("Enter sends the request") else {
+            panic!("an explain request");
+        };
+        assert_eq!((request.id, request.key.as_str()), (1, "k1"));
+        let labels: Vec<&str> = request.targets.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(labels, ["n1", "n2", "n3", "n4", "n5"]);
+        // Without a channel the request is dropped, as a demo key is.
+        assert!(handle_event(&enter, &mut app, &model, None).dirty);
     }
 
     #[test]

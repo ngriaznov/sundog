@@ -37,4 +37,4 @@
 │                                                                                                                                          │
 │                                                                                                                                          │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
- 1-4 view  ↑↓ node  r raw  Esc back  p freeze  a anim  ? help  q quit
+ 1-4 view  ↑↓ node  r raw  Esc back  e explain  p freeze  a anim  ? help  q quit

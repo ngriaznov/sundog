@@ -37,4 +37,4 @@
 │ 00:00:10  ✔ SETTLED  it settled in 5.0 s                                         ││                                                      │
 │ 00:00:10  ○ LEFT     n8 324f  gone after its departure                           ││                                                      │
 ╰──────────────────────────────────────────────────────────────────────────────────╯╰──────────────────────────────────────────────────────╯
- 1-4 view  ↑↓ select  ⏎ node  c cache  f filter  t gone  p freeze  a anim  ? help  q quit
+ 1-4 view  ↑↓ select  ⏎ node  c cache  f filter  t gone  e explain  p freeze  a anim  ? help  q quit
