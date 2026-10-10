@@ -16,6 +16,8 @@
 //! - [`model`] folds the updates into the state the interface draws.
 //! - [`ui`] draws the model; [`app`] holds the interface state and handles
 //!   keys; [`watch`] runs the terminal loop; [`once`] prints one report.
+//! - [`key`] parses a key typed as text into the postcard bytes a cache hashes,
+//!   and [`locate`] names the part and the owners of that key from the model.
 //! - [`scenario`] parses and plays the scripted demo.
 //! - [`fleet`] and [`demo`] start local test nodes (Unix only).
 
@@ -25,6 +27,8 @@ pub mod cli;
 pub mod demo;
 #[cfg(unix)]
 pub mod fleet;
+pub mod key;
+pub mod locate;
 pub mod model;
 pub mod once;
 pub mod scenario;
