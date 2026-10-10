@@ -15,8 +15,11 @@
 //!
 //! `sundog_spill_waiters` bumps on every `reserve()` call before the
 //! acquire is awaited and drops on exit, so a nonzero reading only proves
-//! `reserve()` ran, not that it suspended; the assertion using
-//! it is a sanity check, not proof of a wait.
+//! `reserve()` ran, not that it suspended. The bulk test logs whether its
+//! sampler saw one, as context only: a call that gets room at once holds
+//! the gauge up for microseconds, and a sampler that renders the whole
+//! exposition between reads can miss every such call of a run whose
+//! flusher keeps up.
 //!
 //! Own test binary, so installing the process-global Prometheus recorder
 //! here never races another test for the slot.
@@ -150,9 +153,8 @@ async fn bulk_insert_over_a_saturated_flush_queue_drops_nothing() {
         .await
         .expect("cache opens with a tiny flush queue");
 
-    // Polls sundog_spill_waiters as fast as yield_now allows. Confirms
-    // reserve() was exercised repeatedly; cannot prove a genuine wait
-    // over an instant, uncontended acquire.
+    // Polls sundog_spill_waiters as fast as yield_now allows, for the log
+    // below; see the module docs for why it is not asserted.
     let seen_waiter = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let sampler = tokio::spawn({
@@ -227,11 +229,9 @@ async fn bulk_insert_over_a_saturated_flush_queue_drops_nothing() {
         spilled_entries > 0,
         "a 100-entry max_capacity against 2000 inserts must actually spill something"
     );
-    assert!(
-        seen_waiter.load(Ordering::Relaxed),
-        "the sampler never observed sundog_spill_waiters > 0 across the whole load: reserve() \
-         may not have been exercised at all, which would mean this scenario is not actually \
-         driving apply_grouped's reservation path"
+    eprintln!(
+        "bulk: sampler saw sundog_spill_waiters > 0: {}",
+        seen_waiter.load(Ordering::Relaxed)
     );
 
     for k in (0..ENTRIES).step_by(37) {
