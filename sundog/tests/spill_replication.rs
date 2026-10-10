@@ -237,10 +237,18 @@ async fn replicated_two_node_spill_converges_and_settles_to_zero_repairs() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The joiner's `state_transfer_budget` in [`join_after_bulk_insert`]. The
+/// default 20 s gives each donor 8 s, which a debug build pulling ~22 MB
+/// through a small `max_capacity` outruns on a loaded runner; the transfer
+/// then opens the cache with part of the dataset and leaves the rest to
+/// anti-entropy. Past this budget, `open()` returns with every key, so a
+/// key missing afterwards is a lost one.
+const JOIN_TRANSFER_BUDGET: Duration = Duration::from_secs(60);
+
 /// Builds a solo warm `Mode::Replicated` node `a` with `entries` values,
 /// then joins node `b` against it, opening `b` with `spill_cfg`/
-/// `max_capacity`. Returns both clusters/caches and `b`'s `open()`
-/// wall-clock duration.
+/// `max_capacity` under [`JOIN_TRANSFER_BUDGET`]. Returns both
+/// clusters/caches and `b`'s `open()` wall-clock duration.
 async fn join_after_bulk_insert(
     cluster_name: &str,
     cache_name: &str,
@@ -279,7 +287,7 @@ async fn join_after_bulk_insert(
 
     let cluster_b = Cluster::builder(cluster_name)
         .seeds([cluster_a.local_gossip_addr()])
-        .config(common::fast_config())
+        .config(common::fast_config().with(|c| c.state_transfer_budget = JOIN_TRANSFER_BUDGET))
         .build()
         .await
         .expect("node b builds");
@@ -450,14 +458,17 @@ async fn a_saturated_flush_queue_paces_the_joiners_pull_without_refusing_an_evic
          generous_open={generous_elapsed:?} (waiter seen: {saw_waiter_generous})"
     );
 
+    // Scraped before the reads below: a read of a spilled key promotes it,
+    // and the eviction that makes room carries no reservation, so it is
+    // refused while anti-entropy still keeps the flush queue full.
+    let body = handle.render();
+    assert_paced_without_refusals(&body, "pace-saturated");
+    assert_paced_without_refusals(&body, "pace-generous");
+
     for k in (0..ENTRIES).step_by(1777) {
         assert_eq!(cache_joiner_sat.get(&k).await, Some(fixed_value(k)));
         assert_eq!(cache_joiner_gen.get(&k).await, Some(fixed_value(k)));
     }
-
-    let body = handle.render();
-    assert_paced_without_refusals(&body, "pace-saturated");
-    assert_paced_without_refusals(&body, "pace-generous");
 
     cache_donor_sat.close().await;
     cache_joiner_sat.close().await;
@@ -490,8 +501,9 @@ async fn a_too_short_spill_wait_timeout_degrades_to_a_clean_retry_not_a_hang() {
     /// `Duration::ZERO` is avoided since it takes a different, non-blocking
     /// code path instead of a genuine timeout race.
     const TOO_SHORT_TIMEOUT: Duration = Duration::from_micros(1);
-    /// Generous ceiling past the 20s default budget; not an expected duration.
-    const MUST_NOT_HANG_WITHIN: Duration = Duration::from_secs(30);
+    /// Generous ceiling past [`JOIN_TRANSFER_BUDGET`]; not an expected
+    /// duration.
+    const MUST_NOT_HANG_WITHIN: Duration = Duration::from_secs(90);
 
     let handle = metrics_handle();
 
