@@ -49,7 +49,8 @@ pub enum Action {
     Redraw,
     /// Leave the interface.
     Quit,
-    /// Ask the fleet to act (demo only).
+    /// Send a request to the demo's fleet: an action for a demo key, or an
+    /// explain request (demo only).
     Fleet(FleetCmd),
 }
 
@@ -257,6 +258,7 @@ pub struct App {
     config: AppConfig,
     motion: Motion,
     lifeline_window: Cell<Duration>,
+    too_small: Cell<bool>,
 }
 
 /// `lead` indices of `prev` translated into the eligible order of `next`: a
@@ -303,6 +305,7 @@ impl App {
             config,
             motion: Motion::default(),
             lifeline_window: Cell::new(Duration::ZERO),
+            too_small: Cell::new(false),
         }
     }
 
@@ -319,6 +322,13 @@ impl App {
         let window = timeline::window_for(span, self.lifeline_window.get());
         self.lifeline_window.set(window);
         window
+    }
+
+    /// Records whether the last frame was too small to draw anything but the
+    /// size notice. The explain overlay takes keys only while it is on
+    /// screen, so the next key press reads this.
+    pub fn note_too_small(&self, small: bool) {
+        self.too_small.set(small);
     }
 
     /// Records the observer's gossip address, once the feed is up.
@@ -484,12 +494,15 @@ impl App {
 
     /// Handles one key press and returns what the loop does next.
     ///
-    /// Keys follow the table in the help overlay. `Esc` closes the explain
-    /// overlay, else the help overlay, else the raw-sample list, else returns
-    /// to the previous view; it never quits. While the explain overlay is
-    /// open it takes every key but `Ctrl-C`: letters, `q` and `?` type into
-    /// the key. While help is open every key but `?`, `Esc`, `q` and
-    /// `Ctrl-C` is ignored. The demo keys `S K L R` act only in demo mode.
+    /// Keys follow the table in the help overlay. `Esc` closes the help
+    /// overlay, else the explain overlay, else the raw-sample list, else
+    /// returns to the previous view; it never quits. While help is open every key
+    /// but `?`, `Esc`, `q` and `Ctrl-C` is ignored. Otherwise, while the
+    /// explain overlay is on screen, it takes every key but `Ctrl-C`:
+    /// letters, `q` and `?` type into the key. The overlay is not on screen
+    /// when the last frame was [too small](Self::note_too_small), and then
+    /// `q` quits, `e` opens nothing and `Esc` still closes the overlay. The
+    /// demo keys `S K L R` act only in demo mode.
     pub fn handle_key(&mut self, key: KeyEvent, live: &Model) -> Action {
         if key.kind == KeyEventKind::Release {
             return Action::None;
@@ -498,7 +511,7 @@ impl App {
         if ctrl && key.code == KeyCode::Char('c') {
             return Action::Quit;
         }
-        if self.explain.is_some() {
+        if self.explain.is_some() && !self.help && !self.too_small.get() {
             return self.explain_key(key, live);
         }
         if key.code == KeyCode::Char('q') {
@@ -548,7 +561,7 @@ impl App {
                     self.snap();
                 }
             }
-            KeyCode::Char('e') => self.open_explain(),
+            KeyCode::Char('e') if !self.too_small.get() => self.open_explain(),
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('S') if self.config.demo => return Action::Fleet(FleetCmd::Spawn),
             KeyCode::Char('K') if self.config.demo => {
@@ -698,8 +711,6 @@ impl App {
     fn escape(&mut self) -> Action {
         if self.explain.is_some() {
             self.close_explain();
-        } else if self.help {
-            self.help = false;
         } else if self.raw {
             self.raw = false;
         } else if let Some(previous) = self.prev_view.take() {
@@ -711,7 +722,8 @@ impl App {
         Action::Redraw
     }
 
-    /// Applies one command of the scenario director.
+    /// Applies one command for the interface: the scenario director's, or an
+    /// answer to an explain request.
     pub fn apply_director(&mut self, command: UiCommand, live: &Model) {
         match command {
             UiCommand::Tab(view) => self.go(view),
@@ -1208,26 +1220,90 @@ mod tests {
     }
 
     #[test]
-    fn esc_closes_the_overlay_before_help_then_raw_then_back() {
+    fn esc_closes_help_drawn_over_the_overlay_then_the_overlay_then_raw_then_back() {
         let model = model();
         let mut app = app();
         app.handle_key(ch('3'), &model);
         app.handle_key(ch('r'), &model);
         app.handle_key(ch('?'), &model);
-        // The director can open help over the overlay; Esc closes the
-        // overlay first.
+        // The director can open help over the overlay; help is drawn on top,
+        // so the first Esc closes it and leaves the overlay.
         app.handle_key(ch('?'), &model);
         app.handle_key(ch('e'), &model);
         app.apply_director(UiCommand::Help(true), &model);
         assert!(app.explain.is_some() && app.help && app.raw && app.view == View::Node);
         assert_eq!(app.handle_key(key(KeyCode::Esc), &model), Action::Redraw);
-        assert!(app.explain.is_none() && app.help && app.raw);
+        assert!(app.explain.is_some() && !app.help && app.raw);
         app.handle_key(key(KeyCode::Esc), &model);
-        assert!(!app.help && app.raw && app.view == View::Node);
+        assert!(app.explain.is_none() && !app.help && app.raw && app.view == View::Node);
         app.handle_key(key(KeyCode::Esc), &model);
         assert!(!app.raw && app.view == View::Node);
         app.handle_key(key(KeyCode::Esc), &model);
         assert_eq!(app.view, View::Overview);
+    }
+
+    #[test]
+    fn help_drawn_over_the_overlay_takes_the_keys_its_card_lists() {
+        let model = model();
+        let mut app = explaining_app();
+        app.handle_key(ch('e'), &model);
+        type_into(&mut app, &model, "k1");
+        app.apply_director(UiCommand::Help(true), &model);
+        let pending = app.explain.as_ref().unwrap().pending;
+        // Every key the card does not list is ignored, and none types.
+        for event in [
+            ch('x'),
+            ch('1'),
+            ch('e'),
+            key(KeyCode::Enter),
+            key(KeyCode::Up),
+            key(KeyCode::Down),
+            key(KeyCode::Backspace),
+            control_key('u'),
+        ] {
+            assert_eq!(app.handle_key(event, &model), Action::None, "{event:?}");
+            assert_eq!(typed(&app), "k1", "{event:?}");
+            assert_eq!(app.explain.as_ref().unwrap().pending, pending);
+            assert!(app.help && app.selected.is_none(), "{event:?}");
+        }
+        // `?` closes help and leaves the overlay and its text as they were.
+        assert_eq!(app.handle_key(ch('?'), &model), Action::Redraw);
+        assert!(!app.help && app.explain.is_some());
+        assert_eq!(typed(&app), "k1");
+        // The overlay types again once help is closed.
+        type_into(&mut app, &model, "7");
+        assert_eq!(typed(&app), "k17");
+        // `q` quits from under help, as the card says.
+        app.apply_director(UiCommand::Help(true), &model);
+        assert_eq!(app.handle_key(ch('q'), &model), Action::Quit);
+        assert_eq!(app.handle_key(control_key('c'), &model), Action::Quit);
+        assert_eq!(typed(&app), "k17");
+    }
+
+    #[test]
+    fn a_frame_too_small_to_draw_the_overlay_leaves_it_no_keys() {
+        let model = model();
+        let mut app = explaining_app();
+        app.handle_key(ch('e'), &model);
+        type_into(&mut app, &model, "k1");
+        app.note_too_small(true);
+        // The overlay is not drawn: `q` quits as it does without one.
+        assert_eq!(app.handle_key(ch('q'), &model), Action::Quit);
+        assert_eq!(typed(&app), "k1");
+        // Esc still closes it, and then `e` opens nothing while the notice
+        // is all the screen shows.
+        assert_eq!(app.handle_key(key(KeyCode::Esc), &model), Action::Redraw);
+        assert!(app.explain.is_none());
+        assert_eq!(app.handle_key(ch('e'), &model), Action::None);
+        assert!(app.explain.is_none());
+        // A frame big enough again gives the overlay its keys back.
+        app.note_too_small(false);
+        assert_eq!(app.handle_key(ch('e'), &model), Action::Redraw);
+        assert!(app.explain.is_some());
+        assert_eq!(app.handle_key(ch('q'), &model), Action::Redraw);
+        assert_eq!(typed(&app), "k1q");
+        app.note_too_small(true);
+        assert_eq!(app.handle_key(control_key('c'), &model), Action::Quit);
     }
 
     #[test]

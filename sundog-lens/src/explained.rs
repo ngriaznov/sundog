@@ -5,7 +5,7 @@
 //! line of JSON: `Cache::explain` of the key on its `"it"` cache. The lens
 //! mirrors that reply here instead of sharing a type, because
 //! `ReadExplanation` and every type under it are `#[non_exhaustive]` and
-//! carry no serde impls. The three files under `tests/fixtures/explain/` hold
+//! carry no serde impls. The four files under `tests/fixtures/explain/` hold
 //! the node's encoder output, and tests on both sides read them.
 //!
 //! The parser is tolerant. It ignores fields it does not know, defaults a
@@ -865,10 +865,12 @@ mod tests {
     const OWNER_LINE: &str = include_str!("../tests/fixtures/explain/owner.json");
     const NON_OWNER_LINE: &str = include_str!("../tests/fixtures/explain/non_owner.json");
     const CRASHED_OWNER_LINE: &str = include_str!("../tests/fixtures/explain/crashed_owner.json");
+    const LAPSED_STALE_LINE: &str = include_str!("../tests/fixtures/explain/lapsed_stale.json");
 
     const A: &str = "6f3ac1e29d54b807";
     const B: &str = "c40d9e7a15f2338b";
     const C: &str = "1b88e5d0a7c64f92";
+    const D: &str = "9a2e7fb3c05d1148";
     const VIEW: &str = "5d69e3db4c1a02f7";
     const MOVED: &str = "71c0a2f4e8b3195d";
 
@@ -1000,6 +1002,53 @@ mod tests {
         }
     }
 
+    /// The reading `lapsed_stale.json` describes: node c releases a part it
+    /// no longer owns and holds a copy whose expiry passed, with every mark
+    /// set, and the three owners answer a stale view, a decline and a miss,
+    /// so no owner serves the fetch.
+    fn lapsed_stale_reading() -> Reading {
+        Reading {
+            node: C.to_owned(),
+            mode: "distributed:3".to_owned(),
+            bucket: 640,
+            part: 9,
+            at_ms: 1_760_054_340_250,
+            local: Local::Lapsed {
+                version: format!("1760054280033.1@{A}"),
+                expires_at_ms: Some(1_760_054_336_050),
+                cause: Lapse::Expired,
+            },
+            source: Source::Unavailable,
+            distributed: Some(Distributed {
+                owners: vec![A.to_owned(), B.to_owned(), D.to_owned()],
+                residency: Residency {
+                    owns: false,
+                    releasing_ms: Some(4_200),
+                    cold_marked: true,
+                    unsettled: true,
+                    unverified: true,
+                    stale: true,
+                },
+                local_read: LocalRead::NotOwner,
+                serves_peers: ServeVerdict::DeclineDistrusted,
+                probes: vec![
+                    probe(
+                        A,
+                        Answer::StaleView {
+                            responder_view: MOVED.to_owned(),
+                        },
+                    ),
+                    probe(B, Answer::Declined),
+                    probe(D, Answer::Miss),
+                ],
+                ..owner_reading()
+                    .distributed
+                    .expect("the owner is distributed")
+            }),
+            ..owner_reading()
+        }
+    }
+
     fn answered(label: &str, reading: Reading) -> NodeAnswer {
         NodeAnswer {
             label: SmolStr::new(label),
@@ -1070,6 +1119,7 @@ mod tests {
         assert_eq!(parse(OWNER_LINE), owner_reading());
         assert_eq!(parse(NON_OWNER_LINE), non_owner_reading());
         assert_eq!(parse(CRASHED_OWNER_LINE), crashed_owner_reading());
+        assert_eq!(parse(LAPSED_STALE_LINE), lapsed_stale_reading());
     }
 
     #[test]

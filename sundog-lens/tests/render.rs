@@ -388,6 +388,25 @@ fn no_size_from_1x1_to_200x60_panics() {
     }
 }
 
+#[test]
+fn a_frame_too_small_for_the_overlay_hands_its_keys_back() {
+    let model = bare();
+    let mut app = explaining(&model, View::Overview, Stage::Prompt, ColorMode::Truecolor);
+    let q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+    // A frame that draws the overlay leaves it the keys, `q` included.
+    let shown = text(&render(&app, &model, 80, 24));
+    assert!(shown.contains("Explain a read"), "{shown}");
+    assert_eq!(app.handle_key(q, &model), Action::Redraw);
+    // A frame that is only the size notice draws no overlay, so `q` quits.
+    let small = text(&render(&app, &model, 72, 20));
+    assert!(!small.contains("Explain a read"), "{small}");
+    assert_eq!(app.handle_key(q, &model), Action::Quit);
+    // The next frame that fits gives the overlay its keys back.
+    let shown = text(&render(&app, &model, 80, 24));
+    assert!(shown.contains("Explain a read"), "{shown}");
+    assert_eq!(app.handle_key(q, &model), Action::Redraw);
+}
+
 fn assert_allowed(buf: &Buffer, context: &str) {
     for y in 0..buf.area.height {
         for x in 0..buf.area.width {

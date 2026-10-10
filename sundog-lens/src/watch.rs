@@ -1,9 +1,10 @@
 //! The terminal loop shared by `watch` and `demo`.
 //!
 //! One task owns the model and the interface state. Keys arrive from a
-//! blocking thread, updates from the [`Feed`], director commands from the
-//! demo. A tick every 50 ms advances motion and the model's clock; a frame is
-//! drawn at most once per tick, and only when something changed or moves.
+//! blocking thread, updates from the [`Feed`], and, in the demo, commands from
+//! the scenario director and answers to explain requests. A tick every 50 ms
+//! advances motion and the model's clock; a frame is drawn at most once per
+//! tick, and only when something changed or moves.
 
 use std::io::IsTerminal;
 use std::sync::Arc;
@@ -41,9 +42,10 @@ pub struct Session {
     pub model: Model,
     /// The interface state.
     pub app: App,
-    /// Commands from the scenario director, in demo mode.
+    /// Commands for the interface, in demo mode: the scenario director's and
+    /// the answers to explain requests.
     pub commands: Option<mpsc::UnboundedReceiver<UiCommand>>,
-    /// Where fleet requests from the demo keys go, in demo mode.
+    /// Where the demo keys' requests and explain requests go, in demo mode.
     pub fleet: Option<mpsc::UnboundedSender<FleetCmd>>,
     /// Quit after this long.
     pub exit_after: Option<Duration>,
@@ -120,7 +122,8 @@ pub async fn run(args: WatchArgs) -> anyhow::Result<()> {
     .await
 }
 
-/// The next director command, or never when there is no director.
+/// The next command for the interface, or never when there is no command
+/// channel.
 async fn next_command(
     commands: &mut Option<mpsc::UnboundedReceiver<UiCommand>>,
 ) -> Option<UiCommand> {

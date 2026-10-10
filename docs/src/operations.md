@@ -342,8 +342,13 @@ key lives in the vocabulary of `Cache::explain` and, in the demo, what each
 test node says of reading it. The prompt is always focused: every printable
 key types into the key, including `q`, `?` and `c`, Backspace deletes,
 Ctrl-U clears, Up and Down move the lens's node selection, Esc closes the
-overlay and Ctrl-C quits. The text stays between openings, and the demo's
-first opening shows `k1`, a key its fleet holds.
+overlay and Ctrl-C quits. The last line of the overlay lists Enter, the
+arrows, Ctrl-U, Esc and Ctrl-C when the lens knows the nodes' control ports,
+and Ctrl-U, Esc and Ctrl-C otherwise. The
+overlay takes keys only while it is on screen: below 80x24 the screen is the
+size notice, `q` quits and `e` opens nothing, and help drawn over the overlay
+takes its own keys until `?` or Esc closes it. The text stays between
+openings, and the demo's first opening shows `k1`, a key its fleet holds.
 
 A cache routes a key by the hash of its postcard encoding and gossip
 carries no key type, so the text picks the encoding:
@@ -369,8 +374,8 @@ The key is placed in the `Distributed` cache the Ownership panel shows, and
 `c` picks it before `e` opens the overlay. `provisional: still discovering`
 marks the first seconds of a run, until the live members have held still for
 2 s. A bad key shows its error in place of the block, and a cluster with no
-`Distributed` cache says that `explain` needs part ownership. No node is
-asked for any of it.
+`Distributed` cache says that `explain` needs part ownership and what to do
+about it. No node is asked for any of it.
 
 In the demo, `Enter` adds the **asked** block. The lens sends `explain KEY`
 to the control port of every live test node at once, the channel the fleet
@@ -380,7 +385,14 @@ A line above the table says whether the nodes agree with each other and
 with the lens (`✔ 5 nodes agree, the lens computes the same`), which nodes
 hold which view, which differ from the lens's placement, or that the view
 moved since they were asked, which dims the rows until `Enter` asks again.
-The table has one row per node, in slot order:
+Under a frozen display the nodes answer for the live cluster, so once the
+live view differs from the frozen one, asking again cannot make them match
+until the display unfreezes: a moved view reads `the nodes hold 00c1a2f4,
+the frozen display holds 5d69e3db: Esc, p unfreezes`, and the
+age of answers asked after the freeze reads `asked after the freeze`. The
+test nodes explain their cache `it`; when the key is placed in another cache,
+the line says which cache the nodes explained and compares nothing. The
+table has one row per node, in slot order:
 
 | Column | Shows |
 |---|---|

@@ -62,8 +62,9 @@ OPTIONS
   --settle DUR          With --once, wait until the members hold still this long
                         (default 3s).
   --explain KEY         With --once, name KEY's part and its owners in fetch order,
-                        computed from gossip once the view has settled. Bare text is
-                        a String key; uint:N, int:N, hex:BYTES (postcard bytes) and
+                        computed from gossip after waiting up to 8 s for the view to
+                        settle (the report says whether it did). Bare text is a
+                        String key; uint:N, int:N, hex:BYTES (postcard bytes) and
                         str:TEXT (a String that starts with a prefix) select another
                         encoding.
   --cache NAME          With --explain, the Distributed cache; needed when several are.
@@ -1371,6 +1372,13 @@ mod tests {
             assert!(HELP.contains(word), "{word}");
         }
         assert!(HELP.contains("[--explain KEY [--cache NAME]]"));
+        assert!(
+            HELP.contains(&format!(
+                "waiting up to {} s",
+                crate::once::Limits::default().extras.as_secs()
+            )),
+            "the help names the wait the run makes"
+        );
         assert!(
             HELP.lines().all(|line| line.chars().count() <= 87),
             "no help line is wider than 87 columns"

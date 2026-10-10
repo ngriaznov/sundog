@@ -261,6 +261,7 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &App, live: &Model, ctx: &Ctx) 
     let look = app.look();
     Block::new().style(look.base()).render(area, buf);
     let layout = layout_for(area, app.config().demo && app.config().captions);
+    app.note_too_small(layout.kind == LayoutKind::TooSmall);
     if layout.kind == LayoutKind::TooSmall {
         too_small::render(look, area, buf);
         return;

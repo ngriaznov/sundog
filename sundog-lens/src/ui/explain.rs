@@ -139,7 +139,8 @@ fn title(scene: &Scene<'_>, resolved: &Resolved<'_>) -> Vec<Span<'static>> {
 /// The overlay's lines for `state`, at most `height` of them, each fit to
 /// `width` cells. The last line is the key hints, alone when `height` is
 /// under 3. When the rows do not all fit, the detail block of the selected
-/// node goes first, then the node rows give way to `… +N nodes`.
+/// node goes first, then the node rows give way to `… +N nodes`; the rows
+/// that stay include the selected node's.
 #[must_use]
 pub fn lines(
     scene: &Scene<'_>,
@@ -186,9 +187,15 @@ fn compose(
         } else if rows.len() <= left {
             out.extend(rows);
         } else {
+            // The rows that stay form a window that ends at the selected
+            // node's row when that row lies below the first ones.
             let shown = left - 1;
             let hidden = rows.len() - shown;
-            out.extend(rows.into_iter().take(shown));
+            let start = asked
+                .anchor
+                .saturating_sub(shown.saturating_sub(1))
+                .min(hidden);
+            out.extend(rows.into_iter().skip(start).take(shown));
             out.push(Line::from(vec![
                 gap(2),
                 scene.look.span(format!("… +{hidden} nodes"), Token::Muted),
@@ -265,14 +272,32 @@ fn head(
     ));
     match &resolved.placement {
         Some(Ok(located)) => out.extend(computed(scene, located)),
-        Some(Err(error)) => out.push(labeled(
-            scene,
-            "",
-            vec![look.span(printable(&error.to_string()), Token::Warn)],
-        )),
+        Some(Err(error)) => {
+            // The message ends in what to do, so it wraps rather than clips.
+            let message = printable(&error.to_string());
+            for line in wrap(&message, width.saturating_sub(LABEL)) {
+                out.push(labeled(scene, "", vec![look.span(line, Token::Warn)]));
+            }
+        }
         None => {}
     }
     out
+}
+
+/// `text` broken at spaces into lines of at most `width` characters. A word
+/// longer than `width` keeps a line of its own.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        match lines.last_mut() {
+            Some(line) if line.chars().count() + 1 + word.chars().count() <= width => {
+                line.push(' ');
+                line.push_str(word);
+            }
+            _ => lines.push(word.to_owned()),
+        }
+    }
+    lines
 }
 
 /// The part, the view and the owners of a located key.
@@ -299,16 +324,6 @@ fn computed(scene: &Scene<'_>, located: &Located) -> Vec<Line<'static>> {
             scene,
             "",
             vec![look.span("provisional: still discovering", Token::Warn)],
-        ));
-    }
-    if located.conflicted {
-        out.push(labeled(
-            scene,
-            "",
-            vec![look.span(
-                "⚠ the nodes disagree on this cache's mode: the view is the Distributed nodes'",
-                Token::Warn,
-            )],
         ));
     }
     out.extend(owner_lines(scene, located));
@@ -407,6 +422,9 @@ struct Asked {
     table: Option<(Line<'static>, Vec<Line<'static>>)>,
     /// The selected node in detail, with a blank line before it.
     detail: Vec<Line<'static>>,
+    /// The index in the table's rows of the selected node, 0 when no row is
+    /// selected.
+    anchor: usize,
 }
 
 fn asked_section(
@@ -423,19 +441,28 @@ fn asked_section(
             intro: vec![blank, Line::from(vec![look.span(words, token)])],
             table: None,
             detail: Vec::new(),
+            anchor: 0,
         };
     };
     let verdict = verdict(answers, resolved.located());
-    let age = scene
-        .ctx
-        .wall
-        .duration_since(answers.asked)
-        .unwrap_or_default();
+    // A frozen display stops the clock at the freeze. Answers asked later
+    // come from the live nodes, which the frozen placement need not match.
+    let after_freeze = scene.app.is_frozen() && answers.asked > scene.ctx.wall;
+    let age = if after_freeze {
+        " · asked after the freeze".to_owned()
+    } else {
+        let age = scene
+            .ctx
+            .wall
+            .duration_since(answers.asked)
+            .unwrap_or_default();
+        format!(" · asked {} ago", ago(age))
+    };
     let summary = Line::from(vec![
         look.span(verdict.mark(), verdict.token()),
         gap(1),
-        look.span(verdict.words(), verdict.token()),
-        look.span(format!(" · asked {} ago", ago(age)), Token::Muted),
+        look.span(verdict.words(after_freeze), verdict.token()),
+        look.span(age, Token::Muted),
     ]);
     let dim = matches!(verdict, Verdict::Moved { .. });
     let cols = columns(answers);
@@ -453,6 +480,11 @@ fn asked_section(
         }
         rows.push(line);
     }
+    let anchor = answers
+        .nodes
+        .iter()
+        .position(|answer| selected.as_ref() == Some(&answer.label))
+        .unwrap_or(0);
     let mut detail = Vec::new();
     if let Some(answer) = answers
         .nodes
@@ -469,6 +501,7 @@ fn asked_section(
         intro: vec![blank, summary],
         table: Some((header, rows)),
         detail,
+        anchor,
     }
 }
 
@@ -506,6 +539,14 @@ fn idle_note(scene: &Scene<'_>, state: &ExplainState, resolved: &Resolved<'_>) -
         Ok(spec) => {
             if let Some(why) = key::not_askable(spec) {
                 return (Token::Muted, why.to_owned());
+            }
+            // An ask goes to the live nodes, which a frozen display need not
+            // list.
+            if scene.app.is_frozen() {
+                return (
+                    Token::Muted,
+                    "Enter asks the live nodes about this key".to_owned(),
+                );
             }
             let nodes = data::control_targets(scene.model, template).asked.len();
             (
@@ -549,6 +590,14 @@ enum Verdict {
         /// The lens's view, eight digits.
         view: String,
     },
+    /// The nodes explained another cache than the one the block above places
+    /// the key in: nothing to compare.
+    OtherCache {
+        /// The cache the nodes explained.
+        asked: String,
+        /// The cache the lens placed the key in.
+        shown: String,
+    },
     /// Nothing to compare, for the reason in words.
     Nothing(&'static str),
 }
@@ -557,7 +606,7 @@ impl Verdict {
     const fn mark(&self) -> &'static str {
         match self {
             Self::Agree { .. } => "✔",
-            Self::Nothing(_) => "·",
+            Self::OtherCache { .. } | Self::Nothing(_) => "·",
             Self::Moved { .. } | Self::Split { .. } | Self::Apart { .. } => "↻",
         }
     }
@@ -567,15 +616,21 @@ impl Verdict {
             Self::Agree { .. } => Token::Ok,
             Self::Moved { .. } => Token::Warn,
             Self::Split { .. } | Self::Apart { .. } => Token::Move,
-            Self::Nothing(_) => Token::Muted,
+            Self::OtherCache { .. } | Self::Nothing(_) => Token::Muted,
         }
     }
 
-    fn words(&self) -> String {
+    /// The verdict in a sentence. `after_freeze` says the answers were asked
+    /// after the display froze, when asking again cannot move the lens's
+    /// view.
+    fn words(&self, after_freeze: bool) -> String {
         match self {
             Self::Agree { nodes: 1 } => "1 node agrees, the lens computes the same".to_owned(),
             Self::Agree { nodes } => {
                 format!("{nodes} nodes agree, the lens computes the same")
+            }
+            Self::Moved { from, to } if after_freeze => {
+                format!("the nodes hold {from}, the frozen display holds {to}: Esc, p unfreezes")
             }
             Self::Moved { from, to } => {
                 format!("view moved {from} -> {to}: Enter asks again")
@@ -584,6 +639,10 @@ impl Verdict {
             Self::Apart { nodes, many, view } => format!(
                 "{nodes} {} from the lens, which holds view {view}",
                 if *many { "differ" } else { "differs" }
+            ),
+            Self::OtherCache { asked, shown } => format!(
+                "the nodes explained cache {asked} and the block above is cache {shown}: \
+                 nothing to compare"
             ),
             Self::Nothing(why) => (*why).to_owned(),
         }
@@ -595,6 +654,17 @@ fn verdict(answers: &Explained, located: Option<&Located>) -> Verdict {
     let Some(located) = located else {
         return Verdict::Nothing("the lens has no placement of the key to compare with");
     };
+    // Test nodes explain their cache `it`, whatever cache the block places
+    // the key in.
+    if let Some((_, reading)) = answers
+        .readings()
+        .find(|(_, reading)| reading.cache != located.cache.as_str())
+    {
+        return Verdict::OtherCache {
+            asked: printable(&reading.cache),
+            shown: printable(&located.cache),
+        };
+    }
     let agreement = explained::agreement(answers, located);
     let lens = format!("{:016x}", located.view_hash);
     let short = |view: &str| printable(view.get(..8).unwrap_or(view));
@@ -987,7 +1057,8 @@ fn probe_detail(scene: &Scene<'_>, answers: &Explained, at_ms: u64, answer: &Ans
     }
 }
 
-/// The key hints at the bottom of the popup.
+/// The key hints at the bottom of the popup. The prompt types `q`, so the
+/// hints name `Ctrl-C` as the way out of the interface.
 fn bottom_line(scene: &Scene<'_>) -> Line<'static> {
     let hints: &[(&str, &str)] = if scene.app.config().control.is_some() {
         &[
@@ -995,9 +1066,10 @@ fn bottom_line(scene: &Scene<'_>) -> Line<'static> {
             ("↑↓", "node"),
             ("Ctrl-U", "clear"),
             ("Esc", "close"),
+            ("Ctrl-C", "quit"),
         ]
     } else {
-        &[("Ctrl-U", "clear"), ("Esc", "close")]
+        &[("Ctrl-U", "clear"), ("Esc", "close"), ("Ctrl-C", "quit")]
     };
     Line::from(keycap::keycap_spans(hints, scene.look.mode))
 }
@@ -1343,16 +1415,23 @@ mod tests {
 
     #[test]
     fn hostile_text_stays_in_the_allowlist() {
+        use crate::explained::{Probe, Reads};
+
         let model = model();
         let mut app = opened(&model, "k\u{1b}[31m\u{202e}é\u{7}");
         let hostile = "\u{1b}[2J\u{7}boom \u{202e}é\u{85}";
-        for check in [false, true] {
-            let rows = shown(&app, &model, 100, 30);
-            for row in &rows {
+        let dotted = printable(hostile);
+        assert_ne!(dotted, hostile);
+        assert!(!dotted.chars().any(char::is_control), "{dotted:?}");
+        let allowed = |rows: &[String]| {
+            for row in rows {
                 for c in row.chars() {
                     assert!(theme::is_allowed(c) && !c.is_control(), "{c:?} in {row}");
                 }
             }
+        };
+        for check in [false, true] {
+            allowed(&shown(&app, &model, 100, 30));
             if check {
                 break;
             }
@@ -1365,19 +1444,76 @@ mod tests {
                     reading.local = Local::Other(hostile.to_owned());
                     reading.source = Source::Other(hostile.to_owned());
                     if let Some(dist) = &mut reading.distributed {
-                        dist.probes[0].node = hostile.to_owned();
+                        dist.probes = vec![
+                            Probe {
+                                node: hostile.to_owned(),
+                                answer: Answer::StaleView {
+                                    responder_view: hostile.to_owned(),
+                                },
+                            },
+                            Probe {
+                                node: "ab".to_owned(),
+                                answer: Answer::Held {
+                                    version: format!("{hostile}@{hostile}"),
+                                    expires_at_ms: None,
+                                    reads: Reads::Value,
+                                },
+                            },
+                        ];
                         dist.view = hostile.to_owned();
                         dist.view_moved_to = Some(hostile.to_owned());
                     }
                 }
+                if let Outcome::Read(reading) = &mut answers.nodes[4].outcome {
+                    reading.local = Local::Live {
+                        version: format!("{hostile}@{hostile}"),
+                        expires_at_ms: None,
+                        spilled: false,
+                    };
+                    reading.source = Source::Owner {
+                        node: hostile.to_owned(),
+                        hit: true,
+                    };
+                }
             });
         }
-        let rows = drawn(&app, &model, 140, 40);
-        for row in &rows {
-            for c in row.chars() {
-                assert!(theme::is_allowed(c) && !c.is_control(), "{c:?} in {row}");
+        allowed(&drawn(&app, &model, 140, 40));
+        // The detail block of each node that carries hostile text, drawn
+        // as the allowlist lets it and still saying what it holds. Down
+        // moves to n2, whose reply is the text.
+        let selected = |app: &mut App, steps: usize, label: &str| {
+            for _ in 0..steps {
+                press(app, &model, KeyCode::Down);
             }
-        }
+            let rows = shown(app, &model, 116, 60);
+            allowed(&rows);
+            allowed(&drawn(app, &model, 140, 40));
+            assert!(has(&rows, &format!("{label} in detail")), "{rows:?}");
+            rows
+        };
+        let rows = selected(&mut app, 1, "n2");
+        assert!(find(&rows, "reply   ").contains(&dotted), "{rows:?}");
+        // n3 answers under a label no slot has, so n4 is three Downs from
+        // the first.
+        let rows = selected(&mut app, 2, "n4");
+        let moved = format!("{dotted} · moved to {dotted} during the call");
+        assert!(find(&rows, "  view    ").contains(&moved), "{rows:?}");
+        assert!(find(&rows, "record  ").contains(&dotted), "{rows:?}");
+        assert!(find(&rows, "source  ").contains(&dotted), "{rows:?}");
+        assert!(
+            find(&rows, "probes  ").contains(&format!("its view is {dotted}")),
+            "{rows:?}"
+        );
+        assert!(has(&rows, &format!("{dotted}@")), "{rows:?}");
+        let rows = selected(&mut app, 1, "n5");
+        assert!(
+            find(&rows, "record  ").contains(&format!("live {dotted}@")),
+            "{rows:?}"
+        );
+        assert!(
+            find(&rows, "source  ").contains("the first owner to answer is"),
+            "{rows:?}"
+        );
     }
 
     #[test]
@@ -1416,7 +1552,11 @@ mod tests {
             !has(&rows, "Enter ask"),
             "no Enter hint without ports: {rows:?}"
         );
-        assert!(rows.last().unwrap().contains("Ctrl-U clear  Esc close"));
+        assert_eq!(
+            rows.last().unwrap(),
+            "Ctrl-U clear  Esc close  Ctrl-C quit",
+            "the prompt types q, so the hints name the key that quits"
+        );
         press(&mut plain, &model, KeyCode::Enter);
         let rows = shown(&plain, &model, 100, 30);
         assert!(
@@ -1427,7 +1567,7 @@ mod tests {
         let rows = shown(&opened(&model, "k1"), &model, 100, 30);
         assert_eq!(
             rows.last().unwrap(),
-            "Enter ask  ↑↓ node  Ctrl-U clear  Esc close"
+            "Enter ask  ↑↓ node  Ctrl-U clear  Esc close  Ctrl-C quit"
         );
     }
 
@@ -1937,7 +2077,12 @@ mod tests {
         // Room for the rows and the key hints but not the detail.
         let rows = shown(&app, &model, 116, with_rows + 2);
         assert!(!has(&rows, "in detail"), "{rows:?}");
-        assert!(has(&rows, "n5") && !has(&rows, "more nodes"), "{rows:?}");
+        assert!(!has(&rows, "… +"), "{rows:?}");
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with("  n5") || row.starts_with("▌ n5")),
+            "the fifth node's table row, not the owner line that names it: {rows:?}"
+        );
         assert_eq!(rows.len(), with_rows + 2);
         // Two rows fewer: the last rows give way to a count.
         let rows = shown(&app, &model, 116, with_rows);
@@ -1946,6 +2091,41 @@ mod tests {
         assert!(!rows.iter().any(|row| row.starts_with("  n3")), "{rows:?}");
         assert_eq!(rows.len(), with_rows);
         assert!(rows.last().unwrap().starts_with("Enter ask"));
+        // The rows that stay follow the selection: four Downs select n5, and
+        // the cut keeps its row in view.
+        for _ in 0..4 {
+            press(&mut app, &model, KeyCode::Down);
+        }
+        let rows = shown(&app, &model, 116, with_rows);
+        assert!(has(&rows, "… +3 nodes"), "{rows:?}");
+        assert!(rows.iter().any(|row| row.starts_with("▌ n5")), "{rows:?}");
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.starts_with("  n1") || row.starts_with("▌ n1")),
+            "{rows:?}"
+        );
+        assert_eq!(rows.len(), with_rows);
+        // Up walks the window back to the first rows.
+        for _ in 0..4 {
+            press(&mut app, &model, KeyCode::Up);
+        }
+        let rows = shown(&app, &model, 116, with_rows);
+        assert!(rows.iter().any(|row| row.starts_with("▌ n1")), "{rows:?}");
+        assert!(rows.iter().any(|row| row.starts_with("  n2")), "{rows:?}");
+        assert!(!rows.iter().any(|row| row.starts_with("  n5")), "{rows:?}");
+        // The same in the body of the smallest screen with the demo's
+        // caption row, where the detail block never fits.
+        let rows = drawn(&app, &model, 80, 20);
+        assert!(has(&rows, "▌ n1") && has(&rows, "… +2 nodes"), "{rows:?}");
+        for _ in 0..4 {
+            press(&mut app, &model, KeyCode::Down);
+        }
+        let rows = drawn(&app, &model, 80, 20);
+        assert!(has(&rows, "▌ n5") && has(&rows, "… +2 nodes"), "{rows:?}");
+        for _ in 0..4 {
+            press(&mut app, &model, KeyCode::Up);
+        }
         // Every height down to nothing yields at most that many lines with
         // the key hints last.
         for height in 0..full.len() + 3 {
@@ -2122,7 +2302,8 @@ mod tests {
         assert!(asked_ago(Duration::from_millis(3_400), false).ends_with("asked 3.4 s ago"));
         assert!(asked_ago(Duration::from_secs(250), false).ends_with("asked 4m ago"));
         assert!(asked_ago(Duration::from_secs(7_300), false).ends_with("asked 2h ago"));
-        // A display frozen before the nodes were asked reads no negative age.
+        // A frame clock that has not reached the answers reads no negative
+        // age.
         assert!(asked_ago(Duration::from_secs(5), true).ends_with("asked 0.0 s ago"));
     }
 
@@ -2217,5 +2398,330 @@ mod tests {
             "{}",
             rows[1]
         );
+    }
+
+    /// Five live nodes, all advertising `it` as `Distributed` with two
+    /// owners; n1 to n4 also advertise `other` as `Distributed` with
+    /// `other_owners`. Both caches are ranked.
+    fn two_distributed_caches(other_owners: u8) -> Model {
+        use sundog::observe::{ClusterSnapshot, MemberStatus};
+
+        let snapshot = ClusterSnapshot::new(
+            "fixture",
+            (1..=5)
+                .map(|index| {
+                    let mut caches = vec![("it", testkit::distributed(2))];
+                    if index <= 4 {
+                        caches.push(("other", testkit::distributed(other_owners)));
+                    }
+                    testkit::member_with(index, 0, 1, MemberStatus::Live, &caches)
+                })
+                .collect(),
+            0,
+        );
+        let mut model = model_of(&snapshot);
+        for (cache, owners) in [("it", 2), ("other", other_owners)] {
+            let digest = testkit::ownership_digest_with_owners(
+                &snapshot,
+                cache,
+                std::num::NonZeroU8::new(owners).expect("owners is nonzero"),
+                None,
+            )
+            .expect("a live member advertises the cache");
+            model.apply(
+                Update::Ownership(digest),
+                Instant::now(),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(100),
+            );
+        }
+        model
+    }
+
+    #[test]
+    fn answers_about_another_cache_are_not_compared_with_the_block_above() {
+        let model = two_distributed_caches(3);
+        let mut app = app_in(Look::default(), Some(control()));
+        // The test nodes always explain `it`; the block places the key in the
+        // cache the Ownership panel shows.
+        app.apply_director(UiCommand::Cache("other".into()), &model);
+        typed(&mut app, &model, "k1");
+        let request = ask(&mut app, &model);
+        answered(&mut app, &model, &request, |_| {});
+        let note = "the nodes explained cache it and the block above is cache other: \
+                    nothing to compare";
+        let rows = shown(&app, &model, 116, 40);
+        assert!(
+            has(&rows, &format!("· {note} · asked 3.0 s ago")),
+            "{rows:?}"
+        );
+        assert!(!has(&rows, "view moved"), "{rows:?}");
+        assert!(!has(&rows, "nodes agree"), "{rows:?}");
+        let title = drawn(&app, &model, 140, 40);
+        assert!(
+            has(&title, "Explain a read · other · computed · asked"),
+            "{title:?}"
+        );
+        // Nothing moved, so nothing dims and Enter has nothing to redo.
+        let ctx = ctx_of(&model);
+        let scene = Scene {
+            app: &app,
+            model: &model,
+            ctx: &ctx,
+            look: app.look(),
+            kind: LayoutKind::Full,
+        };
+        let drawn = lines(&scene, app.explain.as_ref().unwrap(), 116, 40);
+        let dimmed = |line: &Line<'_>| {
+            line.spans
+                .iter()
+                .any(|span| span.style.add_modifier.contains(Modifier::DIM))
+        };
+        let node_rows: Vec<_> = drawn
+            .iter()
+            .filter(|line| text_of(line).contains(" hit "))
+            .collect();
+        assert_eq!(node_rows.len(), 5);
+        assert!(node_rows.iter().all(|line| !dimmed(line)));
+
+        // Nodes that hold the very placement the lens computes for `other`
+        // still did not explain it.
+        let located = locate(&model, Some("other"), &KeySpec::parse("k1").unwrap()).unwrap();
+        let request = ask(&mut app, &model);
+        answered(&mut app, &model, &request, |answers| {
+            for answer in &mut answers.nodes {
+                if let Outcome::Read(reading) = &mut answer.outcome {
+                    reading.bucket = located.part.bucket();
+                    reading.part = located.part.part();
+                    let dist = reading.distributed.as_mut().unwrap();
+                    dist.view = format!("{:016x}", located.view_hash);
+                    dist.owners = located.owners.iter().map(|o| o.node.to_string()).collect();
+                }
+            }
+        });
+        let rows = shown(&app, &model, 116, 40);
+        assert!(has(&rows, note), "{rows:?}");
+        assert!(!has(&rows, "agree"), "{rows:?}");
+
+        // The cache the nodes did explain is compared as before.
+        app.apply_director(UiCommand::Cache("it".into()), &model);
+        let request = ask(&mut app, &model);
+        answered(&mut app, &model, &request, |_| {});
+        let rows = shown(&app, &model, 116, 40);
+        assert!(has(&rows, "✔ 5 nodes agree"), "{rows:?}");
+        assert!(!has(&rows, "nothing to compare"), "{rows:?}");
+    }
+
+    #[test]
+    fn the_name_of_a_cache_from_a_node_is_drawn_through_the_allowlist() {
+        let model = two_distributed_caches(3);
+        let mut app = app_in(Look::default(), Some(control()));
+        app.apply_director(UiCommand::Cache("other".into()), &model);
+        typed(&mut app, &model, "k1");
+        let request = ask(&mut app, &model);
+        answered(&mut app, &model, &request, |answers| {
+            for answer in &mut answers.nodes {
+                if let Outcome::Read(reading) = &mut answer.outcome {
+                    reading.cache = "\u{1b}[2Jit".to_owned();
+                }
+            }
+        });
+        let rows = shown(&app, &model, 116, 40);
+        assert!(
+            has(&rows, "the nodes explained cache ·[2Jit and"),
+            "{rows:?}"
+        );
+        for row in &rows {
+            assert!(
+                row.chars().all(|c| theme::is_allowed(c) && !c.is_control()),
+                "{row}"
+            );
+        }
+    }
+
+    /// An overlay on a frozen display, asked about `k1`, whose answers carry
+    /// a view the frozen digest does not, asked `after` the freeze instant.
+    fn frozen_moved(model: &Model, after: Option<Duration>) -> App {
+        let wall = model.wall().expect("the model has a wall clock");
+        let mut app = app_in(Look::default(), Some(control()));
+        press(&mut app, model, KeyCode::Char('p'));
+        typed(&mut app, model, "k1");
+        assert!(app.is_frozen());
+        let request = ask(&mut app, model);
+        answered(&mut app, model, &request, |answers| {
+            answers.asked = after.map_or(wall - Duration::from_secs(3), |gap| wall + gap);
+            for answer in &mut answers.nodes {
+                if let Outcome::Read(reading) = &mut answer.outcome {
+                    reading.distributed.as_mut().unwrap().view = "00c1a2f4e8b3195d".to_owned();
+                }
+            }
+        });
+        app
+    }
+
+    #[test]
+    fn a_moved_view_under_a_frozen_display_names_the_unfreeze_not_asking_again() {
+        let model = model();
+        let lens = eventlog::view_hash(model.ownership("it").unwrap().view_hash);
+        // Asked 30 s after the freeze: the nodes answer for the live cluster
+        // and the display holds the frozen digest, so asking again changes
+        // nothing.
+        let app = frozen_moved(&model, Some(Duration::from_secs(30)));
+        let rows = shown(&app, &model, 116, 40);
+        let summary = find(&rows, "Esc, p unfreezes");
+        assert!(
+            summary.contains(&format!(
+                "the nodes hold 00c1a2f4, the frozen display holds {lens}: Esc, p unfreezes"
+            )),
+            "{summary}"
+        );
+        assert!(summary.ends_with("asked after the freeze"), "{summary}");
+        assert!(!has(&rows, "Enter asks again"), "{rows:?}");
+        assert!(!has(&rows, "0.0 s ago"), "{rows:?}");
+        assert!(!has(&rows, "view moved"), "{rows:?}");
+        // Answers from before the freeze still move with a fresh ask.
+        let app = frozen_moved(&model, None);
+        let rows = shown(&app, &model, 116, 40);
+        assert!(
+            has(
+                &rows,
+                &format!("view moved 00c1a2f4 -> {lens}: Enter asks again · asked 3.0 s ago")
+            ),
+            "{rows:?}"
+        );
+        assert!(!has(&rows, "unfreezes"), "{rows:?}");
+        // A display that is not frozen keeps the plain remedy and the clamped
+        // age, whenever the answers were asked.
+        let mut app = opened(&model, "k1");
+        let request = ask(&mut app, &model);
+        let wall = model.wall().unwrap();
+        answered(&mut app, &model, &request, |answers| {
+            answers.asked = wall + Duration::from_secs(30);
+            for answer in &mut answers.nodes {
+                if let Outcome::Read(reading) = &mut answer.outcome {
+                    reading.distributed.as_mut().unwrap().view = "00c1a2f4e8b3195d".to_owned();
+                }
+            }
+        });
+        let rows = shown(&app, &model, 116, 40);
+        assert!(
+            has(
+                &rows,
+                &format!("view moved 00c1a2f4 -> {lens}: Enter asks again · asked 0.0 s ago")
+            ),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_frozen_display_asks_the_live_nodes_and_says_so_before_it_asks() {
+        let model = model();
+        let mut app = app_in(Look::default(), Some(control()));
+        press(&mut app, &model, KeyCode::Char('p'));
+        typed(&mut app, &model, "k1");
+        let rows = shown(&app, &model, 100, 30);
+        assert!(
+            has(&rows, "Enter asks the live nodes about this key"),
+            "{rows:?}"
+        );
+        assert!(!has(&rows, "Enter asks 5 nodes"), "{rows:?}");
+        // Unfrozen, it counts the nodes it lists.
+        press(&mut app, &model, KeyCode::Esc);
+        press(&mut app, &model, KeyCode::Char('p'));
+        typed(&mut app, &model, "k1");
+        assert!(!app.is_frozen());
+        let rows = shown(&app, &model, 100, 30);
+        assert!(has(&rows, "Enter asks 5 nodes about this key"), "{rows:?}");
+    }
+
+    #[test]
+    fn one_live_node_is_asked_in_the_singular() {
+        let snapshot = testkit::snapshot_with_owners(1, 2);
+        let mut model = model_of(&snapshot);
+        let digest = testkit::ownership_digest(&snapshot, "it").unwrap();
+        model.apply(
+            Update::Ownership(digest),
+            Instant::now(),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(100),
+        );
+        let rows = shown(&opened(&model, "k1"), &model, 100, 30);
+        assert!(has(&rows, "Enter asks 1 node about this key"), "{rows:?}");
+        assert!(!has(&rows, "1 nodes"), "{rows:?}");
+    }
+
+    #[test]
+    fn a_view_that_ranks_no_member_says_so_in_place_of_the_owners() {
+        let model = model();
+        let app = opened(&model, "k1");
+        let mut located = locate(&model, Some("it"), &KeySpec::parse("k1").unwrap()).unwrap();
+        located.owners.clear();
+        let ctx = ctx_of(&model);
+        let scene = Scene {
+            app: &app,
+            model: &model,
+            ctx: &ctx,
+            look: app.look(),
+            kind: LayoutKind::Full,
+        };
+        let owners: Vec<String> = owner_lines(&scene, &located).iter().map(text_of).collect();
+        assert_eq!(owners, ["owner  none: the view ranks no member"]);
+        // With owners there is a line for each, in fetch order.
+        let located = locate(&model, Some("it"), &KeySpec::parse("k1").unwrap()).unwrap();
+        assert_eq!(owner_lines(&scene, &located).len(), located.owners.len());
+    }
+
+    #[test]
+    fn a_cluster_with_no_distributed_cache_wraps_its_remedy_under_the_key() {
+        let snapshot = sundog::observe::ClusterSnapshot::new(
+            "fixture",
+            (1..=3)
+                .map(|index| {
+                    testkit::member_with(
+                        index,
+                        0,
+                        1,
+                        sundog::observe::MemberStatus::Live,
+                        &[("churn", Mode::Replicated)],
+                    )
+                })
+                .collect(),
+            0,
+        );
+        let model = model_of(&snapshot);
+        let app = opened(&model, "k1");
+        let error = LocateError::NoDistributedCache.to_string();
+        // 72 cells is what the 80-column screen leaves a line of the popup.
+        for width in [72, 100] {
+            let rows = shown(&app, &model, width, 30);
+            let message: Vec<&String> = rows[3..]
+                .iter()
+                .take_while(|row| !row.trim().is_empty())
+                .collect();
+            assert!(
+                message.iter().all(|row| row.chars().count() <= width
+                    && row.starts_with(NO_LABEL_TEXT)
+                    && !row.ends_with('…')),
+                "{width}: {message:?}"
+            );
+            let whole = message
+                .iter()
+                .map(|row| row.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(whole, error, "{width}: the whole sentence shows");
+            assert!(
+                message.len() > 1,
+                "{width}: the sentence takes several lines"
+            );
+        }
+    }
+
+    #[test]
+    fn wrap_breaks_at_spaces_and_keeps_a_long_word_whole() {
+        assert_eq!(wrap("a bb ccc dddd", 6), ["a bb", "ccc", "dddd"]);
+        assert_eq!(wrap("a bb ccc", 8), ["a bb ccc"]);
+        assert_eq!(wrap("  spaced   out  ", 20), ["spaced out"]);
+        assert_eq!(wrap("abcdefgh ij", 4), ["abcdefgh", "ij"]);
+        assert_eq!(wrap("", 10), Vec::<String>::new());
+        assert_eq!(wrap("é é é", 3), ["é é", "é"], "width counts characters");
     }
 }
