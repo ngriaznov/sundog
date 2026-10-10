@@ -5566,9 +5566,13 @@ mod tests {
         let mut nodes: Vec<(Cluster, Cache<u32, String>)> = Vec::new();
         for index in 0..3 {
             // Every owner here stays up: a longer fetch timeout lets one
-            // whose runtime is busy computing views still answer.
-            let builder = Cluster::builder(name)
-                .config(loopback_config().with(|c| c.fetch_timeout = Duration::from_secs(5)));
+            // whose runtime is busy computing views still answer, and the
+            // failure detector never marks down a node too busy to gossip,
+            // which would move the view and cool the parts a test waits on.
+            let builder = Cluster::builder(name).config(loopback_config().with(|c| {
+                c.fetch_timeout = Duration::from_secs(5);
+                c.phi_threshold = 1_000.0;
+            }));
             let cluster = match nodes.first() {
                 None => builder.seeds(std::iter::empty()),
                 Some((seed, _)) => builder.seeds([seed.local_gossip_addr()]),
