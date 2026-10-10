@@ -63,6 +63,18 @@ All notable changes to this project are documented in this file. Format follows
   its records and cleared the mark in between left the read answering
   `None` as definitive for a key the pull had just brought in. Each now
   reads the part's marks before the record.
+- **A write past `max_capacity` keeps its own entry.** The eviction a write
+  triggers starts in the stripe the write landed in, and with more stripes
+  (1,024) than entries that stripe often held nothing but the new entry, so
+  the write evicted itself: on a `Shard` capped at 100 entries, 178 of 200
+  writes past the cap read back `None` at once. That eviction now passes
+  over the entries the write just stored, every entry of a batch across
+  all its stripes alike, and evicts colder entries from any stripe first.
+  It takes the write's own entries only once nothing else is left, and an
+  entry heavier than the whole cap goes like any other, so the cap holds. A
+  `get_or_load` fill, a re-arm by `expire`, `touch` or `persist`, and with
+  `spill` the hand-off to the tier and its reservation retries, follow the
+  same rule.
 
 ## [0.6.6] – 2026-10-09
 
