@@ -1,7 +1,8 @@
 //! The drift guard for `key` and `locate`: a key typed as text hashes to the
 //! part `Cache::explain` reports, and the owners the lens computes from
 //! gossip are the owners every node's `Cache::owners_of` answers, on real
-//! in-process clusters.
+//! in-process clusters. The `sundog-lens` binary's `watch --once --explain`
+//! reports the same part, view and owners as the nodes' own `Cache::explain`.
 //!
 //! The lens knows no cache's key type, so it assumes the encoding the cache
 //! applies: postcard. These tests fail when `sundog` changes how it encodes a
@@ -15,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sundog::store::{Mode, PartId};
-use sundog::{Cache, Cluster, ClusterConfig};
+use sundog::{Cache, Cluster, ClusterConfig, ReadExplanation};
 use sundog_lens::cli::Seed;
 use sundog_lens::key::KeySpec;
 use sundog_lens::locate::{LocateError, locate};
@@ -316,6 +317,203 @@ async fn a_key_spec_locates_the_owners_the_caches_report() {
         cache.close().await;
     }
     for cache in names {
+        cache.close().await;
+    }
+    a.shutdown().await;
+    b.shutdown().await;
+    c.shutdown().await;
+}
+
+/// Waits until every node knows both other nodes and `caches` all report
+/// the same ownership view and the same two owners for `probe`, and returns
+/// the first node's explanation.
+async fn wait_for_one_view<K>(
+    clusters: &[&Cluster],
+    caches: &[&Cache<K, String>],
+    probe: &K,
+) -> ReadExplanation
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    let converged = tokio::time::timeout(CONVERGE, async {
+        loop {
+            let mut explained = Vec::new();
+            for cache in caches {
+                if let Ok(read) = cache.explain(probe).await {
+                    explained.push(read);
+                }
+            }
+            let views: Vec<_> = explained
+                .iter()
+                .filter_map(|read| read.distributed.as_ref())
+                .map(|read| (read.view_hash, read.owners.clone()))
+                .collect();
+            let known = clusters
+                .iter()
+                .all(|cluster| cluster.peers().len() + 1 == clusters.len());
+            if known
+                && views.len() == caches.len()
+                && views
+                    .iter()
+                    .all(|view| view.1.len() == 2 && *view == views[0])
+            {
+                return explained.swap_remove(0);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    converged.unwrap_or_else(|_| {
+        panic!(
+            "the nodes did not agree on one view and two owners of the key in {} within {CONVERGE:?}",
+            caches.first().map_or("", |cache| cache.name())
+        )
+    })
+}
+
+/// Runs `sundog-lens watch CLUSTER --once --json` through `seed` with the
+/// `extra` arguments and waits for it to exit.
+async fn lens_once(cluster: &str, seed: SocketAddr, extra: &[&str]) -> std::process::Output {
+    let run = tokio::process::Command::new(env!("CARGO_BIN_EXE_sundog-lens"))
+        .args(["watch", cluster, "--seed", &seed.to_string()])
+        .args([
+            "--bind",
+            "127.0.0.1:0",
+            "--once",
+            "--json",
+            "--settle",
+            "1s",
+        ])
+        .args(extra)
+        .kill_on_drop(true)
+        .output();
+    tokio::time::timeout(Duration::from_secs(60), run)
+        .await
+        .expect("the binary exits within the bound")
+        .expect("the binary runs")
+}
+
+/// The JSON object a successful run printed.
+fn report_of(output: &std::process::Output) -> serde_json::Value {
+    assert!(
+        output.status.success(),
+        "exit {:?}: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("stdout is one JSON object")
+}
+
+/// Asserts that a run failed with exit 1, printed nothing on stdout and named
+/// `needle` on stderr.
+fn assert_refused(output: &std::process::Output, needle: &str) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+    assert!(stderr.contains(needle), "{needle:?} is not in: {stderr}");
+}
+
+/// Asserts that `section`, a run's `explain` object, is what `read`, a
+/// node's own explanation of the same key, says.
+fn assert_agrees(section: &serde_json::Value, cache: &str, read: &ReadExplanation) {
+    let distributed = read.distributed.as_ref().expect("the cache is Distributed");
+    assert_eq!(section["cache"], cache);
+    assert_eq!(section["part"]["bucket"], read.part.bucket());
+    assert_eq!(section["part"]["part"], read.part.part());
+    assert_eq!(
+        section["view"],
+        format!("{:016x}", distributed.view_hash).as_str()
+    );
+    assert_eq!(section["eligible"], 3);
+    assert_eq!(section["owners_per_part"], 2);
+    assert_eq!(
+        section["settled"], true,
+        "the run waits until the view it names has held"
+    );
+    let owners: Vec<String> = section["owners"]
+        .as_array()
+        .expect("owners is a list")
+        .iter()
+        .map(|owner| owner["node"].as_str().expect("a node id").to_owned())
+        .collect();
+    assert_eq!(
+        owners,
+        distributed
+            .owners
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        "the owners in fetch order"
+    );
+    for (index, owner) in section["owners"].as_array().unwrap().iter().enumerate() {
+        assert_eq!(owner["rank"], index + 1);
+        assert_eq!(owner["status"], "live");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_once_explain_agrees_with_cache_explain_and_refuses_a_wrong_cache() {
+    let name = "lens-once-explain";
+    let a = node(name, None).await;
+    let b = node(name, Some(a.local_gossip_addr())).await;
+    let c = node(name, Some(a.local_gossip_addr())).await;
+    let clusters = [&a, &b, &c];
+    let mut its: Vec<Cache<String, String>> = Vec::new();
+    let mut ids: Vec<Cache<u32, String>> = Vec::new();
+    for cluster in clusters {
+        its.push(open(cluster, "it", Mode::distributed()).await);
+        ids.push(open(cluster, "ids", Mode::distributed()).await);
+    }
+    let it_read =
+        wait_for_one_view(&clusters, &its.iter().collect::<Vec<_>>(), &"k1".to_owned()).await;
+    let ids_read = wait_for_one_view(&clusters, &ids.iter().collect::<Vec<_>>(), &7).await;
+    let seed = a.local_gossip_addr();
+
+    // A String key in a named cache.
+    let output = lens_once(name, seed, &["--explain", "k1", "--cache", "it"]).await;
+    let json = report_of(&output);
+    let section = &json["explain"];
+    assert_agrees(section, "it", &it_read);
+    assert_eq!(
+        section["key"],
+        serde_json::json!({"kind": "str", "text": "k1", "hex": "026b31"})
+    );
+    let own = json["caches"]
+        .as_array()
+        .and_then(|caches| caches.iter().find(|cache| cache["name"] == "it"))
+        .expect("the report lists it");
+    assert_eq!(
+        section["view"].as_str().map(|view| &view[..8]),
+        own["ownership"]["view"].as_str(),
+        "the explain view is the view the caches table shows"
+    );
+
+    // An integer key in the other cache.
+    let output = lens_once(name, seed, &["--explain", "uint:7", "--cache", "ids"]).await;
+    let json = report_of(&output);
+    assert_agrees(&json["explain"], "ids", &ids_read);
+    assert_eq!(
+        json["explain"]["key"],
+        serde_json::json!({"kind": "uint", "text": "7", "hex": "07"})
+    );
+
+    // Two Distributed caches are ranked: a run without a name asks for one.
+    let output = lens_once(name, seed, &["--explain", "k1"]).await;
+    assert_refused(&output, "--cache");
+    // A cache the cluster does not advertise is named in the refusal.
+    let output = lens_once(name, seed, &["--explain", "k1", "--cache", "nope"]).await;
+    assert_refused(&output, "nope");
+
+    // A plain run carries no explain object.
+    let output = lens_once(name, seed, &[]).await;
+    let json = report_of(&output);
+    assert!(json.get("explain").is_none(), "{json}");
+    assert_eq!(json["live"], 3);
+
+    for cache in its {
+        cache.close().await;
+    }
+    for cache in ids {
         cache.close().await;
     }
     a.shutdown().await;

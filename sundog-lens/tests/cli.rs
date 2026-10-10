@@ -52,6 +52,49 @@ fn a_missing_cluster_exits_two() {
 }
 
 #[test]
+fn explain_without_once_exits_two_and_names_the_flag() {
+    let output = lens(&["lens-demo", "--explain", "k1", "--seed", "127.0.0.1:9"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--explain needs --once"), "{stderr}");
+    assert!(stderr.contains("--help"), "{stderr}");
+}
+
+#[test]
+fn cache_without_explain_exits_two_and_names_the_flag() {
+    let output = lens(&[
+        "lens-demo",
+        "--once",
+        "--cache",
+        "it",
+        "--seed",
+        "127.0.0.1:9",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--cache needs --explain"), "{stderr}");
+}
+
+#[test]
+fn a_bad_explain_key_exits_two_before_any_network_use() {
+    let output = lens(&[
+        "lens-demo",
+        "--once",
+        "--explain",
+        "hex:abc",
+        "--seed",
+        "127.0.0.1:9",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--explain"), "{stderr}");
+    assert!(stderr.contains("add or drop a digit"), "{stderr}");
+}
+
+#[test]
 fn watch_without_a_terminal_refuses_and_points_at_once() {
     // The test harness pipes stdout, so it is no terminal.
     let output = lens(&["watch", "lens-demo", "--seed", "127.0.0.1:9"]);
