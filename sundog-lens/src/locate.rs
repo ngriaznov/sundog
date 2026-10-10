@@ -120,9 +120,11 @@ pub enum LocateError {
 impl fmt::Display for LocateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoDistributedCache => {
-                f.write_str("no Distributed cache is advertised: explain needs part ownership")
-            }
+            Self::NoDistributedCache => f.write_str(
+                "no Distributed cache is advertised: explain needs part ownership, \
+                 so open a Distributed cache on the nodes or check the cluster name \
+                 and the seeds",
+            ),
             Self::UnknownCache { cache, known } if known.is_empty() => write!(
                 f,
                 "no live node advertises a cache named {} and none advertises any cache: \
@@ -789,7 +791,9 @@ mod tests {
         let cases = [
             (
                 LocateError::NoDistributedCache,
-                "no Distributed cache is advertised: explain needs part ownership",
+                "no Distributed cache is advertised: explain needs part ownership, \
+                 so open a Distributed cache on the nodes or check the cluster name \
+                 and the seeds",
             ),
             (
                 LocateError::UnknownCache {

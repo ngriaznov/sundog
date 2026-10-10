@@ -11,17 +11,19 @@
 
 use std::hash::Hash;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use sundog::observe::{ClusterSnapshot, MemberStatus};
 use sundog::store::{Mode, PartId};
 use sundog::{Cache, Cluster, ClusterConfig, ReadExplanation};
 use sundog_lens::cli::Seed;
 use sundog_lens::key::KeySpec;
 use sundog_lens::locate::{LocateError, locate};
-use sundog_lens::model::Model;
-use sundog_lens::source::{Feed, FeedConfig};
+use sundog_lens::model::{Model, testkit};
+use sundog_lens::source::{Feed, FeedConfig, Update};
 
 /// The bound on each wait: a Distributed cache opening on a joining node, and
 /// the nodes and the lens agreeing on one ownership view. Three nodes spend
@@ -36,6 +38,11 @@ fn loopback_config() -> ClusterConfig {
         config.gossip_bind_addr = loopback;
         config.data_bind_addr = loopback;
         config.ae_interval = Duration::from_millis(200);
+        // No test node stops, so its failure detector never drops a peer from
+        // a view: a runner that starves the gossip loops for seconds, as one
+        // pinned core does, would otherwise shrink a node's view between the
+        // wait for it and the comparison with the lens.
+        config.phi_threshold = 1_000.0;
     })
 }
 
@@ -158,6 +165,23 @@ async fn integer_keys_hash_to_the_part_cache_explain_reports() {
     cluster.shutdown().await;
 }
 
+/// Whether `model` places a key in each of `caches` over three eligible
+/// members: the digest ranks three nodes and the snapshot lists live
+/// advertisers of the cache, which `locate` reads the cache's mode from.
+///
+/// A digest alone does not say so. The ownership worker ranks a snapshot on a
+/// blocking thread, and its digest reaches the model after any snapshot
+/// published meanwhile. On a starved runner the observer's failure detector
+/// holds every node down in such a snapshot, and the model holds the digests
+/// of three nodes beside a snapshot with no live advertiser until the worker
+/// retracts them.
+fn ranked_over_three(model: &Model, caches: &[&str]) -> bool {
+    let probe = KeySpec::parse("uint:0").expect("a number parses");
+    caches
+        .iter()
+        .all(|cache| locate(model, Some(cache), &probe).is_ok_and(|located| located.eligible == 3))
+}
+
 /// Applies the feed's updates to `model` until `ready` holds.
 async fn watch_until(
     feed: &mut Feed,
@@ -221,6 +245,74 @@ where
     );
 }
 
+#[test]
+fn a_digest_ranked_before_the_nodes_went_down_does_not_rank_the_cache() {
+    let nodes = |status| {
+        ClusterSnapshot::new(
+            "ranked",
+            (1..=3)
+                .map(|index| {
+                    testkit::member_with(
+                        index,
+                        0,
+                        1,
+                        status,
+                        &[
+                            ("ids", testkit::distributed(2)),
+                            ("names", testkit::distributed(2)),
+                        ],
+                    )
+                })
+                .collect(),
+            0,
+        )
+    };
+    let (now, wall) = (Instant::now(), SystemTime::now());
+    let apply = |model: &mut Model, update| {
+        model.apply(update, now, wall);
+    };
+    let live = nodes(MemberStatus::Live);
+    let digests: Vec<_> = ["ids", "names"]
+        .iter()
+        .map(|cache| testkit::ownership_digest(&live, cache).expect("three nodes are eligible"))
+        .collect();
+
+    // The worker ranks `live` while the observer publishes the snapshot that
+    // holds every node down; the digests arrive after it.
+    let mut model = Model::new();
+    apply(&mut model, Update::Snapshot(Arc::new(live.clone()), now));
+    apply(
+        &mut model,
+        Update::Snapshot(Arc::new(nodes(MemberStatus::Down)), now),
+    );
+    for digest in digests {
+        apply(&mut model, Update::Ownership(digest));
+    }
+
+    let digests_rank_three = ["ids", "names"].iter().all(|cache| {
+        model
+            .ownership(cache)
+            .is_some_and(|digest| digest.eligible.len() == 3)
+    });
+    assert!(digests_rank_three, "the model holds both digests");
+    let key = KeySpec::parse("uint:7").expect("a number parses");
+    assert_eq!(
+        locate(&model, Some("ids"), &key),
+        Err(LocateError::UnknownCache {
+            cache: "ids".into(),
+            known: Vec::new()
+        }),
+        "no live node advertises a cache, whatever the digests hold"
+    );
+    assert!(!ranked_over_three(&model, &["ids", "names"]));
+
+    // The snapshot that lists the nodes live again ranks both caches.
+    apply(&mut model, Update::Snapshot(Arc::new(live), now));
+    assert!(ranked_over_three(&model, &["ids", "names"]));
+    assert!(locate(&model, Some("names"), &key).is_ok());
+    assert!(!ranked_over_three(&model, &["ids", "other"]));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_key_spec_locates_the_owners_the_caches_report() {
     let name = "lens-locate-owners";
@@ -243,13 +335,7 @@ async fn a_key_spec_locates_the_owners_the_caches_report() {
         &mut feed,
         &mut model,
         "both caches ranked over three nodes",
-        |model| {
-            ["ids", "names"].iter().all(|cache| {
-                model
-                    .ownership(cache)
-                    .is_some_and(|digest| digest.eligible.len() == 3)
-            })
-        },
+        |model| ranked_over_three(model, &["ids", "names"]),
     )
     .await;
     // The lens and the nodes rank one view.

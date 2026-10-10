@@ -34,8 +34,9 @@
 //! on `"it"` for that key: the record this node stores, and in a
 //! `Mode::Distributed` cache the ownership view, the owners, the residency
 //! marks, how a fetch decides and what each other owner answers. The line's
-//! shape is the `explain_reply` module's, and the files under
-//! `sundog-lens/tests/fixtures/explain/` hold one reply of each kind.
+//! shape is the `explain_reply` module's, and the four files under
+//! `sundog-lens/tests/fixtures/explain/` hold the encoder's output for four
+//! replies, which the lens parses in its own tests.
 //!
 //! `SUNDOG_TESTNODE_LOADER_DELAY_MS` registers a loader on `"it"`: each call
 //! waits that long, then answers `src-{key}.{n}` for every key, `n`
@@ -2234,8 +2235,10 @@ mod tests {
     #[tokio::test]
     async fn an_expired_entry_the_sweep_has_not_reached_reads_lapsed() {
         let node = test_node("testnode-explain-lapsed").await;
-        // The sweep runs on a timer of minutes, so an expired entry lapses
-        // first; a key swept inside the window is replaced by the next.
+        // The cache's entries gauge task sweeps every 5 s, so a sweep can land
+        // between a key's expiry and its read. The 20 attempts span about 3 s,
+        // which fits at most one tick: it removes that attempt's key, and the
+        // next attempt's key lapses.
         let mut lapsed = None;
         for attempt in 0..20 {
             let key = format!("ttl{attempt}");
@@ -2261,6 +2264,108 @@ mod tests {
             reply.source.hit,
             Some(false),
             "a lapsed entry reads as a miss"
+        );
+        node.cluster.clone().shutdown().await;
+    }
+
+    /// `node`'s explanation of `key`, once its `"it"` reports how a
+    /// `Distributed` fetch decides.
+    async fn distributed_explanation(node: &TestNode, key: &str) -> sundog::ReadExplanation {
+        let deadline = tokio::time::Instant::now() + EXPLAIN_WAIT;
+        loop {
+            let explanation = node
+                .cache
+                .explain(&key.to_string())
+                .await
+                .expect("a String key encodes");
+            if explanation.distributed.is_some() {
+                return explanation;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the cache did not explain its ownership within 30 s"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn each_residency_mark_and_the_moved_view_reach_the_reply_through_their_own_field() {
+        let node = distributed_node("testnode-explain-marks", None).await;
+        let mut explanation = distributed_explanation(&node, "k17").await;
+        // Each mark alone, so a swap of two fields, a dropped field or a
+        // constant fails in at least one case.
+        for field in 0..6 {
+            let residency = &mut explanation
+                .distributed
+                .as_mut()
+                .expect("a Distributed cache")
+                .residency;
+            residency.owns = false;
+            residency.releasing_for = None;
+            residency.cold_marked = false;
+            residency.unsettled = false;
+            residency.unverified = false;
+            residency.stale = false;
+            let mut expected = explain_reply::Marks::default();
+            match field {
+                0 => (residency.owns, expected.owns) = (true, true),
+                1 => {
+                    residency.releasing_for = Some(Duration::from_millis(4_200));
+                    expected.releasing_ms = Some(4_200);
+                }
+                2 => (residency.cold_marked, expected.cold_marked) = (true, true),
+                3 => (residency.unsettled, expected.unsettled) = (true, true),
+                4 => (residency.unverified, expected.unverified) = (true, true),
+                _ => (residency.stale, expected.stale) = (true, true),
+            }
+            let reply = explain_reply::from_explanation(&explanation);
+            let read = reply.distributed.expect("a Distributed cache");
+            assert_eq!(read.residency, expected, "mark {field}");
+        }
+        // A view that moved during the call prints as 16 hex digits.
+        let read = explanation
+            .distributed
+            .as_mut()
+            .expect("a Distributed cache");
+        read.view_moved_to = Some(0x71c0_a2f4_e8b3_195d);
+        let reply = explain_reply::from_explanation(&explanation);
+        let read = reply.distributed.expect("a Distributed cache");
+        assert_eq!(read.view_moved_to.as_deref(), Some("71c0a2f4e8b3195d"));
+        node.cluster.clone().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_record_in_the_spill_tier_reports_spilled() {
+        use sundog::explain::LocalRecord;
+
+        let node = test_node("testnode-explain-spilled").await;
+        assert_eq!(reply_line(node.dispatch("put k17 v").await), "ok");
+        let mut explanation = node
+            .cache
+            .explain(&"k17".to_string())
+            .await
+            .expect("a String key encodes");
+        let spilled = |explanation: &mut sundog::ReadExplanation, to: bool| {
+            let LocalRecord::Live { spilled, .. } = &mut explanation.local else {
+                panic!("a written key reads live: {explanation:?}");
+            };
+            *spilled = to;
+        };
+        assert_eq!(
+            explain_reply::from_explanation(&explanation).local.spilled,
+            Some(false),
+            "the test node keeps its entries in memory"
+        );
+        spilled(&mut explanation, true);
+        assert_eq!(
+            explain_reply::from_explanation(&explanation).local.spilled,
+            Some(true)
+        );
+        spilled(&mut explanation, false);
+        assert_eq!(
+            explain_reply::from_explanation(&explanation).local.spilled,
+            Some(false)
         );
         node.cluster.clone().shutdown().await;
     }

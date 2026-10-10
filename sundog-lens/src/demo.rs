@@ -654,6 +654,95 @@ mod tests {
         );
     }
 
+    /// A control server that reads one line, tells the first channel it did,
+    /// holds its reply until the second fires and then answers `reply`.
+    async fn gated_node(
+        reply: &'static str,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (read_tx, read_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let Ok((socket, _)) = listener.accept().await else {
+                return;
+            };
+            let (reader, mut writer) = socket.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            if let Ok(Some(_)) = lines.next_line().await {
+                let _ = read_tx.send(());
+                let _ = release_rx.await;
+                let _ = writer.write_all(format!("{reply}\n").as_bytes()).await;
+            }
+        });
+        (addr, read_rx, release_tx)
+    }
+
+    #[tokio::test]
+    async fn a_slow_explain_never_holds_up_the_keys_behind_it() {
+        let (addr, read, release) =
+            gated_node(include_str!("../tests/fixtures/explain/owner.json").trim()).await;
+        let (key_tx, key_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let (applied_tx, mut applied_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(serve_keys(key_rx, ui_tx, move |command| {
+            let applied_tx = applied_tx.clone();
+            async move {
+                applied_tx.send(command).unwrap();
+                Ok(())
+            }
+        }));
+        key_tx
+            .send(FleetCmd::Explain(crate::app::ExplainRequest {
+                id: 1,
+                key: "k17".to_owned(),
+                targets: vec![crate::ask::Target {
+                    label: "n1".into(),
+                    addr,
+                }],
+            }))
+            .unwrap();
+        key_tx.send(FleetCmd::Spawn).unwrap();
+        // The node holds the line it read, so the explain is in flight.
+        tokio::time::timeout(Duration::from_secs(10), read)
+            .await
+            .expect("the node reads the line")
+            .unwrap();
+        // The key behind the explain is applied well before the explain
+        // times out, and the explain is still unanswered.
+        let applied = tokio::time::timeout(ask::TIMEOUT / 2, applied_rx.recv())
+            .await
+            .expect("a key behind a pending explain is applied at once")
+            .expect("the applier stays open");
+        assert_eq!(applied, FleetCmd::Spawn);
+        assert!(matches!(
+            ui_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        // The answer arrives once the node replies.
+        release.send(()).unwrap();
+        let UiCommand::Explained(answers) =
+            tokio::time::timeout(Duration::from_secs(10), ui_rx.recv())
+                .await
+                .expect("the answer arrives")
+                .expect("the channel stays open")
+        else {
+            panic!("the answer is an Explained command");
+        };
+        assert_eq!(answers.id, 1);
+        assert_eq!(answers.readings().count(), 1);
+        drop(key_tx);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the task ends when the requests close")
+            .unwrap();
+    }
+
     #[test]
     fn captions_follow_the_flag_and_a_signal_fails_only_a_headless_run() {
         assert!(

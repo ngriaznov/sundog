@@ -5,15 +5,17 @@
 //! no serde impls and keep their `Display` layout outside semver, so the
 //! test node reads their public fields and writes its own reply type,
 //! [`ExplainReply`]. Every id is a 16-digit hex [`NodeId`](sundog::NodeId),
-//! every version is `wall_ms.logical@node`, and every variant is a lowercase
-//! token. A variant this build does not know becomes `other:` and its
-//! `Debug` text with each character outside `[A-Za-z0-9_:.]` replaced by
-//! `_`, so a reply never carries whitespace in a token. A field that does
-//! not apply to a record, source or answer kind is left out of the line.
+//! every version is `wall_ms.logical@node`, and every variant is a token of
+//! letters, digits, `_`, `:` and `.`, lowercase except the `io:` kind and an
+//! `other:` tail, which keep the case of their `Debug` text. A variant this
+//! build does not know becomes `other:` and its `Debug` text with each
+//! character outside `[A-Za-z0-9_:.]` replaced by `_`, so a reply never
+//! carries whitespace in a token. A field that does not apply to a record,
+//! source or answer kind is left out of the line.
 //!
 //! The reply is compact JSON, so it is one line that starts with `{` and
-//! never with `err `. The three files under
-//! `sundog-lens/tests/fixtures/explain/` hold the encoder's output for three
+//! never with `err `. The four files under
+//! `sundog-lens/tests/fixtures/explain/` hold the encoder's output for four
 //! replies, and a test compares the encoder's bytes with them.
 
 use std::time::Duration;
@@ -437,11 +439,15 @@ mod tests {
         include_str!("../../sundog-lens/tests/fixtures/explain/non_owner.json");
     const CRASHED_OWNER_LINE: &str =
         include_str!("../../sundog-lens/tests/fixtures/explain/crashed_owner.json");
+    const LAPSED_STALE_LINE: &str =
+        include_str!("../../sundog-lens/tests/fixtures/explain/lapsed_stale.json");
 
     const A: &str = "6f3ac1e29d54b807";
     const B: &str = "c40d9e7a15f2338b";
     const C: &str = "1b88e5d0a7c64f92";
+    const D: &str = "9a2e7fb3c05d1148";
     const VIEW: &str = "5d69e3db4c1a02f7";
+    const MOVED: &str = "71c0a2f4e8b3195d";
 
     fn marks(owns: bool, unsettled: bool) -> Marks {
         Marks {
@@ -553,7 +559,7 @@ mod tests {
             },
             distributed: Some(Distributed {
                 view: VIEW.to_string(),
-                view_moved_to: Some("71c0a2f4e8b3195d".to_string()),
+                view_moved_to: Some(MOVED.to_string()),
                 owners: vec![A.to_string(), B.to_string()],
                 residency: marks(false, true),
                 local_read: "not_owner".to_string(),
@@ -571,12 +577,71 @@ mod tests {
         }
     }
 
+    /// Node c releases a part of `k99` it no longer owns, and holds a copy
+    /// whose expiry passed. Every mark is set, and the three owners answer a
+    /// stale view, a decline and a miss, so no owner serves the fetch.
+    fn lapsed_stale_reply() -> ExplainReply {
+        ExplainReply {
+            cache: "it".to_string(),
+            node: C.to_string(),
+            mode: "distributed:3".to_string(),
+            bucket: 640,
+            part: 9,
+            at_ms: 1_760_054_340_250,
+            local: Local {
+                kind: "lapsed".to_string(),
+                version: Some(format!("1760054280033.1@{A}")),
+                expires_at_ms: Expiry::At(1_760_054_336_050),
+                cause: Some("expired".to_string()),
+                ..Local::default()
+            },
+            source: Source {
+                kind: "unavailable".to_string(),
+                ..Source::default()
+            },
+            distributed: Some(Distributed {
+                view: VIEW.to_string(),
+                view_moved_to: None,
+                owners: vec![A.to_string(), B.to_string(), D.to_string()],
+                residency: Marks {
+                    owns: false,
+                    releasing_ms: Some(4_200),
+                    cold_marked: true,
+                    unsettled: true,
+                    unverified: true,
+                    stale: true,
+                },
+                local_read: "not_owner".to_string(),
+                serves_peers: "decline_distrusted".to_string(),
+                probes: vec![
+                    Probe {
+                        node: A.to_string(),
+                        answer: "stale_view".to_string(),
+                        responder_view: Some(MOVED.to_string()),
+                        ..Probe::default()
+                    },
+                    Probe {
+                        node: B.to_string(),
+                        answer: "declined".to_string(),
+                        ..Probe::default()
+                    },
+                    Probe {
+                        node: D.to_string(),
+                        answer: "miss".to_string(),
+                        ..Probe::default()
+                    },
+                ],
+            }),
+        }
+    }
+
     #[test]
     fn the_encoder_writes_the_fixture_replies_byte_for_byte() {
         for (name, reply, fixture) in [
             ("owner", owner_reply(), OWNER_LINE),
             ("non_owner", non_owner_reply(), NON_OWNER_LINE),
             ("crashed_owner", crashed_owner_reply(), CRASHED_OWNER_LINE),
+            ("lapsed_stale", lapsed_stale_reply(), LAPSED_STALE_LINE),
         ] {
             assert_eq!(to_line(&reply), fixture.trim_end(), "{name}.json");
         }
@@ -592,6 +657,7 @@ mod tests {
             owner_reply(),
             non_owner_reply(),
             crashed_owner_reply(),
+            lapsed_stale_reply(),
             hostile.clone(),
         ] {
             let line = to_line(&reply);

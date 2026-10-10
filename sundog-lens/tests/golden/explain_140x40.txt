@@ -30,7 +30,7 @@
 │ 00:00:21│   probes  n3 held · 1760054300112.3@n3 · expires in 38.1 s · a read gets a value                                     │         │
 │ 00:00:21│           n5 held · 1760054300112.3@n3 · expires in 38.1 s · a read gets a value                                     │         │
 │ 00:00:21│                                                                                                                      │         │
-│ 00:00:21│ Enter ask  ↑↓ node  Ctrl-U clear  Esc close                                                                          │         │
+│ 00:00:21│ Enter ask  ↑↓ node  Ctrl-U clear  Esc close  Ctrl-C quit                                                             │         │
 │ 00:00:21╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯· err 0% │
 │ 00:00:20  ✔ SETTLED  it settled in 10.0 s                                        ││ ⇄ rebal in ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀  out ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀        │
 │ 00:00:10  ⇄ VIEW     it bf0b7189 → 5d69e3db · 48,957 parts move · n7 −16.5k      ││                                                      │
