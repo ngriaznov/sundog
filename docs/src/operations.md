@@ -207,6 +207,18 @@ The marks and records are read one after another, not atomically, so a
 membership change during the call can show a state from either side of
 it.
 
+`sundog-lens` names the same placement for any key without asking a node.
+Its `e` key and `watch --once --explain KEY` show the key's `part` as
+`bucket/part`, the ownership `view` and the `owners` in the order `fetch`
+asks them, computed from gossip with the code the nodes run (see
+[Explaining a key](#explaining-a-key)). The lens does not call `explain`; a
+node does. A node's `local` record, `residency`, `local_read`,
+`serves_peers` and `probes` come from `Cache::explain` on that node, and
+the lens shows them for the demo's test nodes only, which answer over a
+control port. A node whose `view` differs from the lens's has not
+converged to the cluster's view, or the view moved after the node
+answered.
+
 ### Records are refused for clock skew
 
 `sundog_clock_skew_rejected_total` rises, and the node logs one warning
@@ -276,7 +288,8 @@ with `{ip}`, `{gossip_port}`, `{data_port}` and `{node_id}`;
 `{gossip_port+N}` and `{gossip_port-N}` shift the gossip port. `--scrape
 NODE=URL` pins one node's URL. A node with no exporter shows membership,
 modes, status and computed ownership only. `1`-`4` switch between Overview,
-Caches, Node and Timeline, `?` lists every key, and `q` quits.
+Caches, Node and Timeline, `e` explains a key, `?` lists every key, and `q`
+quits.
 
 The lens speaks plain UDP for gossip even when the nodes run with the `tls`
 feature, so it needs no certificates, and exporters are plain HTTP, so
@@ -290,6 +303,9 @@ JSON for scripts:
 ```sh
 sundog-lens watch mycluster --seed 10.0.0.5:7946 --once --json
 ```
+
+`--once --explain KEY` adds the placement of one key to the report; see
+[Explaining a key](#explaining-a-key).
 
 ### Reading the screen
 
@@ -319,6 +335,146 @@ the number of parts that moved, and the ownership mosaic flashes.
 The Timeline view draws one lifeline per node. A crash ends in `✖`, and a
 graceful leave runs `◐` to `○`, so the two read differently at a glance.
 
+### Explaining a key
+
+`e` opens "Explain a read" over any view, in every mode. It says where one
+key lives in the vocabulary of `Cache::explain` and, in the demo, what each
+test node says of reading it. The prompt is always focused: every printable
+key types into the key, including `q`, `?` and `c`, Backspace deletes,
+Ctrl-U clears, Up and Down move the lens's node selection, Esc closes the
+overlay and Ctrl-C quits. The text stays between openings, and the demo's
+first opening shows `k1`, a key its fleet holds.
+
+A cache routes a key by the hash of its postcard encoding and gossip
+carries no key type, so the text picks the encoding:
+
+| Text | Key |
+|---|---|
+| `k17` | A `String`: a varint length, then UTF-8. |
+| `uint:N` | A `u16`, `u32` or `u64`: one LEB128 varint. |
+| `int:N` | An `i16`, `i32` or `i64`: one zigzag varint. |
+| `hex:036b` | The postcard bytes `03 6b` verbatim, for any other key type: a `u8`, a tuple, a newtype, an enum. |
+| `str:uint:1` | The `String` `uint:1`. `str:` escapes a prefix. |
+
+A key holds at most 256 characters. A key typed as the wrong type reads as
+a confident answer for another part, so the overlay echoes the kind and the
+bytes it hashed; `hex:` states the bytes you mean.
+
+The top of the overlay is **computed** from gossip and works against any
+cluster. It shows the part as `bucket/part`, the ownership view with its
+hash, owners per part, whether it ranks parts or buckets, and `✔ settled` or
+`↻ settling`, and the part's owners in fetch order with their slot, short
+id and status. The first owner, marked `◆`, is the one a fetch asks first.
+The key is placed in the `Distributed` cache the Ownership panel shows, and
+`c` picks it before `e` opens the overlay. `provisional: still discovering`
+marks the first seconds of a run, until the live members have held still for
+2 s. A bad key shows its error in place of the block, and a cluster with no
+`Distributed` cache says that `explain` needs part ownership. No node is
+asked for any of it.
+
+In the demo, `Enter` adds the **asked** block. The lens sends `explain KEY`
+to the control port of every live test node at once, the channel the fleet
+uses for `fill` and `crash`, and each node answers one line of JSON, the
+report of `Cache::explain` on its cache `it`. The lens waits 3 s for a node.
+A line above the table says whether the nodes agree with each other and
+with the lens (`✔ 5 nodes agree, the lens computes the same`), which nodes
+hold which view, which differ from the lens's placement, or that the view
+moved since they were asked, which dims the rows until `Enter` asks again.
+The table has one row per node, in slot order:
+
+| Column | Shows |
+|---|---|
+| `NODE` | The node's slot label. |
+| `OWNS` | Whether the node owns the key's part. |
+| `LOCAL` | What the node stores for the key: `absent`, `live` with its expiry, `spilled`, `tombstone` or `lapsed`. |
+| `READ` | What the node's own copy makes of a fetch. |
+| `SERVES` | What the node answers another node's fetch. |
+| `SOURCE` | Where a fetch on the node takes its answer: `this node hit`, an owner and `hit` or `miss`, or `unavailable`. |
+| `PROBES` | Each other owner's answer to the fetch a read sends. |
+
+Up and Down select a node, and a detail block under the table shows its
+record with the version, its residency marks, its local read, where a fetch
+on it takes its answer, and every probe with the version it returned and
+what a read makes of it. As the popup narrows, `PROBES` drops first, then
+`SERVES` and `READ`. As it shortens, the detail block goes first, then rows
+give way to a `… +N nodes` line. A node that does not answer keeps its row
+with the reason in words: `no answer (connection refused)`, `no answer
+within 3 s`, or, for a `sundog-testnode` built before `explain`, a note to
+rebuild it. Every verdict is a word as well as a color, so mono reads the
+same.
+
+A test node holds `String` keys and reads the line as one word, so the
+lens asks only about a `String` key of visible ASCII characters with no
+space. A key of another type is computed and never asked: the line
+`explain 5` explains the `String` `5`, a different key from the integer. A
+lens with no control ports, which is every `watch`, asks nobody and says
+so. A result shows while the text names the key it answered; edit the text
+and the block offers to ask again.
+
+Each asked node probes the key's other owners with the fetch a read sends,
+so one `Enter` shows in the frame and byte counters on both ends of every
+probe, and an owner that holds the key spilled reads it from disk and counts
+that in `sundog_spill_reads_total`. No hit, miss or fetch counter moves.
+
+`--once --explain KEY` prints the computed block without a terminal and
+asks no node:
+
+```sh
+sundog-lens watch mycluster --seed 10.0.0.5:7946 --once --explain k17 --cache it
+```
+
+```text
+explain it · key "k17" as String (4 bytes 03 6b 31 37) · computed
+part   305/17 · ranked per part
+view   5d69e3dbbfa02966 · settled (gossip only) · 5 eligible · 2 owners per part
+owner  1  n2  204f5d2e9b010000  127.0.0.12:7946  data 127.0.0.12:39211
+owner  2  n5  294f5d2e9b010000  127.0.0.15:7946  data 127.0.0.15:39211
+note   no node was asked; a node's record, residency marks and probes come from Cache::explain on that node
+```
+
+The block follows the caches table. `--cache NAME` names the `Distributed`
+cache and is needed when several are ranked. The run waits up to 8 s after
+the members settle for the key's view to settle, and `settled` says whether
+it did. With `--json`, the report gains an `explain` object, and a run
+without `--explain` has none:
+
+```json
+"explain": {
+  "cache": "it",
+  "key": { "kind": "str", "text": "k17", "hex": "036b3137" },
+  "part": { "bucket": 305, "part": 17 },
+  "view": "5d69e3dbbfa02966",
+  "owners_per_part": 2,
+  "ranks_parts": true,
+  "eligible": 5,
+  "settled": true,
+  "gossip_only": true,
+  "conflicted": false,
+  "owners": [
+    { "rank": 1, "slot": "n2", "node": "204f5d2e9b010000", "status": "live",
+      "gossip": "127.0.0.12:7946", "data": "127.0.0.12:39211" },
+    { "rank": 2, "slot": "n5", "node": "294f5d2e9b010000", "status": "live",
+      "gossip": "127.0.0.15:7946", "data": "127.0.0.15:39211" }
+  ]
+}
+```
+
+`key.kind` is `str`, `uint`, `int` or `hex`, and `key.hex` holds the
+postcard bytes, which `hex:` takes back. `view` is the 16 hex digits of the
+view hash, as `Cache::explain` reports `view_hash`. `owners` runs in fetch
+order. `status` is `live`, `departing`, `left` or `down`, and an owner the
+snapshot no longer lists has slot `??` and `null` for `status`, `gossip` and
+`data`. `settled` is the lens's verdict for the view and `gossip_only` says
+it rests on gossip alone. `conflicted` is true when the members that
+advertise the cache disagree on its mode.
+
+A bad key, `--explain` without `--once` and `--cache` without `--explain`
+exit 2 with a message naming the flag. A key the report cannot place
+prints nothing on stdout and one line on stderr that names the remedy, and
+exits 1: no `Distributed` cache is advertised, `--cache` names a cache no
+node advertises or one that is not `Distributed`, the lens has not ranked
+the cache yet, or several caches are ranked and `--cache` is missing.
+
 ### What it cannot show
 
 | Wanted | Status |
@@ -327,6 +483,7 @@ graceful leave runs `◐` to `○`, so the two read differently at a glance.
 | Pulls and repairs in flight per part; cold, unverified or releasing parts | Not shown. Only rates from the rebalance, anti-entropy and state-transfer counters. |
 | The slowest or most frequent parts | Not shown. No per-part metric or latency histogram exists. |
 | Keys, digests, content convergence | Not shown. Entry-count divergence across `Replicated` nodes and the entry total divided by `k` for `Distributed` stand in. |
+| One key's placement and a node's own read | Placement for any key you type: `e` and `--once --explain`, computed from gossip. A node's record, residency marks and probes are shown for test nodes only, in the demo. On a production node they come from `Cache::explain`. |
 | Per-cache warmth on a node | Not shown. Only the node's `/readyz` bit. |
 | A node's own membership view | The PEERS column compares its live peer count with the lens's. |
 | A node without an exporter | Membership, modes, status and computed ownership only. |
@@ -350,6 +507,15 @@ spawn a node, kill one, make one leave and restart one.
 `sundog-lens/demo/record.sh` and `render.sh` produce the recording and GIF in
 `assets/`.
 
+`e` in the demo asks every test node over its control port, the channel the
+fleet uses for `fill` and `crash`. The test node accepts `explain KEY` and
+answers one line of JSON, the report of `Cache::explain` on its cache `it`;
+see [Explaining a key](#explaining-a-key). The lens opens no connection to
+a data port. A `sundog-testnode` built before `explain` answers `unknown
+command`, which the overlay shows as a row that says to rebuild it. The
+`watch` command that `cluster` prints knows no control ports, so `e` there
+computes the placement and asks nobody.
+
 The fleet addresses its nodes in one of two layouts. In the per-address
 layout node `n1` binds `127.0.0.11`, `n2` binds `127.0.0.12` and so on, each
 on the fixed ports: gossip 7946, control 8080 and exporter 9090. Linux
@@ -368,6 +534,7 @@ not.
 
 The exporter port lies 1144 above the gossip port in both layouts, so the
 demo scrapes through one template, `http://{ip}:{gossip_port+1144}/metrics`,
-and `cluster` prints the `watch` command that goes with its layout. The event
-log shows a node's gossip address with its port, so nodes that share an
-address stay apart.
+and `cluster` prints the `watch` command that goes with its layout. The
+control port lies 134 above the gossip port, so `e` reaches every node
+through `{ip}:{gossip_port+134}`. The event log shows a node's gossip address
+with its port, so nodes that share an address stay apart.

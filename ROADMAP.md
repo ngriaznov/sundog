@@ -66,6 +66,25 @@ bounded per-part ring of residency events (gained, dropped, marked cold,
 pulled from a donor, settled), off by default or sampled. An observer
 would read the same request.
 
+`sundog-lens` shows the computed half today. `e` and `watch --once
+--explain KEY` place any key from gossip, and in the demo `e` asks each
+test node for its own `Cache::explain` over the control port the fleet
+already uses. A production node has no control port, so there `explain`
+stays a library call.
+
+The production surface is a protocol 8 request, built when the trigger
+shows. `PROTOCOL_EXPLAIN` follows `PROTOCOL_LOAD` and raises
+`PROTOCOL_VERSION` to 8. `Msg::Explain` asks an owner for its marks of a
+key's part, and `Msg::ExplainReply` answers with them, the owner's view
+hash, what it makes of a fetch and why it declines; both append to `Msg`.
+The reply tells a cache that is not open, a cache that is not
+`Distributed` and a part tracker not yet attached apart, which `Declined`
+does not. A responder answers the request only to a peer whose hello
+speaks protocol 8, and the observer sends it only to owners whose gossiped
+protocol is 8 or more, so release N interoperates with N-1. The observer
+then dials data ports, which it does not do today, and the lens's `e`
+asks the owners it computes in place of a control port.
+
 **Trigger:** an operator who reads a `Cache::explain` explanation and still
 cannot tell why an owner declined or which pull last touched a part.
 

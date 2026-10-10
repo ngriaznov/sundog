@@ -114,7 +114,8 @@ background tasks and frees the name for a fresh `open()`. A clone kept past
 observer that owns nothing and is never a peer, and shows each node's status,
 which node owns which part of a `Distributed` cache, the parts every view
 change moves, and the rates each node exports. A crash and a graceful leave
-look different on it.
+look different on it. `e` names where one key lives, the part it hashes to
+and its owners in fetch order, computed from gossip.
 
 <p align="center">
   <img src="assets/sundog-lens.gif" width="720" alt="The sundog-lens terminal UI during its tour: three nodes join, a fourth and fifth scale the cluster out, one node crashes, one leaves gracefully and one restarts while the part-ownership mosaic, member table, throughput chart and event log update">
@@ -123,6 +124,10 @@ look different on it.
 ```sh
 cargo run --release -p sundog-lens -- watch mycluster --seed 10.0.0.5:7946 \
     --metrics 'http://{ip}:9090/metrics'
+
+# where one key lives, as a report
+cargo run --release -p sundog-lens -- watch mycluster --seed 10.0.0.5:7946 \
+    --once --explain k17 --cache it
 
 # the scripted tour above, against a local fleet (Linux and macOS)
 cargo build --release -p sundog-testnode --features prometheus
