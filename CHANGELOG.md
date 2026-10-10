@@ -18,6 +18,29 @@ All notable changes to this project are documented in this file. Format follows
   the fetch a read already sends, so an owner on the previous release
   answers it, and the probe counts as wire traffic on both nodes. The `explain` module holds the report's
   types, and `ReadExplanation` is re-exported at the crate root.
+- **`sundog-lens` explains a key.** `e` opens an overlay over any view, in
+  every mode, that takes a key as text and names the part it hashes to as
+  `bucket/part`, the ownership view with its settled state, and the part's
+  owners in fetch order, computed from gossip with the code the nodes run.
+  No node is asked for it, so it works against any cluster. Bare text is a
+  `String` key; `uint:N`, `int:N`, `hex:BYTES` and `str:TEXT` select another
+  encoding, and the overlay echoes the kind and the bytes it hashed.
+  `sundog-lens watch CLUSTER --once --explain KEY [--cache NAME]` prints the
+  same placement after the caches table, and `--json` adds an `explain`
+  object with the cache, the key and its bytes, the part, the view, the
+  settled verdict and the owners. A key the report cannot place exits 1 with
+  a message that names the remedy.
+- **`sundog-testnode` answers `explain <key>` with one line of JSON, and the
+  demo's `e` shows each node's answer.** The test node reports
+  `Cache::explain` of the key on its cache `it`: the record it stores and, in
+  a `Distributed` cache, its view, the owners, its residency marks, how a
+  fetch decides and what each other owner answers. In the demo, `Enter` in
+  the overlay asks every live test node over its control port, the channel
+  the fleet uses for `fill` and `crash`, and draws one row per node under
+  the computed placement, with a line that says whether the nodes agree with
+  each other and with the lens. A node that does not answer keeps its row
+  with the reason. The lens opens no connection to a data port. No wire
+  change and no change to the `sundog` crate.
 
 ### Fixed
 
