@@ -15,6 +15,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use smol_str::SmolStr;
 use sundog::NodeId;
 
+use crate::ask::Target;
+use crate::explained::Explained;
 use crate::model::Model;
 use crate::model::events::Filter;
 use crate::model::ownership::{BUCKETS, NO_LEAD, OwnershipDigest};
@@ -62,7 +64,20 @@ pub enum FleetCmd {
     Restart(SmolStr),
 }
 
-/// What the scenario director asks of the interface.
+/// A request to ask test nodes what they make of a key. [`crate::ask::answer`]
+/// runs it and returns the answers as a [`UiCommand::Explained`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplainRequest {
+    /// The request's number; an answer carries it back.
+    pub id: u64,
+    /// The key: the text after `explain ` on the control line.
+    pub key: String,
+    /// The nodes to ask, in slot order.
+    pub targets: Vec<Target>,
+}
+
+/// What reaches the interface from outside the keyboard: the scenario
+/// director's commands and the answers to an explain request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiCommand {
     /// Show a view.
@@ -75,6 +90,8 @@ pub enum UiCommand {
     Help(bool),
     /// Show a caption, or clear it.
     Caption(Option<String>),
+    /// The test nodes' answers to an [`ExplainRequest`].
+    Explained(Box<Explained>),
     /// End the interface: the scenario is over.
     Quit,
 }
@@ -517,7 +534,7 @@ impl App {
             UiCommand::Cache(name) => self.cache = Some(name),
             UiCommand::Help(open) => self.help = open,
             UiCommand::Caption(text) => self.caption = text,
-            UiCommand::Quit => {}
+            UiCommand::Explained(_) | UiCommand::Quit => {}
         }
     }
 
@@ -1128,6 +1145,24 @@ mod tests {
         assert_eq!(app.caption.as_deref(), Some("hello"));
         app.apply_director(UiCommand::Caption(None), &model);
         assert_eq!(app.caption, None);
+    }
+
+    #[test]
+    fn an_explained_command_changes_no_view_state() {
+        let model = model();
+        let mut app = app();
+        app.apply_director(UiCommand::Tab(View::Node), &model);
+        app.apply_director(UiCommand::Caption(Some("kept".into())), &model);
+        let explained = Explained {
+            id: 3,
+            key: "k1".to_owned(),
+            asked: SystemTime::UNIX_EPOCH,
+            nodes: Vec::new(),
+        };
+        app.apply_director(UiCommand::Explained(Box::new(explained)), &model);
+        assert_eq!(app.view, View::Node);
+        assert_eq!(app.caption.as_deref(), Some("kept"));
+        assert!(!app.help);
     }
 
     #[test]

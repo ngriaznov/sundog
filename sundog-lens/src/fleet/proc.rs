@@ -37,6 +37,10 @@ pub const METRICS_PORT: u16 = 9090;
 /// layout: the scrape template relies on it.
 pub const METRICS_OFFSET: u16 = METRICS_PORT - GOSSIP_PORT;
 
+/// How far a node's control port lies above its gossip port, in every fleet
+/// layout: the control template relies on it.
+pub const CONTROL_OFFSET: u16 = CONTROL_PORT - GOSSIP_PORT;
+
 /// What a test node prints when its cluster and caches are open.
 pub const READY_LINE: &str = "testnode-ready";
 
@@ -442,6 +446,26 @@ mod tests {
     fn the_exporter_lies_a_fixed_distance_above_gossip() {
         assert_eq!(METRICS_OFFSET, 1144);
         assert_eq!(GOSSIP_PORT + METRICS_OFFSET, METRICS_PORT);
+    }
+
+    #[test]
+    fn the_control_offset_is_the_same_in_both_layouts() {
+        assert_eq!(CONTROL_OFFSET, 134);
+        assert_eq!(GOSSIP_PORT + CONTROL_OFFSET, CONTROL_PORT);
+        let layouts = [
+            Layout::PerAddress(Ipv4Addr::new(127, 0, 0, 11)),
+            Layout::Shared,
+        ];
+        for layout in layouts {
+            for slot in 1..=crate::fleet::MAX_SLOTS {
+                let ports = layout.ports(slot).expect("every slot fits either layout");
+                assert_eq!(
+                    ports.control - ports.gossip,
+                    CONTROL_OFFSET,
+                    "{layout:?} slot {slot}"
+                );
+            }
+        }
     }
 
     fn env_value<'a>(env: &'a [(&'static str, String)], key: &str) -> Option<&'a str> {
