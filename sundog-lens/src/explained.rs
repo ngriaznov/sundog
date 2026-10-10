@@ -711,6 +711,142 @@ fn span_text(ms: u64) -> String {
     }
 }
 
+/// Canned answers for the interface's render tests and goldens.
+///
+/// The module is part of the library, not of the tests, so the integration
+/// tests import it; it is not part of the interface's API.
+#[doc(hidden)]
+pub mod fixture {
+    use std::time::SystemTime;
+
+    use smol_str::SmolStr;
+    use sundog::observe::MemberStatus;
+
+    use super::{
+        Answer, Distributed, Explained, Local, LocalRead, NodeAnswer, Outcome, Probe, Reading,
+        Reads, Residency, ServeVerdict, Source,
+    };
+    use crate::key::KeySpec;
+    use crate::locate::locate;
+    use crate::model::Model;
+    use crate::ui::data;
+
+    /// The node's clock in the fixture replies, in epoch milliseconds.
+    pub const AT_MS: u64 = 1_760_054_321_987;
+
+    /// How long before [`AT_MS`] the fixture entry was written, in
+    /// milliseconds.
+    const WRITTEN_BEFORE_MS: u64 = 21_875;
+
+    /// How long after [`AT_MS`] the fixture entry expires, in milliseconds.
+    const EXPIRES_AFTER_MS: u64 = 38_125;
+
+    /// The answers of every live node of `model` to `explain key` about its
+    /// `Distributed` cache `it`, as a converged cluster gives them: every
+    /// node holds the lens's view and owners, each owner holds the entry and
+    /// serves it, and each other node reads it from the first owner. The
+    /// request is number `id` and was asked at `asked`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `key` is not a key or the model ranks no `it` cache.
+    #[must_use]
+    pub fn explained(model: &Model, id: u64, key: &str, asked: SystemTime) -> Explained {
+        let spec = KeySpec::parse(key).expect("the fixture key parses");
+        let located =
+            locate(model, Some("it"), &spec).expect("the fixture model ranks the cache it");
+        let view = format!("{:016x}", located.view_hash);
+        let owners: Vec<String> = located
+            .owners
+            .iter()
+            .map(|owner| owner.node.to_string())
+            .collect();
+        let first = owners.first().cloned().unwrap_or_default();
+        let version = format!("{}.3@{first}", AT_MS - WRITTEN_BEFORE_MS);
+        let expires = Some(AT_MS + EXPIRES_AFTER_MS);
+        let held = Answer::Held {
+            version: version.clone(),
+            expires_at_ms: expires,
+            reads: Reads::Value,
+        };
+        let nodes = data::all_node_rows(model)
+            .into_iter()
+            .filter(|row| row.status() == MemberStatus::Live)
+            .map(|row| {
+                let node = row.full_id();
+                let owns = owners.contains(&node);
+                let probes = owners
+                    .iter()
+                    .filter(|owner| **owner != node)
+                    .map(|owner| Probe {
+                        node: owner.clone(),
+                        answer: held.clone(),
+                    })
+                    .collect();
+                let reading = Reading {
+                    cache: "it".to_owned(),
+                    node,
+                    mode: format!("distributed:{}", located.owners_per_part),
+                    bucket: located.part.bucket(),
+                    part: located.part.part(),
+                    at_ms: AT_MS,
+                    local: if owns {
+                        Local::Live {
+                            version: version.clone(),
+                            expires_at_ms: expires,
+                            spilled: false,
+                        }
+                    } else {
+                        Local::Absent
+                    },
+                    source: if owns {
+                        Source::Local { hit: true }
+                    } else {
+                        Source::Owner {
+                            node: first.clone(),
+                            hit: true,
+                        }
+                    },
+                    distributed: Some(Distributed {
+                        view: view.clone(),
+                        view_moved_to: None,
+                        owners: owners.clone(),
+                        residency: Residency {
+                            owns,
+                            releasing_ms: None,
+                            cold_marked: false,
+                            unsettled: !owns,
+                            unverified: false,
+                            stale: false,
+                        },
+                        local_read: if owns {
+                            LocalRead::Hit
+                        } else {
+                            LocalRead::NotOwner
+                        },
+                        serves_peers: if owns {
+                            ServeVerdict::Serve
+                        } else {
+                            ServeVerdict::Miss
+                        },
+                        probes,
+                    }),
+                };
+                NodeAnswer {
+                    label: SmolStr::new(row.label()),
+                    outcome: Outcome::Read(Box::new(reading)),
+                }
+            })
+            .collect();
+        Explained {
+            id,
+            key: key.to_owned(),
+            asked,
+            nodes,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU8;
@@ -1240,6 +1376,62 @@ mod tests {
             Some(A)
         );
         assert_eq!(explained(vec![failed("n1", "x")]).views(), []);
+    }
+
+    #[test]
+    fn the_fixture_answers_are_a_converged_cluster_that_agrees_with_the_lens() {
+        use crate::locate::locate;
+        use crate::model::testkit;
+
+        let model = testkit::fixture_model(std::time::Instant::now());
+        let asked = SystemTime::UNIX_EPOCH + Duration::from_secs(7);
+        let answers = fixture::explained(&model, 4, "k1", asked);
+        assert_eq!(
+            (answers.id, answers.key.as_str(), answers.asked),
+            (4, "k1", asked)
+        );
+        let labels: Vec<&str> = answers.nodes.iter().map(|a| a.label.as_str()).collect();
+        assert_eq!(labels, ["n1", "n2", "n3", "n4", "n5"], "the live nodes");
+
+        let located = locate(&model, Some("it"), &KeySpec::parse("k1").unwrap()).unwrap();
+        let owners: Vec<String> = located.owners.iter().map(|o| o.node.to_string()).collect();
+        let outcome = agreement(&answers, &located);
+        assert!(outcome.agrees(), "{outcome:?}");
+        assert_eq!(outcome.groups.len(), 1);
+        assert_eq!(outcome.groups[0].nodes.len(), 5);
+        for (label, reading) in answers.readings() {
+            let dist = reading.distributed.as_ref().expect("distributed");
+            assert_eq!(dist.owners, owners, "{label}");
+            assert_eq!(
+                (reading.bucket, reading.part),
+                (located.part.bucket(), located.part.part())
+            );
+            assert_eq!(reading.mode, "distributed:2");
+            let owns = owners.contains(&reading.node);
+            assert_eq!(dist.residency.owns, owns, "{label}");
+            assert_eq!(
+                dist.probes.len(),
+                owners.len() - usize::from(owns),
+                "{label}"
+            );
+            assert!(dist.probes.iter().all(|p| p.node != reading.node));
+            if owns {
+                assert!(matches!(reading.local, Local::Live { .. }), "{label}");
+                assert_eq!(reading.source, Source::Local { hit: true });
+                assert_eq!(dist.local_read, LocalRead::Hit);
+            } else {
+                assert_eq!(reading.local, Local::Absent);
+                assert_eq!(
+                    reading.source,
+                    Source::Owner {
+                        node: owners[0].clone(),
+                        hit: true
+                    }
+                );
+                assert_eq!(dist.local_read, LocalRead::NotOwner);
+                assert!(dist.residency.unsettled);
+            }
+        }
     }
 
     #[test]

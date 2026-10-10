@@ -706,6 +706,9 @@ impl FleetStage {
             FleetCmd::Kill(label) => self.kill(&label).await,
             FleetCmd::Leave(label) => self.leave(&label).await,
             FleetCmd::Restart(label) => self.restart(&label).await,
+            FleetCmd::Explain(_) => {
+                bail!("an explain request is answered by ask::answer, not applied")
+            }
         }
     }
 
@@ -1780,6 +1783,39 @@ mod process_tests {
         assert!(stage.load.is_running());
         stage.set_load(false);
         assert!(!stage.load.is_running());
+        stage.stop_all().await;
+        load.shutdown();
+    }
+
+    #[tokio::test]
+    async fn an_explain_request_is_not_a_fleet_action() {
+        let dir = scratch("explain-not-applied");
+        let (load, handle) = load::Load::spawn(10, 10);
+        let stage = FleetStage::new(
+            Fleet::new(FleetConfig {
+                cluster: "c".to_owned(),
+                layout: Layout::PerAddress(Ipv4Addr::new(127, 0, 0, 185)),
+                testnode: fake_node(&dir),
+                owners: NonZeroU8::new(2).unwrap(),
+                logs: dir.join("logs"),
+            }),
+            handle,
+        );
+        let request = crate::app::ExplainRequest {
+            id: 1,
+            key: "k1".to_owned(),
+            targets: Vec::new(),
+        };
+        let error = stage
+            .apply(FleetCmd::Explain(request))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "an explain request is answered by ask::answer, not applied"
+        );
+        assert!(stage.infos().await.is_empty(), "no node was started");
         stage.stop_all().await;
         load.shutdown();
     }

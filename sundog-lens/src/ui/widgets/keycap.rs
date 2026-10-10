@@ -38,6 +38,29 @@ pub fn fit<'a>(hints: &'a [(&'a str, &'a str)], width: usize) -> &'a [(&'a str, 
     hints
 }
 
+/// The longest prefix of `hints` that fits in `width` cells beside the last
+/// `keep` hints, which stay whatever the width: the hints that fit, then the
+/// last `keep`. When every hint fits, that is all of them.
+///
+/// The tail is never cut, so a `width` below its own width draws it past the
+/// edge of the row; the callers' rows are at least 80 cells wide.
+#[must_use]
+pub fn fit_keeping<'a>(
+    hints: &[(&'a str, &'a str)],
+    keep: usize,
+    width: usize,
+) -> Vec<(&'a str, &'a str)> {
+    let split = hints.len().saturating_sub(keep);
+    let (head, tail) = hints.split_at(split);
+    if keycaps_width(hints) <= width {
+        return hints.to_vec();
+    }
+    let room = width.saturating_sub(keycaps_width(tail) + if tail.is_empty() { 0 } else { GAP });
+    let mut kept = head[..fit(head, room).len()].to_vec();
+    kept.extend_from_slice(tail);
+    kept
+}
+
 /// The spans for `hints`: the key bold in the accent color, the label muted,
 /// two spaces between hints. In mono the key is bold and the label dim.
 #[must_use]
@@ -104,6 +127,33 @@ mod tests {
         assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
         assert!(spans[1].style.add_modifier.contains(Modifier::DIM));
         assert_eq!(spans[1].style.fg, None);
+    }
+
+    #[test]
+    fn fit_keeping_drops_hints_before_the_kept_tail() {
+        let hints = [
+            ("1-4", "view"),
+            ("c", "cache"),
+            ("e", "explain"),
+            ("?", "help"),
+            ("q", "quit"),
+        ];
+        let shown = |width| {
+            let kept = fit_keeping(&hints, 2, width);
+            line(&keycap_spans(&kept, ColorMode::Truecolor))
+        };
+        let all = keycaps_width(&hints);
+        assert_eq!(shown(all), "1-4 view  c cache  e explain  ? help  q quit");
+        assert_eq!(shown(all - 1), "1-4 view  c cache  ? help  q quit");
+        assert_eq!(shown(all - 11), "1-4 view  c cache  ? help  q quit");
+        assert_eq!(shown(all - 12), "1-4 view  ? help  q quit");
+        // Below the tail's own width the tail stays and nothing precedes it.
+        assert_eq!(shown(0), "? help  q quit");
+        assert_eq!(shown(keycaps_width(&hints[3..])), "? help  q quit");
+        // Without a tail it is `fit`.
+        assert_eq!(fit_keeping(&hints, 0, 12), fit(&hints, 12));
+        // A tail longer than the list keeps every hint.
+        assert_eq!(fit_keeping(&hints, 9, 0), hints);
     }
 
     #[test]

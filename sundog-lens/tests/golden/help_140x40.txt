@@ -7,13 +7,13 @@
 │ ● n3 234f   127.0.0.13:7946 01:20 7  D R R R  ━━━┊────  40.0% ↻ 5/5   ⣿⣿⣿⣿ 1.16k ││                   ⣀⣠⣤⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ │
 │ ● n4 264f   127.0.0.14:7946 01:20 7  D R R R  ━━━┊────  40.1% ✓ 5/5   ⣿⣿⣿⣷   775 ││             ⢀⣠⣤⣶⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ │
 │ ● n5 294f   127.0.0.15:7946 01:20 7  D R R R  ━━━┊────  40.0% ✓ 5/5   ⣿⣷⣦⣤   222 ││        ⢀⣠⣤⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ │
-│ ◐ n6 2c4f   127.0.0.16:7946 01:20 7  D R R R  ──┊──── leave 71s 5/5   ⣤⣤⣶⣿   510 ││  ⢀⣀⣤⣴⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ │
-│ ✖ n7 2f4f   12╭ ●•• sundog lens · keys ─────────────────────────────────────────────────────────────────────────────────╮⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ │
-│ ○ n8 324f   12│  1-4 Tab ⇧Tab views                         ↑↓ j k g G select                                           │⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ │
-│               │  ⏎            node detail                   Esc        close, then back                                 │⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ │
+│ ◐ n6 2c4f   12╭ ●•• sundog lens · keys ─────────────────────────────────────────────────────────────────────────────────╮⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ │
+│ ✖ n7 2f4f   12│  1-4 Tab ⇧Tab views                         ↑↓ j k g G select                                           │⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ │
+│ ○ n8 324f   12│  ⏎            node detail                   Esc        close, then back                                 │⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ │
 │               │  c C          next/prev Distributed cache   f          event filter                                     │⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ │
-│               │  t            gone rows                     p          freeze                                           │─────────── now │
-│               │  a            animations                    r          raw samples (Node)                               │  /s            │
+│               │  t            gone rows                     p          freeze                                           │⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ │
+│               │  a            animations                    r          raw samples (Node)                               │─────────── now │
+│               │  e            explain a key                 Ctrl-U     clear key                                        │  /s            │
 ╰───────────────│  ?            help                          q Ctrl-C   quit                                             │────────────────╯
 ╭ Ownership · it│  S            spawn (demo)                  K          SIGKILL (demo)                                   │ reported ↻ 4/5 ╮
 │ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀│  L            SIGTERM leave (demo)          R          restart (demo)                                   │39.9%  ✓        │
@@ -25,9 +25,9 @@
 │ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀│  gossip = observer 127.0.0.1:41733 (never a peer)                                                       │ ┊ 40.0%        │
 │ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀│  metrics = each node's /metrics, mapped by template                                                     │ 71.0 s         │
 ╰───────────────│  computed = worked out here with the code the nodes run                                                 │────────────────╯
-╭ Events ───────│  not shown: per-part pulls and repairs, slowest parts, keys and digests, per-cache warmth, CPU and RSS  │────────────────╮
-│ 00:00:21  ✓ EX╰─────────────────────────────────────────────────────────────────────────────────────────────────────────╯ttling          │
-│ 00:00:21  ✓ EXPORTER n5 294f  answering                                          ││   churn R    6/6         0 keys  ±0                  │
+╭ Events ───────│  asked = a test node's own answer to explain, over its control port                                     │────────────────╮
+│ 00:00:21  ✓ EX│  not shown: per-part pulls and repairs, slowest parts, keys and digests, per-cache warmth, CPU and RSS  │ttling          │
+│ 00:00:21  ✓ EX╰─────────────────────────────────────────────────────────────────────────────────────────────────────────╯                │
 │ 00:00:21  ✓ EXPORTER n4 264f  answering                                          ││   os    R    6/6         1 keys  ±0                  │
 │ 00:00:21  ✓ EXPORTER n3 234f  answering                                          ││   pn    R    6/6        20 keys  ±0                  │
 │ 00:00:21  ✓ EXPORTER n2 204f  answering                                          ││                                                      │
@@ -37,4 +37,4 @@
 │ 00:00:10  ✔ SETTLED  it settled in 5.0 s                                         ││                                                      │
 │ 00:00:10  ○ LEFT     n8 324f  gone after its departure                           ││                                                      │
 ╰──────────────────────────────────────────────────────────────────────────────────╯╰──────────────────────────────────────────────────────╯
- 1-4 view  ↑↓ select  ⏎ node  c cache  f filter  t gone  p freeze  a anim  ? help  q quit
+ 1-4 view  ↑↓ select  ⏎ node  c cache  f filter  t gone  e explain  p freeze  a anim  ? help  q quit

@@ -20,7 +20,8 @@
 //!   and [`locate`] names the part and the owners of that key from the model.
 //! - [`control`] runs commands on a test node's control port, [`explained`]
 //!   reads the answer to one of them, `explain <key>`, and [`ask`] asks every
-//!   test node at once.
+//!   test node at once. The `e` overlay, [`ui::explain`], draws those answers
+//!   under the placement [`locate`] computes from gossip.
 //! - [`scenario`] parses and plays the scripted demo.
 //! - [`fleet`] and [`demo`] start local test nodes (Unix only).
 

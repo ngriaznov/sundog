@@ -15,10 +15,12 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
-use sundog_lens::app::{App, AppConfig, UiCommand};
+use sundog_lens::app::{Action, App, AppConfig, FleetCmd, UiCommand};
 use sundog_lens::cli::DisplayArgs;
+use sundog_lens::explained::fixture;
 use sundog_lens::model::Model;
 use sundog_lens::model::testkit;
+use sundog_lens::source::targets::UrlTemplate;
 use sundog_lens::ui::look::Look;
 use sundog_lens::ui::theme::{self, ColorMode};
 use sundog_lens::ui::{self, Ctx, View};
@@ -89,6 +91,55 @@ fn press(app: &mut App, model: &Model, c: char) {
     app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), model);
 }
 
+/// Where the fixture nodes' control ports are: 134 above their gossip ports.
+fn control() -> UrlTemplate {
+    UrlTemplate::parse("{ip}:{gossip_port+134}").expect("the template parses")
+}
+
+/// The states the explain overlay is drawn in.
+#[derive(Clone, Copy, Debug)]
+enum Stage {
+    /// Open on an empty key, before anything is asked.
+    Prompt,
+    /// `Enter` pressed, no answer back.
+    Asking,
+    /// The nodes' answers drawn.
+    Answered,
+}
+
+const STAGES: [Stage; 3] = [Stage::Prompt, Stage::Asking, Stage::Answered];
+
+/// An app on `view` with the explain overlay in `stage` for the key `k1`,
+/// whose control ports are known.
+fn explaining(model: &Model, view: View, stage: Stage, mode: ColorMode) -> App {
+    let mut app = App::new(AppConfig {
+        control: Some(control()),
+        ..config(mode)
+    });
+    app.observe(model, ctx_of(model).now);
+    app.snap();
+    app.apply_director(UiCommand::Tab(view), model);
+    press(&mut app, model, 'e');
+    let ctrl_u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
+    app.handle_key(ctrl_u, model);
+    if matches!(stage, Stage::Prompt) {
+        return app;
+    }
+    press(&mut app, model, 'k');
+    press(&mut app, model, '1');
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    let Action::Fleet(FleetCmd::Explain(request)) = app.handle_key(enter, model) else {
+        // A cluster with no live node has nobody to ask.
+        return app;
+    };
+    if matches!(stage, Stage::Answered) {
+        let asked = ctx_of(model).wall - Duration::from_secs(3);
+        let answers = fixture::explained(model, request.id, &request.key, asked);
+        app.apply_director(UiCommand::Explained(Box::new(answers)), model);
+    }
+    app
+}
+
 #[test]
 fn every_view_renders_at_every_size_with_its_landmarks() {
     for model in [bare(), live()] {
@@ -128,6 +179,71 @@ fn every_view_renders_at_every_size_with_its_landmarks() {
             }
         }
     }
+}
+
+#[test]
+fn the_explain_overlay_draws_over_every_view_at_every_size() {
+    for model in [bare(), live()] {
+        for (width, height) in SIZES {
+            for view in VIEWS {
+                for stage in STAGES {
+                    let app = explaining(&model, view, stage, ColorMode::Truecolor);
+                    let shown = text(&render(&app, &model, width, height));
+                    let context = format!("{stage:?} over {view:?} at {width}x{height}\n{shown}");
+                    // The header, tabs and footer stay visible around it.
+                    assert!(shown.contains("sundog lens"), "{context}");
+                    assert!(shown.contains("1 Overview"), "{context}");
+                    assert!(
+                        shown.contains("e explain") || shown.contains("e ? q"),
+                        "{context}"
+                    );
+                    for landmark in [
+                        "Explain a read · it · computed",
+                        "key    k1▌",
+                        "part   ",
+                        "owner  1 ◆",
+                        "Esc close",
+                    ] {
+                        if matches!(stage, Stage::Prompt) && landmark == "key    k1▌" {
+                            continue;
+                        }
+                        assert!(shown.contains(landmark), "{landmark}: {context}");
+                    }
+                    let stage_landmarks: &[&str] = match stage {
+                        Stage::Prompt => &["type a key: Enter asks"],
+                        Stage::Asking => &["asking n1 n2 n3 n4 n5"],
+                        Stage::Answered => &["✔ 5 nodes agree", "NODE"],
+                    };
+                    for landmark in stage_landmarks {
+                        assert!(shown.contains(landmark), "{landmark}: {context}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_frozen_display_names_itself_in_the_overlay_and_help_draws_over_it() {
+    let model = bare();
+    let mut app = explaining(
+        &model,
+        View::Overview,
+        Stage::Answered,
+        ColorMode::Truecolor,
+    );
+    app.apply_director(UiCommand::Help(true), &model);
+    let shown = text(&render(&app, &model, 140, 40));
+    assert!(shown.contains("sundog lens · keys"), "{shown}");
+    app.apply_director(UiCommand::Help(false), &model);
+    // `p` types while the overlay is open: freeze before opening it.
+    let mut frozen = App::new(config(ColorMode::Truecolor));
+    frozen.observe(&model, ctx_of(&model).now);
+    press(&mut frozen, &model, 'p');
+    press(&mut frozen, &model, 'e');
+    let shown = text(&render(&frozen, &model, 140, 40));
+    assert!(shown.contains("(display frozen)"), "{shown}");
+    assert!(shown.contains("‖ frozen"), "{shown}");
 }
 
 #[test]
@@ -244,6 +360,30 @@ fn no_size_from_1x1_to_200x60_panics() {
                     width += 7;
                 }
             }
+            // The overlay does not depend on the view beneath it, and help
+            // draws over it: help joins the answered overlay only.
+            let overlays: &[(Stage, bool)] = if view == View::Overview {
+                &[
+                    (Stage::Prompt, false),
+                    (Stage::Asking, false),
+                    (Stage::Answered, false),
+                    (Stage::Answered, true),
+                ]
+            } else {
+                &[]
+            };
+            for &(stage, help) in overlays {
+                let mut app = explaining(model, view, stage, ColorMode::Truecolor);
+                app.help = help;
+                // The overlay needs 80x24; below that the screen is a
+                // notice, which the sweep above covers.
+                let widths = (71..=200).step_by(7).chain([79, 80]);
+                for width in widths {
+                    for height in (22..=60).step_by(7).chain([23, 24]) {
+                        let _ = render(&app, model, width, height);
+                    }
+                }
+            }
         }
     }
 }
@@ -285,6 +425,14 @@ fn every_rendered_glyph_is_in_the_allowlist() {
                         &render(&app, &model, width, height),
                         &format!("help {context}"),
                     );
+                    for stage in STAGES {
+                        let mut explain = explaining(&model, view, stage, ColorMode::Truecolor);
+                        explain.apply_director(UiCommand::Help(false), &model);
+                        assert_allowed(
+                            &render(&explain, &model, width, height),
+                            &format!("explain {stage:?} {context}"),
+                        );
+                    }
                 }
             }
         }
@@ -305,6 +453,13 @@ fn the_banned_glyphs_never_appear() {
             let shown = text(&render(&app, &model, 140, 40));
             for banned in theme::BANNED.chars() {
                 assert!(!shown.contains(banned), "{banned} in {view:?}");
+            }
+        }
+        for stage in STAGES {
+            let app = explaining(&model, view, stage, ColorMode::Truecolor);
+            let shown = text(&render(&app, &model, 140, 40));
+            for banned in theme::BANNED.chars() {
+                assert!(!shown.contains(banned), "{banned} in {view:?} {stage:?}");
             }
         }
     }
@@ -358,6 +513,35 @@ fn truecolor_256_and_mono_use_their_own_color_spaces() {
         assert!(
             mono.iter().all(|c| *c == Color::Reset),
             "{view:?}: {:?}",
+            mono.iter().find(|c| **c != Color::Reset)
+        );
+    }
+}
+
+#[test]
+fn the_explain_overlay_uses_each_color_space_and_mono_uses_none() {
+    let model = live();
+    for stage in STAGES {
+        let draw = |mode| {
+            let app = explaining(&model, View::Overview, stage, mode);
+            colors(&render(&app, &model, 140, 40))
+        };
+        assert!(
+            draw(ColorMode::Truecolor)
+                .iter()
+                .all(|c| matches!(c, Color::Rgb(..) | Color::Reset)),
+            "{stage:?}"
+        );
+        assert!(
+            draw(ColorMode::Ansi256)
+                .iter()
+                .all(|c| matches!(c, Color::Indexed(_) | Color::Reset)),
+            "{stage:?}"
+        );
+        let mono = draw(ColorMode::Mono);
+        assert!(
+            mono.iter().all(|c| *c == Color::Reset),
+            "{stage:?}: {:?}",
             mono.iter().find(|c| **c != Color::Reset)
         );
     }
@@ -522,10 +706,22 @@ fn the_splash_matches_the_golden() {
     assert_golden("splash_140x40", &frame_text(&app, &empty));
 }
 
+#[test]
+fn the_explain_overlay_matches_the_golden() {
+    let model = live();
+    let app = explaining(
+        &model,
+        View::Overview,
+        Stage::Answered,
+        ColorMode::Truecolor,
+    );
+    assert_golden("explain_140x40", &frame_text(&app, &model));
+}
+
 /// Prints one frame, for looking at a layout while changing it:
 ///
 /// ```sh
-/// DUMP_VIEW=overview DUMP_SIZE=100x30 DUMP_METRICS=1 \
+/// DUMP_VIEW=overview DUMP_SIZE=100x30 DUMP_METRICS=1 DUMP_EXPLAIN=answered \
 ///     cargo test -p sundog-lens --test render -- --ignored --nocapture dump_a_frame
 /// ```
 #[test]
@@ -547,6 +743,11 @@ fn dump_a_frame() {
     } else {
         bare()
     };
-    let app = app_for(&model, view);
+    let app = match std::env::var("DUMP_EXPLAIN").as_deref() {
+        Ok("prompt") => explaining(&model, view, Stage::Prompt, ColorMode::Truecolor),
+        Ok("asking") => explaining(&model, view, Stage::Asking, ColorMode::Truecolor),
+        Ok(_) => explaining(&model, view, Stage::Answered, ColorMode::Truecolor),
+        Err(_) => app_for(&model, view),
+    };
     println!("{}", rows(&render(&app, &model, width, height)).join("\n"));
 }

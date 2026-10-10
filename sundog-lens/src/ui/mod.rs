@@ -20,6 +20,7 @@ pub mod caches;
 pub mod caption;
 pub mod data;
 pub mod eventlog;
+pub mod explain;
 pub mod footer;
 pub mod header;
 pub mod help;
@@ -288,6 +289,9 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &App, live: &Model, ctx: &Ctx) 
         caption::render(&scene, row, buf);
     }
     footer::render(&scene, layout.footer, buf);
+    if let Some(state) = &app.explain {
+        explain::render(&scene, state, layout.body, buf);
+    }
     if app.help {
         help::render(&scene, area, buf);
     }

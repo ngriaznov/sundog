@@ -14,7 +14,7 @@ use super::{Scene, text};
 type Key = (&'static str, &'static str);
 
 /// The key table: each row is a left entry and a right entry.
-const KEYS: [(Key, Key); 8] = [
+const KEYS: [(Key, Key); 9] = [
     (("1-4 Tab ⇧Tab", "views"), ("↑↓ j k g G", "select")),
     (("⏎", "node detail"), ("Esc", "close, then back")),
     (
@@ -23,6 +23,7 @@ const KEYS: [(Key, Key); 8] = [
     ),
     (("t", "gone rows"), ("p", "freeze")),
     (("a", "animations"), ("r", "raw samples (Node)")),
+    (("e", "explain a key"), ("Ctrl-U", "clear key")),
     (("?", "help"), ("q Ctrl-C", "quit")),
     (("S", "spawn (demo)"), ("K", "SIGKILL (demo)")),
     (("L", "SIGTERM leave (demo)"), ("R", "restart (demo)")),
@@ -92,6 +93,14 @@ fn content(scene: &Scene<'_>, look: Look, left_width: usize) -> Vec<Line<'static
         look.span("computed", Token::Move),
         look.span(
             " = worked out here with the code the nodes run",
+            Token::Muted,
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        gap(2),
+        look.span("asked", Token::Muted),
+        look.span(
+            " = a test node's own answer to explain, over its control port",
             Token::Muted,
         ),
     ]));
@@ -196,10 +205,38 @@ mod tests {
             "gossip = observer 127.0.0.1:41733 (never a peer)",
             "metrics = each node's /metrics",
             "computed = worked out here",
+            "asked = a test node's own answer to explain, over its control port",
+            "e            explain a key",
+            "Ctrl-U     clear key",
             "not shown: per-part pulls",
         ] {
             assert!(rows.contains(needle), "missing {needle:?} in\n{rows}");
         }
+    }
+
+    #[test]
+    fn the_help_lists_the_explain_key_and_the_asked_tag() {
+        let rows = rendered(Rect::new(0, 0, 140, 40));
+        let key = rows
+            .iter()
+            .find(|row| row.contains("explain a key"))
+            .expect("a key row names explain");
+        assert!(key.contains("Ctrl-U     clear key"), "{key}");
+        assert!(
+            rows.iter().any(|row| row.contains("asked = a test node's")),
+            "{rows:?}"
+        );
+        // The right label of the row ends inside the 80x24 popup.
+        let small = rendered(Rect::new(0, 0, 80, 24));
+        let key = small
+            .iter()
+            .find(|row| row.contains("explain a key"))
+            .expect("the row survives the small popup");
+        assert!(key.contains("clear key"), "{key}");
+        assert!(
+            small.iter().any(|row| row.contains("asked = ")),
+            "{small:?}"
+        );
     }
 
     #[test]

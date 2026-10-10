@@ -303,18 +303,34 @@ pub fn printable(text: &str) -> String {
         .collect()
 }
 
-/// The control line that asks a test node about this key, `explain <text>`.
+/// Why a test node cannot be asked about this key, or `None` when it can.
 ///
 /// A test node holds `String` keys and splits a line at spaces, so only a
 /// non-empty `String` key of ASCII graphic characters is askable. Every other
 /// kind is located but never asked: the node would explain the `String` of the
 /// same text, a different key.
 #[must_use]
+pub fn not_askable(key: &KeySpec) -> Option<&'static str> {
+    if key.kind != KeyKind::Str {
+        Some(
+            "test nodes take String keys, so this key is computed only: write it bare or after str: to ask",
+        )
+    } else if key.text.is_empty() {
+        Some("a test node is asked about a key with at least one character")
+    } else if !key.text.chars().all(|c| c.is_ascii_graphic()) {
+        Some("a test node takes a key of visible ASCII characters with no space")
+    } else {
+        None
+    }
+}
+
+/// The control line that asks a test node about this key, `explain <text>`,
+/// for a key [`not_askable`] accepts.
+#[must_use]
 pub fn request_line(key: &KeySpec) -> Option<String> {
-    let askable = key.kind == KeyKind::Str
-        && !key.text.is_empty()
-        && key.text.chars().all(|c| c.is_ascii_graphic());
-    askable.then(|| format!("explain {}", key.text))
+    not_askable(key)
+        .is_none()
+        .then(|| format!("explain {}", key.text))
 }
 
 #[cfg(test)]
@@ -547,6 +563,30 @@ mod tests {
         assert_eq!(line("uint:5"), None);
         assert_eq!(line("int:5"), None);
         assert_eq!(line("hex:6b"), None);
+    }
+
+    #[test]
+    fn not_askable_names_why_a_test_node_is_not_asked() {
+        let why = |input: &str| not_askable(&spec(input));
+        assert_eq!(why("k17"), None);
+        assert_eq!(why("str:uint:1"), None);
+        for other in ["uint:5", "int:-5", "hex:6b"] {
+            let reason = why(other).expect("another kind is never asked");
+            assert!(reason.contains("String keys"), "{reason}");
+        }
+        assert!(why("").unwrap().contains("at least one character"));
+        for text in ["a b", " a", "é", "a\tb"] {
+            let reason = why(text).expect("a space or a non-ASCII character is not asked");
+            assert!(reason.contains("visible ASCII"), "{reason}");
+        }
+        // The request line exists exactly when nothing stands in the way.
+        for input in ["k17", "a b", "", "uint:5", "str:hex:6b", "é"] {
+            assert_eq!(
+                request_line(&spec(input)).is_some(),
+                why(input).is_none(),
+                "{input:?}"
+            );
+        }
     }
 
     #[test]

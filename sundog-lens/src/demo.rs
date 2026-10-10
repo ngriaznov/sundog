@@ -18,9 +18,12 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, bail};
 use tokio::sync::{mpsc, watch};
 
-use crate::app::{App, AppConfig};
+use crate::app::{App, AppConfig, FleetCmd, UiCommand};
+use crate::ask;
 use crate::cli::{DemoArgs, ScenarioSource, Seed};
-use crate::fleet::{Fleet, FleetConfig, FleetStage, MAX_SLOTS, SlotInfo, load, metrics_template};
+use crate::fleet::{
+    Fleet, FleetConfig, FleetStage, MAX_SLOTS, SlotInfo, control_template, load, metrics_template,
+};
 use crate::model::Model;
 use crate::model::digest::ModelDigest;
 use crate::model::events::Event;
@@ -147,10 +150,15 @@ pub async fn run(args: DemoArgs) -> anyhow::Result<()> {
     outcome
 }
 
-/// The interface configuration of the demo: captions and demo keys on, and the
-/// seeds the observer joins through named on the splash.
-fn app_config(args: &DemoArgs, seeds: &[String]) -> AppConfig {
-    AppConfig {
+/// The interface configuration of the demo: captions and demo keys on, the
+/// seeds the observer joins through named on the splash, and the template that
+/// finds each test node's control port, which the explain overlay asks.
+///
+/// # Errors
+///
+/// Returns an error when the control template does not parse.
+fn app_config(args: &DemoArgs, seeds: &[String]) -> anyhow::Result<AppConfig> {
+    Ok(AppConfig {
         look: Look::from_args(&args.display),
         forget_after: Duration::from_secs(90),
         anim: !args.display.no_anim,
@@ -160,7 +168,8 @@ fn app_config(args: &DemoArgs, seeds: &[String]) -> AppConfig {
         cluster: args.fleet.name.clone(),
         seeds: seeds.to_vec(),
         observer: None,
-    }
+        control: Some(UrlTemplate::parse(&control_template()).context("the control template")?),
+    })
 }
 
 /// How a run ends when the process is asked to stop: a headless run did not
@@ -185,22 +194,19 @@ async fn run_ui(
     let seeds: Vec<String> = feed_config.seeds.iter().map(ToString::to_string).collect();
     let wall = SystemTime::now();
     let feed = Feed::spawn(feed_config).await?;
-    let mut app = App::new(app_config(args, &seeds));
+    let mut app = App::new(app_config(args, &seeds)?);
     app.set_observer(feed.observer_addr());
     let model = model_for(&feed, wall);
 
     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
-    let (fleet_tx, mut fleet_rx) = mpsc::unbounded_channel();
+    let (fleet_tx, fleet_rx) = mpsc::unbounded_channel();
     let (digest_tx, digest_rx) = watch::channel(ModelDigest::default());
     let keys = {
         let stage = stage.clone();
-        tokio::spawn(async move {
-            while let Some(command) = fleet_rx.recv().await {
-                if let Err(error) = stage.apply(command).await {
-                    tracing::warn!("a demo key failed: {error:#}");
-                }
-            }
-        })
+        tokio::spawn(serve_keys(fleet_rx, commands_tx.clone(), move |command| {
+            let stage = stage.clone();
+            async move { stage.apply(command).await }
+        }))
     };
     let director = Director::new(
         stage.clone(),
@@ -244,6 +250,36 @@ async fn run_ui(
     };
     keys.abort();
     result
+}
+
+/// Serves the demo keys: each request the interface sends on `requests` is
+/// either an explain request, which a task of its own asks the test nodes
+/// about and answers on `commands` so a slow node never holds up the keys
+/// behind it, or an action `apply` carries out. An action that fails is
+/// logged. The task ends when `requests` closes.
+async fn serve_keys<F, Fut>(
+    mut requests: mpsc::UnboundedReceiver<FleetCmd>,
+    commands: mpsc::UnboundedSender<UiCommand>,
+    apply: F,
+) where
+    F: Fn(FleetCmd) -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
+    while let Some(command) = requests.recv().await {
+        match command {
+            FleetCmd::Explain(request) => {
+                let commands = commands.clone();
+                tokio::spawn(async move {
+                    let _ = commands.send(ask::answer(request).await);
+                });
+            }
+            command => {
+                if let Err(error) = apply(command).await {
+                    tracing::warn!("a demo key failed: {error:#}");
+                }
+            }
+        }
+    }
 }
 
 /// Writes `events` to `out` as the log lines of a headless run.
@@ -465,7 +501,7 @@ mod tests {
         let args = demo_args(&[]);
         let feed = feed_config(&config()).unwrap();
         let seeds: Vec<String> = feed.seeds.iter().map(ToString::to_string).collect();
-        let app_config = app_config(&args, &seeds);
+        let app_config = app_config(&args, &seeds).unwrap();
         assert_eq!(app_config.seeds, ["127.0.0.11:7946", "127.0.0.12:7946"]);
         assert!(app_config.demo && app_config.captions);
         assert_eq!(app_config.cluster, "lens-demo");
@@ -496,8 +532,135 @@ mod tests {
     }
 
     #[test]
+    fn the_demo_config_enables_explain() {
+        let args = demo_args(&[]);
+        let config = app_config(&args, &[]).unwrap();
+        let template = config
+            .control
+            .clone()
+            .expect("the demo knows the control ports");
+        assert_eq!(template, UrlTemplate::parse(&control_template()).unwrap());
+        // The template reaches each slot's control port, where the test
+        // nodes of the fleet listen.
+        let model = testkit::fixture_model(Instant::now());
+        let targets = crate::ui::data::control_targets(&model, &template);
+        assert_eq!(targets.asked.len(), 5, "{targets:?}");
+        assert_eq!(targets.asked[0].addr, "127.0.0.11:8080".parse().unwrap());
+        assert!(targets.skipped.is_empty(), "{targets:?}");
+        // The interface opens the overlay on the key the fleet holds.
+        let mut app = App::new(config);
+        let key = |c| {
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(c),
+                crossterm::event::KeyModifiers::NONE,
+            )
+        };
+        app.handle_key(key('e'), &model);
+        assert_eq!(app.explain.as_ref().unwrap().text, crate::app::SEED_KEY);
+    }
+
+    /// A control server that answers every line with `reply`, and the lines
+    /// it read.
+    async fn control_node(
+        reply: &'static str,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let log = std::sync::Arc::clone(&log);
+                tokio::spawn(async move {
+                    let (reader, mut writer) = socket.into_split();
+                    let mut lines = BufReader::new(reader).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        log.lock().unwrap().push(line);
+                        if writer
+                            .write_all(format!("{reply}\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    #[tokio::test]
+    async fn the_keys_task_answers_an_explain_request_on_the_ui_channel() {
+        let (addr, seen) =
+            control_node(include_str!("../tests/fixtures/explain/owner.json").trim()).await;
+        let (key_tx, key_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let applied = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&applied);
+        let task = tokio::spawn(serve_keys(key_rx, ui_tx, move |command| {
+            let log = std::sync::Arc::clone(&log);
+            async move {
+                log.lock().unwrap().push(command.clone());
+                match command {
+                    FleetCmd::Kill(label) if label == "n9" => anyhow::bail!("n9 is not running"),
+                    _ => Ok(()),
+                }
+            }
+        }));
+        // An ordinary key reaches the applier, and one that fails is logged,
+        // not fatal.
+        key_tx.send(FleetCmd::Spawn).unwrap();
+        key_tx.send(FleetCmd::Kill("n9".into())).unwrap();
+        // An explain request is asked of the control ports and answered on
+        // the interface's channel with the number it carried.
+        key_tx
+            .send(FleetCmd::Explain(crate::app::ExplainRequest {
+                id: 9,
+                key: "k17".to_owned(),
+                targets: vec![crate::ask::Target {
+                    label: "n1".into(),
+                    addr,
+                }],
+            }))
+            .unwrap();
+        let UiCommand::Explained(answers) =
+            tokio::time::timeout(Duration::from_secs(10), ui_rx.recv())
+                .await
+                .expect("the answer arrives")
+                .expect("the channel stays open")
+        else {
+            panic!("the answer is an Explained command");
+        };
+        assert_eq!((answers.id, answers.key.as_str()), (9, "k17"));
+        let readings: Vec<_> = answers.readings().collect();
+        assert_eq!(readings.len(), 1);
+        assert_eq!(readings[0].0, "n1");
+        assert_eq!(readings[0].1.node, "6f3ac1e29d54b807");
+        assert_eq!(*seen.lock().unwrap(), ["explain k17"]);
+        // The explain request never reached the applier.
+        drop(key_tx);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the task ends when the requests close")
+            .unwrap();
+        assert_eq!(
+            *applied.lock().unwrap(),
+            [FleetCmd::Spawn, FleetCmd::Kill("n9".into())]
+        );
+    }
+
+    #[test]
     fn captions_follow_the_flag_and_a_signal_fails_only_a_headless_run() {
-        assert!(!app_config(&demo_args(&["--no-captions"]), &[]).captions);
+        assert!(
+            !app_config(&demo_args(&["--no-captions"]), &[])
+                .unwrap()
+                .captions
+        );
         assert!(signal_outcome(true).is_err());
         assert!(signal_outcome(false).is_ok());
     }

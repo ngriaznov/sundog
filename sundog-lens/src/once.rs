@@ -235,7 +235,8 @@ pub struct OnceOwner {
     pub data: Option<String>,
 }
 
-const fn status_name(status: MemberStatus) -> &'static str {
+/// A member status as the word the report and the interface print.
+pub(crate) const fn status_name(status: MemberStatus) -> &'static str {
     match status {
         MemberStatus::Live => "live",
         MemberStatus::Departing => "departing",

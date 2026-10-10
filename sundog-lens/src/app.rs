@@ -17,9 +17,11 @@ use sundog::NodeId;
 
 use crate::ask::Target;
 use crate::explained::Explained;
+use crate::key::{self, KeySpec};
 use crate::model::Model;
 use crate::model::events::Filter;
 use crate::model::ownership::{BUCKETS, NO_LEAD, OwnershipDigest};
+use crate::source::targets::UrlTemplate;
 use crate::ui::View;
 use crate::ui::anim::{self, Tween};
 use crate::ui::data;
@@ -51,7 +53,8 @@ pub enum Action {
     Fleet(FleetCmd),
 }
 
-/// What the demo keys ask the fleet to do.
+/// What the interface asks of the demo: a fleet action for a demo key, or a
+/// request to ask test nodes about a key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FleetCmd {
     /// Start the next slot.
@@ -62,6 +65,9 @@ pub enum FleetCmd {
     Leave(SmolStr),
     /// Start the node with this label again at its address.
     Restart(SmolStr),
+    /// Ask test nodes about a key. The demo answers it with
+    /// [`crate::ask::answer`]; the fleet never applies it.
+    Explain(ExplainRequest),
 }
 
 /// A request to ask test nodes what they make of a key. [`crate::ask::answer`]
@@ -117,6 +123,9 @@ pub struct AppConfig {
     pub seeds: Vec<String>,
     /// The observer's gossip address, once known.
     pub observer: Option<SocketAddr>,
+    /// Where each node's control port is, when the nodes are test nodes the
+    /// interface can ask about a key: `{ip}:{gossip_port+134}`.
+    pub control: Option<UrlTemplate>,
 }
 
 impl Default for AppConfig {
@@ -131,8 +140,68 @@ impl Default for AppConfig {
             cluster: String::new(),
             seeds: Vec::new(),
             observer: None,
+            control: None,
         }
     }
+}
+
+/// The key shown the first time the explain overlay opens in the demo: the
+/// fleet's keys are `k{n}`, so it names a key the test nodes hold.
+pub const SEED_KEY: &str = "k1";
+
+/// The explain overlay: the key being typed and what the test nodes
+/// answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplainState {
+    /// The key as typed, with its prefix.
+    pub text: String,
+    /// What the last `Enter` did when it asked nobody, or whom it asked.
+    pub note: Option<String>,
+    /// The number of the request whose answer the overlay waits for.
+    pub pending: Option<u64>,
+    /// The answers to the last request that came back.
+    pub result: Option<Box<Explained>>,
+}
+
+/// Whether the overlay waits for `answer`: it is open and the answer carries
+/// the number of its pending request. Any other answer, such as one that
+/// arrives after the overlay closed, is dropped.
+#[must_use]
+pub fn accepts(explain: &Option<ExplainState>, answer: &Explained) -> bool {
+    explain
+        .as_ref()
+        .is_some_and(|state| state.pending == Some(answer.id))
+}
+
+/// What the overlay says while it waits: the nodes asked, and the live nodes
+/// the control template gives no address.
+fn asking_note(targets: &data::ControlTargets) -> String {
+    let names = |labels: Vec<&str>| labels.join(" ");
+    let asked = names(targets.asked.iter().map(|t| t.label.as_str()).collect());
+    if targets.skipped.is_empty() {
+        format!("asking {asked}")
+    } else {
+        let skipped = names(targets.skipped.iter().map(|(l, _)| l.as_str()).collect());
+        format!("asking {asked} · not asked: {skipped}")
+    }
+}
+
+/// The key a request for `text` carries, when a test node can be asked about
+/// it: the text a control line sends after `explain `.
+#[must_use]
+pub fn asked_key(text: &str) -> Option<String> {
+    let spec = KeySpec::parse(text).ok()?;
+    key::not_askable(&spec)
+        .is_none()
+        .then(|| spec.text().to_owned())
+}
+
+/// The answers to show for the text typed: the last result, while the text
+/// still names the key it answered.
+#[must_use]
+pub fn result_for(state: &ExplainState) -> Option<&Explained> {
+    let asked = asked_key(&state.text)?;
+    state.result.as_deref().filter(|result| result.key == asked)
 }
 
 /// The buckets whose lead changed at the last view change.
@@ -174,6 +243,8 @@ pub struct App {
     pub caption: Option<String>,
     /// Whether the Node view lists the raw samples.
     pub raw: bool,
+    /// The explain overlay, while it is open.
+    pub explain: Option<ExplainState>,
     prev_view: Option<View>,
     selected: Option<SocketAddr>,
     cache: Option<SmolStr>,
@@ -181,6 +252,8 @@ pub struct App {
     pinned: bool,
     scroll: usize,
     pin_len: usize,
+    last_key: Option<String>,
+    next_id: u64,
     config: AppConfig,
     motion: Motion,
     lifeline_window: Cell<Duration>,
@@ -217,6 +290,7 @@ impl App {
             anim: config.anim,
             caption: None,
             raw: false,
+            explain: None,
             prev_view: None,
             selected: None,
             cache: None,
@@ -224,6 +298,8 @@ impl App {
             pinned: false,
             scroll: 0,
             pin_len: 0,
+            last_key: None,
+            next_id: 1,
             config,
             motion: Motion::default(),
             lifeline_window: Cell::new(Duration::ZERO),
@@ -408,19 +484,25 @@ impl App {
 
     /// Handles one key press and returns what the loop does next.
     ///
-    /// Keys follow the table in the help overlay. `Esc` closes the help
-    /// overlay, else the raw-sample list, else returns to the previous view;
-    /// it never quits. While help is open every key but `?`, `Esc`, `q` and
+    /// Keys follow the table in the help overlay. `Esc` closes the explain
+    /// overlay, else the help overlay, else the raw-sample list, else returns
+    /// to the previous view; it never quits. While the explain overlay is
+    /// open it takes every key but `Ctrl-C`: letters, `q` and `?` type into
+    /// the key. While help is open every key but `?`, `Esc`, `q` and
     /// `Ctrl-C` is ignored. The demo keys `S K L R` act only in demo mode.
     pub fn handle_key(&mut self, key: KeyEvent, live: &Model) -> Action {
         if key.kind == KeyEventKind::Release {
             return Action::None;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Char('c') if ctrl => return Action::Quit,
-            KeyCode::Char('q') => return Action::Quit,
-            _ => {}
+        if ctrl && key.code == KeyCode::Char('c') {
+            return Action::Quit;
+        }
+        if self.explain.is_some() {
+            return self.explain_key(key, live);
+        }
+        if key.code == KeyCode::Char('q') {
+            return Action::Quit;
         }
         if self.help {
             return match key.code {
@@ -466,6 +548,7 @@ impl App {
                     self.snap();
                 }
             }
+            KeyCode::Char('e') => self.open_explain(),
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('S') if self.config.demo => return Action::Fleet(FleetCmd::Spawn),
             KeyCode::Char('K') if self.config.demo => {
@@ -480,6 +563,110 @@ impl App {
             _ => return Action::None,
         }
         Action::Redraw
+    }
+
+    /// Opens the explain overlay on the key typed last; the first time, the
+    /// demo's seed key, which its test nodes hold.
+    fn open_explain(&mut self) {
+        let text = self.last_key.clone().unwrap_or_else(|| {
+            if self.config.demo {
+                SEED_KEY.to_owned()
+            } else {
+                String::new()
+            }
+        });
+        self.explain = Some(ExplainState {
+            text,
+            note: None,
+            pending: None,
+            result: None,
+        });
+    }
+
+    /// Closes the explain overlay and keeps its text for the next opening.
+    /// An answer to a request still pending is dropped when it arrives.
+    fn close_explain(&mut self) {
+        if let Some(state) = self.explain.take() {
+            self.last_key = Some(state.text);
+        }
+    }
+
+    /// Handles a key while the explain overlay is open: it types into the
+    /// key, `Enter` asks the test nodes, `Up` and `Down` select a node, `Esc`
+    /// closes the overlay.
+    fn explain_key(&mut self, key: KeyEvent, live: &Model) -> Action {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => return self.escape(),
+            KeyCode::Enter => return self.ask(live),
+            KeyCode::Up => self.select_row(live, Step::Prev),
+            KeyCode::Down => self.select_row(live, Step::Next),
+            KeyCode::Backspace => self.edit_key(|text| {
+                text.pop();
+            }),
+            KeyCode::Char('u') if ctrl => self.edit_key(String::clear),
+            KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+                self.edit_key(|text| {
+                    if text.chars().count() < key::MAX_CHARS {
+                        text.push(c);
+                    }
+                });
+            }
+            _ => return Action::None,
+        }
+        Action::Redraw
+    }
+
+    /// Edits the key being typed and drops the note of the last `Enter`, which
+    /// described the key before the edit.
+    fn edit_key(&mut self, edit: impl FnOnce(&mut String)) {
+        if let Some(state) = &mut self.explain {
+            edit(&mut state.text);
+            state.note = None;
+        }
+    }
+
+    /// Asks the test nodes about the key typed. A key a node cannot be asked
+    /// about, a lens that knows no control ports and a cluster with no live
+    /// node to ask each leave a note and ask nobody.
+    fn ask(&mut self, live: &Model) -> Action {
+        let Some(state) = &mut self.explain else {
+            return Action::None;
+        };
+        let spec = match KeySpec::parse(&state.text) {
+            Ok(spec) => spec,
+            Err(error) => {
+                state.note = Some(format!("nobody is asked: {error}"));
+                return Action::Redraw;
+            }
+        };
+        let Some(template) = &self.config.control else {
+            state.note = Some(
+                "nobody is asked: this lens does not know the nodes' control ports, \
+                 which only the demo's test nodes serve"
+                    .to_owned(),
+            );
+            return Action::Redraw;
+        };
+        if let Some(why) = key::not_askable(&spec) {
+            state.note = Some(format!("nobody is asked: {why}"));
+            return Action::Redraw;
+        }
+        let key = spec.text().to_owned();
+        let targets = data::control_targets(live, template);
+        if targets.asked.is_empty() {
+            state.note = Some("nobody is asked: no live node has a control port to ask".to_owned());
+            return Action::Redraw;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        state.pending = Some(id);
+        state.note = Some(asking_note(&targets));
+        Action::Fleet(FleetCmd::Explain(ExplainRequest {
+            id,
+            key,
+            targets: targets.asked,
+        }))
     }
 
     fn move_selection(&mut self, live: &Model, step: Step) -> Action {
@@ -509,7 +696,9 @@ impl App {
     }
 
     fn escape(&mut self) -> Action {
-        if self.help {
+        if self.explain.is_some() {
+            self.close_explain();
+        } else if self.help {
             self.help = false;
         } else if self.raw {
             self.raw = false;
@@ -534,7 +723,16 @@ impl App {
             UiCommand::Cache(name) => self.cache = Some(name),
             UiCommand::Help(open) => self.help = open,
             UiCommand::Caption(text) => self.caption = text,
-            UiCommand::Explained(_) | UiCommand::Quit => {}
+            UiCommand::Explained(answer) => {
+                if accepts(&self.explain, &answer)
+                    && let Some(state) = &mut self.explain
+                {
+                    state.pending = None;
+                    state.note = None;
+                    state.result = Some(answer);
+                }
+            }
+            UiCommand::Quit => {}
         }
     }
 
@@ -896,6 +1094,444 @@ mod tests {
         assert!(!app.raw && app.view == View::Node);
         app.handle_key(key(KeyCode::Esc), &model);
         assert_eq!(app.view, View::Overview);
+    }
+
+    fn control() -> UrlTemplate {
+        UrlTemplate::parse("{ip}:{gossip_port+134}").expect("the template parses")
+    }
+
+    fn explaining_app() -> App {
+        App::new(AppConfig {
+            control: Some(control()),
+            ..AppConfig::default()
+        })
+    }
+
+    fn control_key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// Types `text` into the open overlay.
+    fn type_into(app: &mut App, model: &Model, text: &str) {
+        for c in text.chars() {
+            assert_eq!(app.handle_key(ch(c), model), Action::Redraw, "{c:?}");
+        }
+    }
+
+    fn typed(app: &App) -> &str {
+        &app.explain.as_ref().expect("the overlay is open").text
+    }
+
+    fn request_of(action: Action) -> ExplainRequest {
+        match action {
+            Action::Fleet(FleetCmd::Explain(request)) => request,
+            other => panic!("expected an explain request, got {other:?}"),
+        }
+    }
+
+    /// An answer to request `id` about `key` that holds no node's reading.
+    fn answers(id: u64, key: &str) -> Explained {
+        Explained {
+            id,
+            key: key.to_owned(),
+            asked: SystemTime::UNIX_EPOCH,
+            nodes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn e_opens_the_overlay_in_every_mode_seeded_with_k1_only_in_demo() {
+        let model = model();
+        for view in View::ALL {
+            for (demo, seed) in [(false, ""), (true, SEED_KEY)] {
+                let mut app = App::new(AppConfig {
+                    demo,
+                    ..AppConfig::default()
+                });
+                app.go(view);
+                assert_eq!(app.handle_key(ch('e'), &model), Action::Redraw);
+                let state = app.explain.as_ref().expect("e opens the overlay");
+                assert_eq!(state.text, seed, "{view:?} demo={demo}");
+                assert_eq!(app.view, view, "e leaves the view alone");
+                assert_eq!(
+                    (state.pending, &state.result, &state.note),
+                    (None, &None, &None)
+                );
+            }
+        }
+        assert_eq!(SEED_KEY, "k1");
+        // It opens over an empty model too.
+        let mut empty = app();
+        assert_eq!(empty.handle_key(ch('e'), &Model::new()), Action::Redraw);
+        assert!(empty.explain.is_some());
+    }
+
+    #[test]
+    fn e_is_swallowed_while_help_is_open() {
+        let model = model();
+        let mut app = app();
+        app.handle_key(ch('?'), &model);
+        assert_eq!(app.handle_key(ch('e'), &model), Action::None);
+        assert!(app.explain.is_none() && app.help);
+        app.handle_key(ch('?'), &model);
+        assert_eq!(app.handle_key(ch('e'), &model), Action::Redraw);
+        assert!(app.explain.is_some());
+    }
+
+    #[test]
+    fn q_and_every_hotkey_type_inside_the_overlay_but_ctrl_c_quits() {
+        let model = model();
+        let mut app = demo_app();
+        app.handle_key(ch('e'), &model);
+        app.handle_key(control_key('u'), &model);
+        let before = (app.view, app.filter, app.anim, app.show_gone, app.raw);
+        let hotkeys = "qcCftpar?1234jkgGSKLRe";
+        type_into(&mut app, &model, hotkeys);
+        assert_eq!(typed(&app), hotkeys);
+        assert_eq!(
+            (app.view, app.filter, app.anim, app.show_gone, app.raw),
+            before,
+            "no hotkey acted"
+        );
+        assert!(!app.help && !app.is_frozen());
+        assert_eq!(app.handle_key(key(KeyCode::Tab), &model), Action::None);
+        assert_eq!(app.handle_key(key(KeyCode::Left), &model), Action::None);
+        // Ctrl-C quits from inside the overlay, and Ctrl-U is no letter.
+        assert_eq!(app.handle_key(control_key('c'), &model), Action::Quit);
+        assert_eq!(app.handle_key(control_key('x'), &model), Action::None);
+        let alt = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT);
+        assert_eq!(app.handle_key(alt, &model), Action::None);
+        assert_eq!(typed(&app), hotkeys);
+        // Outside the overlay the same keys act again.
+        app.handle_key(key(KeyCode::Esc), &model);
+        assert_eq!(app.handle_key(ch('q'), &model), Action::Quit);
+    }
+
+    #[test]
+    fn esc_closes_the_overlay_before_help_then_raw_then_back() {
+        let model = model();
+        let mut app = app();
+        app.handle_key(ch('3'), &model);
+        app.handle_key(ch('r'), &model);
+        app.handle_key(ch('?'), &model);
+        // The director can open help over the overlay; Esc closes the
+        // overlay first.
+        app.handle_key(ch('?'), &model);
+        app.handle_key(ch('e'), &model);
+        app.apply_director(UiCommand::Help(true), &model);
+        assert!(app.explain.is_some() && app.help && app.raw && app.view == View::Node);
+        assert_eq!(app.handle_key(key(KeyCode::Esc), &model), Action::Redraw);
+        assert!(app.explain.is_none() && app.help && app.raw);
+        app.handle_key(key(KeyCode::Esc), &model);
+        assert!(!app.help && app.raw && app.view == View::Node);
+        app.handle_key(key(KeyCode::Esc), &model);
+        assert!(!app.raw && app.view == View::Node);
+        app.handle_key(key(KeyCode::Esc), &model);
+        assert_eq!(app.view, View::Overview);
+    }
+
+    #[test]
+    fn backspace_and_ctrl_u_edit_the_key_and_the_text_is_capped() {
+        let model = model();
+        let mut app = app();
+        app.handle_key(ch('e'), &model);
+        type_into(&mut app, &model, "k17");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Backspace), &model),
+            Action::Redraw
+        );
+        assert_eq!(typed(&app), "k1");
+        assert_eq!(app.handle_key(control_key('u'), &model), Action::Redraw);
+        assert_eq!(typed(&app), "");
+        // Backspace on nothing is a redraw, not a panic.
+        assert_eq!(
+            app.handle_key(key(KeyCode::Backspace), &model),
+            Action::Redraw
+        );
+        assert_eq!(typed(&app), "");
+        // Any character types, a multibyte one included; the cap counts
+        // characters.
+        type_into(&mut app, &model, "é k");
+        assert_eq!(typed(&app), "é k");
+        app.handle_key(control_key('u'), &model);
+        type_into(&mut app, &model, &"é".repeat(key::MAX_CHARS + 20));
+        assert_eq!(typed(&app).chars().count(), key::MAX_CHARS);
+        app.handle_key(key(KeyCode::Backspace), &model);
+        assert_eq!(typed(&app).chars().count(), key::MAX_CHARS - 1);
+    }
+
+    #[test]
+    fn the_last_key_is_kept() {
+        let model = model();
+        let mut app = demo_app();
+        app.handle_key(ch('e'), &model);
+        assert_eq!(typed(&app), "k1");
+        type_into(&mut app, &model, "2");
+        app.handle_key(key(KeyCode::Esc), &model);
+        assert!(app.explain.is_none());
+        app.handle_key(ch('e'), &model);
+        assert_eq!(typed(&app), "k12", "the text is kept, not the seed again");
+        // An emptied key stays empty.
+        app.handle_key(control_key('u'), &model);
+        app.handle_key(key(KeyCode::Esc), &model);
+        app.handle_key(ch('e'), &model);
+        assert_eq!(typed(&app), "");
+    }
+
+    #[test]
+    fn enter_without_control_ports_asks_nobody_and_says_so() {
+        let model = model();
+        let mut app = app();
+        app.handle_key(ch('e'), &model);
+        type_into(&mut app, &model, "k1");
+        assert_eq!(app.handle_key(key(KeyCode::Enter), &model), Action::Redraw);
+        let state = app.explain.as_ref().unwrap();
+        assert_eq!(state.pending, None);
+        let note = state.note.as_deref().expect("the note says why");
+        assert!(
+            note.starts_with("nobody is asked:") && note.contains("control ports"),
+            "{note}"
+        );
+        // Editing the key retires the note.
+        type_into(&mut app, &model, "7");
+        assert_eq!(app.explain.as_ref().unwrap().note, None);
+    }
+
+    #[test]
+    fn enter_sends_an_explain_request_with_the_live_targets_and_records_the_pending_id() {
+        let model = model();
+        let mut app = explaining_app();
+        app.handle_key(ch('e'), &model);
+        type_into(&mut app, &model, "k1");
+        let first = request_of(app.handle_key(key(KeyCode::Enter), &model));
+        assert_eq!(first.id, 1);
+        assert_eq!(first.key, "k1");
+        // The five live nodes, in slot order, at their control ports: the
+        // departing, down and left members are not asked.
+        let asked: Vec<(String, String)> = first
+            .targets
+            .iter()
+            .map(|target| (target.label.to_string(), target.addr.to_string()))
+            .collect();
+        let expected: Vec<(String, String)> = (1..=5)
+            .map(|n| (format!("n{n}"), format!("127.0.0.{}:8080", 10 + n)))
+            .collect();
+        assert_eq!(asked, expected);
+        let state = app.explain.as_ref().unwrap();
+        assert_eq!(state.pending, Some(1));
+        assert_eq!(state.note.as_deref(), Some("asking n1 n2 n3 n4 n5"));
+        assert_eq!(state.result, None);
+        // A second Enter replaces the pending request.
+        let second = request_of(app.handle_key(key(KeyCode::Enter), &model));
+        assert_eq!(second.id, 2);
+        assert_eq!(app.explain.as_ref().unwrap().pending, Some(2));
+        // `str:` sends the text after the prefix.
+        app.handle_key(control_key('u'), &model);
+        type_into(&mut app, &model, "str:uint:1");
+        let escaped = request_of(app.handle_key(key(KeyCode::Enter), &model));
+        assert_eq!((escaped.id, escaped.key.as_str()), (3, "uint:1"));
+    }
+
+    #[test]
+    fn a_key_of_another_kind_is_computed_but_never_asked() {
+        let model = model();
+        for text in ["uint:5", "int:-5", "hex:6b", "a b", ""] {
+            let mut app = explaining_app();
+            app.handle_key(ch('e'), &model);
+            type_into(&mut app, &model, text);
+            assert_eq!(
+                app.handle_key(key(KeyCode::Enter), &model),
+                Action::Redraw,
+                "{text:?}"
+            );
+            let state = app.explain.as_ref().unwrap();
+            assert_eq!(state.pending, None, "{text:?}");
+            let note = state.note.as_deref().expect("a note says why");
+            assert!(note.starts_with("nobody is asked: "), "{note}");
+            let why = key::not_askable(&KeySpec::parse(text).unwrap()).unwrap();
+            assert!(note.ends_with(why), "{note}");
+        }
+    }
+
+    #[test]
+    fn enter_with_no_live_node_keeps_the_overlay_and_says_so() {
+        let mut app = explaining_app();
+        app.handle_key(ch('e'), &Model::new());
+        type_into(&mut app, &Model::new(), "k1");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter), &Model::new()),
+            Action::Redraw
+        );
+        let state = app.explain.as_ref().expect("the overlay stays open");
+        assert_eq!(state.pending, None);
+        assert_eq!(
+            state.note.as_deref(),
+            Some("nobody is asked: no live node has a control port to ask")
+        );
+        // A template that gives no node an address is the same.
+        let model = model();
+        let mut app = App::new(AppConfig {
+            control: Some(UrlTemplate::parse("{ip}:{gossip_port+65500}").unwrap()),
+            ..AppConfig::default()
+        });
+        app.handle_key(ch('e'), &model);
+        type_into(&mut app, &model, "k1");
+        app.handle_key(key(KeyCode::Enter), &model);
+        assert!(
+            app.explain
+                .as_ref()
+                .unwrap()
+                .note
+                .as_deref()
+                .unwrap()
+                .contains("no live node")
+        );
+    }
+
+    #[test]
+    fn the_note_names_the_nodes_asked_and_the_nodes_left_out() {
+        let target = |label: &str| Target {
+            label: label.into(),
+            addr: "127.0.0.1:8080".parse().unwrap(),
+        };
+        let mut targets = data::ControlTargets {
+            asked: vec![target("n1"), target("n2")],
+            skipped: Vec::new(),
+        };
+        assert_eq!(asking_note(&targets), "asking n1 n2");
+        targets.skipped = vec![("n3".into(), "why".into()), ("n4".into(), "why".into())];
+        assert_eq!(asking_note(&targets), "asking n1 n2 · not asked: n3 n4");
+    }
+
+    #[test]
+    fn a_reply_for_the_pending_id_lands() {
+        let model = model();
+        let mut app = explaining_app();
+        app.handle_key(ch('e'), &model);
+        type_into(&mut app, &model, "k1");
+        let request = request_of(app.handle_key(key(KeyCode::Enter), &model));
+        app.apply_director(
+            UiCommand::Explained(Box::new(answers(request.id, "k1"))),
+            &model,
+        );
+        let state = app.explain.as_ref().unwrap();
+        assert_eq!(state.pending, None);
+        assert_eq!(state.note, None);
+        assert_eq!(state.result.as_deref(), Some(&answers(request.id, "k1")));
+        // The same reply twice lands once: nothing is pending any more.
+        app.apply_director(
+            UiCommand::Explained(Box::new(answers(request.id, "other"))),
+            &model,
+        );
+        assert_eq!(
+            app.explain.as_ref().unwrap().result.as_deref(),
+            Some(&answers(request.id, "k1"))
+        );
+    }
+
+    #[test]
+    fn a_late_reply_after_esc_is_dropped() {
+        let model = model();
+        let mut app = explaining_app();
+        app.handle_key(ch('e'), &model);
+        type_into(&mut app, &model, "k1");
+        let request = request_of(app.handle_key(key(KeyCode::Enter), &model));
+        app.handle_key(key(KeyCode::Esc), &model);
+        app.apply_director(
+            UiCommand::Explained(Box::new(answers(request.id, "k1"))),
+            &model,
+        );
+        assert!(app.explain.is_none());
+        // Reopened, the overlay waits for nothing: the old reply is not
+        // adopted, and a reply to a request replaced by a newer one is
+        // dropped too.
+        app.handle_key(ch('e'), &model);
+        app.apply_director(
+            UiCommand::Explained(Box::new(answers(request.id, "k1"))),
+            &model,
+        );
+        assert_eq!(app.explain.as_ref().unwrap().result, None);
+        let old = request_of(app.handle_key(key(KeyCode::Enter), &model));
+        let new = request_of(app.handle_key(key(KeyCode::Enter), &model));
+        assert_ne!(old.id, new.id);
+        app.apply_director(
+            UiCommand::Explained(Box::new(answers(old.id, "k1"))),
+            &model,
+        );
+        assert_eq!(app.explain.as_ref().unwrap().result, None);
+        assert_eq!(app.explain.as_ref().unwrap().pending, Some(new.id));
+    }
+
+    #[test]
+    fn accepts_decides_by_id() {
+        let state = |pending| ExplainState {
+            text: "k1".to_owned(),
+            note: None,
+            pending,
+            result: None,
+        };
+        assert!(accepts(&Some(state(Some(4))), &answers(4, "k1")));
+        assert!(!accepts(&Some(state(Some(4))), &answers(5, "k1")));
+        assert!(!accepts(&Some(state(None)), &answers(4, "k1")));
+        assert!(!accepts(&None, &answers(4, "k1")));
+    }
+
+    #[test]
+    fn a_result_shows_only_for_the_key_it_answered() {
+        let state = |text: &str, key: &str| ExplainState {
+            text: text.to_owned(),
+            note: None,
+            pending: None,
+            result: Some(Box::new(answers(1, key))),
+        };
+        assert!(result_for(&state("k1", "k1")).is_some());
+        assert!(result_for(&state("k12", "k1")).is_none());
+        assert!(result_for(&state("", "k1")).is_none());
+        // The text after `str:` is the key that was sent.
+        assert!(result_for(&state("str:uint:1", "uint:1")).is_some());
+        assert!(result_for(&state("uint:1", "uint:1")).is_none());
+        // A text that is no key shows nothing.
+        assert!(result_for(&state("hex:zz", "hex:zz")).is_none());
+        assert!(
+            result_for(&ExplainState {
+                result: None,
+                ..state("k1", "k1")
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn asked_key_is_the_text_a_test_node_is_sent() {
+        assert_eq!(asked_key("k1").as_deref(), Some("k1"));
+        assert_eq!(asked_key("str:uint:1").as_deref(), Some("uint:1"));
+        for text in ["", "a b", "uint:5", "hex:6b", "hex:zz", "é"] {
+            assert_eq!(asked_key(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn arrows_move_the_selected_node_in_every_view() {
+        let model = model();
+        for view in View::ALL {
+            let mut app = app();
+            app.go(view);
+            app.handle_key(ch('e'), &model);
+            let before = app.view;
+            assert_eq!(selected_label(&app, &model), "n1");
+            assert_eq!(app.handle_key(key(KeyCode::Down), &model), Action::Redraw);
+            assert_eq!(app.handle_key(key(KeyCode::Down), &model), Action::Redraw);
+            assert_eq!(selected_label(&app, &model), "n3", "{view:?}");
+            assert_eq!(app.handle_key(key(KeyCode::Up), &model), Action::Redraw);
+            assert_eq!(selected_label(&app, &model), "n2", "{view:?}");
+            assert_eq!(app.view, before, "the arrows do not leave the view");
+            assert_eq!(app.selected_cache(&model), model_first_cache(&model));
+            assert_eq!(typed(&app), "", "the arrows do not type");
+        }
+    }
+
+    fn model_first_cache(model: &Model) -> Option<SmolStr> {
+        data::cache_rows(model).first().map(|row| row.name.clone())
     }
 
     #[test]
