@@ -100,7 +100,9 @@ where
         self
     }
 
-    /// Bounds local entry count. Default: unbounded.
+    /// Bounds local entry count. Default: unbounded. A write that takes
+    /// the cache past it evicts the least recently used of a sample of the
+    /// other entries, and its own entry only when nothing else is left.
     pub fn max_capacity(mut self, max_capacity: u64) -> Self {
         self.max_capacity = max_capacity;
         self
@@ -2313,6 +2315,70 @@ mod tests {
         socket
             .local_addr()
             .expect("a freshly bound udp socket reports a local address")
+    }
+
+    /// Through `Cache`: on a capped cache with more stripes than entries,
+    /// every write past the cap reads back at once and the cap holds.
+    #[tokio::test]
+    async fn every_write_past_max_capacity_reads_back_through_the_cache() {
+        let cluster = Cluster::builder("cache-it-write-past-cap")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node builds");
+        let cache = cluster
+            .cache::<u32, String>("capped")
+            .mode(Mode::Local)
+            .max_capacity(50)
+            .open()
+            .await
+            .expect("opens");
+        for k in 0..200u32 {
+            cache.insert(k, k.to_string()).await.expect("insert");
+            assert_eq!(cache.get(&k).await, Some(k.to_string()), "key {k}");
+        }
+        assert_eq!(cache.entry_count().await, 50);
+        cluster.shutdown().await;
+    }
+
+    /// Through `Cache`: a value heavier than the whole cap goes, and an
+    /// older entry in another stripe stays.
+    #[tokio::test]
+    async fn a_value_heavier_than_max_capacity_leaves_the_older_entry() {
+        let cluster = Cluster::builder("cache-it-heavier-than-cap")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node builds");
+        let cache = cluster
+            .cache::<u32, String>("heavy")
+            .mode(Mode::Local)
+            .max_capacity(5)
+            .weigher(|_k: &u32, v: &String| u32::try_from(v.len()).unwrap_or(u32::MAX))
+            .open()
+            .await
+            .expect("opens");
+        let stripe = |k: u32| {
+            crate::store::hash_key_bytes(&postcard::to_stdvec(&k).expect("key encodes"))
+                % crate::store::BUCKET_COUNT as u64
+        };
+        let heavy = (2..100_000u32)
+            .find(|&k| stripe(k) != stripe(1))
+            .expect("another stripe");
+        cache.insert(1, "x".to_string()).await.expect("insert");
+
+        cache.insert(heavy, "x".repeat(10)).await.expect("insert");
+
+        assert_eq!(cache.get(&heavy).await, None, "the heavy value goes");
+        assert_eq!(
+            cache.get(&1).await.as_deref(),
+            Some("x"),
+            "the older entry stays"
+        );
+        assert_eq!(cache.entry_count().await, 1);
+        cluster.shutdown().await;
     }
 
     #[test]

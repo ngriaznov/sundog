@@ -12,7 +12,8 @@
 //! visits only stripes with an entry due. Capacity eviction is sampled LRU:
 //! [`Engine::enforce_capacity`] locks one stripe at a time and evicts the
 //! coldest of a sampled batch under that one lock hold, until total weight
-//! fits under `max_capacity`. [`Engine::live_entry_count`] is a counter
+//! fits under `max_capacity`. The entries the triggering write just stored
+//! go last, only once nothing else is left to evict. [`Engine::live_entry_count`] is a counter
 //! every insert and remove path maintains.
 //!
 //! [`super::Shard::get_or_load`] collapses concurrent misses through a
@@ -29,7 +30,7 @@
 //! Under `feature = "spill"`, a live entry can move to disk instead of
 //! being evicted; see [`super::spill::SpillTier`] for that mechanism.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -553,6 +554,45 @@ fn is_resident<K, V>(live: &Live<K, V>) -> bool {
 /// second time while pending. Pure; unit tested directly.
 fn is_spill_candidate<K, V>(live: &Live<K, V>) -> bool {
     is_resident(live) && live.weight > 0
+}
+
+/// The keys the writes in progress just stored, by hash. The eviction a
+/// write triggers samples every other entry first and takes these only
+/// once nothing else is left to evict, so a write never makes room by
+/// evicting itself while an older entry remains. An entry heavier than the
+/// whole cap never fits, so it is sampled like any other. A caller
+/// applying one batch across several stripes keeps one `Written` for the
+/// whole batch; the eviction clears it once a scan finds nothing but these
+/// entries, so later passes for the same batch skip that scan.
+#[derive(Debug, Default)]
+pub(crate) struct Written(HashSet<u64>);
+
+impl Written {
+    /// `hash` alone.
+    pub(crate) fn of(hash: u64) -> Self {
+        let mut written = Self::default();
+        written.insert(hash);
+        written
+    }
+
+    /// Adds `hash`.
+    pub(crate) fn insert(&mut self, hash: u64) {
+        self.0.insert(hash);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Drops every hash, leaving the writes' entries to ordinary sampling.
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// Whether `live` is one of the entries these writes stored.
+    fn holds<K, V>(&self, live: &Live<K, V>) -> bool {
+        !self.0.is_empty() && self.0.contains(&hash_key_bytes(record_key(&live.record)))
+    }
 }
 
 /// Whether `live`'s record is currently spilled: the mirror of
@@ -3871,11 +3911,14 @@ where
 
     /// The sampling window [`Engine::evict_one_sampled`] and [`Engine::evict_batch_sampled`] both draw from.
     /// Walks `stripe.live` in arena order, so a tie on [`idle_elapsed_ms`]
-    /// resolves to whichever comes last: an undocumented tie-break.
+    /// resolves to whichever comes last: an undocumented tie-break. The
+    /// entries `written` holds are never in the window, except one heavier
+    /// than the whole cap, which never fits.
     fn sample_candidates<'s>(
         &self,
         stripe: &'s Stripe<K, V>,
         sample_size: usize,
+        written: &'s Written,
     ) -> impl Iterator<Item = &'s Live<K, V>> {
         let offset = self.sample_offset(stripe.live.len());
         stripe
@@ -3883,6 +3926,7 @@ where
             .iter()
             .skip(offset)
             .chain(stripe.live.iter().take(offset))
+            .filter(|live| u64::from(live.weight) > self.max_capacity || !written.holds(live))
             .take(sample_size)
             .filter(|live| is_spill_candidate(live))
     }
@@ -3903,21 +3947,23 @@ where
         )
     )]
     fn evict_one_sampled(&self, bucket: usize, now_ms: u64) -> EvictOutcome {
-        self.evict_one_sampled_with_reservation(bucket, None, now_ms)
+        self.evict_one_sampled_with_reservation(bucket, None, &Written::default(), now_ms)
     }
 
     /// [`Engine::evict_one_sampled`], threading `reservation` through to
-    /// [`Engine::evict_victim_locked`].
+    /// [`Engine::evict_victim_locked`] and passing over the entries
+    /// `written` holds.
     fn evict_one_sampled_with_reservation(
         &self,
         bucket: usize,
         reservation: Option<&mut Reservation<'_>>,
+        written: &Written,
         now_ms: u64,
     ) -> EvictOutcome {
         self.note_eviction_lock_acquisition();
         let mut stripe = self.stripes[bucket].write();
         let Some(victim_bytes) = self
-            .sample_candidates(&stripe, EVICTION_SAMPLE)
+            .sample_candidates(&stripe, EVICTION_SAMPLE, written)
             .max_by_key(|live| idle_elapsed_ms(now_ms, live.last_access_ms.load(Ordering::Relaxed)))
             .map(|live| record_key_bytes(&live.record))
         else {
@@ -3977,7 +4023,7 @@ where
         )
     )]
     fn evict_one_scanning(&self, bucket: usize, now_ms: u64) -> Option<EvictOutcome> {
-        self.evict_one_scanning_with_reservation(bucket, None, now_ms)
+        self.evict_one_scanning_with_reservation(bucket, None, &Written::default(), now_ms)
     }
 
     /// [`Engine::evict_one_scanning`], reborrowing `reservation` into each
@@ -3986,11 +4032,14 @@ where
     /// reports [`EvictOutcome::deficit`]: one reservation covers every
     /// stripe, so a deficit in one is a deficit in all. Stops early too,
     /// `Some` with no progress, at a victim refused while a hand-off is in
-    /// flight, the case [`defer_to_flusher`] leaves to the flusher.
+    /// flight, the case [`defer_to_flusher`] leaves to the flusher. Passes
+    /// over the entries `written` holds, so `None` means every stripe holds
+    /// nothing else to evict.
     fn evict_one_scanning_with_reservation(
         &self,
         bucket: usize,
         mut reservation: Option<&mut Reservation<'_>>,
+        written: &Written,
         now_ms: u64,
     ) -> Option<EvictOutcome> {
         (0..BUCKET_COUNT)
@@ -3999,6 +4048,7 @@ where
                 let outcome = self.evict_one_sampled_with_reservation(
                     candidate,
                     reservation.as_deref_mut(),
+                    written,
                     now_ms,
                 );
                 let refused_while_busy = outcome.refused && self.pending_spill_weight_or_zero() > 0;
@@ -4023,7 +4073,13 @@ where
         )
     )]
     fn evict_batch_sampled(&self, bucket: usize, over_by: u64, now_ms: u64) -> EvictOutcome {
-        self.evict_batch_sampled_with_reservation(bucket, over_by, None, now_ms)
+        self.evict_batch_sampled_with_reservation(
+            bucket,
+            over_by,
+            None,
+            &Written::default(),
+            now_ms,
+        )
     }
 
     /// [`Engine::evict_batch_sampled`], reborrowing `reservation` into each
@@ -4036,12 +4092,13 @@ where
         bucket: usize,
         over_by: u64,
         mut reservation: Option<&mut Reservation<'_>>,
+        written: &Written,
         now_ms: u64,
     ) -> EvictOutcome {
         self.note_eviction_lock_acquisition();
         let mut stripe = self.stripes[bucket].write();
         let mut sampled: Vec<(Bytes, u64, u32)> = self
-            .sample_candidates(&stripe, EVICTION_BATCH_SAMPLE)
+            .sample_candidates(&stripe, EVICTION_BATCH_SAMPLE, written)
             .map(|live| {
                 (
                     record_key_bytes(&live.record),
@@ -4156,11 +4213,15 @@ where
     /// across stripes, if the tier refused the pass's victim, most often
     /// for a full flush queue, or `total_weight` alone is within the cap.
     /// Otherwise the scan runs, spill tier configured or not, and stops
-    /// early at a victim refused while a hand-off is in flight. A thin
-    /// wrapper, `reservation: None`, over
+    /// early at a victim refused while a hand-off is in flight.
+    ///
+    /// The entries `written` holds, the ones the triggering write just
+    /// stored, are passed over until nothing else is left to evict, and
+    /// evicted only then, so the cap holds even for a write heavier than
+    /// the whole cap. A thin wrapper, `reservation: None`, over
     /// [`Engine::enforce_capacity_with_reservation`].
-    pub(crate) fn enforce_capacity(&self, start_bucket: usize, now_ms: u64) {
-        let _ = self.enforce_capacity_with_reservation(start_bucket, None, now_ms);
+    pub(crate) fn enforce_capacity(&self, start_bucket: usize, written: &mut Written, now_ms: u64) {
+        let _ = self.enforce_capacity_with_reservation(start_bucket, None, written, now_ms);
     }
 
     /// [`Engine::enforce_capacity`], reborrowing `reservation` into every
@@ -4181,21 +4242,31 @@ where
         &self,
         start_bucket: usize,
         reservation: Option<&mut Reservation<'_>>,
+        written: &mut Written,
         now_ms: u64,
     ) -> u64 {
-        self.evict_down_to(self.max_capacity, start_bucket, reservation, now_ms)
+        self.evict_down_to(
+            self.max_capacity,
+            start_bucket,
+            reservation,
+            written,
+            now_ms,
+        )
     }
 
     /// [`Engine::enforce_capacity_with_reservation`]'s loop, evicting until
     /// `total_weight` plus `pending_spill_weight` is within `limit`, at
     /// most `max_capacity`. [`Engine::promote_locked`] passes the cap less
     /// the weight it is about to reinstall, to make that room first. A
-    /// no-op when `max_capacity` is [`u64::MAX`].
+    /// no-op when `max_capacity` is [`u64::MAX`]. Passes over the entries
+    /// `written` holds until a scan finds nothing else to evict, then
+    /// clears `written`.
     fn evict_down_to(
         &self,
         limit: u64,
         start_bucket: usize,
         mut reservation: Option<&mut Reservation<'_>>,
+        written: &mut Written,
         now_ms: u64,
     ) -> u64 {
         if self.max_capacity == u64::MAX {
@@ -4214,6 +4285,7 @@ where
                 bucket,
                 over_by,
                 reservation.as_deref_mut(),
+                written,
                 now_ms,
             );
             if batch_outcome.deficit > 0 {
@@ -4234,8 +4306,12 @@ where
                 match self.evict_one_scanning_with_reservation(
                     bucket,
                     reservation.as_deref_mut(),
+                    written,
                     now_ms,
                 ) {
+                    // Only the writes' own entries are left: they go too,
+                    // so the cap holds.
+                    None if !written.is_empty() => written.clear(),
                     None => return 0,
                     Some(outcome) if outcome.deficit > 0 => return outcome.deficit,
                     // The scan stopped at a victim refused while a hand-off
@@ -4303,6 +4379,7 @@ where
             tombstone_max_ttl_ms,
             now_ms,
             None,
+            &mut Written::default(),
         )
         .0
     }
@@ -4312,6 +4389,9 @@ where
     /// anything, spending the pre-lock budget one caller reserved before
     /// its first stripe lock. The tuple's second element is that method's
     /// own deficit, `0` when nothing was written or every victim resolved.
+    /// Each value the batch stores joins `written`, which that eviction
+    /// passes over until nothing else is left; a caller applying one batch
+    /// across several stripes passes the same `written` to every call.
     #[allow(
         clippy::too_many_arguments,
         reason = "one caller per bucket, from an already-grouped batch; splitting these into a struct would not make either call site clearer"
@@ -4325,7 +4405,9 @@ where
         tombstone_max_ttl_ms: u64,
         now_ms: u64,
         reservation: Option<&mut Reservation<'_>>,
+        written: &mut Written,
     ) -> (Vec<ApplyOutcome<K, V>>, u64) {
+        let capped = self.max_capacity != u64::MAX;
         let prefold = resolver.merges() && self.prefold_enabled.load(Ordering::Relaxed);
         #[cfg(feature = "spill")]
         let prefetched_spilled = prefetch_spilled_conflict_bytes(
@@ -4392,12 +4474,17 @@ where
                     incoming,
                 );
                 self.note_spill_departure(displaced_spilled);
-                wrote |= matches!(outcome, ApplyOutcome::Put { .. });
+                if matches!(outcome, ApplyOutcome::Put { .. }) {
+                    wrote = true;
+                    if capped {
+                        written.insert(hash);
+                    }
+                }
                 outcomes.push(outcome);
             }
         }
         let deficit = if wrote {
-            self.enforce_capacity_with_reservation(bucket, reservation, now_ms)
+            self.enforce_capacity_with_reservation(bucket, reservation, written, now_ms)
         } else {
             0
         };
@@ -4467,7 +4554,7 @@ where
             outcome
         };
         if matches!(outcome, ApplyOutcome::Put { .. }) {
-            self.enforce_capacity(bucket, now_ms);
+            self.enforce_capacity(bucket, &mut Written::of(hash), now_ms);
         }
         Some(outcome)
     }
@@ -4864,7 +4951,7 @@ where
             FillOutcome::Installed { had_live }
         };
         inflight.finish();
-        self.enforce_capacity(bucket, now_ms);
+        self.enforce_capacity(bucket, &mut Written::of(hash), now_ms);
         outcome
     }
 
@@ -5034,6 +5121,7 @@ where
             self.max_capacity.saturating_sub(u64::from(weight)),
             bucket,
             None,
+            &mut Written::default(),
             now_ms,
         );
         if !self.claim_weight(weight) {
@@ -6877,7 +6965,7 @@ mod tests {
         assert_eq!(entries_before, 5);
         assert_eq!(weight_before, 25);
 
-        engine.enforce_capacity(target_bucket, 500);
+        engine.enforce_capacity(target_bucket, &mut Written::default(), 500);
 
         let (entries_after, weight_after) = engine.debug_totals();
         assert!(
@@ -7161,6 +7249,289 @@ mod tests {
         );
     }
 
+    /// `n` keys, each in a stripe of its own, none in `taken`; their
+    /// stripes join `taken`.
+    fn keys_in_distinct_stripes(n: usize, taken: &mut HashSet<usize>) -> Vec<u32> {
+        let mut keys = Vec::new();
+        let mut candidate = 0u32;
+        while keys.len() < n {
+            let bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(candidate).as_ref()));
+            if taken.insert(bucket) {
+                keys.push(candidate);
+            }
+            candidate += 1;
+        }
+        keys
+    }
+
+    /// An engine at its cap of `cap` unit-weight entries, stored the way
+    /// [`put`] stores, which never enforces the cap: `cap` keys, each in a
+    /// stripe of its own, written at times `0..cap`.
+    fn full_engine(cap: u64, taken: &mut HashSet<usize>) -> (Engine<u32, String>, Vec<u32>) {
+        let weigher: Weigher<u32, String> = Box::new(|_k, _v| 1);
+        let engine = Engine::<u32, String>::new(cap, None, Some(weigher), None);
+        let keys = keys_in_distinct_stripes(usize::try_from(cap).expect("small"), taken);
+        for (i, &k) in keys.iter().enumerate() {
+            let now = u64::try_from(i).expect("small");
+            let _ = put(
+                &engine,
+                k,
+                key_bytes(k),
+                k.to_string(),
+                hlc(now + 1, 1),
+                None,
+                now,
+            );
+        }
+        (engine, keys)
+    }
+
+    #[test]
+    fn a_write_never_evicts_its_own_entry_while_another_is_left() {
+        let mut taken = HashSet::new();
+        let (engine, older) = full_engine(3, &mut taken);
+        // A key alone in its stripe: the eviction this write triggers
+        // starts there, with nothing in the stripe but the write itself.
+        let fresh = keys_in_distinct_stripes(1, &mut taken)[0];
+        let bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(fresh).as_ref()));
+
+        let _ = engine.apply_many(
+            bucket,
+            vec![put_entry(fresh, "fresh", hlc(100, 1), None)],
+            &LwwResolver,
+            60_000,
+            600_000,
+            100,
+        );
+
+        assert_eq!(engine.debug_totals(), (3, 3), "back within the cap");
+        assert_eq!(
+            engine.get(&fresh, 100),
+            Some("fresh".to_string()),
+            "the write keeps its own entry"
+        );
+        let evicted = older
+            .iter()
+            .filter(|&&k| engine.get(&k, 100).is_none())
+            .count();
+        assert_eq!(evicted, 1, "an older entry made the room");
+    }
+
+    #[test]
+    fn a_batch_evicts_its_own_entries_last_and_still_fits_the_cap() {
+        let mut taken = HashSet::new();
+        let (engine, older) = full_engine(3, &mut taken);
+        // Four keys of one stripe no older key is in: one batch.
+        let bucket = (0..BUCKET_COUNT)
+            .find(|b| !taken.contains(b))
+            .expect("a free stripe");
+        let batch: Vec<u32> = (1_000u32..)
+            .filter(|&k| stripe_index_from_hash(hash_key_bytes(key_bytes(k).as_ref())) == bucket)
+            .take(4)
+            .collect();
+
+        let _ = engine.apply_many(
+            bucket,
+            batch
+                .iter()
+                .map(|&k| put_entry(k, "new", hlc(100, 1), None))
+                .collect(),
+            &LwwResolver,
+            60_000,
+            600_000,
+            100,
+        );
+
+        assert_eq!(engine.debug_totals(), (3, 3), "the cap holds");
+        assert!(
+            older.iter().all(|&k| engine.get(&k, 100).is_none()),
+            "every older entry goes before any of the batch's own"
+        );
+        let kept = batch
+            .iter()
+            .filter(|&&k| engine.get(&k, 100).is_some())
+            .count();
+        assert_eq!(kept, 3, "the batch's own entries fill the cap");
+    }
+
+    /// A write heavier than the whole cap never fits, so its eviction
+    /// samples it like any other entry: alone in its stripe, where the
+    /// eviction starts, it goes first and the older entry stays.
+    #[test]
+    fn a_write_heavier_than_the_whole_cap_goes_and_the_older_entry_stays() {
+        let weigher: Weigher<u32, String> =
+            Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
+        let engine = Engine::<u32, String>::new(5, None, Some(weigher), None);
+        let mut taken = HashSet::new();
+        let [small, heavy] = keys_in_distinct_stripes(2, &mut taken)[..] else {
+            panic!("two keys");
+        };
+        let _ = put(
+            &engine,
+            small,
+            key_bytes(small),
+            "x".to_string(),
+            hlc(1, 1),
+            None,
+            0,
+        );
+        let bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(heavy).as_ref()));
+
+        let _ = engine.apply_many(
+            bucket,
+            vec![put_entry(heavy, &"x".repeat(10), hlc(100, 1), None)],
+            &LwwResolver,
+            60_000,
+            600_000,
+            100,
+        );
+
+        assert_eq!(engine.debug_totals(), (1, 1), "the cap holds");
+        assert_eq!(engine.get(&heavy, 100), None, "the heavy write goes");
+        assert_eq!(
+            engine.get(&small, 100),
+            Some("x".to_string()),
+            "the older entry stays"
+        );
+    }
+
+    /// A scan that finds nothing but the batch's own entries clears
+    /// `written`, so the batch's next stripe group evicts one of them at
+    /// once rather than scan every stripe again.
+    #[test]
+    fn a_scan_finding_only_written_entries_clears_them_for_the_next_group() {
+        let weigher: Weigher<u32, String> = Box::new(|_k, _v| 1);
+        let engine = Engine::<u32, String>::new(2, None, Some(weigher), None);
+        let mut taken = HashSet::new();
+        let late = keys_in_distinct_stripes(1, &mut taken)[0];
+        let late_bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(late).as_ref()));
+        // The stripe a scan from `late`'s visits next.
+        let early_bucket = (late_bucket + 1) % BUCKET_COUNT;
+        let early: Vec<u32> = (1_000u32..)
+            .filter(|&k| {
+                stripe_index_from_hash(hash_key_bytes(key_bytes(k).as_ref())) == early_bucket
+            })
+            .take(3)
+            .collect();
+        let mut written = Written::default();
+
+        let _ = engine.apply_many_with_reservation(
+            early_bucket,
+            early
+                .iter()
+                .map(|&k| put_entry(k, "early", hlc(100, 1), None))
+                .collect(),
+            &LwwResolver,
+            60_000,
+            600_000,
+            100,
+            None,
+            &mut written,
+        );
+        assert_eq!(engine.debug_totals(), (2, 2), "the cap holds");
+        assert!(
+            written.is_empty(),
+            "the scan found nothing but the batch's own entries"
+        );
+
+        let before = engine.debug_eviction_lock_acquisitions();
+        let _ = engine.apply_many_with_reservation(
+            late_bucket,
+            vec![put_entry(late, "late", hlc(101, 1), None)],
+            &LwwResolver,
+            60_000,
+            600_000,
+            101,
+            None,
+            &mut written,
+        );
+
+        assert_eq!(engine.debug_totals(), (2, 2), "the cap holds");
+        assert_eq!(engine.get(&late, 101), Some("late".to_string()));
+        assert_eq!(
+            engine.debug_eviction_lock_acquisitions() - before,
+            3,
+            "a sample of `late`'s stripe, then a scan of it and the next"
+        );
+    }
+
+    #[test]
+    fn a_rearm_keeps_its_own_entry_when_it_enforces_the_cap() {
+        let mut taken = HashSet::new();
+        let (engine, older) = full_engine(3, &mut taken);
+        // Over the cap by one more stored the way `put` stores: the rearm
+        // is the first write to enforce the cap.
+        let rearmed = keys_in_distinct_stripes(1, &mut taken)[0];
+        let _ = put(
+            &engine,
+            rearmed,
+            key_bytes(rearmed),
+            "kept".to_string(),
+            hlc(50, 1),
+            None,
+            50,
+        );
+        assert_eq!(engine.debug_totals(), (4, 4));
+
+        let outcome = engine.apply_if_current(
+            put_entry(rearmed, "kept", hlc(60, 1), Some(60_000)),
+            hlc(50, 1),
+            &LwwResolver,
+            60_000,
+            600_000,
+            60,
+        );
+
+        assert!(matches!(outcome, Some(ApplyOutcome::Put { .. })));
+        assert_eq!(engine.debug_totals(), (3, 3), "back within the cap");
+        assert_eq!(engine.get(&rearmed, 60), Some("kept".to_string()));
+        let evicted = older
+            .iter()
+            .filter(|&&k| engine.get(&k, 60).is_none())
+            .count();
+        assert_eq!(evicted, 1, "an older entry made the room");
+    }
+
+    #[test]
+    fn the_sample_and_the_scan_pass_over_the_written_entries() {
+        let (first, second, bucket) = same_bucket_pair(100_000);
+        let engine = engine_u32_string(u64::MAX, None);
+        for k in [first, second] {
+            let _ = put(&engine, k, key_bytes(k), k.to_string(), hlc(1, 1), None, 0);
+        }
+        let hash_of = |k: u32| hash_key_bytes(key_bytes(k).as_ref());
+        let sampled = |written: &Written| -> Vec<Bytes> {
+            let stripe = engine.stripe_lock(bucket).read();
+            engine
+                .sample_candidates(&stripe, EVICTION_BATCH_SAMPLE, written)
+                .map(|live| record_key_bytes(&live.record))
+                .collect()
+        };
+        assert_eq!(sampled(&Written::default()).len(), 2);
+        assert_eq!(
+            sampled(&Written::of(hash_of(first))),
+            vec![key_bytes(second)],
+            "the written entry is not in the window"
+        );
+        let mut both = Written::of(hash_of(first));
+        both.insert(hash_of(second));
+        assert_eq!(sampled(&both), Vec::<Bytes>::new());
+
+        assert!(
+            engine
+                .evict_one_scanning_with_reservation(bucket, None, &both, 0)
+                .is_none(),
+            "a scan finds nothing but written entries to evict"
+        );
+        assert!(
+            engine
+                .evict_one_scanning_with_reservation(bucket, None, &Written::of(hash_of(first)), 0)
+                .is_some()
+        );
+        assert_eq!(engine.get(&first, 0), Some(first.to_string()));
+        assert_eq!(engine.get(&second, 0), None, "the unwritten entry went");
+    }
+
     #[test]
     fn capacity_eviction_rotates_past_an_empty_start_bucket_into_other_stripes() {
         let weigher: Weigher<u32, String> = Box::new(|_k, _v| 1);
@@ -7214,7 +7585,7 @@ mod tests {
         assert_eq!(entries_before, 9);
         assert_eq!(weight_before, 9);
 
-        engine.enforce_capacity(start_bucket, 500);
+        engine.enforce_capacity(start_bucket, &mut Written::default(), 500);
 
         let (entries_after, weight_after) = engine.debug_totals();
         assert!(
@@ -7840,7 +8211,7 @@ mod tests {
         );
         assert_eq!(engine.debug_totals().1, 15_500);
 
-        engine.enforce_capacity(start_bucket, 100);
+        engine.enforce_capacity(start_bucket, &mut Written::default(), 100);
 
         let (entries, weight) = engine.debug_totals();
         assert!(
@@ -8034,7 +8405,7 @@ mod tests {
         assert_eq!(entries_before, 50_000);
         assert_eq!(weight_before, 50_000);
 
-        engine.enforce_capacity(0, 0);
+        engine.enforce_capacity(0, &mut Written::default(), 0);
 
         let (entries_after, weight_after) = engine.debug_totals();
         assert!(
@@ -8077,7 +8448,7 @@ mod tests {
         let engine = Engine::<u32, String>::new(5, None, Some(weigher), None);
         // One entry heavier than the whole cap: evicting it is all there is.
         let _ = put(&engine, 1, key_bytes(1), "z".repeat(50), hlc(1, 1), None, 0);
-        engine.enforce_capacity(0, 0);
+        engine.enforce_capacity(0, &mut Written::default(), 0);
         assert_eq!(engine.debug_totals(), (0, 0));
         assert!(
             engine.evict_one_sampled(0, 0).made_no_progress(),
@@ -8144,7 +8515,7 @@ mod tests {
                         },
                         now,
                     );
-                    engine.enforce_capacity(bucket, now);
+                    engine.enforce_capacity(bucket, &mut Written::default(), now);
                 }
                 1 => {
                     let ver = clock.now(now);
@@ -8328,7 +8699,7 @@ mod tests {
                         encoded,
                     };
                     apply_direct(&engine, bucket, entry, clock.now(now), incoming, now);
-                    engine.enforce_capacity(bucket, now);
+                    engine.enforce_capacity(bucket, &mut Written::default(), now);
                 }
                 1 => {
                     let ver = clock.now(now);
@@ -8450,7 +8821,7 @@ mod tests {
                     let value = format!("v{key}-{i}");
                     let _ = put(&engine, key, kb, value.clone(), ver, None, now);
                     mirror.insert(key, MirrorState::Live(value));
-                    engine.enforce_capacity(bucket, now);
+                    engine.enforce_capacity(bucket, &mut Written::default(), now);
                 }
                 2 => {
                     let ver = clock.now(now);
@@ -10346,7 +10717,7 @@ mod tests {
             assert_eq!(engine.debug_totals().1, 0);
             assert_eq!(engine.debug_pending_spill_weight(), 80);
 
-            engine.enforce_capacity(bucket, 0);
+            engine.enforce_capacity(bucket, &mut Written::default(), 0);
 
             assert_eq!(
                 engine.debug_eviction_lock_acquisitions(),
@@ -11047,7 +11418,7 @@ mod tests {
                 // and returns immediately: nothing left to evict in this
                 // bucket, and total_weight alone is within the cap, so the
                 // pending hand-off's install is all that is left.
-                engine.enforce_capacity(bucket, 2);
+                engine.enforce_capacity(bucket, &mut Written::default(), 2);
 
                 // Once the flusher is allowed to run, the one queued job
                 // installs and pending_spill_weight drains back to zero.
@@ -11176,7 +11547,7 @@ mod tests {
                 // rather than scan every other stripe for a victim the
                 // queue would refuse too.
                 let locks_before = engine.debug_eviction_lock_acquisitions();
-                engine.enforce_capacity(bucket, 2);
+                engine.enforce_capacity(bucket, &mut Written::default(), 2);
                 assert!(
                     engine.debug_eviction_lock_acquisitions() - locks_before <= 2,
                     "a full queue ends the pass at once, took {} stripe locks",
@@ -11193,7 +11564,7 @@ mod tests {
                 // `enforce_capacity` pass spills it.
                 tier.resume_flusher();
                 assert!(poll_until(POLL_TIMEOUT, || tier.queued_bytes() == 0));
-                engine.enforce_capacity(bucket, 2);
+                engine.enforce_capacity(bucket, &mut Written::default(), 2);
                 assert!(
                     poll_until(POLL_TIMEOUT, || is_spilled(&engine, &key_bytes(keys[1]))),
                     "the retried victim is spilled once the tier has room again"
@@ -11313,7 +11684,7 @@ mod tests {
                 let (done_tx, done_rx) = std::sync::mpsc::channel();
                 let enforcing = Arc::clone(&engine);
                 std::thread::spawn(move || {
-                    enforcing.enforce_capacity(start, 2);
+                    enforcing.enforce_capacity(start, &mut Written::default(), 2);
                     let _ = done_tx.send(());
                 });
                 assert!(
@@ -11492,8 +11863,12 @@ mod tests {
                      fully drained by the reservation above"
                 );
 
-                let outcome =
-                    engine.evict_one_sampled_with_reservation(bucket, Some(&mut reservation), 0);
+                let outcome = engine.evict_one_sampled_with_reservation(
+                    bucket,
+                    Some(&mut reservation),
+                    &Written::default(),
+                    0,
+                );
                 assert_eq!(
                     outcome.removed_weight,
                     value.len() as u64,
@@ -11579,15 +11954,23 @@ mod tests {
                     .await
                     .expect("the whole queue is free before this call");
 
-                let first =
-                    engine.evict_one_sampled_with_reservation(bucket, Some(&mut reservation), 2);
+                let first = engine.evict_one_sampled_with_reservation(
+                    bucket,
+                    Some(&mut reservation),
+                    &Written::default(),
+                    2,
+                );
                 assert_eq!(
                     first.removed_weight,
                     value_a.len() as u64,
                     "the colder key hands off from the reservation's own budget"
                 );
-                let second =
-                    engine.evict_one_sampled_with_reservation(bucket, Some(&mut reservation), 2);
+                let second = engine.evict_one_sampled_with_reservation(
+                    bucket,
+                    Some(&mut reservation),
+                    &Written::default(),
+                    2,
+                );
                 assert_eq!(
                     second.removed_weight,
                     value_b.len() as u64,
@@ -11680,8 +12063,12 @@ mod tests {
                     .await
                     .expect("the whole (single-record) queue is free before this call");
 
-                let deficit =
-                    engine.enforce_capacity_with_reservation(bucket, Some(&mut reservation), 10);
+                let deficit = engine.enforce_capacity_with_reservation(
+                    bucket,
+                    Some(&mut reservation),
+                    &mut Written::default(),
+                    10,
+                );
                 assert_eq!(
                     deficit,
                     u64::from(record_len_1),
@@ -11786,8 +12173,12 @@ mod tests {
                     .await
                     .expect("the whole (single-record) queue is free before this call");
 
-                let deficit =
-                    engine.enforce_capacity_with_reservation(bucket, Some(&mut reservation), 10);
+                let deficit = engine.enforce_capacity_with_reservation(
+                    bucket,
+                    Some(&mut reservation),
+                    &mut Written::default(),
+                    10,
+                );
                 assert_eq!(deficit, u64::from(record_len_1));
                 assert_eq!(
                     engine.get(&keys[1], 0),
@@ -11801,7 +12192,7 @@ mod tests {
 
                 // The closing call falls back to the ordinary
                 // `reservation: None` path and keeps evicting.
-                engine.enforce_capacity(bucket, 10);
+                engine.enforce_capacity(bucket, &mut Written::default(), 10);
 
                 assert_eq!(
                     engine.get(&keys[1], 0),

@@ -3838,6 +3838,8 @@ where
     /// the whole flush queue and spent none of it ends the retries at once
     /// (see [`retry_round_is_futile`]): the victim it stopped at needs more
     /// than the whole queue, so no later reservation could cover it either.
+    /// Every pass leaves the entries `written` holds, the batch's own, for
+    /// last.
     #[cfg_attr(
         not(feature = "spill"),
         allow(
@@ -3851,6 +3853,7 @@ where
         start_bucket: usize,
         deficit: u64,
         deadline: Option<std::time::Instant>,
+        written: &mut engine::Written,
     ) {
         #[cfg(feature = "spill")]
         {
@@ -3861,7 +3864,8 @@ where
                 return;
             };
             let Some(deadline) = deadline else {
-                self.engine.enforce_capacity(start_bucket, self.now_ms());
+                self.engine
+                    .enforce_capacity(start_bucket, written, self.now_ms());
                 return;
             };
             let mut deficit = deficit;
@@ -3879,6 +3883,7 @@ where
                         deficit = self.engine.enforce_capacity_with_reservation(
                             start_bucket,
                             Some(&mut reservation),
+                            written,
                             self.now_ms(),
                         );
                         if retry_round_is_futile(
@@ -3896,12 +3901,13 @@ where
                 }
             }
             if deficit > 0 {
-                self.engine.enforce_capacity(start_bucket, self.now_ms());
+                self.engine
+                    .enforce_capacity(start_bucket, written, self.now_ms());
             }
         }
         #[cfg(not(feature = "spill"))]
         {
-            let _ = (start_bucket, deficit, deadline);
+            let _ = (start_bucket, deficit, deadline, written);
         }
     }
 
@@ -3934,6 +3940,7 @@ where
         }
         let now = self.now_ms();
         let mut applied_keys: Vec<K> = Vec::new();
+        let mut written = engine::Written::default();
         // The reservation lives in this block only, so its unspent budget
         // is back with the tier before `retry_reservation_deficit` asks for
         // a fresh one: a retry clamped to the whole flush queue can never be
@@ -3953,6 +3960,7 @@ where
                     self.tombstone_max_ttl_ms,
                     now,
                     reservation.as_mut(),
+                    &mut written,
                 );
                 deficit += bucket_deficit;
                 for outcome in outcomes {
@@ -3964,7 +3972,8 @@ where
             deficit
         };
         self.hand_off_bulk(&mut applied_keys, true);
-        self.retry_reservation_deficit(0, deficit, deadline).await;
+        self.retry_reservation_deficit(0, deficit, deadline, &mut written)
+            .await;
     }
 
     /// Stamps and applies a local tombstone, then fans it out per [`Mode`], as
@@ -4597,6 +4606,7 @@ where
                 by_stripe[engine::stripe_index_from_hash(entry.0)].push(entry);
             }
             let now = self.now_ms();
+            let mut written = engine::Written::default();
             // Scoped as in `Shard::apply_grouped`: the reservation is back
             // with the tier before the retry asks for a fresh one.
             let deficit = {
@@ -4622,6 +4632,7 @@ where
                         self.tombstone_max_ttl_ms,
                         now,
                         reservation.as_mut(),
+                        &mut written,
                     );
                     deficit += bucket_deficit;
                     for (outcome, origin) in outcomes.into_iter().zip(origins) {
@@ -4630,7 +4641,8 @@ where
                 }
                 deficit
             };
-            self.retry_reservation_deficit(0, deficit, deadline).await;
+            self.retry_reservation_deficit(0, deficit, deadline, &mut written)
+                .await;
         })
     }
 
@@ -6154,6 +6166,152 @@ mod tests {
     #[derive(Debug, thiserror::Error)]
     #[error("loader boom")]
     struct BoomError;
+
+    /// A `Mode::Local` shard capped at 100 unit-weight entries, filled to
+    /// the cap with keys `0..100`.
+    async fn full_local_shard() -> Shard<u32, String> {
+        let s = Shard::<u32, String>::new(
+            SmolStr::new("full"),
+            Mode::Local,
+            NodeId::from(1u64),
+            100,
+            None,
+            None,
+        );
+        s.insert_many((0..100u32).map(|k| (k, k.to_string())))
+            .await
+            .expect("fills to the cap");
+        assert_eq!(s.entry_count().await, 100);
+        s
+    }
+
+    /// With more stripes than entries, most writes land in a stripe of their
+    /// own, where the eviction they trigger starts: each one still reads back
+    /// at once, and an older entry makes the room.
+    #[tokio::test]
+    async fn every_write_past_max_capacity_reads_back_at_once() {
+        let s = full_local_shard().await;
+        for k in 100..300u32 {
+            s.insert(k, k.to_string()).await.expect("insert");
+            assert_eq!(s.get(&k).await, Some(k.to_string()), "key {k}");
+            assert_eq!(s.entry_count().await, 100, "key {k}: the cap holds");
+        }
+    }
+
+    /// A batch spread over many stripes keeps its own entries over older
+    /// ones, though each stripe's group enforces the cap on its own: a batch
+    /// within the cap stays whole, and one past it leaves no older entry.
+    #[tokio::test]
+    async fn a_batch_past_max_capacity_keeps_its_own_entries() {
+        let s = full_local_shard().await;
+        s.insert_many((1_000..1_060u32).map(|k| (k, k.to_string())))
+            .await
+            .expect("insert_many");
+        for k in 1_000..1_060u32 {
+            assert_eq!(s.get(&k).await, Some(k.to_string()), "key {k}");
+        }
+        assert_eq!(s.entry_count().await, 100);
+
+        s.insert_many((2_000..2_150u32).map(|k| (k, k.to_string())))
+            .await
+            .expect("insert_many");
+        assert_eq!(s.entry_count().await, 100, "the cap holds");
+        for k in (0..100u32).chain(1_000..1_060) {
+            assert_eq!(s.get(&k).await, None, "older key {k} went first");
+        }
+    }
+
+    /// A peer's batch keeps its own entries over older ones across its
+    /// stripe groups: the later group's scan wraps past the earlier group's
+    /// entry to an older one.
+    #[tokio::test]
+    async fn a_remote_batch_past_max_capacity_keeps_its_own_entries() {
+        let stripe =
+            |k: u32| engine::stripe_index_from_hash(engine::hash_key_bytes(&key_bytes(&k)));
+        let first = (0..100_000u32)
+            .find(|&k| stripe(k) < 300)
+            .expect("a low stripe");
+        let last = (0..100_000u32)
+            .find(|&k| stripe(k) > 700)
+            .expect("a high stripe");
+        let older: Vec<u32> = (0u32..)
+            .filter(|&k| (300..=700).contains(&stripe(k)))
+            .take(3)
+            .collect();
+        let s = Shard::<u32, String>::new(
+            SmolStr::new("remote-batch"),
+            Mode::Replicated,
+            NodeId::from(1u64),
+            3,
+            None,
+            None,
+        );
+        for &k in &older {
+            s.insert(k, k.to_string()).await.expect("insert");
+        }
+
+        ShardOps::apply_remote_batch(
+            &s,
+            vec![
+                wire_record(last, "last", hlc(10, 2)),
+                wire_record(first, "first", hlc(10, 2)),
+            ],
+        )
+        .await;
+
+        assert_eq!(s.entry_count().await, 3, "the cap holds");
+        assert_eq!(s.get(&first).await.as_deref(), Some("first"));
+        assert_eq!(s.get(&last).await.as_deref(), Some("last"));
+    }
+
+    /// A write heavier than the whole cap never fits, so its eviction
+    /// samples it like any other entry: alone in its stripe, it goes and
+    /// the older entry stays.
+    #[tokio::test]
+    async fn a_write_heavier_than_max_capacity_goes_and_the_older_entry_stays() {
+        let s = Shard::<u32, String>::new(
+            SmolStr::new("heavy"),
+            Mode::Local,
+            NodeId::from(1u64),
+            5,
+            None,
+            None,
+        )
+        .with_weigher(|_k: &u32, v: &String| u32::try_from(v.len()).unwrap_or(u32::MAX));
+        let stripe =
+            |k: u32| engine::stripe_index_from_hash(engine::hash_key_bytes(&key_bytes(&k)));
+        let heavy = (2..100_000u32)
+            .find(|&k| stripe(k) != stripe(1))
+            .expect("another stripe");
+        s.insert(1, "x".to_string()).await.expect("insert");
+
+        s.insert(heavy, "x".repeat(10)).await.expect("insert");
+
+        assert_eq!(s.get(&heavy).await, None, "the heavy write goes");
+        assert_eq!(
+            s.get(&1).await.as_deref(),
+            Some("x"),
+            "the older entry stays"
+        );
+        assert_eq!(s.entry_count().await, 1);
+    }
+
+    /// A loaded value is not evicted by the fill that stores it.
+    #[tokio::test]
+    async fn get_or_load_past_max_capacity_keeps_the_loaded_value() {
+        let s = full_local_shard().await;
+        for k in 100..200u32 {
+            let loaded = s
+                .get_or_load(&k, async move |key: &u32| -> Result<String, BoomError> {
+                    Ok(key.to_string())
+                })
+                .await
+                .expect("loads");
+            assert_eq!(loaded, k.to_string());
+            assert_eq!(s.get(&k).await, Some(k.to_string()), "key {k}");
+        }
+        assert_eq!(s.entry_count().await, 100);
+    }
 
     #[tokio::test]
     async fn get_or_load_propagates_loader_error() {
@@ -11609,6 +11767,33 @@ mod tests {
             }
         }
 
+        /// A write past the cap spills an older entry, never itself: under
+        /// a cap of one, the second key stays resident and the first spills.
+        #[tokio::test]
+        async fn a_write_past_the_cap_spills_an_older_entry_rather_than_itself() {
+            let (shard, dir) = spill_shard("spills-the-older", 1);
+            shard.insert(1, "one".to_string()).await.expect("insert 1");
+            shard.insert(2, "two".to_string()).await.expect("insert 2");
+            assert!(
+                poll_until(POLL_TIMEOUT, || {
+                    shard
+                        .engine
+                        .spill()
+                        .is_some_and(|tier| tier.bytes_used() > 0)
+                })
+                .await,
+                "one key spills within the poll bound"
+            );
+            assert_eq!(
+                shard.get_sync(&2),
+                Some("two".to_string()),
+                "the write stays resident"
+            );
+            assert_eq!(shard.get_sync(&1), None, "the older key spilled");
+            assert_eq!(shard.get(&1).await, Some("one".to_string()));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         #[tokio::test]
         async fn get_sync_misses_a_spilled_key_while_get_promotes_it() {
             let (shard, spilled_key, spilled_value, _resident_key, _resident_value, dir) =
@@ -12171,6 +12356,63 @@ mod tests {
                  forever because a background retry ran out of budget"
             );
 
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// `retry_reservation_deficit` leaves the batch's own entries for
+        /// last: its closing pass starts in stripe 0, where the batch wrote
+        /// a key, and evicts an older key there instead. The flusher stays
+        /// paused and the flush queue holds one record, so the batch's
+        /// reservation covers one hand-off and the retry times out.
+        #[tokio::test]
+        async fn retry_reservation_deficit_keeps_the_batchs_own_entries() {
+            let dir = temp_dir("retry-deficit-keeps-the-batch");
+            let value = "x".repeat(20);
+            let encoded_len = postcard::to_stdvec(&value)
+                .expect("test value encodes")
+                .len();
+            let stripe =
+                |k: u32| engine::stripe_index_from_hash(engine::hash_key_bytes(&key_bytes(&k)));
+            // Keys of two encoded bytes alike, so one record length fits each.
+            let in_stripe_zero = (128..16_384u32)
+                .find(|&k| stripe(k) == 0)
+                .expect("a key in stripe 0");
+            let others: Vec<u32> = (128..16_384u32)
+                .filter(|&k| stripe(k) != 0)
+                .take(3)
+                .collect();
+            let [older_a, older_b, elsewhere] = others[..] else {
+                panic!("three keys outside stripe 0");
+            };
+            let record_len = spill::spill_record_len(key_bytes(&in_stripe_zero).len(), encoded_len);
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .flush_queue_bytes(u64::from(record_len))
+                .spill_wait_timeout(Duration::from_millis(150));
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("retry-deficit-keeps-the-batch"),
+                Mode::Local,
+                NodeId::from(1u64),
+                40,
+                None,
+                None,
+            )
+            .with_weigher(|_k: &u32, v: &String| u32::try_from(v.len()).unwrap_or(u32::MAX))
+            .with_spill(&cfg)
+            .expect("tier opens");
+            let tier = Arc::clone(shard.engine.spill().expect("with_spill attaches a tier"));
+            tier.pause_flusher();
+            for k in [older_a, older_b] {
+                shard.insert(k, value.clone()).await.expect("insert");
+            }
+
+            shard
+                .insert_many([(in_stripe_zero, value.clone()), (elsewhere, value.clone())])
+                .await
+                .expect("insert_many");
+
+            assert_eq!(shard.get_sync(&in_stripe_zero), Some(value.clone()));
+            assert_eq!(shard.get_sync(&elsewhere), Some(value.clone()));
             let _ = std::fs::remove_dir_all(&dir);
         }
 
