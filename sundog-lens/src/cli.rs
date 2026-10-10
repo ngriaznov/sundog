@@ -9,6 +9,7 @@ use std::num::NonZeroU8;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::key::KeySpec;
 use crate::ui::theme::ColorChoice;
 
 /// The help text.
@@ -20,7 +21,7 @@ USAGE
               [--metrics TEMPLATE]... [--scrape NODE=URL]... [--interval 1s]
               [--forget-after 90s] [--color auto|truecolor|256|mono] [--no-bg]
               [--no-braille] [--no-anim] [--exit-after DUR] [--log FILE]
-              [--once [--json] [--settle 3s]]
+              [--once [--json] [--settle 3s] [--explain KEY [--cache NAME]]]
   sundog-lens cluster [--name lens-demo] [--nodes 3] [--base-ip IP]
               [--testnode PATH] [--owners 2] [--keys 20000] [--rate 1500] [--logs DIR]
   sundog-lens demo [--scenario tour|FILE] [--headless] [--no-captions] [--marks FILE]
@@ -60,6 +61,12 @@ OPTIONS
   --json                With --once, print the report as JSON.
   --settle DUR          With --once, wait until the members hold still this long
                         (default 3s).
+  --explain KEY         With --once, name KEY's part and its owners in fetch order,
+                        computed from gossip once the view has settled. Bare text is
+                        a String key; uint:N, int:N, hex:BYTES (postcard bytes) and
+                        str:TEXT (a String that starts with a prefix) select another
+                        encoding.
+  --cache NAME          With --explain, the Distributed cache; needed when several are.
   -h, --help            Print this help.
 
 Durations take ms, s, m or h: 500ms, 2s, 1m.
@@ -160,6 +167,18 @@ pub struct OnceArgs {
     pub json: bool,
     /// `--settle`: how long the member set must hold still.
     pub settle: Duration,
+    /// `--explain`, with `--cache`: where one key lives.
+    pub explain: Option<ExplainArgs>,
+}
+
+/// The `--explain` options of `--once`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplainArgs {
+    /// `--explain`: the key, read as [`KeySpec::parse`] reads it.
+    pub key: KeySpec,
+    /// `--cache`: the `Distributed` cache the key lives in; `None` lets the
+    /// one ranked `Distributed` cache stand in.
+    pub cache: Option<String>,
 }
 
 /// Arguments of `watch`.
@@ -497,6 +516,8 @@ struct WatchDraft {
     once: bool,
     json: bool,
     settle: Option<Duration>,
+    explain: Option<KeySpec>,
+    cache: Option<String>,
 }
 
 /// Applies a `watch`-only flag to `draft`. Returns whether `flag` was one.
@@ -550,6 +571,11 @@ fn watch_flag(
             let value = args.value(flag, inline)?;
             draft.settle = Some(positive_duration(flag, &value)?);
         }
+        "--explain" => {
+            let value = args.value(flag, inline)?;
+            draft.explain = Some(parsed(flag, &value, KeySpec::parse)?);
+        }
+        "--cache" => draft.cache = Some(args.value(flag, inline)?),
         _ => return Ok(false),
     }
     Ok(true)
@@ -574,6 +600,8 @@ fn parse_watch(rest: &[String]) -> Result<WatchArgs, CliError> {
         once: false,
         json: false,
         settle: None,
+        explain: None,
+        cache: None,
     };
     let mut cluster: Option<String> = None;
 
@@ -593,7 +621,19 @@ fn parse_watch(rest: &[String]) -> Result<WatchArgs, CliError> {
         }
         cluster = Some(flag);
     }
+    if draft.cache.is_some() && draft.explain.is_none() {
+        return Err(CliError::Requires {
+            flag: "--cache",
+            needs: "--explain",
+        });
+    }
     if !draft.once {
+        if draft.explain.is_some() {
+            return Err(CliError::Requires {
+                flag: "--explain",
+                needs: "--once",
+            });
+        }
         if draft.json {
             return Err(CliError::Requires {
                 flag: "--json",
@@ -611,6 +651,10 @@ fn parse_watch(rest: &[String]) -> Result<WatchArgs, CliError> {
     draft.args.once = draft.once.then(|| OnceArgs {
         json: draft.json,
         settle: draft.settle.unwrap_or(Duration::from_secs(3)),
+        explain: draft.explain.take().map(|key| ExplainArgs {
+            key,
+            cache: draft.cache.take(),
+        }),
     });
     Ok(draft.args)
 }
@@ -819,7 +863,8 @@ mod tests {
             args.once,
             Some(OnceArgs {
                 json: false,
-                settle: Duration::from_secs(3)
+                settle: Duration::from_secs(3),
+                explain: None,
             })
         );
         let args = watch(&["prod", "--once", "--json", "--settle", "500ms"]);
@@ -827,7 +872,8 @@ mod tests {
             args.once,
             Some(OnceArgs {
                 json: true,
-                settle: Duration::from_millis(500)
+                settle: Duration::from_millis(500),
+                explain: None,
             })
         );
     }
@@ -848,6 +894,146 @@ mod tests {
                 needs: "--once"
             }
         );
+    }
+
+    #[test]
+    fn explain_takes_a_key_and_a_cache() {
+        let explain = |args: &[&str]| watch(args).once.and_then(|once| once.explain);
+        let key = |text: &str| KeySpec::parse(text).expect("the key parses");
+
+        assert_eq!(explain(&["prod", "--once"]), None);
+        assert_eq!(
+            explain(&["prod", "--once", "--explain", "k17"]),
+            Some(ExplainArgs {
+                key: key("k17"),
+                cache: None,
+            })
+        );
+        assert_eq!(
+            explain(&["prod", "--once", "--explain", "uint:7", "--cache", "ids"]),
+            Some(ExplainArgs {
+                key: key("uint:7"),
+                cache: Some("ids".to_owned()),
+            })
+        );
+        // The flags take an equals value and come in either order, and the
+        // key keeps every character after the first equals sign.
+        assert_eq!(
+            explain(&["--cache=it", "--once", "--explain=str:a=b", "prod"]),
+            Some(ExplainArgs {
+                key: key("str:a=b"),
+                cache: Some("it".to_owned()),
+            })
+        );
+        // The key is a value even when it looks like a flag.
+        assert_eq!(
+            explain(&["prod", "--once", "--explain", "--json"]),
+            Some(ExplainArgs {
+                key: key("--json"),
+                cache: None,
+            })
+        );
+        // It combines with the other `--once` options.
+        let once = watch(&[
+            "prod",
+            "--once",
+            "--json",
+            "--settle",
+            "1s",
+            "--explain",
+            "hex:6b",
+        ])
+        .once
+        .expect("--once is given");
+        assert!(once.json);
+        assert_eq!(once.settle, Duration::from_secs(1));
+        assert_eq!(once.explain.map(|e| e.key), Some(key("hex:6b")));
+        assert_eq!(
+            err(&["prod", "--once", "--explain"]),
+            CliError::MissingValue("--explain".into())
+        );
+        assert_eq!(
+            err(&["prod", "--once", "--explain", "k", "--cache"]),
+            CliError::MissingValue("--cache".into())
+        );
+    }
+
+    #[test]
+    fn explain_needs_once_and_cache_needs_explain() {
+        assert_eq!(
+            err(&["prod", "--explain", "k1"]),
+            CliError::Requires {
+                flag: "--explain",
+                needs: "--once"
+            }
+        );
+        assert_eq!(
+            err(&["prod", "--explain", "k1", "--cache", "it"]),
+            CliError::Requires {
+                flag: "--explain",
+                needs: "--once"
+            }
+        );
+        for args in [
+            &["prod", "--cache", "it"][..],
+            &["prod", "--once", "--cache", "it"],
+        ] {
+            assert_eq!(
+                err(args),
+                CliError::Requires {
+                    flag: "--cache",
+                    needs: "--explain"
+                },
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            CliError::Requires {
+                flag: "--cache",
+                needs: "--explain"
+            }
+            .to_string(),
+            "--cache needs --explain"
+        );
+        // Neither flag belongs to the fleet commands.
+        assert_eq!(
+            err(&["cluster", "--explain", "k"]),
+            CliError::UnknownFlag("--explain".into())
+        );
+        assert_eq!(
+            err(&["demo", "--cache", "it"]),
+            CliError::UnknownFlag("--cache".into())
+        );
+    }
+
+    #[test]
+    fn a_bad_key_is_a_bad_value_naming_explain() {
+        for (value, remedy) in [
+            ("hex:abc", "add or drop a digit"),
+            ("hex:", "at least one pair"),
+            ("hex:0g", "remove it"),
+            ("uint:-1", "write a negative key as int:"),
+            ("uint:x", "uint: takes decimal digits"),
+            ("int:99999999999999999999", "use hex: for a wider key"),
+        ] {
+            let error = err(&["prod", "--once", "--explain", value]);
+            let CliError::BadValue {
+                flag,
+                value: given,
+                reason,
+            } = &error
+            else {
+                panic!("{value}: {error:?}");
+            };
+            assert_eq!((flag.as_str(), given.as_str()), ("--explain", value));
+            assert!(reason.contains(remedy), "{value}: {reason}");
+            assert!(error.to_string().starts_with("--explain: bad value"));
+        }
+        let long = "k".repeat(crate::key::MAX_CHARS + 1);
+        assert!(matches!(
+            err(&["prod", "--once", "--explain", &long]),
+            CliError::BadValue { reason, .. } if reason.contains("shorten it")
+        ));
     }
 
     #[test]
@@ -1160,6 +1346,8 @@ mod tests {
             "--once",
             "--json",
             "--settle",
+            "--explain",
+            "--cache",
             "--name",
             "--nodes",
             "--base-ip",
@@ -1175,5 +1363,17 @@ mod tests {
         ] {
             assert!(HELP.contains(word), "{word}");
         }
+    }
+
+    #[test]
+    fn the_help_text_gives_the_key_grammar() {
+        for word in ["uint:N", "int:N", "hex:BYTES", "str:TEXT", "String"] {
+            assert!(HELP.contains(word), "{word}");
+        }
+        assert!(HELP.contains("[--explain KEY [--cache NAME]]"));
+        assert!(
+            HELP.lines().all(|line| line.chars().count() <= 87),
+            "no help line is wider than 87 columns"
+        );
     }
 }
