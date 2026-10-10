@@ -43,11 +43,13 @@ use proc::{
     parse_label, slot_label,
 };
 
-pub mod control;
 pub mod layout;
 pub mod load;
 pub mod proc;
 
+/// The control client lives at the crate root, where every platform builds
+/// it; this path keeps `fleet::control` resolving.
+pub use crate::control;
 pub use layout::{Layout, Ports};
 
 /// How many nodes a fleet runs at most: one per color the interface has.
