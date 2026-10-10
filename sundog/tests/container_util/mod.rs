@@ -642,6 +642,22 @@ impl Node {
             .collect()
     }
 
+    /// `explain k`, why a read of `k` answers what it answers on this node:
+    /// the test node's `Cache::explain` of `"it"` as one parsed JSON object.
+    /// The reply's fields are documented on `sundog-testnode`'s
+    /// `explain_reply` module.
+    /// # Errors
+    ///
+    /// Returns `Err` if the connection fails, or the reply is `err ...` or
+    /// not JSON.
+    pub async fn explain(&self, key: &str) -> Result<serde_json::Value, String> {
+        let reply = self.command(&format!("explain {key}")).await?;
+        if !reply.starts_with('{') {
+            return Err(reply);
+        }
+        serde_json::from_str(&reply).map_err(|error| format!("bad explain reply: {error}: {reply}"))
+    }
+
     /// `id`, this node's own `NodeId` as a decimal `u64`.
     /// # Errors
     ///

@@ -30,6 +30,13 @@
 //! `members`, `share <cache> <owners> <node-id>` and `quit`; see
 //! `ObserverNode::dispatch`.
 //!
+//! `explain <key>` answers with one line of JSON, `Cache::explain`'s report
+//! on `"it"` for that key: the record this node stores, and in a
+//! `Mode::Distributed` cache the ownership view, the owners, the residency
+//! marks, how a fetch decides and what each other owner answers. The line's
+//! shape is the `explain_reply` module's, and the files under
+//! `sundog-lens/tests/fixtures/explain/` hold one reply of each kind.
+//!
 //! `SUNDOG_TESTNODE_LOADER_DELAY_MS` registers a loader on `"it"`: each call
 //! waits that long, then answers `src-{key}.{n}` for every key, `n`
 //! counting this node's loader calls, which the `loads` line reports.
@@ -63,6 +70,8 @@ use sundog::{
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use xxhash_rust::xxh3::xxh3_64;
+
+mod explain_reply;
 
 const GOSSIP_PORT: u16 = 7946;
 const CONTROL_PORT: u16 = 8080;
@@ -1049,6 +1058,9 @@ impl TestNode {
                 self.cache.invalidate_local(&key.to_string()).await;
                 Reply::Line("ok".to_string())
             }
+            // explain k -> one line of JSON, why a read of k answers what it answers on this
+            // node | err <e>.
+            "explain" => explain_command(&self.cache, parts.next()).await,
             "fetch" | "owners" => ownership_command(&self.cache, command, parts.next()).await,
             // id -> this node's own NodeId as a decimal u64.
             "id" => Reply::Line(self.cluster.node_id().as_u64().to_string()),
@@ -1327,6 +1339,19 @@ async fn ownership_command(
             .map(|id| id.as_u64().to_string())
             .collect::<Vec<_>>()
             .join(" "),
+    })
+}
+
+/// `explain`, `Cache::explain` of a key of `"it"` as one line of JSON, or
+/// `err <e>` when `Cache::explain` fails. It is not a read: it counts no
+/// hit, miss or fetch and calls no loader.
+async fn explain_command(cache: &Cache<String, String>, key: Option<&str>) -> Reply {
+    let Some(key) = key else {
+        return Reply::Line("err explain needs a key".to_string());
+    };
+    Reply::Line(match cache.explain(&key.to_string()).await {
+        Ok(explanation) => explain_reply::to_line(&explain_reply::from_explanation(&explanation)),
+        Err(error) => format!("err {error}"),
     })
 }
 
@@ -2021,6 +2046,379 @@ mod tests {
         node.cluster.clone().shutdown().await;
     }
 
+    /// A single-node [`TestNode`] on loopback whose `"it"` has a loader, as
+    /// `SUNDOG_TESTNODE_LOADER_DELAY_MS` registers one. No other test
+    /// registers a loader, so only this node moves `loads`.
+    async fn loading_node(name: &str) -> TestNode {
+        let loopback = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
+        let config = ClusterConfig::default().with(|c| {
+            c.gossip_bind_addr = loopback;
+            c.data_bind_addr = loopback;
+        });
+        let cluster = Cluster::builder(name)
+            .seeds(std::iter::empty())
+            .config(config)
+            .build()
+            .await
+            .expect("a single-node cluster builds with no seeds");
+        let builder = cluster
+            .cache::<String, String>(CACHE_NAME)
+            .mode(Mode::Replicated);
+        let loading = Loading {
+            loader_delay: Some(Duration::from_millis(1)),
+            ttl: None,
+            refresh_ahead: None,
+        };
+        let cache = apply_loading(builder, loading)
+            .open()
+            .await
+            .expect("\"it\" opens");
+        TestNode {
+            cache,
+            side: None,
+            cluster,
+        }
+    }
+
+    /// A loopback node with `"it"` open under two-owner `Distributed`,
+    /// joined to `seed` when there is one.
+    async fn distributed_node(name: &str, seed: Option<SocketAddr>) -> TestNode {
+        let loopback = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
+        let config = ClusterConfig::default().with(|c| {
+            c.gossip_bind_addr = loopback;
+            c.data_bind_addr = loopback;
+        });
+        let cluster = Cluster::builder(name)
+            .seeds(seed)
+            .config(config)
+            .build()
+            .await
+            .expect("a loopback node builds");
+        let cache = cluster
+            .cache::<String, String>(CACHE_NAME)
+            .mode(Mode::Distributed {
+                owners: two_owners(),
+            })
+            .open()
+            .await
+            .expect("\"it\" opens");
+        TestNode {
+            cache,
+            side: None,
+            cluster,
+        }
+    }
+
+    /// What `node` reports for `key` through [`explain_reply`].
+    async fn explained(node: &TestNode, key: &str) -> explain_reply::ExplainReply {
+        let explanation = node
+            .cache
+            .explain(&key.to_string())
+            .await
+            .expect("a String key encodes");
+        explain_reply::from_explanation(&explanation)
+    }
+
+    /// `node`'s `explain key` reply, parsed.
+    async fn explain_json(node: &TestNode, key: &str) -> serde_json::Value {
+        let line = reply_line(node.dispatch(&format!("explain {key}")).await);
+        serde_json::from_str(&line).unwrap_or_else(|error| panic!("{error}: {line}"))
+    }
+
+    /// `node`'s id as the `explain` reply prints it.
+    fn id_text(node: &TestNode) -> String {
+        node.cluster.node_id().to_string()
+    }
+
+    const EXPLAIN_WAIT: Duration = Duration::from_secs(30);
+
+    #[tokio::test]
+    async fn a_replicated_cache_reply_has_no_distributed_section() {
+        let node = test_node("testnode-explain-replicated").await;
+        let reply = explain_json(&node, "k17").await;
+        assert_eq!(reply["cache"], "it");
+        assert_eq!(reply["node"], id_text(&node));
+        assert_eq!(reply["mode"], "replicated");
+        assert_eq!(
+            reply["distributed"],
+            serde_json::Value::Null,
+            "a Replicated cache has no ownership to explain"
+        );
+        let typed = explained(&node, "k17").await;
+        assert_eq!(typed.mode, "replicated");
+        assert_eq!(typed.distributed, None);
+        node.cluster.clone().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_single_node_distributed_reply_names_the_node_as_the_only_owner_and_has_no_probes() {
+        let node = distributed_node("testnode-explain-single", None).await;
+        let me = id_text(&node);
+        let deadline = tokio::time::Instant::now() + EXPLAIN_WAIT;
+        let read = loop {
+            let reply = explained(&node, "k17").await;
+            if let Some(read) = reply.distributed
+                && read.owners == [me.clone()]
+            {
+                break read;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the node did not become the only owner within 30 s"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert!(read.residency.owns, "the only owner owns the part");
+        assert_eq!(read.probes, Vec::new(), "no other owner is asked");
+        assert_eq!(read.view.len(), 16);
+        assert_eq!(read.view_moved_to, None);
+
+        let reply = explain_json(&node, "k17").await;
+        assert_eq!(reply["mode"], "distributed:2");
+        assert_eq!(reply["distributed"]["owners"], serde_json::json!([me]));
+        assert_eq!(reply["distributed"]["probes"], serde_json::json!([]));
+        node.cluster.clone().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_written_key_reads_live_and_a_removed_key_reads_tombstone() {
+        let node = test_node("testnode-explain-records").await;
+        let me = id_text(&node);
+        let part = sundog::store::PartId::of_key(
+            &postcard::to_stdvec(&"k17".to_string()).expect("a String encodes"),
+        );
+
+        let absent = explained(&node, "k17").await;
+        assert_eq!((absent.bucket, absent.part), (part.bucket(), part.part()));
+        assert_eq!((absent.cache.as_str(), absent.node.as_str()), ("it", &*me));
+        assert_eq!(absent.local.kind, "absent");
+        assert_eq!(absent.local.version, None);
+        assert_eq!(absent.source.kind, "local");
+        assert_eq!(absent.source.hit, Some(false));
+
+        assert_eq!(reply_line(node.dispatch("put k17 v").await), "ok");
+        let live = explained(&node, "k17").await;
+        assert_eq!(live.local.kind, "live");
+        let live_version = live
+            .local
+            .version
+            .clone()
+            .expect("a live record has a version");
+        let (stamp, writer) = live_version.split_once('@').expect("wall.logical@node");
+        assert_eq!(writer, me, "this node wrote the record");
+        let (wall, logical) = stamp.split_once('.').expect("wall.logical");
+        wall.parse::<u64>().expect("the wall clock is a number");
+        logical
+            .parse::<u32>()
+            .expect("the logical clock is a number");
+        assert_eq!(live.local.expires_at_ms, explain_reply::Expiry::Never);
+        assert_eq!(live.local.spilled, Some(false));
+        assert_eq!(live.source.hit, Some(true));
+
+        assert_eq!(reply_line(node.dispatch("del k17").await), "ok");
+        let tombstone = explained(&node, "k17").await;
+        assert_eq!(tombstone.local.kind, "tombstone");
+        let tombstone_version = tombstone.local.version.expect("a tombstone has a version");
+        assert_ne!(
+            tombstone_version, live_version,
+            "the delete is a newer version"
+        );
+        assert_eq!(
+            tombstone.local.expires_at_ms,
+            explain_reply::Expiry::Omitted
+        );
+        assert_eq!(tombstone.source.hit, Some(false));
+        node.cluster.clone().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_expired_entry_the_sweep_has_not_reached_reads_lapsed() {
+        let node = test_node("testnode-explain-lapsed").await;
+        // The sweep runs on a timer of minutes, so an expired entry lapses
+        // first; a key swept inside the window is replaced by the next.
+        let mut lapsed = None;
+        for attempt in 0..20 {
+            let key = format!("ttl{attempt}");
+            node.cache
+                .insert_with_ttl(key.clone(), "v".to_string(), Duration::from_millis(20))
+                .await
+                .expect("a TTL insert succeeds");
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let reply = explained(&node, &key).await;
+            if reply.local.kind == "lapsed" {
+                lapsed = Some(reply);
+                break;
+            }
+        }
+        let reply = lapsed.expect("an expired entry reads lapsed before the sweep removes it");
+        assert!(reply.local.version.is_some(), "{reply:?}");
+        assert_eq!(reply.local.cause.as_deref(), Some("expired"));
+        let explain_reply::Expiry::At(expires_at_ms) = reply.local.expires_at_ms else {
+            panic!("a lapsed entry carries its expiry: {reply:?}");
+        };
+        assert!(expires_at_ms <= reply.at_ms, "{reply:?}");
+        assert_eq!(
+            reply.source.hit,
+            Some(false),
+            "a lapsed entry reads as a miss"
+        );
+        node.cluster.clone().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn two_nodes_explain_reports_the_other_owners_probe() {
+        let a = distributed_node("testnode-explain-two", None).await;
+        let b = distributed_node("testnode-explain-two", Some(a.cluster.local_gossip_addr())).await;
+        let (a_id, b_id) = (id_text(&a), id_text(&b));
+        let key = "k17".to_string();
+        let deadline = tokio::time::Instant::now() + EXPLAIN_WAIT;
+        while a.cache.owners_of(&key).len() != 2 || b.cache.owners_of(&key).len() != 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "both nodes did not own the key within 30 s"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(reply_line(a.dispatch("put k17 v").await), "ok");
+
+        let mut seen = Vec::new();
+        for (node, other) in [(&a, &b_id), (&b, &a_id)] {
+            let reply = loop {
+                let reply = explained(node, "k17").await;
+                if reply.local.kind == "live"
+                    && reply
+                        .distributed
+                        .as_ref()
+                        .is_some_and(|read| read.probes.iter().any(|p| p.answer == "held"))
+                {
+                    break reply;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{} did not see the other owner hold the key within 30 s: {reply:?}",
+                    node.cluster.node_id()
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            let read = reply.distributed.as_ref().expect("a Distributed cache");
+            assert_eq!(read.owners.len(), 2, "{reply:?}");
+            assert!(read.owners.contains(&a_id) && read.owners.contains(&b_id));
+            assert!(
+                read.residency.owns,
+                "two nodes at two owners own every part"
+            );
+            assert_eq!(read.local_read, "hit");
+            assert_eq!(read.serves_peers, "serve");
+            assert_eq!(read.view_moved_to, None);
+            assert_eq!(read.probes.len(), 1, "the one other owner is asked");
+            let probe = &read.probes[0];
+            assert_eq!(&probe.node, other);
+            assert_eq!(probe.answer, "held");
+            assert_eq!(probe.reads.as_deref(), Some("value"));
+            assert_eq!(probe.expires_at_ms, explain_reply::Expiry::Never);
+            assert_eq!(
+                probe.version, reply.local.version,
+                "both owners hold the one write"
+            );
+            assert_eq!(reply.source.kind, "local");
+            assert_eq!(reply.source.hit, Some(true));
+            seen.push((read.view.clone(), read.owners.clone()));
+        }
+        assert_eq!(seen[0], seen[1], "both nodes explain from one view");
+        a.cluster.clone().shutdown().await;
+        b.cluster.clone().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_through_test_node_explain_replies_with_a_reading_and_touches_nothing() {
+        let node = test_node("testnode-dispatch-explain").await;
+        let reply = explain_json(&node, "k").await;
+        assert_eq!(reply["cache"], "it");
+        assert_eq!(reply["node"], id_text(&node));
+        assert_eq!(reply["local"], serde_json::json!({ "kind": "absent" }));
+        assert_eq!(reply["source"]["kind"], "local");
+        assert_eq!(reply["source"]["hit"], false);
+        assert_eq!(reply_line(node.dispatch("count").await), "0");
+        assert_eq!(
+            reply_line(node.dispatch("get k").await),
+            "none",
+            "explain stores nothing"
+        );
+        node.cluster.clone().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn explain_runs_no_loader_where_load_runs_it() {
+        let node = loading_node("testnode-explain-loader").await;
+        let loads = || async { reply_line(node.dispatch("loads").await) };
+        let before = loads().await;
+
+        let reply = explain_json(&node, "k").await;
+        assert_eq!(reply["local"], serde_json::json!({ "kind": "absent" }));
+        assert_eq!(
+            loads().await,
+            before,
+            "explain of a missing key loads nothing"
+        );
+        assert_eq!(reply_line(node.dispatch("count").await), "0");
+
+        let loaded = reply_line(node.dispatch("load k").await);
+        assert!(loaded.starts_with("val src-k."), "{loaded}");
+        assert_ne!(loads().await, before, "load runs the loader");
+        assert_eq!(explain_json(&node, "k").await["local"]["kind"], "live");
+
+        let after = loads().await;
+        explain_json(&node, "k").await;
+        explain_json(&node, "other").await;
+        assert_eq!(loads().await, after, "explain never runs the loader");
+        node.cluster.clone().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_through_test_node_explain_needs_a_key() {
+        let node = test_node("testnode-dispatch-explain-key").await;
+        assert_eq!(
+            reply_line(node.dispatch("explain").await),
+            "err explain needs a key"
+        );
+        assert_eq!(
+            reply_line(explain_command(&node.cache, None).await),
+            "err explain needs a key"
+        );
+        node.cluster.clone().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn explain_is_not_answered_by_the_owners_arm() {
+        let node = test_node("testnode-dispatch-explain-arm").await;
+        let explain = reply_line(node.dispatch("explain k").await);
+        let owners = reply_line(node.dispatch("owners k").await);
+        assert!(explain.starts_with('{'), "{explain}");
+        assert!(
+            !owners.starts_with('{')
+                && owners
+                    .split_whitespace()
+                    .all(|id| id.parse::<u64>().is_ok()),
+            "owners stays a list of decimal ids: {owners:?}"
+        );
+        // The cache's clock is the one field two replies in a row can differ in.
+        let without_clock = |line: &str| {
+            let mut reply: serde_json::Value = serde_json::from_str(line).expect("a JSON reply");
+            reply
+                .as_object_mut()
+                .expect("a JSON object")
+                .remove("at_ms")
+                .expect("every reply carries the cache's clock");
+            reply
+        };
+        assert_eq!(
+            without_clock(&reply_line(explain_command(&node.cache, Some("k")).await)),
+            without_clock(&explain),
+            "the arm and the handler give one reply"
+        );
+        node.cluster.clone().shutdown().await;
+    }
+
     #[tokio::test]
     async fn dispatch_through_test_node_quit_yields_no_reply_line() {
         let node = test_node("testnode-dispatch-quit").await;
@@ -2276,6 +2674,11 @@ mod tests {
             reply_line(observing.dispatch("count").await),
             "err unknown command \"count\"",
             "an observer has no cache commands"
+        );
+        assert_eq!(
+            reply_line(observing.dispatch("explain k").await),
+            "err unknown command \"explain\"",
+            "an observer has no cache to explain"
         );
         observing.shutdown().await;
 

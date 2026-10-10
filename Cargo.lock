@@ -3289,6 +3289,7 @@ dependencies = [
  "rightsize-modules",
  "rustls",
  "serde",
+ "serde_json",
  "smol_str",
  "thiserror 2.0.20",
  "tokio",
@@ -3388,6 +3389,8 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "postcard",
+ "serde",
+ "serde_json",
  "sundog",
  "tikv-jemallocator",
  "tokio",
