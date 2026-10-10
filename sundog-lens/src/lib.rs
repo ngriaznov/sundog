@@ -18,12 +18,14 @@
 //!   keys; [`watch`] runs the terminal loop; [`once`] prints one report.
 //! - [`key`] parses a key typed as text into the postcard bytes a cache hashes,
 //!   and [`locate`] names the part and the owners of that key from the model.
-//! - [`control`] runs commands on a test node's control port, and [`explained`]
-//!   reads the answer to one of them, `explain <key>`.
+//! - [`control`] runs commands on a test node's control port, [`explained`]
+//!   reads the answer to one of them, `explain <key>`, and [`ask`] asks every
+//!   test node at once.
 //! - [`scenario`] parses and plays the scripted demo.
 //! - [`fleet`] and [`demo`] start local test nodes (Unix only).
 
 pub mod app;
+pub mod ask;
 pub mod cli;
 pub mod control;
 #[cfg(unix)]

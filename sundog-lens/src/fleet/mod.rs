@@ -39,8 +39,8 @@ use crate::scenario::director::Stage;
 use crate::source::http;
 use load::LoadHandle;
 use proc::{
-    BUILD_HINT, CONTROL_PORT, METRICS_OFFSET, METRICS_PORT, NodeProc, READY_TIMEOUT, ReadyHandle,
-    parse_label, slot_label,
+    BUILD_HINT, CONTROL_OFFSET, CONTROL_PORT, METRICS_OFFSET, METRICS_PORT, NodeProc,
+    READY_TIMEOUT, ReadyHandle, parse_label, slot_label,
 };
 
 pub mod layout;
@@ -759,6 +759,14 @@ pub fn metrics_template() -> String {
     format!("http://{{ip}}:{{gossip_port+{METRICS_OFFSET}}}/metrics")
 }
 
+/// The control address template that reaches each node's control port: the
+/// control port lies [`CONTROL_OFFSET`] ports above the node's gossip port in
+/// every layout, so the template needs no per-layout form.
+#[must_use]
+pub fn control_template() -> String {
+    format!("{{ip}}:{{gossip_port+{CONTROL_OFFSET}}}")
+}
+
 /// The command line that watches the fleet `config` starts.
 #[must_use]
 pub fn watch_line(config: &FleetConfig) -> String {
@@ -954,8 +962,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_metrics_template_reaches_each_nodes_exporter_in_either_layout() {
+    /// The live member that gossip shows for the node at `info`.
+    fn live_member(info: &SlotInfo) -> sundog::observe::Member {
         use std::collections::BTreeMap;
         use std::time::SystemTime;
 
@@ -963,6 +971,24 @@ mod tests {
         use sundog::node::{NodeId, NodeName};
         use sundog::observe::{Member, MemberStatus};
 
+        let node = NodeId::from(info.slot as u64);
+        Member::new(
+            Peer {
+                node,
+                name: NodeName::new("host", node),
+                gossip_addr: info.gossip,
+                data_addr: SocketAddr::from((info.ip, 40_000)),
+                incarnation: 1,
+                protocol: 6,
+            },
+            MemberStatus::Live,
+            SystemTime::UNIX_EPOCH,
+            BTreeMap::new(),
+        )
+    }
+
+    #[test]
+    fn the_metrics_template_reaches_each_nodes_exporter_in_either_layout() {
         use crate::source::targets::UrlTemplate;
 
         let template = UrlTemplate::parse(&metrics_template()).unwrap();
@@ -970,22 +996,8 @@ mod tests {
         for layout in [PER_ADDRESS, Layout::Shared] {
             for slot in 1..=MAX_SLOTS {
                 let info = SlotInfo::new(layout, slot).unwrap();
-                let node = NodeId::from(slot as u64);
-                let member = Member::new(
-                    Peer {
-                        node,
-                        name: NodeName::new("host", node),
-                        gossip_addr: info.gossip,
-                        data_addr: SocketAddr::from((info.ip, 40_000)),
-                        incarnation: 1,
-                        protocol: 6,
-                    },
-                    MemberStatus::Live,
-                    SystemTime::UNIX_EPOCH,
-                    BTreeMap::new(),
-                );
                 assert_eq!(
-                    template.expand(&member).unwrap(),
+                    template.expand(&live_member(&info)).unwrap(),
                     format!("http://{}/metrics", info.metrics),
                     "{layout:?} slot {slot}"
                 );
@@ -994,6 +1006,25 @@ mod tests {
         // The second shared slot's exporter, as the fleet documents it.
         let second = SlotInfo::new(Layout::Shared, 2).unwrap();
         assert_eq!(second.metrics, "127.0.0.1:9091".parse().unwrap());
+    }
+
+    #[test]
+    fn the_control_template_reaches_each_slots_control_port() {
+        use crate::source::targets::UrlTemplate;
+
+        assert_eq!(control_template(), "{ip}:{gossip_port+134}");
+        let template = UrlTemplate::parse(&control_template()).unwrap();
+        for layout in [PER_ADDRESS, Layout::Shared] {
+            for slot in 1..=MAX_SLOTS {
+                let info = SlotInfo::new(layout, slot).unwrap();
+                let url = template.expand(&live_member(&info)).unwrap();
+                assert_eq!(url, info.control.to_string(), "{layout:?} slot {slot}");
+                assert_eq!(url.parse::<SocketAddr>().unwrap(), info.control);
+            }
+        }
+        // The second shared slot's control port, as the fleet documents it.
+        let second = SlotInfo::new(Layout::Shared, 2).unwrap();
+        assert_eq!(second.control, "127.0.0.1:8081".parse().unwrap());
     }
 
     #[test]

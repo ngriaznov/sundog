@@ -14,11 +14,14 @@ use sundog::store::Mode;
 
 use super::text;
 use super::theme::{self, Rgb};
+use crate::ask::Target;
+use crate::key::printable;
 use crate::model::derive::{self, FetchMix};
 use crate::model::metrics::NodeMetrics;
 use crate::model::series::RING_LEN;
 use crate::model::{Model, Slot};
 use crate::source::names;
+use crate::source::targets::UrlTemplate;
 
 /// How long after a node first shows live its row reads as newly joined.
 pub const JOINED_FOR: Duration = Duration::from_secs(10);
@@ -371,6 +374,42 @@ pub fn ownership_cache(model: &Model, preferred: Option<&str>) -> Option<SmolStr
         .and_then(|wanted| caches.iter().find(|name| *name == wanted))
         .or_else(|| caches.first())
         .cloned()
+}
+
+/// The test nodes to ask about a key, and the live nodes with no control
+/// address.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ControlTargets {
+    /// The live nodes with a control address, in slot order.
+    pub asked: Vec<Target>,
+    /// The live nodes the template gives no control address, in slot order,
+    /// each with the reason in words.
+    pub skipped: Vec<(SmolStr, String)>,
+}
+
+/// Where each live member's control port is: `template` expanded for the
+/// member and read as a socket address. A departing, down or left member is
+/// not asked.
+#[must_use]
+pub fn control_targets(model: &Model, template: &UrlTemplate) -> ControlTargets {
+    let mut targets = ControlTargets::default();
+    for row in all_node_rows(model)
+        .into_iter()
+        .filter(|row| row.status() == MemberStatus::Live)
+    {
+        let label = row.slot.label.clone();
+        match template.expand(row.member) {
+            Err(error) => targets.skipped.push((label, error.to_string())),
+            Ok(url) => match url.parse::<SocketAddr>() {
+                Ok(addr) => targets.asked.push(Target { label, addr }),
+                Err(_) => targets.skipped.push((
+                    label,
+                    format!("`{}` is not a socket address", printable(&url)),
+                )),
+            },
+        }
+    }
+    targets
 }
 
 /// The members that are live or departing, as the count the header shows.
@@ -809,6 +848,110 @@ mod tests {
             theme::NODE_COLORS[0]
         );
         assert!(row_labeled(&model, "zz").is_none());
+    }
+
+    /// A model with one live member per gossip address in `addrs`.
+    fn model_at(addrs: &[SocketAddr]) -> Model {
+        let members = (1u8..)
+            .zip(addrs)
+            .map(|(index, &addr)| {
+                let mut member = testkit::member(index, MemberStatus::Live);
+                member.peer.gossip_addr = addr;
+                member
+            })
+            .collect();
+        let mut model = Model::new();
+        let now = Instant::now();
+        model.apply(
+            Update::Snapshot(
+                std::sync::Arc::new(ClusterSnapshot::new("c", members, 0)),
+                now,
+            ),
+            now,
+            SystemTime::UNIX_EPOCH,
+        );
+        model
+    }
+
+    fn template(text: &str) -> UrlTemplate {
+        UrlTemplate::parse(text).unwrap()
+    }
+
+    #[test]
+    fn control_targets_expand_the_template_for_live_members_only() {
+        let model = fixture();
+        let targets = control_targets(&model, &template("{ip}:{gossip_port+134}"));
+        // n6 is departing, n7 down and n8 left: only the live five are asked.
+        let expected = (1..=5)
+            .map(|n| Target {
+                label: format!("n{n}").into(),
+                addr: format!("127.0.0.{}:8080", 10 + n).parse().unwrap(),
+            })
+            .collect();
+        assert_eq!(
+            targets,
+            ControlTargets {
+                asked: expected,
+                skipped: Vec::new()
+            }
+        );
+        assert_eq!(
+            control_targets(&Model::new(), &template("{ip}:{gossip_port+134}")),
+            ControlTargets::default(),
+            "a model with no snapshot has no one to ask"
+        );
+    }
+
+    #[test]
+    fn a_template_that_makes_no_address_skips_the_node_and_says_why() {
+        let model = model_at(&[
+            "127.0.0.11:7946".parse().unwrap(),
+            "127.0.0.12:65000".parse().unwrap(),
+        ]);
+        let shifted = control_targets(&model, &template("{ip}:{gossip_port+1000}"));
+        let asked: Vec<_> = shifted.asked.iter().map(|t| t.addr.to_string()).collect();
+        assert_eq!(asked, ["127.0.0.11:8946"]);
+        assert_eq!(
+            shifted.skipped,
+            [(
+                SmolStr::new("n2"),
+                "gossip port 65000 +1000 is above 65535".to_owned()
+            )]
+        );
+
+        let url = control_targets(&model, &template("http://{ip}/\u{1b}control"));
+        assert_eq!(url.asked, Vec::<Target>::new());
+        assert_eq!(
+            url.skipped,
+            [
+                (
+                    SmolStr::new("n1"),
+                    "`http://127.0.0.11/·control` is not a socket address".to_owned()
+                ),
+                (
+                    SmolStr::new("n2"),
+                    "`http://127.0.0.12/·control` is not a socket address".to_owned()
+                ),
+            ],
+            "the template's text is made safe to draw"
+        );
+    }
+
+    #[test]
+    fn an_ipv6_member_gets_its_control_address_in_brackets() {
+        let model = model_at(&["[::1]:7946".parse().unwrap()]);
+        let targets = control_targets(&model, &template("{ip}:{gossip_port+134}"));
+        let ipv6 = Target {
+            label: "n1".into(),
+            addr: "[::1]:8080".parse().unwrap(),
+        };
+        assert_eq!(
+            targets,
+            ControlTargets {
+                asked: vec![ipv6],
+                skipped: Vec::new()
+            }
+        );
     }
 
     #[test]
