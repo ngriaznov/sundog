@@ -30,7 +30,7 @@
 //! Under `feature = "spill"`, a live entry can move to disk instead of
 //! being evicted; see [`super::spill::SpillTier`] for that mechanism.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -563,9 +563,10 @@ fn is_spill_candidate<K, V>(live: &Live<K, V>) -> bool {
 /// whole cap never fits, so it is sampled like any other. A caller
 /// applying one batch across several stripes keeps one `Written` for the
 /// whole batch; the eviction clears it once a scan finds nothing but these
-/// entries, so later passes for the same batch skip that scan.
+/// entries, so later passes for the same batch skip that scan. Each hash
+/// is already an xxh3 of the key bytes, so the table keys on it as is.
 #[derive(Debug, Default)]
-pub(crate) struct Written(HashSet<u64>);
+pub(crate) struct Written(HashTable<u64>);
 
 impl Written {
     /// `hash` alone.
@@ -577,7 +578,13 @@ impl Written {
 
     /// Adds `hash`.
     pub(crate) fn insert(&mut self, hash: u64) {
-        self.0.insert(hash);
+        if !self.contains(hash) {
+            self.0.insert_unique(hash, hash, |&held| held);
+        }
+    }
+
+    fn contains(&self, hash: u64) -> bool {
+        self.0.find(hash, |&held| held == hash).is_some()
     }
 
     fn is_empty(&self) -> bool {
@@ -591,7 +598,7 @@ impl Written {
 
     /// Whether `live` is one of the entries these writes stored.
     fn holds<K, V>(&self, live: &Live<K, V>) -> bool {
-        !self.0.is_empty() && self.0.contains(&hash_key_bytes(record_key(&live.record)))
+        !self.0.is_empty() && self.contains(hash_key_bytes(record_key(&live.record)))
     }
 }
 
@@ -3912,8 +3919,9 @@ where
     /// The sampling window [`Engine::evict_one_sampled`] and [`Engine::evict_batch_sampled`] both draw from.
     /// Walks `stripe.live` in arena order, so a tie on [`idle_elapsed_ms`]
     /// resolves to whichever comes last: an undocumented tie-break. The
-    /// entries `written` holds are never in the window, except one heavier
-    /// than the whole cap, which never fits.
+    /// candidates `written` holds are never in the window, except one
+    /// heavier than the whole cap, which never fits; only a candidate's key
+    /// is hashed to check.
     fn sample_candidates<'s>(
         &self,
         stripe: &'s Stripe<K, V>,
@@ -3926,7 +3934,11 @@ where
             .iter()
             .skip(offset)
             .chain(stripe.live.iter().take(offset))
-            .filter(|live| u64::from(live.weight) > self.max_capacity || !written.holds(live))
+            .filter(|live| {
+                !is_spill_candidate(live)
+                    || u64::from(live.weight) > self.max_capacity
+                    || !written.holds(live)
+            })
             .take(sample_size)
             .filter(|live| is_spill_candidate(live))
     }
@@ -4024,6 +4036,7 @@ where
     )]
     fn evict_one_scanning(&self, bucket: usize, now_ms: u64) -> Option<EvictOutcome> {
         self.evict_one_scanning_with_reservation(bucket, None, &Written::default(), now_ms)
+            .map(|(_, outcome)| outcome)
     }
 
     /// [`Engine::evict_one_scanning`], reborrowing `reservation` into each
@@ -4034,14 +4047,14 @@ where
     /// `Some` with no progress, at a victim refused while a hand-off is in
     /// flight, the case [`defer_to_flusher`] leaves to the flusher. Passes
     /// over the entries `written` holds, so `None` means every stripe holds
-    /// nothing else to evict.
+    /// nothing else to evict. `Some` carries the stripe it stopped at.
     fn evict_one_scanning_with_reservation(
         &self,
         bucket: usize,
         mut reservation: Option<&mut Reservation<'_>>,
         written: &Written,
         now_ms: u64,
-    ) -> Option<EvictOutcome> {
+    ) -> Option<(usize, EvictOutcome)> {
         (0..BUCKET_COUNT)
             .map(|step| (bucket + step) % BUCKET_COUNT)
             .find_map(|candidate| {
@@ -4053,7 +4066,7 @@ where
                 );
                 let refused_while_busy = outcome.refused && self.pending_spill_weight_or_zero() > 0;
                 (!outcome.made_no_progress() || outcome.deficit > 0 || refused_while_busy)
-                    .then_some(outcome)
+                    .then_some((candidate, outcome))
             })
     }
 
@@ -4078,6 +4091,7 @@ where
             over_by,
             None,
             &Written::default(),
+            false,
             now_ms,
         )
     }
@@ -4086,13 +4100,16 @@ where
     /// victim's own [`Engine::evict_victim_locked`] call, so the same
     /// pre-lock budget carries across every victim this lock hold evicts.
     /// Victims are ranked coldest-first by [`idle_elapsed_ms`] as of
-    /// `now_ms`, correct across a `last_access_ms` rollover.
+    /// `now_ms`, correct across a `last_access_ms` rollover. With
+    /// `only_if_dense`, a sample of fewer than [`EVICTION_SAMPLE`]
+    /// candidates gives up nothing, so a sparse stripe is never drained.
     fn evict_batch_sampled_with_reservation(
         &self,
         bucket: usize,
         over_by: u64,
         mut reservation: Option<&mut Reservation<'_>>,
         written: &Written,
+        only_if_dense: bool,
         now_ms: u64,
     ) -> EvictOutcome {
         self.note_eviction_lock_acquisition();
@@ -4107,7 +4124,7 @@ where
                 )
             })
             .collect();
-        if sampled.is_empty() {
+        if sampled.is_empty() || (only_if_dense && sampled.len() < EVICTION_SAMPLE) {
             return EvictOutcome::default();
         }
         sampled.sort_unstable_by_key(|&(_, idle, _)| std::cmp::Reverse(idle));
@@ -4197,8 +4214,13 @@ where
     /// `start_bucket` then pseudo-random stripes, until it is back under
     /// the cap, up to [`EVICTION_BATCH`] entries per lock hold. A random
     /// probe that lands on an empty stripe falls back to a scan for the next
-    /// non-empty one, so the loop ends under the cap, with nothing left to
-    /// evict, or with the rest left to the flusher, as below. Never holds
+    /// non-empty one. When the stripe the scan found holds at least
+    /// [`EVICTION_SAMPLE`] candidates, the next pass stays there and evicts
+    /// the colder half of its sample, so draining a dense stripe in an
+    /// otherwise sparse cache pays for one scan per batch rather than one
+    /// per victim; a sparser stripe is left to the random probes. The loop
+    /// ends under the cap, with nothing left to evict, or with the rest
+    /// left to the flusher, as below. Never holds
     /// two stripe locks at once; a no-op when `max_capacity` is
     /// [`u64::MAX`].
     ///
@@ -4260,7 +4282,8 @@ where
     /// the weight it is about to reinstall, to make that room first. A
     /// no-op when `max_capacity` is [`u64::MAX`]. Passes over the entries
     /// `written` holds until a scan finds nothing else to evict, then
-    /// clears `written`.
+    /// clears `written` and goes back to `start_bucket`, where the write
+    /// that triggered this call landed.
     fn evict_down_to(
         &self,
         limit: u64,
@@ -4273,6 +4296,10 @@ where
             return 0;
         }
         let mut bucket = start_bucket;
+        // Whether a scan just found a victim in `bucket`: the one pass that
+        // follows samples that stripe, and evicts there only from a full
+        // sample.
+        let mut after_scan = false;
         loop {
             let total = self.total_weight.load(Ordering::Relaxed);
             let pending = self.pending_spill_weight_or_zero();
@@ -4286,6 +4313,7 @@ where
                 over_by,
                 reservation.as_deref_mut(),
                 written,
+                after_scan,
                 now_ms,
             );
             if batch_outcome.deficit > 0 {
@@ -4294,7 +4322,7 @@ where
                 let current = total.saturating_add(pending);
                 return deficit_once_still_over_capacity(current, limit, batch_outcome.deficit);
             }
-            if batch_outcome.made_no_progress() {
+            if batch_outcome.made_no_progress() && !after_scan {
                 if defer_to_flusher(
                     batch_outcome.refused,
                     self.total_weight.load(Ordering::Relaxed),
@@ -4311,15 +4339,24 @@ where
                 ) {
                     // Only the writes' own entries are left: they go too,
                     // so the cap holds.
-                    None if !written.is_empty() => written.clear(),
+                    None if !written.is_empty() => {
+                        written.clear();
+                        bucket = start_bucket;
+                        continue;
+                    }
                     None => return 0,
-                    Some(outcome) if outcome.deficit > 0 => return outcome.deficit,
+                    Some((_, outcome)) if outcome.deficit > 0 => return outcome.deficit,
                     // The scan stopped at a victim refused while a hand-off
                     // is in flight.
-                    Some(outcome) if outcome.made_no_progress() => return 0,
-                    Some(_) => {}
+                    Some((_, outcome)) if outcome.made_no_progress() => return 0,
+                    Some((found, _)) => {
+                        bucket = found;
+                        after_scan = true;
+                        continue;
+                    }
                 }
             }
+            after_scan = false;
             bucket = self.next_pseudo_random_bucket();
         }
     }
@@ -5626,6 +5663,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
@@ -7396,7 +7434,8 @@ mod tests {
     }
 
     /// A scan that finds nothing but the batch's own entries clears
-    /// `written`, so the batch's next stripe group evicts one of them at
+    /// `written` and goes back to the write's stripe, so that group evicts
+    /// one of its own there, and the batch's next stripe group evicts at
     /// once rather than scan every stripe again.
     #[test]
     fn a_scan_finding_only_written_entries_clears_them_for_the_next_group() {
@@ -7415,6 +7454,7 @@ mod tests {
             .collect();
         let mut written = Written::default();
 
+        let first_group = engine.debug_eviction_lock_acquisitions();
         let _ = engine.apply_many_with_reservation(
             early_bucket,
             early
@@ -7432,6 +7472,11 @@ mod tests {
         assert!(
             written.is_empty(),
             "the scan found nothing but the batch's own entries"
+        );
+        assert_eq!(
+            engine.debug_eviction_lock_acquisitions() - first_group,
+            1 + BUCKET_COUNT as u64 + 1,
+            "a sample of the group's stripe, a scan of every stripe, then the group's stripe again"
         );
 
         let before = engine.debug_eviction_lock_acquisitions();
@@ -7452,6 +7497,97 @@ mod tests {
             engine.debug_eviction_lock_acquisitions() - before,
             3,
             "a sample of `late`'s stripe, then a scan of it and the next"
+        );
+    }
+
+    /// Once a scan finds a victim, the next pass samples the stripe it
+    /// found rather than a random one: a sparse cache clears an overage in
+    /// a far stripe with one scan, not one scan per victim.
+    #[test]
+    fn the_pass_after_a_scan_stays_in_the_stripe_it_found() {
+        let weigher: Weigher<u32, String> = Box::new(|_k, _v| 1);
+        let engine = Engine::<u32, String>::new(10, None, Some(weigher), None);
+        let far = 7;
+        let keys: Vec<u32> = (0..100_000u32)
+            .filter(|&k| stripe_index_from_hash(hash_key_bytes(key_bytes(k).as_ref())) == far)
+            .take(19)
+            .collect();
+        for (i, &k) in keys.iter().enumerate() {
+            let now = u64::try_from(i).expect("small");
+            let _ = put(
+                &engine,
+                k,
+                key_bytes(k),
+                k.to_string(),
+                hlc(now + 1, 1),
+                None,
+                now,
+            );
+        }
+        assert_eq!(engine.debug_totals(), (19, 19));
+        let before = engine.debug_eviction_lock_acquisitions();
+
+        engine.enforce_capacity(far + 1, &mut Written::default(), 100);
+
+        assert_eq!(engine.debug_totals(), (10, 10), "back within the cap");
+        assert_eq!(
+            engine.debug_eviction_lock_acquisitions() - before,
+            1 + BUCKET_COUNT as u64 + 1,
+            "the empty start stripe, a scan around to the far stripe, then one batch there"
+        );
+    }
+
+    /// A batch that evicts only from a dense stripe takes nothing from one
+    /// holding fewer than [`EVICTION_SAMPLE`] candidates, and the colder
+    /// half of one holding that many.
+    #[test]
+    fn a_batch_only_if_dense_spares_a_sparse_stripe() {
+        let weigher: Weigher<u32, String> = Box::new(|_k, _v| 1);
+        let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher), None);
+        let (sparse, dense) = (7, 9);
+        for (stripe, count) in [(sparse, EVICTION_SAMPLE - 1), (dense, EVICTION_SAMPLE)] {
+            let keys = (0..100_000u32)
+                .filter(|&k| {
+                    stripe_index_from_hash(hash_key_bytes(key_bytes(k).as_ref())) == stripe
+                })
+                .take(count);
+            for (i, k) in keys.enumerate() {
+                let now = u64::try_from(i).expect("small");
+                let _ = put(
+                    &engine,
+                    k,
+                    key_bytes(k),
+                    k.to_string(),
+                    hlc(now + 1, 1),
+                    None,
+                    now,
+                );
+            }
+        }
+        let batch = |stripe, only_if_dense| {
+            engine.evict_batch_sampled_with_reservation(
+                stripe,
+                100,
+                None,
+                &Written::default(),
+                only_if_dense,
+                100,
+            )
+        };
+
+        assert!(
+            batch(sparse, true).made_no_progress(),
+            "a sparse stripe gives up nothing"
+        );
+        assert_eq!(
+            batch(dense, true).removed_weight,
+            4,
+            "a dense stripe gives up its colder half"
+        );
+        assert_eq!(
+            batch(sparse, false).removed_weight,
+            4,
+            "without the flag, a sparse stripe gives up its colder half too"
         );
     }
 
@@ -8184,8 +8320,9 @@ mod tests {
         let weigher: Weigher<u32, String> =
             Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
         let engine = Engine::<u32, String>::new(10_000, None, Some(weigher), None);
-        // 6,000 one-unit entries, then one warmer 9,500-unit entry: back
-        // under the cap only after more than 5,500 evictions of cold ones.
+        // 6,000 one-unit entries, then one 9,500-unit write: back under the
+        // cap only after more than 5,500 evictions of older ones, since the
+        // write's own entry goes only once nothing else is left.
         for k in 1..=6_000u32 {
             let _ = put(
                 &engine,
@@ -8199,7 +8336,8 @@ mod tests {
         }
         let big = 7_000u32;
         let big_bytes = key_bytes(big);
-        let start_bucket = stripe_index_from_hash(hash_key_bytes(big_bytes.as_ref()));
+        let big_hash = hash_key_bytes(big_bytes.as_ref());
+        let start_bucket = stripe_index_from_hash(big_hash);
         let _ = put(
             &engine,
             big,
@@ -8211,7 +8349,7 @@ mod tests {
         );
         assert_eq!(engine.debug_totals().1, 15_500);
 
-        engine.enforce_capacity(start_bucket, &mut Written::default(), 100);
+        engine.enforce_capacity(start_bucket, &mut Written::of(big_hash), 100);
 
         let (entries, weight) = engine.debug_totals();
         assert!(
@@ -8220,7 +8358,7 @@ mod tests {
         );
         assert!(
             entries <= 501,
-            "{entries} entries remain; the warm big entry was evicted instead of cold ones"
+            "{entries} entries remain; the big write was evicted instead of older ones"
         );
     }
 

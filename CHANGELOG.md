@@ -19,6 +19,13 @@ All notable changes to this project are documented in this file. Format follows
   `get_or_load` fill, a re-arm by `expire`, `touch` or `persist`, and with
   `spill` the hand-off to the tier and its reservation retries, follow the
   same rule.
+- **Eviction in a sparse capped cache scans once per batch, not once per
+  victim.** When the stripe a scan finds holds a full sample, the next pass
+  evicts the colder half of it there instead of probing another random,
+  likely empty stripe. A joiner pulling a whole cache into a small
+  `max_capacity` took about 450 stripe locks per applied entry, enough to
+  run its state transfer past `state_transfer_budget` and open with part of
+  the cache; it now takes a third of that.
 
 ## [0.6.6] – 2026-10-09
 
