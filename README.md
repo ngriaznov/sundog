@@ -117,7 +117,7 @@ change moves, and the rates each node exports. A crash and a graceful leave
 look different on it.
 
 <p align="center">
-  <img src="assets/sundog-lens.gif" width="720" alt="The sundog-lens terminal UI during its tour: three nodes join, a fourth and fifth scale the cluster out, one node crashes, one leaves gracefully and one restarts while the part-ownership mosaic, member table, throughput chart and event log update">
+  <img src="assets/sundog-lens.gif" width="720" alt="The sundog-lens terminal UI during its tour: three nodes join, a fourth and fifth scale the cluster out, the explain overlay shows where one key lives and what each of the five nodes says of reading it, one node crashes, one leaves gracefully and one restarts while the part-ownership mosaic, member table, throughput chart and event log update">
 </p>
 
 `e` opens "Explain a read" over any view. Type a key and the lens names the
