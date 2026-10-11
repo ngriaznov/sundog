@@ -114,18 +114,35 @@ background tasks and frees the name for a fresh `open()`. A clone kept past
 observer that owns nothing and is never a peer, and shows each node's status,
 which node owns which part of a `Distributed` cache, the parts every view
 change moves, and the rates each node exports. A crash and a graceful leave
-look different on it. `e` names where one key lives, the part it hashes to
-and its owners in fetch order, computed from gossip.
+look different on it.
 
 <p align="center">
   <img src="assets/sundog-lens.gif" width="720" alt="The sundog-lens terminal UI during its tour: three nodes join, a fourth and fifth scale the cluster out, one node crashes, one leaves gracefully and one restarts while the part-ownership mosaic, member table, throughput chart and event log update">
 </p>
 
+`e` opens "Explain a read" over any view. Type a key and the lens names the
+part it hashes to and its owners in fetch order, computed from gossip for any
+cluster that runs a `Distributed` cache, with no node asked. In the demo
+(`sundog-lens demo`, below), `Enter` also asks every live `sundog-testnode` for
+its `Cache::explain` of a `String` key and lays the answers below the
+placement, headed by a line that says whether the nodes agree with each other
+and with the lens. `--once --explain KEY` adds the placement to the `--once`
+report, `--cache NAME` picks the `Distributed` cache when several exist, and
+`--json` adds an `explain` object to the JSON report. Gossip carries no key
+type, so the text picks the encoding: bare `k17` is a `String`, `uint:N` a
+`u16`, `u32` or `u64`, `int:N` an `i16`, `i32` or `i64`, `hex:036b` the postcard
+bytes verbatim for any other type, and `str:` escapes a `String` that starts
+with one of those prefixes. Only a `String` key of visible ASCII with no space
+is asked; the other encodings are computed only.
+[Explaining a read](#explaining-a-read) describes the library call behind each
+node's answer, and the [runbook](docs/src/operations.md#explaining-a-key)
+covers the overlay, its columns and the report.
+
 ```sh
 cargo run --release -p sundog-lens -- watch mycluster --seed 10.0.0.5:7946 \
     --metrics 'http://{ip}:9090/metrics'
 
-# where one key lives, as a report
+# the --once report, with where one key lives
 cargo run --release -p sundog-lens -- watch mycluster --seed 10.0.0.5:7946 \
     --once --explain k17 --cache it
 
