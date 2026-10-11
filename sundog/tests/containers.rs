@@ -853,7 +853,11 @@ async fn wait_for_quiescent_netstats(node: &Node, timeout: Duration) {
 /// the repair below runs through the IBLT sketch path, not a full listing.
 /// n2 cold-joins and warms first, so both replicas start byte-identical;
 /// dropping one key locally on n2 then leaves exactly one bucket mismatched
-/// for anti-entropy to close.
+/// for anti-entropy to close. The drop waits for n1's sent bytes to go
+/// quiet ([`wait_for_quiescent_netstats`]): n2's local count reaches ENTRIES
+/// slightly before its state-transfer stream and the first post-join
+/// anti-entropy round finish draining, and a record of that tail delivered
+/// after the drop puts the dropped key straight back.
 #[tokio::test]
 async fn anti_entropy_repairs_a_dropped_key_at_sketch_scale() {
     const ENTRIES: u32 = 500_000;
@@ -873,6 +877,7 @@ async fn anti_entropy_repairs_a_dropped_key_at_sketch_scale() {
     })
     .await;
     assert_eq!(n2.get(TARGET_KEY).await, Ok(Some(TARGET_VALUE.to_string())));
+    wait_for_quiescent_netstats(&n1, Duration::from_secs(90)).await;
 
     n2.drop_key(TARGET_KEY)
         .await
