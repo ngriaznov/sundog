@@ -59,7 +59,10 @@ joiner takes. Anti-entropy between two owners compares one digest per
 bucket, folded over the parts they share, so an idle round costs the same
 at any cluster size.
 
-A write for a part this node does not own goes to that part's owners.
+A write for a part this node does not own goes to that part's owners. The
+forwarded batch carries the writer's ownership view, and an owner whose view
+differs passes it on once more, so a write routed under a view that has since
+changed still reaches every current owner.
 `get` reads this node's copy and returns `None` off a non-owner. `fetch` is
 the network-aware read: it answers locally when this node owns the part
 and otherwise asks the owners in order, returning `Ok(None)` for a real
@@ -73,6 +76,12 @@ owner answers.
 ```rust
 {{#include ../cookbook/src/deploy.rs:distributed}}
 ```
+
+A `Distributed` cache opened on a fixed seed list with no known peer waits
+up to 5 seconds, or `state_transfer_budget` if shorter, for a first peer
+before it computes ownership, so `open` can take that long on the first node
+of a seeded cluster. The wait keeps a node from taking itself for the sole
+owner of every part just because no peer has reported in yet.
 
 When a node joins or leaves, ownership follows gossip within a few gossip
 intervals. A node that gains a part pulls it from the previous owners, and

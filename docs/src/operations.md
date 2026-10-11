@@ -62,15 +62,23 @@ addresses once it forms, under `cluster formed`.
 | `sundog_rebalance_pull_timeouts_total{cache}` | part pulls that timed out repeatedly and left the rest to anti-entropy |
 | `sundog_fetch_total{cache, outcome}` | `fetch` calls by outcome: `local`, `remote`, `miss` or `error` |
 | `sundog_fetch_duration_seconds{cache, outcome}` | histogram of every `fetch` that asked an owner, under its outcome: `remote`, `miss`, `error`, or `local` after a view change |
-| `sundog_forwarded_writes_total{cache}` | writes sent on to a part's owners |
+| `sundog_forwarded_writes_total{cache}` | writes sent on to a part's owners, or passed on because they arrived under another node's view |
 | `sundog_stale_view_total{cache}` | anti-entropy rounds a peer declined over a different ownership view |
 | `sundog_unowned_inbound_dropped_total{cache}` | inbound records dropped for a part this node does not own |
+
+### Registered loaders
+
+| Metric | Meaning |
+|---|---|
+| `sundog_loader_calls_total{cache}` | calls to the cache's registered loader on this node |
+| `sundog_refreshes_total{cache, outcome}` | refresh-ahead reloads by outcome: `loaded`, `absent` or `failed` |
+| `sundog_refresh_hints_sent_total{cache}` | hints this node sent to the node that refreshes a key |
 
 ### Merge resolvers
 
 | Metric | Meaning |
 |---|---|
-| `sundog_crdt_retired_writers_total{cache}` | writer slots the compaction sweep found eligible for retirement |
+| `sundog_crdt_retired_writers_total{cache}` | writer slots the compaction sweep found eligible for retirement, which can exceed the compactions because a writer counts as eligible even when its record is skipped |
 | `sundog_crdt_compactions_total{cache}` | records the sweep rewrote in compacted form |
 
 ### The spill tier
@@ -522,7 +530,8 @@ event instead of drawing and exits 1 when a step times out, which makes the
 tour a smoke test. `sundog-lens cluster` starts the same fleet with no
 scenario, and `S`, `K`, `L` and `R` in the demo spawn a node, kill one, make
 one leave and restart one. `sundog-lens/demo/record.sh` and `render.sh`
-produce the recording and GIF in `assets/`.
+produce the recording and GIF in `assets/`, and `asciinema play
+assets/sundog-lens.cast` replays the recording.
 
 `e` in the demo asks every test node over its control port, the channel the
 fleet uses for `fill` and `crash`. The test node accepts `explain KEY` and

@@ -8,7 +8,8 @@ write latency at p50 and p99, throughput, and memory per entry.
 
 ## The workload
 
-- **Keys**: 100,000 fixed-width keys, all loaded before measuring.
+- **Keys**: 100,000 fixed-width keys of 14 bytes (`key:` and ten digits),
+  all loaded before measuring.
 - **Values**: 100 bytes, different for every key, so no server can share
   one value across keys.
 - **Mix**: 90% reads and 10% writes.
@@ -48,6 +49,49 @@ its figures.
 
 `SUNDOG_BENCH_<SERVER>_IMAGE` replaces a server's image, for example
 `SUNDOG_BENCH_REDIS_IMAGE=redis:7.4`.
+
+## Results
+
+On one machine, at the median, a `Local` or `Replicated` read is more than
+500 times faster than a Redis, Valkey or Dragonfly read, a write more than
+100 times faster, and throughput more than 50 times higher. The weakest pairing
+in each case is `Replicated` against Valkey: 137 µs / 0.26 µs is 527 for
+reads, 136 µs / 1.18 µs is 115 for writes, and 5.13M / 100K ops/s is 51 for
+throughput. The ratios are for `Local` and `Replicated`. A `Distributed` read
+of a key another node owns costs a round trip, which sets its 257 µs read
+p99 and holds its throughput to 415K ops/s.
+
+The figures below come from one run of the workload above on a 4-core
+GitHub Actions runner:
+
+| Target | Read p50 | Read p99 | Write p50 | Write p99 | Throughput |
+|---|---:|---:|---:|---:|---:|
+| sundog, `Local` | 0.25 µs | 0.80 µs | 1.02 µs | 1.76 µs | 6.52M ops/s |
+| sundog, `Replicated`, 3 nodes | 0.26 µs | 0.93 µs | 1.18 µs | 2.48 µs | 5.13M ops/s |
+| sundog, `Distributed`, 3 nodes | 0.58 µs | 257 µs | 1.23 µs | 2.38 µs | 415K ops/s |
+| Redis 8 | 143 µs | 527 µs | 144 µs | 539 µs | 96.5K ops/s |
+| Valkey 8 | 137 µs | 494 µs | 136 µs | 502 µs | 100K ops/s |
+| Dragonfly | 223 µs | 596 µs | 225 µs | 591 µs | 65.3K ops/s |
+| Olric | 208 µs | 717 µs | 209 µs | 744 µs | 67.6K ops/s |
+| Hazelcast 5.5 | 337 µs | 876 µs | 340 µs | 901 µs | 43.4K ops/s |
+
+The comparison is an embedded cache against a networked one, so three things
+shape the figures:
+
+- **The servers**: their figures include the loopback TCP round trip to the
+  container. Across a real network that round trip grows, while a `Local` or
+  `Replicated` read stays in memory.
+- **Writes**: a `Replicated` write returns once the local copy is applied and
+  the write is queued for its peers. A `Distributed` write returns once it is
+  applied, or queued for the owners when this node does not own the part.
+  Neither waits on the network, so their latency leaves out the network.
+- **`Distributed` reads**: a node owns about two thirds of the keys (two
+  owners on three nodes). It reads those from memory, and each of the rest
+  costs one round trip to an owner. Those remote reads set the 257 µs p99.
+
+The servers hold each entry in less memory: Redis and Valkey used 166 to 168
+bytes per entry, Dragonfly 131, and sundog 205 to 209 bytes per copy.
+[Bytes per entry](sizing.md#bytes-per-entry) breaks down sundog's layout.
 
 ## Memory per entry
 

@@ -43,7 +43,8 @@ peers do not route to. The override covers both ports.
 
 ## Docker
 
-mDNS does not cross Docker's default bridge network. Give each container
+mDNS does not cross Docker's default bridge network, and most Wi-Fi networks
+block it too with access-point isolation. Give each container
 its seeds through `SUNDOG_SEEDS` or `.seeds(..)`, and with published ports
 set `advertise_ip` to the address other containers dial.
 

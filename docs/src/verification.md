@@ -90,5 +90,47 @@ SUNDOG_CONTAINER_TESTS=1 RIGHTSIZE_BACKEND=docker \
     cargo test --release -p sundog --test containers -- --test-threads=1
 ```
 
-The container suite needs Docker. The README lists the bench suites and the
-flags that pin a chaos seed for replay.
+The container suite needs Docker, because sundog's gossip is UDP and only the
+Docker backend carries it. Where registry pulls are unavailable, point
+`SUNDOG_TEST_BASE_IMAGE` at a pre-seeded image.
+
+A chaos run logs its seed. A red run replays with the seed and duration it
+printed:
+
+```sh
+SUNDOG_CONTAINER_TESTS=1 SUNDOG_CHAOS_SEED=<seed> SUNDOG_CHAOS_SECS=<secs> \
+    RIGHTSIZE_BACKEND=docker cargo test --release -p sundog --test containers \
+    -- --test-threads=1 chaos_
+```
+
+The Kani proofs run locally with `cargo install --locked kani-verifier &&
+cargo kani setup && cargo kani -p sundog --features spill`.
+
+Four benchmark suites sit outside the layers, each gated on `SUNDOG_BENCH=1`
+so a plain `cargo test` never pays their wall-clock cost:
+`entry_diet_bench` (memory per entry and local read latency),
+`replication_bench` (bulk write and read latency across a live cluster),
+`spill_bench` (the spill tier) and `crdt_bench` (merge resolvers against
+last-write-wins). Each is a test target of `sundog`:
+
+```sh
+SUNDOG_BENCH=1 cargo test --release -p sundog --features spill,prometheus \
+    --test spill_bench -- --test-threads=1 --nocapture
+```
+
+The two demos in `demos/` are soak rigs that run N nodes in one process. Each
+opens a terminal UI that kills and restarts nodes under write load, and
+`--headless <SECS>` runs it with no terminal, then prints a convergence report
+and exits nonzero on any divergence:
+
+```sh
+cargo run -p sundog-demo -- --nodes 5
+cargo run --release -p sundog-distributed-demo -- --nodes 5 --keys 2000000
+```
+
+The distributed demo's headless run also kills and restarts a node at the
+midpoint and samples keys against their expected values. `--report-json
+<PATH>` writes the run as a JSON summary, and `--gate <PATH>` checks it against
+a threshold file such as `ops/scale-gate.json`; both need `--metrics`. Build
+with `--features prometheus` for `--metrics` and `--features spill` for
+`--spill-dir`, which puts a spill tier under a per-node RAM cap.

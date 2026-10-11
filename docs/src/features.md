@@ -67,9 +67,11 @@ against the same directory replays the snapshot instead of starting empty,
 reading no values into RAM. A replayed bucket answers `fetch` only after a
 live co-owner confirms it, or after the warm-up finds no co-owner to ask.
 
-A crash leaves no snapshot, and a node down longer than `tombstone_ttl`
-opens cold regardless, since a peer may already have collected a tombstone
-that would outvote a stale replayed entry.
+The snapshot holds no tombstones and no expired entries. A crash leaves no
+snapshot, a successful warm reopen deletes the one it replayed, so a second
+open with no clean close between is cold, and a node down longer than
+`tombstone_ttl` opens cold regardless, since a peer may already have
+collected a tombstone that would outvote a stale replayed entry.
 `sundog_spill_reopen_total{outcome, reason}` records which path each open
 took.
 

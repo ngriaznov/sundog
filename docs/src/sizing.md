@@ -33,8 +33,24 @@ memory divided by entry count:
 | 16-byte key, 100-byte value | 4,000,000 | 212.2 |
 
 For comparison, Redis 7 uses 85 to 100 bytes per key for the first shape
-and 195 to 230 for the second, from `used_memory` over `DBSIZE`. The README
-has the commands to reproduce both sides.
+and 195 to 230 for the second, from `used_memory` over `DBSIZE`. To measure
+Redis at the first shape:
+
+```sh
+redis-server --daemonize yes --save '' --appendonly no
+seq 1 4000000 | awk '{printf "SET %07d %08d\n", $1, $1}' | redis-cli --pipe
+redis-cli info memory | grep used_memory:
+redis-cli dbsize
+```
+
+`used_memory` divided by `dbsize` is Redis's bytes per entry. For the second
+shape, run `redis-cli flushall` and load again:
+
+```sh
+seq 1 4000000 | awk '{printf "SET %016d %0100d\n", $1, $1}' | redis-cli --pipe
+```
+
+`redis-cli shutdown nosave` stops the server.
 
 For a shape of your own, estimate 60 bytes per entry plus the encoded key
 and value rounded up to the allocator's next size class, then confirm with
