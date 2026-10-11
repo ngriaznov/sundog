@@ -1,9 +1,11 @@
 //! The model's summary that the scenario director awaits on.
 
 use std::collections::BTreeMap;
+use std::fmt;
+use std::sync::Arc;
 
 use smol_str::SmolStr;
-use sundog::observe::MemberStatus;
+use sundog::observe::{MemberStatus, OwnershipShares};
 
 use super::Model;
 
@@ -19,6 +21,36 @@ pub struct ModelDigest {
     pub view_hash: BTreeMap<SmolStr, u64>,
     /// Whether each `Distributed` cache has settled.
     pub settled: BTreeMap<SmolStr, bool>,
+    /// Each `Distributed` cache's ownership, which a scenario's `explain`
+    /// step places a key in to judge what the nodes answer.
+    pub ownership: BTreeMap<SmolStr, HeldShares>,
+}
+
+/// A cache's ownership shares, shared with the model. Two are equal when they
+/// hold the same view, so an unchanged view keeps the digest unchanged.
+#[derive(Clone)]
+pub struct HeldShares(pub Arc<OwnershipShares>);
+
+impl PartialEq for HeldShares {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+            || (self.0.cache() == other.0.cache()
+                && self.0.owners() == other.0.owners()
+                && self.0.view_hash() == other.0.view_hash())
+    }
+}
+
+impl Eq for HeldShares {}
+
+impl fmt::Debug for HeldShares {
+    /// The cache and the view: the shares themselves hold every part.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HeldShares")
+            .field("cache", &self.0.cache())
+            .field("owners", &self.0.owners())
+            .field("view_hash", &format_args!("{:016x}", self.0.view_hash()))
+            .finish()
+    }
 }
 
 /// The digest of `model`.
@@ -59,6 +91,10 @@ pub fn digest(model: &Model) -> ModelDigest {
         digest.settled.insert(
             ownership.cache.clone(),
             model.settled(&ownership.cache).unwrap_or(false),
+        );
+        digest.ownership.insert(
+            ownership.cache.clone(),
+            HeldShares(Arc::clone(&ownership.shares)),
         );
     }
     digest
@@ -149,5 +185,61 @@ mod tests {
         assert_ne!(moved.view_hash["it"], first.view_hash["it"]);
         assert!(!moved.settled["it"]);
         assert_eq!(moved.live, 4);
+    }
+
+    #[test]
+    fn the_digest_carries_the_ownership_the_model_ranks() {
+        let mut model = Model::new();
+        let start = Instant::now();
+        feed(&mut model, testkit::snapshot(3), start);
+        let first = digest(&model);
+        let shares = &first.ownership["it"];
+        let ranked = model.ownership("it").expect("the model ranks it");
+        assert_eq!(shares.0.view_hash(), ranked.view_hash);
+        assert!(
+            Arc::ptr_eq(&shares.0, &ranked.shares),
+            "the digest shares the model's shares"
+        );
+        assert_eq!(first.ownership.len(), 1);
+
+        // The view holding still keeps the digest equal; it moving does not.
+        model.tick(start + Duration::from_secs(1));
+        assert_eq!(digest(&model).ownership, first.ownership);
+        feed(
+            &mut model,
+            testkit::snapshot(4),
+            start + Duration::from_secs(5),
+        );
+        let moved = digest(&model);
+        assert_ne!(moved.ownership, first.ownership);
+        assert_eq!(
+            moved.ownership["it"].0.view_hash(),
+            moved.view_hash["it"],
+            "the shares and the view hash move together"
+        );
+    }
+
+    #[test]
+    fn held_shares_compare_by_view_and_print_without_their_parts() {
+        let ranked = |live: u8| {
+            testkit::ownership_digest(&testkit::snapshot(live), "it").expect("members are eligible")
+        };
+        let (three, four) = (ranked(3), ranked(4));
+        let held = |digest: &crate::model::OwnershipDigest| {
+            HeldShares(Arc::new(digest.shares.as_ref().clone()))
+        };
+        // Another allocation of the same view is equal; another view is not.
+        assert_eq!(held(&three), held(&three));
+        assert_ne!(held(&three), held(&four));
+        let text = format!("{:?}", held(&three));
+        assert!(
+            text.starts_with("HeldShares { cache: \"it\", owners: 2"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("view_hash: {:016x}", three.view_hash)),
+            "{text}"
+        );
+        assert!(text.len() < 120, "{text}");
     }
 }

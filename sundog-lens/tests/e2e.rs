@@ -274,6 +274,62 @@ fn a_headless_await_that_times_out_exits_one_and_stops_the_nodes() {
 
 #[test]
 #[ignore = "starts sundog-testnode processes on 127.0.0.11 and up"]
+fn a_headless_explain_asks_every_node_and_agrees_with_the_lens() {
+    let _ports = PORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let testnode = require_testnode();
+    let cluster = "lens-e2e-explain";
+    let (code, output, took) = demo_headless(
+        &testnode,
+        cluster,
+        "spawn 3 stagger 1s\n\
+         await members 3 within 30s\n\
+         fill 2000\n\
+         await settled it within 30s\n\
+         explain k1 within 10s\n\
+         explain close\n\
+         quit\n",
+        Duration::from_secs(120),
+    );
+    assert_eq!(code, Some(0), "the run passes:\n{output}");
+    assert!(took < Duration::from_secs(95), "{took:?}");
+    for want in [
+        "] explain k1 within 10s",
+        "3 nodes agree, the lens computes the same",
+        "scenario done: 7 steps, 0 timeouts, 0 failures",
+        "headless run passed",
+    ] {
+        assert!(output.contains(want), "missing {want:?}:\n{output}");
+    }
+    assert!(testnode_pids(cluster).is_empty(), "every node is stopped");
+}
+
+#[test]
+#[ignore = "starts sundog-testnode processes on 127.0.0.11 and up"]
+fn a_headless_explain_that_gets_no_explanation_exits_one_and_stops_the_nodes() {
+    let _ports = PORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let testnode = require_testnode();
+    let cluster = "lens-e2e-explain-early";
+    // The lens has seen no cache to place the key in, and the node may not
+    // have opened its control port.
+    let (code, output, _) = demo_headless(
+        &testnode,
+        cluster,
+        "spawn 1\nexplain k1 within 5s\nquit\n",
+        Duration::from_secs(120),
+    );
+    assert_eq!(code, Some(1), "{output}");
+    assert!(output.contains("line 2"), "{output}");
+    assert!(output.contains("explain k1 within 5s"), "{output}");
+    assert!(output.contains("failed"), "{output}");
+    assert!(testnode_pids(cluster).is_empty(), "every node is stopped");
+}
+
+#[test]
+#[ignore = "starts sundog-testnode processes on 127.0.0.11 and up"]
 fn watch_once_json_reports_the_cluster_command_s_nodes_and_ownership() {
     let _ports = PORTS
         .lock()

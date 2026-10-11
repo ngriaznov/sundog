@@ -41,6 +41,18 @@ All notable changes to this project are documented in this file. Format follows
   each other and with the lens. A node that does not answer keeps its row
   with the reason. The lens opens no connection to a data port. No wire
   change and no change to the `sundog` crate.
+- **The `sundog-lens` demo tour shows the explain overlay.** After the
+  scale-out the tour opens the overlay on `k1`, a key its fleet filled, with
+  the computed placement, a row for each of the five test nodes and the line
+  that says they agree with each other and with the lens, then closes it
+  before the crash. Scenarios gain two steps for it: `explain KEY [within
+  DUR]` asks every running test node about the key and opens the overlay on
+  it with the answers in, and `explain close` closes it. The key `close` is
+  written `str:close`. The answers pass when every node explained the key and
+  all agree with each other and with the lens's placement of it; the step asks
+  again until they do and fails the run when the deadline passes first, so
+  `demo --headless` and `demo/record.sh`'s smoke run exercise `explain`
+  before anything is filmed.
 
 ### Fixed
 

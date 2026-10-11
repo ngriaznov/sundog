@@ -99,6 +99,16 @@ pub enum UiCommand {
     Caption(Option<String>),
     /// The test nodes' answers to an [`ExplainRequest`].
     Explained(Box<Explained>),
+    /// Open the explain overlay on `key`, as typed, with `answers` already in:
+    /// the scenario asked the test nodes itself.
+    Explain {
+        /// The key as typed, with its prefix.
+        key: String,
+        /// What the test nodes answered.
+        answers: Box<Explained>,
+    },
+    /// Close the explain overlay.
+    CloseExplain,
     /// End the interface: the scenario is over.
     Quit,
 }
@@ -723,7 +733,9 @@ impl App {
     }
 
     /// Applies one command for the interface: the scenario director's, or an
-    /// answer to an explain request.
+    /// answer to an explain request. A scripted `Explain` replaces the
+    /// overlay as it stands; `CloseExplain` closes it and keeps its text for
+    /// the next opening, as `Esc` does.
     pub fn apply_director(&mut self, command: UiCommand, live: &Model) {
         match command {
             UiCommand::Tab(view) => self.go(view),
@@ -744,6 +756,15 @@ impl App {
                     state.result = Some(answer);
                 }
             }
+            UiCommand::Explain { key, answers } => {
+                self.explain = Some(ExplainState {
+                    text: key,
+                    note: None,
+                    pending: None,
+                    result: Some(answers),
+                });
+            }
+            UiCommand::CloseExplain => self.close_explain(),
             UiCommand::Quit => {}
         }
     }
@@ -1381,6 +1402,7 @@ mod tests {
         type_into(&mut app, &model, "k1");
         let first = request_of(app.handle_key(key(KeyCode::Enter), &model));
         assert_eq!(first.id, 1);
+        assert_ne!(first.id, crate::ask::SCRIPTED_ID, "ids count from 1");
         assert_eq!(first.key, "k1");
         // The five live nodes, in slot order, at their control ports: the
         // departing, down and left members are not asked.
@@ -1857,6 +1879,111 @@ mod tests {
         assert_eq!(app.caption.as_deref(), Some("hello"));
         app.apply_director(UiCommand::Caption(None), &model);
         assert_eq!(app.caption, None);
+    }
+
+    #[test]
+    fn a_scripted_explain_opens_the_overlay_on_its_key_with_the_answers_in() {
+        let model = model();
+        let mut app = explaining_app();
+        app.apply_director(UiCommand::Tab(View::Node), &model);
+        app.apply_director(UiCommand::Caption(Some("kept".into())), &model);
+        let scripted = || answers(crate::ask::SCRIPTED_ID, "k1");
+        app.apply_director(
+            UiCommand::Explain {
+                key: "k1".to_owned(),
+                answers: Box::new(scripted()),
+            },
+            &model,
+        );
+        let state = app.explain.as_ref().expect("the command opens the overlay");
+        assert_eq!(state.text, "k1");
+        assert_eq!(state.result.as_deref(), Some(&scripted()));
+        assert_eq!((state.pending, &state.note), (None, &None));
+        assert_eq!(result_for(state), Some(&scripted()), "the answers show");
+        // Nothing but the overlay changed.
+        assert_eq!(app.view, View::Node);
+        assert_eq!(app.caption.as_deref(), Some("kept"));
+        assert!(!app.help);
+        // The overlay takes keys as if the person had opened it: typing edits
+        // the key, and the answers stop showing for another key.
+        type_into(&mut app, &model, "2");
+        assert_eq!(typed(&app), "k12");
+        assert_eq!(result_for(app.explain.as_ref().unwrap()), None);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Esc), &model),
+            Action::Redraw,
+            "Esc closes it"
+        );
+        assert!(app.explain.is_none());
+
+        // A key spelled with its prefix shows the answers to the key it names.
+        app.apply_director(
+            UiCommand::Explain {
+                key: "str:close".to_owned(),
+                answers: Box::new(answers(crate::ask::SCRIPTED_ID, "close")),
+            },
+            &model,
+        );
+        let state = app.explain.as_ref().unwrap();
+        assert_eq!(state.text, "str:close");
+        assert!(result_for(state).is_some_and(|result| result.key == "close"));
+    }
+
+    #[test]
+    fn a_scripted_explain_replaces_an_overlay_that_is_open() {
+        let model = model();
+        let mut app = explaining_app();
+        app.handle_key(ch('e'), &model);
+        type_into(&mut app, &model, "x");
+        let request = request_of(app.handle_key(key(KeyCode::Enter), &model));
+        assert_eq!(app.explain.as_ref().unwrap().pending, Some(request.id));
+        app.apply_director(
+            UiCommand::Explain {
+                key: "k1".to_owned(),
+                answers: Box::new(answers(crate::ask::SCRIPTED_ID, "k1")),
+            },
+            &model,
+        );
+        let state = app.explain.as_ref().unwrap();
+        assert_eq!(state.text, "k1", "the typed key is replaced");
+        assert_eq!((state.pending, &state.note), (None, &None));
+        // The answer to the request the command replaced is dropped.
+        app.apply_director(
+            UiCommand::Explained(Box::new(answers(request.id, "x"))),
+            &model,
+        );
+        assert_eq!(
+            app.explain.as_ref().unwrap().result.as_deref(),
+            Some(&answers(crate::ask::SCRIPTED_ID, "k1"))
+        );
+    }
+
+    #[test]
+    fn closing_a_scripted_explain_keeps_its_key_for_the_next_opening() {
+        let model = model();
+        let mut app = explaining_app();
+        // Closing what is not open changes nothing.
+        app.apply_director(UiCommand::CloseExplain, &model);
+        assert!(app.explain.is_none());
+        app.handle_key(ch('?'), &model);
+        app.apply_director(UiCommand::CloseExplain, &model);
+        assert!(app.help, "the help overlay is not the explain overlay");
+        app.handle_key(ch('?'), &model);
+
+        app.apply_director(
+            UiCommand::Explain {
+                key: "k1".to_owned(),
+                answers: Box::new(answers(crate::ask::SCRIPTED_ID, "k1")),
+            },
+            &model,
+        );
+        assert!(app.explain.is_some());
+        app.apply_director(UiCommand::CloseExplain, &model);
+        assert!(app.explain.is_none());
+        app.handle_key(ch('e'), &model);
+        let state = app.explain.as_ref().unwrap();
+        assert_eq!(state.text, "k1", "the text stays between openings");
+        assert_eq!((&state.result, state.pending), (&None, None));
     }
 
     #[test]

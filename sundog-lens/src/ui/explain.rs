@@ -32,7 +32,8 @@ use super::widgets::keycap;
 use super::{Scene, data, eventlog, text};
 use crate::app::{self, ExplainState};
 use crate::explained::{
-    self, Answer, Distributed, Explained, Local, NodeAnswer, Outcome, Reading, Source,
+    self, Answer, Distributed, Explained, Local, NodeAnswer, Outcome, Reading, Source, Verdict,
+    verdict,
 };
 use crate::key::{self, KeyError, KeySpec, printable};
 use crate::locate::{LocateError, Located, locate};
@@ -444,7 +445,7 @@ fn asked_section(
             anchor: 0,
         };
     };
-    let verdict = verdict(answers, resolved.located());
+    let verdict = verdict(answers, resolved.located().map(Located::placement).as_ref());
     // A frozen display stops the clock at the freeze. Answers asked later
     // come from the live nodes, which the frozen placement need not match.
     let after_freeze = scene.app.is_frozen() && answers.asked > scene.ctx.wall;
@@ -561,48 +562,8 @@ fn idle_note(scene: &Scene<'_>, state: &ExplainState, resolved: &Resolved<'_>) -
     }
 }
 
-/// What the answers say against each other and against the lens.
-enum Verdict {
-    /// Every `Distributed` answer holds the lens's view and owners.
-    Agree {
-        /// How many nodes answered.
-        nodes: usize,
-    },
-    /// No answer holds the lens's view: the view moved since the nodes were
-    /// asked.
-    Moved {
-        /// The view the answers used, eight digits.
-        from: String,
-        /// The lens's view, eight digits.
-        to: String,
-    },
-    /// The nodes hold different views.
-    Split {
-        /// The nodes in each view, as words.
-        groups: String,
-    },
-    /// The nodes agree on a view but not with the lens on the placement.
-    Apart {
-        /// The nodes that differ, as words.
-        nodes: String,
-        /// Whether more than one node differs.
-        many: bool,
-        /// The lens's view, eight digits.
-        view: String,
-    },
-    /// The nodes explained another cache than the one the block above places
-    /// the key in: nothing to compare.
-    OtherCache {
-        /// The cache the nodes explained.
-        asked: String,
-        /// The cache the lens placed the key in.
-        shown: String,
-    },
-    /// Nothing to compare, for the reason in words.
-    Nothing(&'static str),
-}
-
 impl Verdict {
+    /// The glyph that leads the verdict line.
     const fn mark(&self) -> &'static str {
         match self {
             Self::Agree { .. } => "✔",
@@ -611,6 +572,7 @@ impl Verdict {
         }
     }
 
+    /// The color of the verdict line.
     const fn token(&self) -> Token {
         match self {
             Self::Agree { .. } => Token::Ok,
@@ -618,92 +580,6 @@ impl Verdict {
             Self::Split { .. } | Self::Apart { .. } => Token::Move,
             Self::OtherCache { .. } | Self::Nothing(_) => Token::Muted,
         }
-    }
-
-    /// The verdict in a sentence. `after_freeze` says the answers were asked
-    /// after the display froze, when asking again cannot move the lens's
-    /// view.
-    fn words(&self, after_freeze: bool) -> String {
-        match self {
-            Self::Agree { nodes: 1 } => "1 node agrees, the lens computes the same".to_owned(),
-            Self::Agree { nodes } => {
-                format!("{nodes} nodes agree, the lens computes the same")
-            }
-            Self::Moved { from, to } if after_freeze => {
-                format!("the nodes hold {from}, the frozen display holds {to}: Esc, p unfreezes")
-            }
-            Self::Moved { from, to } => {
-                format!("view moved {from} -> {to}: Enter asks again")
-            }
-            Self::Split { groups } => groups.clone(),
-            Self::Apart { nodes, many, view } => format!(
-                "{nodes} {} from the lens, which holds view {view}",
-                if *many { "differ" } else { "differs" }
-            ),
-            Self::OtherCache { asked, shown } => format!(
-                "the nodes explained cache {asked} and the block above is cache {shown}: \
-                 nothing to compare"
-            ),
-            Self::Nothing(why) => (*why).to_owned(),
-        }
-    }
-}
-
-/// Compares `answers` with `located`, when the lens placed the key.
-fn verdict(answers: &Explained, located: Option<&Located>) -> Verdict {
-    let Some(located) = located else {
-        return Verdict::Nothing("the lens has no placement of the key to compare with");
-    };
-    // Test nodes explain their cache `it`, whatever cache the block places
-    // the key in.
-    if let Some((_, reading)) = answers
-        .readings()
-        .find(|(_, reading)| reading.cache != located.cache.as_str())
-    {
-        return Verdict::OtherCache {
-            asked: printable(&reading.cache),
-            shown: printable(&located.cache),
-        };
-    }
-    let agreement = explained::agreement(answers, located);
-    let lens = format!("{:016x}", located.view_hash);
-    let short = |view: &str| printable(view.get(..8).unwrap_or(view));
-    let Some(first) = agreement.groups.first() else {
-        return Verdict::Nothing("no node gave a Distributed reading to compare");
-    };
-    if agreement.groups.iter().all(|group| group.view != lens) {
-        return Verdict::Moved {
-            from: short(&first.view),
-            to: short(&lens),
-        };
-    }
-    if agreement.groups.len() > 1 {
-        let groups: Vec<String> = agreement
-            .groups
-            .iter()
-            .map(|group| {
-                let nodes: Vec<String> = group.nodes.iter().map(|node| printable(node)).collect();
-                format!(
-                    "{} {} {}",
-                    nodes.join(" "),
-                    if nodes.len() == 1 { "holds" } else { "hold" },
-                    short(&group.view)
-                )
-            })
-            .collect();
-        return Verdict::Split {
-            groups: groups.join(", "),
-        };
-    }
-    if agreement.apart.is_empty() {
-        let nodes = agreement.groups.iter().map(|group| group.nodes.len()).sum();
-        return Verdict::Agree { nodes };
-    }
-    let nodes: Vec<String> = agreement.apart.iter().map(|node| printable(node)).collect();
-    Verdict::Apart {
-        many: nodes.len() > 1,
-        nodes: nodes.join(" "),
-        view: short(&lens),
     }
 }
 

@@ -33,6 +33,11 @@ pub const TIMEOUT: Duration = Duration::from_secs(3);
 pub const PREDATES: &str =
     "this test node predates explain; rebuild sundog-testnode and restart the fleet";
 
+/// The number a scenario's own ask carries. The interface numbers its
+/// requests from 1, so no answer to a key typed in the overlay can be taken
+/// for it.
+pub const SCRIPTED_ID: u64 = 0;
+
 /// How many characters of a node's `err` line the interface shows.
 const REPLY_CHARS: usize = 60;
 

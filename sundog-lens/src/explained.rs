@@ -14,10 +14,10 @@
 //! is not an explanation is a [`ParseError`].
 //!
 //! The module does no I/O. [`Reading`] is one node's answer, [`Explained`]
-//! the answers of every node asked, and [`agreement`] states whether those
-//! answers match each other and the placement [`locate`](crate::locate::locate)
-//! computes from gossip. A reading holds the reply's text as received, so the
-//! interface draws it through [`printable`].
+//! the answers of every node asked, [`agreement`] states whether those
+//! answers match each other and the [`Placement`] the lens computes from
+//! gossip, and [`verdict`] puts that in a sentence. A reading holds the
+//! reply's text as received, so the interface draws it through [`printable`].
 
 use std::fmt;
 use std::time::{Duration, SystemTime};
@@ -26,7 +26,7 @@ use serde::Deserialize;
 use smol_str::SmolStr;
 
 use crate::key::printable;
-use crate::locate::Located;
+use crate::locate::Placement;
 use crate::ui::text;
 
 /// How many characters of a reply a [`ParseError`] quotes.
@@ -624,19 +624,15 @@ impl Agreement {
     }
 }
 
-/// Compares every `Distributed` reading in `explained` with the placement
-/// `located` computes from gossip. A reading differs when its view hash, its
+/// Compares every `Distributed` reading in `explained` with the `placement`
+/// the lens computes from gossip. A reading differs when its view hash, its
 /// part or its owners in fetch order differ. A node that failed, and a node
 /// whose cache is not `Distributed`, takes no part in the comparison.
 #[must_use]
-pub fn agreement(explained: &Explained, located: &Located) -> Agreement {
-    let view = format!("{:016x}", located.view_hash);
-    let owners: Vec<String> = located
-        .owners
-        .iter()
-        .map(|owner| owner.node.to_string())
-        .collect();
-    let part = (located.part.bucket(), located.part.part());
+pub fn agreement(explained: &Explained, placement: &Placement) -> Agreement {
+    let view = format!("{:016x}", placement.view_hash);
+    let owners: Vec<String> = placement.owners.iter().map(ToString::to_string).collect();
+    let part = (placement.part.bucket(), placement.part.part());
     let apart = explained
         .readings()
         .filter(|(_, reading)| {
@@ -651,6 +647,138 @@ pub fn agreement(explained: &Explained, located: &Located) -> Agreement {
     Agreement {
         groups: explained.views(),
         apart,
+    }
+}
+
+/// What the answers say against each other and against the lens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// Every `Distributed` answer holds the lens's view and owners.
+    Agree {
+        /// How many nodes answered.
+        nodes: usize,
+    },
+    /// No answer holds the lens's view: the view moved since the nodes were
+    /// asked.
+    Moved {
+        /// The view the answers used, eight digits.
+        from: String,
+        /// The lens's view, eight digits.
+        to: String,
+    },
+    /// The nodes hold different views.
+    Split {
+        /// The nodes in each view, as words.
+        groups: String,
+    },
+    /// The nodes agree on a view but not with the lens on the placement.
+    Apart {
+        /// The nodes that differ, as words.
+        nodes: String,
+        /// Whether more than one node differs.
+        many: bool,
+        /// The lens's view, eight digits.
+        view: String,
+    },
+    /// The nodes explained another cache than the one the block above places
+    /// the key in: nothing to compare.
+    OtherCache {
+        /// The cache the nodes explained.
+        asked: String,
+        /// The cache the lens placed the key in.
+        shown: String,
+    },
+    /// Nothing to compare, for the reason in words.
+    Nothing(&'static str),
+}
+
+impl Verdict {
+    /// The verdict in a sentence. `after_freeze` says the answers were asked
+    /// after the display froze, when asking again cannot move the lens's
+    /// view.
+    #[must_use]
+    pub fn words(&self, after_freeze: bool) -> String {
+        match self {
+            Self::Agree { nodes: 1 } => "1 node agrees, the lens computes the same".to_owned(),
+            Self::Agree { nodes } => {
+                format!("{nodes} nodes agree, the lens computes the same")
+            }
+            Self::Moved { from, to } if after_freeze => {
+                format!("the nodes hold {from}, the frozen display holds {to}: Esc, p unfreezes")
+            }
+            Self::Moved { from, to } => {
+                format!("view moved {from} -> {to}: Enter asks again")
+            }
+            Self::Split { groups } => groups.clone(),
+            Self::Apart { nodes, many, view } => format!(
+                "{nodes} {} from the lens, which holds view {view}",
+                if *many { "differ" } else { "differs" }
+            ),
+            Self::OtherCache { asked, shown } => format!(
+                "the nodes explained cache {asked} and the block above is cache {shown}: \
+                 nothing to compare"
+            ),
+            Self::Nothing(why) => (*why).to_owned(),
+        }
+    }
+}
+
+/// Compares `answers` with `placement`, when the lens placed the key.
+#[must_use]
+pub fn verdict(answers: &Explained, placement: Option<&Placement>) -> Verdict {
+    let Some(placement) = placement else {
+        return Verdict::Nothing("the lens has no placement of the key to compare with");
+    };
+    // Test nodes explain their cache `it`, whatever cache the block places
+    // the key in.
+    if let Some((_, reading)) = answers
+        .readings()
+        .find(|(_, reading)| reading.cache != placement.cache.as_str())
+    {
+        return Verdict::OtherCache {
+            asked: printable(&reading.cache),
+            shown: printable(&placement.cache),
+        };
+    }
+    let compared = agreement(answers, placement);
+    let lens = format!("{:016x}", placement.view_hash);
+    let short = |view: &str| printable(view.get(..8).unwrap_or(view));
+    let Some(first) = compared.groups.first() else {
+        return Verdict::Nothing("no node gave a Distributed reading to compare");
+    };
+    if compared.groups.iter().all(|group| group.view != lens) {
+        return Verdict::Moved {
+            from: short(&first.view),
+            to: short(&lens),
+        };
+    }
+    if compared.groups.len() > 1 {
+        let groups: Vec<String> = compared
+            .groups
+            .iter()
+            .map(|group| {
+                let nodes: Vec<String> = group.nodes.iter().map(|node| printable(node)).collect();
+                format!(
+                    "{} {} {}",
+                    nodes.join(" "),
+                    if nodes.len() == 1 { "holds" } else { "hold" },
+                    short(&group.view)
+                )
+            })
+            .collect();
+        return Verdict::Split {
+            groups: groups.join(", "),
+        };
+    }
+    if compared.apart.is_empty() {
+        let nodes = compared.groups.iter().map(|group| group.nodes.len()).sum();
+        return Verdict::Agree { nodes };
+    }
+    let nodes: Vec<String> = compared.apart.iter().map(|node| printable(node)).collect();
+    Verdict::Apart {
+        many: nodes.len() > 1,
+        nodes: nodes.join(" "),
+        view: short(&lens),
     }
 }
 
@@ -857,7 +985,7 @@ mod tests {
     use sundog::store::PartId;
 
     use crate::key::KeySpec;
-    use crate::locate::LocatedOwner;
+    use crate::locate::{Located, LocatedOwner};
     use crate::model::derive::Settle;
 
     use super::*;
@@ -1445,7 +1573,7 @@ mod tests {
 
         let located = locate(&model, Some("it"), &KeySpec::parse("k1").unwrap()).unwrap();
         let owners: Vec<String> = located.owners.iter().map(|o| o.node.to_string()).collect();
-        let outcome = agreement(&answers, &located);
+        let outcome = agreement(&answers, &located.placement());
         assert!(outcome.agrees(), "{outcome:?}");
         assert_eq!(outcome.groups.len(), 1);
         assert_eq!(outcome.groups[0].nodes.len(), 5);
@@ -1486,7 +1614,7 @@ mod tests {
 
     #[test]
     fn agreement_compares_views_and_owners_with_the_lens() {
-        let lens = located();
+        let lens = located().placement();
 
         let agreeing = explained(vec![
             answered("n1", owner_reading()),
@@ -1553,6 +1681,123 @@ mod tests {
         let result = agreement(&nobody, &lens);
         assert!(result.groups.is_empty() && result.apart.is_empty());
         assert!(!result.agrees(), "nothing was compared");
+    }
+
+    #[test]
+    fn a_located_key_places_as_its_fields_say() {
+        let placement = located().placement();
+        assert_eq!(placement.cache, "it");
+        assert_eq!(placement.part, PartId::new(305, 17));
+        assert_eq!(placement.view_hash, 0x5d69_e3db_4c1a_02f7);
+        assert_eq!(
+            placement.owners,
+            [A, B].map(|hex| hex.parse::<NodeId>().expect("16 hex digits"))
+        );
+    }
+
+    #[test]
+    fn the_verdict_names_what_the_answers_say_against_the_lens() {
+        let lens = located().placement();
+        let verdict_of = |nodes: Vec<NodeAnswer>| verdict(&explained(nodes), Some(&lens));
+
+        let agree = verdict_of(vec![
+            answered("n1", owner_reading()),
+            answered("n2", non_owner_reading()),
+        ]);
+        assert_eq!(agree, Verdict::Agree { nodes: 2 });
+        assert_eq!(
+            agree.words(false),
+            "2 nodes agree, the lens computes the same"
+        );
+        assert_eq!(
+            verdict_of(vec![answered("n1", owner_reading())]).words(false),
+            "1 node agrees, the lens computes the same"
+        );
+
+        let moved = verdict_of(vec![
+            answered("n1", with_view(owner_reading(), MOVED)),
+            answered("n2", with_view(non_owner_reading(), MOVED)),
+        ]);
+        assert_eq!(
+            moved,
+            Verdict::Moved {
+                from: "71c0a2f4".to_owned(),
+                to: "5d69e3db".to_owned()
+            }
+        );
+        assert_eq!(
+            moved.words(false),
+            "view moved 71c0a2f4 -> 5d69e3db: Enter asks again"
+        );
+        assert_eq!(
+            moved.words(true),
+            "the nodes hold 71c0a2f4, the frozen display holds 5d69e3db: Esc, p unfreezes"
+        );
+
+        let split = verdict_of(vec![
+            answered("n1", owner_reading()),
+            answered("n2", with_view(non_owner_reading(), MOVED)),
+        ]);
+        assert_eq!(
+            split.words(false),
+            "n1 holds 5d69e3db, n2 holds 71c0a2f4",
+            "{split:?}"
+        );
+
+        let mut elsewhere = owner_reading();
+        elsewhere
+            .distributed
+            .as_mut()
+            .expect("distributed")
+            .owners
+            .reverse();
+        let apart = verdict_of(vec![
+            answered("n1", elsewhere.clone()),
+            answered("n2", non_owner_reading()),
+        ]);
+        assert_eq!(
+            apart,
+            Verdict::Apart {
+                nodes: "n1".to_owned(),
+                many: false,
+                view: "5d69e3db".to_owned()
+            }
+        );
+        assert_eq!(
+            apart.words(false),
+            "n1 differs from the lens, which holds view 5d69e3db"
+        );
+        let both = verdict_of(vec![
+            answered("n1", elsewhere.clone()),
+            answered("n2", elsewhere),
+        ]);
+        assert_eq!(
+            both.words(false),
+            "n1 n2 differ from the lens, which holds view 5d69e3db"
+        );
+
+        let other = Reading {
+            cache: "other".to_owned(),
+            ..owner_reading()
+        };
+        assert_eq!(
+            verdict_of(vec![answered("n1", other)]).words(false),
+            "the nodes explained cache other and the block above is cache it: \
+             nothing to compare"
+        );
+
+        let replicated = Reading {
+            distributed: None,
+            ..owner_reading()
+        };
+        assert_eq!(
+            verdict_of(vec![answered("n1", replicated), failed("n2", "x")]).words(false),
+            "no node gave a Distributed reading to compare"
+        );
+        assert_eq!(
+            verdict(&explained(vec![answered("n1", owner_reading())]), None).words(false),
+            "the lens has no placement of the key to compare with"
+        );
     }
 
     #[test]

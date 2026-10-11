@@ -5,11 +5,25 @@
 //! fill <n>                 load start|stop      kill <label>   leave <label>   crash <label>
 //! restart <label>          tab overview|caches|node|timeline
 //! select <label>           cache <name>         help on|off
+//! explain <key> [within <dur>]
+//! explain close
 //! await members <n> [within <dur>]
 //! await departing|left|down <label> [within <dur>]
 //! await settled <cache> [within <dur>]
 //! quit
 //! ```
+//!
+//! `explain <key>` asks every running test node about the key and opens the
+//! explain overlay with the key typed and the answers in. The answers pass
+//! when every node explained the key and all agree with each other and with
+//! the lens's own placement of it. Answers that do not pass yet are asked for
+//! again, so a node still opening its caches is waited for. The overlay
+//! opens on the answers that ended the wait, passing or not: the step fails
+//! with the last reason when the deadline passes first, and times out with
+//! nothing opened when no answer came at all. A `<key>` is a `String` of
+//! visible ASCII characters with no space, as the overlay types it.
+//! `explain close` closes the overlay, so the key `close` is written
+//! `str:close`.
 //!
 //! Blank lines and lines starting with `#` are ignored. [`parse`] is pure and
 //! reports the first bad line with its number.
@@ -20,6 +34,7 @@ use std::time::Duration;
 use sundog::observe::MemberStatus;
 
 use crate::cli::parse_duration;
+use crate::key::{self, KeySpec};
 use crate::ui::View;
 
 pub mod director;
@@ -69,6 +84,20 @@ pub enum Step {
     Cache(String),
     /// Show or hide the help overlay.
     Help(bool),
+    /// Ask every running test node about `key` until their answers pass:
+    /// every node explained the key, and all agree with each other and with
+    /// the lens's placement of it. Open the explain overlay with the key
+    /// typed and the answers that ended the wait in, passing or not; no
+    /// answer at all opens nothing.
+    Explain {
+        /// The key as typed in the overlay: `k1`, or `str:close` for the key
+        /// `close`.
+        key: String,
+        /// The deadline for the answers.
+        within: Option<Duration>,
+    },
+    /// Close the explain overlay.
+    ExplainClose,
     /// Wait for `count` live members.
     AwaitMembers {
         /// The live count to reach.
@@ -175,6 +204,11 @@ impl fmt::Display for Step {
             Self::Cache(name) => write!(f, "cache {name}"),
             Self::Help(true) => f.write_str("help on"),
             Self::Help(false) => f.write_str("help off"),
+            Self::Explain { key, within } => {
+                write!(f, "explain {key}")?;
+                write_within(f, *within)
+            }
+            Self::ExplainClose => f.write_str("explain close"),
             Self::AwaitMembers { count, within } => {
                 write!(f, "await members {count}")?;
                 write_within(f, *within)
@@ -283,6 +317,7 @@ fn parse_step(text: &str) -> Result<Step, String> {
         ("cache", [name]) => Ok(Step::Cache((*name).to_owned())),
         ("help", ["on"]) => Ok(Step::Help(true)),
         ("help", ["off"]) => Ok(Step::Help(false)),
+        ("explain", words) => parse_explain(words),
         ("await", words) => parse_await(words),
         ("quit", []) => Ok(Step::Quit),
         (
@@ -291,6 +326,47 @@ fn parse_step(text: &str) -> Result<Step, String> {
             _,
         ) => Err(format!("wrong arguments for {keyword}")),
         _ => Err(format!("unknown step {keyword:?}")),
+    }
+}
+
+/// Parses the words after `explain`: `close`, or a key and an optional
+/// deadline. The key `close` is written `str:close`.
+fn parse_explain(words: &[&str]) -> Result<Step, String> {
+    let (target, within) = match words {
+        [target @ .., "within", dur] => (target, Some(duration(dur)?)),
+        target => (target, None),
+    };
+    match (target, within) {
+        (["close"], None) => Ok(Step::ExplainClose),
+        (["close"], Some(_)) => Err("explain close takes no deadline".to_owned()),
+        ([key], within) => {
+            askable_key(key)?;
+            Ok(Step::Explain {
+                key: (*key).to_owned(),
+                within,
+            })
+        }
+        _ => Err(
+            "explain takes a key and an optional within <dur>, or close; write a key spelled \
+             close as str:close"
+                .to_owned(),
+        ),
+    }
+}
+
+/// Reads `text` as the key a scripted explain types and asks about: a key
+/// the overlay can ask a test node. The key to place and to ask is the
+/// [`KeySpec`] it parses to.
+///
+/// # Errors
+///
+/// Returns why `text` is not a key, or why a test node cannot be asked
+/// about it: only a `String` of visible ASCII characters with no space can.
+pub fn askable_key(text: &str) -> Result<KeySpec, String> {
+    let spec = KeySpec::parse(text).map_err(|error| format!("{text:?} is not a key: {error}"))?;
+    match key::not_askable(&spec) {
+        Some(why) => Err(format!("{text:?} cannot be asked: {why}")),
+        None => Ok(spec),
     }
 }
 
@@ -507,6 +583,88 @@ mod tests {
     }
 
     #[test]
+    fn explain_opens_the_overlay_on_a_key_and_close_closes_it() {
+        assert_eq!(
+            one("explain k1"),
+            Step::Explain {
+                key: "k1".into(),
+                within: None
+            }
+        );
+        assert_eq!(
+            one("explain k1 within 10s"),
+            Step::Explain {
+                key: "k1".into(),
+                within: Some(S(10))
+            }
+        );
+        assert_eq!(one("explain close"), Step::ExplainClose);
+        assert_eq!(one("  explain   close  "), Step::ExplainClose);
+    }
+
+    #[test]
+    fn a_key_spelled_like_a_step_word_is_written_after_str() {
+        let key = |text: &str, within| Step::Explain {
+            key: text.into(),
+            within,
+        };
+        // `close` is the step that closes; `str:close` is the key.
+        assert_eq!(one("explain str:close"), key("str:close", None));
+        assert_eq!(
+            one("explain str:close within 5s"),
+            key("str:close", Some(S(5)))
+        );
+        // `within` stays a key where it cannot be taken for the deadline.
+        assert_eq!(one("explain within"), key("within", None));
+        assert_eq!(one("explain within within 5s"), key("within", Some(S(5))));
+        assert_eq!(one("explain str:within"), key("str:within", None));
+        // `str:` escapes a prefix, and the keys of the other words parse bare.
+        assert_eq!(one("explain str:uint:1"), key("str:uint:1", None));
+        for word in ["quit", "pause", "explain", "on", "off"] {
+            assert_eq!(one(&format!("explain {word}")), key(word, None), "{word}");
+        }
+    }
+
+    #[test]
+    fn a_key_a_test_node_cannot_be_asked_is_a_parse_error_with_its_reason() {
+        let bad = |line: &str| fails(line).msg;
+        assert!(bad("explain uint:5").contains("test nodes take String keys"));
+        assert!(bad("explain int:-5").contains("cannot be asked"));
+        assert!(bad("explain hex:6b").contains("cannot be asked"));
+        assert!(bad("explain uint:x").contains("is not a key: uint: takes decimal digits"));
+        assert!(bad("explain hex:6").contains("is not a key"));
+        assert!(bad("explain naïve").contains("visible ASCII"));
+        assert!(bad(&format!("explain {}", "k".repeat(300))).contains("at most 256"));
+        assert_eq!(fails("pause 1s\nexplain uint:5").line, 2);
+        assert!(bad("explain k1 k2").contains("explain takes a key"));
+        assert!(bad("explain close within 5s").contains("takes no deadline"));
+    }
+
+    #[test]
+    fn askable_key_reads_the_key_a_test_node_is_asked() {
+        let spec = askable_key("k17").unwrap();
+        assert_eq!((spec.text(), spec.kind()), ("k17", key::KeyKind::Str));
+        // The prefix is the overlay's: the key asked is the text after it.
+        assert_eq!(askable_key("str:close").unwrap().text(), "close");
+        assert_eq!(askable_key("str:uint:1").unwrap().text(), "uint:1");
+        for text in [
+            "uint:5", "int:-5", "hex:6b", "str:", "a\u{1}", "naïve", "uint:x",
+        ] {
+            assert!(askable_key(text).is_err(), "{text}");
+        }
+        assert_eq!(
+            askable_key("uint:5").unwrap_err(),
+            "\"uint:5\" cannot be asked: test nodes take String keys, so this key is \
+             computed only: write it bare or after str: to ask"
+        );
+        assert_eq!(
+            askable_key("hex:6").unwrap_err(),
+            "\"hex:6\" is not a key: hex: takes pairs of hex digits and this has 1: add or \
+             drop a digit"
+        );
+    }
+
+    #[test]
     fn blank_lines_and_comments_are_skipped_and_lines_are_numbered() {
         let scenario = parse("# a tour\n\n  pause 1s  \n  # note\nquit\n").unwrap();
         assert_eq!(scenario.steps.len(), 2);
@@ -580,6 +738,13 @@ mod tests {
             "await down",
             "await frozen n1",
             "await settled",
+            "explain",
+            "explain k1 k2",
+            "explain k1 within",
+            "explain k1 within soon",
+            "explain within 5s",
+            "explain close within 5s",
+            "explain close now",
         ] {
             assert!(parse(line).is_err(), "{line}");
         }
@@ -613,6 +778,8 @@ await members 4 within 20s
 tab node
 help on
 help off
+explain k1 within 10s
+explain close
 tab timeline
 load stop
 cache it
@@ -623,10 +790,18 @@ quit
     #[test]
     fn a_script_using_every_step_kind_parses_in_order() {
         let all = steps(EVERY_STEP);
-        assert_eq!(all.len(), 26);
+        assert_eq!(all.len(), 28);
         assert!(matches!(all[0], Step::Caption(_)));
         assert!(matches!(all[2], Step::Spawn { count: 3, .. }));
-        assert_eq!(all[25], Step::Quit);
+        assert_eq!(
+            all[21],
+            Step::Explain {
+                key: "k1".into(),
+                within: Some(S(10))
+            }
+        );
+        assert_eq!(all[22], Step::ExplainClose);
+        assert_eq!(all[27], Step::Quit);
     }
 
     #[test]
@@ -637,7 +812,7 @@ quit
             assert_eq!(parse(&line).unwrap().steps[0].step, entry.step, "{line}");
         }
         let printed: Vec<String> = scenario.steps.iter().map(|e| e.step.to_string()).collect();
-        assert_eq!(parse(&printed.join("\n")).unwrap().steps.len(), 26);
+        assert_eq!(parse(&printed.join("\n")).unwrap().steps.len(), 28);
     }
 
     #[test]
@@ -677,6 +852,28 @@ quit
             (Step::Cache("it".into()), "cache it"),
             (Step::Help(true), "help on"),
             (Step::Help(false), "help off"),
+            (
+                Step::Explain {
+                    key: "k1".into(),
+                    within: None,
+                },
+                "explain k1",
+            ),
+            (
+                Step::Explain {
+                    key: "k1".into(),
+                    within: Some(S(10)),
+                },
+                "explain k1 within 10s",
+            ),
+            (
+                Step::Explain {
+                    key: "str:close".into(),
+                    within: Some(Duration::from_millis(1500)),
+                },
+                "explain str:close within 1500ms",
+            ),
+            (Step::ExplainClose, "explain close"),
             (
                 Step::AwaitMembers {
                     count: 4,
@@ -810,11 +1007,13 @@ quit
                 "`{step}` is followed by `{next}`, not an await"
             );
         }
-        // Every await has its own deadline.
+        // Every await, and the wait for the explain overlay's answers, has its
+        // own deadline.
         for step in &steps {
             if let Step::AwaitMembers { within, .. }
             | Step::AwaitStatus { within, .. }
-            | Step::AwaitSettled { within, .. } = step
+            | Step::AwaitSettled { within, .. }
+            | Step::Explain { within, .. } = step
             {
                 assert!(within.is_some(), "`{step}` has no deadline");
             }
@@ -857,6 +1056,59 @@ quit
     }
 
     #[test]
+    fn the_built_in_tour_explains_a_read_once_the_cluster_has_scaled_out() {
+        let steps = tour();
+        let at = |wanted: &str| {
+            steps
+                .iter()
+                .position(|step| step.to_string() == wanted)
+                .unwrap_or_else(|| panic!("the tour has no `{wanted}`"))
+        };
+        // The overlay opens on a key the demo's fleet filled, after the last
+        // node has joined and the cluster has settled, and the caption that
+        // names it comes just before.
+        let explain = at("explain k1 within 10s");
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| matches!(step, Step::Spawn { .. }))
+                .count(),
+            3
+        );
+        let last_spawn = steps[..explain]
+            .iter()
+            .rposition(|step| matches!(step, Step::Spawn { .. }))
+            .expect("the tour has scaled out by then");
+        assert!(
+            steps[last_spawn..explain]
+                .iter()
+                .any(|step| matches!(step, Step::AwaitSettled { .. })),
+            "the last scale-out has settled by then"
+        );
+        assert!(
+            matches!(&steps[explain - 1], Step::Caption(text) if text.starts_with("e explains")),
+            "{}",
+            steps[explain - 1]
+        );
+        // The eye gets time to read the three blocks, then the overlay closes
+        // before the crash it would cover.
+        assert!(matches!(steps[explain + 1], Step::Pause(time) if time >= S(5)));
+        assert_eq!(steps[explain + 2], Step::ExplainClose);
+        assert!(explain + 2 < at("kill n3"));
+        // Nothing else in the tour opens or closes the overlay.
+        let overlay_steps = steps
+            .iter()
+            .filter(|step| matches!(step, Step::Explain { .. } | Step::ExplainClose))
+            .count();
+        assert_eq!(overlay_steps, 2);
+        // The key is one the fleet filled and a test node can be asked.
+        let Step::Explain { key, .. } = &steps[explain] else {
+            unreachable!("`at` found the explain step");
+        };
+        assert_eq!(askable_key(key).unwrap().text(), "k1");
+    }
+
+    #[test]
     fn the_built_in_tour_has_time_to_read_and_stays_inside_the_budget() {
         let steps = tour();
         let pauses: Duration = steps
@@ -867,14 +1119,17 @@ quit
             })
             .sum();
         // The pauses are the eye's time; the awaits add the cluster's. The
-        // whole run targets 75 to 90 seconds and must finish within 95.
-        assert!(pauses >= S(40) && pauses <= S(50), "{pauses:?}");
+        // whole run targets 75 to 90 seconds and must finish within 95, and
+        // the filmed take must stay within its byte budget. The pauses total
+        // forty seconds, which with the awaits keeps both.
+        assert_eq!(pauses, S(40));
         let deadlines: Duration = steps
             .iter()
             .filter_map(|step| match step {
                 Step::AwaitMembers { within, .. }
                 | Step::AwaitStatus { within, .. }
-                | Step::AwaitSettled { within, .. } => *within,
+                | Step::AwaitSettled { within, .. }
+                | Step::Explain { within, .. } => *within,
                 _ => None,
             })
             .sum();

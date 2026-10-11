@@ -348,7 +348,7 @@ and Ctrl-U, Esc and Ctrl-C otherwise. The
 overlay takes keys only while it is on screen: below 80x24 the screen is the
 size notice, `q` quits and `e` opens nothing, and help drawn over the overlay
 takes its own keys until `?` or Esc closes it. The text stays between
-openings, and the demo's first opening shows `k1`, a key its fleet holds.
+openings, and the demo's first opening shows `k1`, a key its fleet filled.
 
 A cache routes a key by the hash of its postcard encoding and gossip
 carries no key type, so the text picks the encoding:
@@ -509,15 +509,15 @@ sundog-lens demo --scenario tour
 ```
 
 The demo starts a fleet of `sundog-testnode` processes under load, plays a
-scripted tour of joins, a crash, a graceful leave and a restart, and shows
-the lens while it runs. It needs a built `sundog-testnode` (`cargo build
---release -p sundog-testnode --features prometheus`); `--testnode PATH` names
-it. `--headless` prints every step and event instead of drawing and exits 1 when
-a step times out, which makes the tour a smoke test. `sundog-lens cluster`
-starts the same fleet with no scenario, and `S`, `K`, `L` and `R` in the demo
-spawn a node, kill one, make one leave and restart one.
-`sundog-lens/demo/record.sh` and `render.sh` produce the recording and GIF in
-`assets/`.
+scripted tour of joins, an explained read, a crash, a graceful leave and a
+restart, and shows the lens while it runs. It needs a built
+`sundog-testnode` (`cargo build --release -p sundog-testnode --features
+prometheus`); `--testnode PATH` names it. `--headless` prints every step and
+event instead of drawing and exits 1 when a step times out, which makes the
+tour a smoke test. `sundog-lens cluster` starts the same fleet with no
+scenario, and `S`, `K`, `L` and `R` in the demo spawn a node, kill one, make
+one leave and restart one. `sundog-lens/demo/record.sh` and `render.sh`
+produce the recording and GIF in `assets/`.
 
 `e` in the demo asks every test node over its control port, the channel the
 fleet uses for `fill` and `crash`. The test node accepts `explain KEY` and
@@ -527,6 +527,23 @@ a data port. A `sundog-testnode` built before `explain` answers `unknown
 command`, which the overlay shows as a row that says to rebuild it. The
 `watch` command that `cluster` prints knows no control ports, so `e` there
 computes the placement and asks nobody.
+
+The tour opens the explain overlay once the cluster has scaled out to five
+nodes and settled. Its `explain k1 within 10s` step asks every running test
+node about `k1` and opens the overlay on `k1` with the answers in, and a few
+seconds later `explain close` closes it. The viewer sees the computed block,
+a row for each node and the line that says the nodes agree with each other
+and with the lens. The step is a check as well as a scene: the answers pass
+when every node explained the key and all agree with each other and with the
+lens's own placement of it. Answers that do not pass yet are asked for again
+every quarter second, as an `await` looks again, so a node still opening its
+caches is waited for. When the deadline passes (30 s without a `within`), the
+step fails with what the last answers said, or times out when none came. A
+headless run therefore fails on a broken `explain` before anything is
+filmed, and prints the overlay's sentence for a run that passes. A scenario
+file writes the same two steps, `explain KEY [within DUR]` and `explain
+close`. The key is a `String` of visible ASCII characters with no space, as
+the overlay types it, and the key `close` is written `str:close`.
 
 The fleet addresses its nodes in one of two layouts. In the per-address
 layout node `n1` binds `127.0.0.11`, `n2` binds `127.0.0.12` and so on, each

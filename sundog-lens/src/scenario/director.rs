@@ -10,6 +10,18 @@
 //! rest is plumbing: [`Director::play`] reads the digest, calls
 //! [`next_action`], acts on the [`Stage`] and sends [`UiCommand`]s.
 //!
+//! An `explain` step asks the stage's test nodes about a key and waits for
+//! their answers to pass, up to its deadline. The answers pass when every
+//! node read the key and all agree with each other and with the placement the
+//! lens computes from the ownership shares in the digest: [`placement_in`]
+//! places the key and [`judge`] decides, on the [`Verdict`] the overlay draws.
+//! Answers that do not pass yet are asked for again every [`ASK_AGAIN`], as an
+//! `await` looks at the digest again: a node that is still opening its caches
+//! refuses the connection, and a view settles in a moment. The step fails
+//! with the last reason once the deadline passes. The interface gets the
+//! answers that ended the wait, passing or not, so the overlay shows what the
+//! nodes said.
+//!
 //! An `await settled` must not pass on the view that held before the step
 //! that caused the change. At every fleet action the director records each
 //! cache's view hash as a baseline, and `await settled` completes only once
@@ -24,8 +36,11 @@ use smol_str::SmolStr;
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
-use super::{AwaitedStatus, Scenario, Step};
+use super::{AwaitedStatus, Scenario, Step, askable_key};
 use crate::app::UiCommand;
+use crate::explained::{self, Explained, Verdict, verdict};
+use crate::key::KeySpec;
+use crate::locate::Placement;
 use crate::model::digest::ModelDigest;
 
 /// How long an `await` without `within` waits.
@@ -36,6 +51,11 @@ pub const POLL: Duration = Duration::from_millis(50);
 
 /// The caption a timed-out await leaves on screen.
 pub const TIMED_OUT_CAPTION: &str = "await timed out";
+
+/// The time between the asks of an `explain` step whose answers do not pass
+/// yet: a node that is still opening its caches refuses the connection, and
+/// the lens may not have ranked the cache.
+pub const ASK_AGAIN: Duration = Duration::from_millis(250);
 
 /// What a scenario acts on: the fleet of nodes and the load against it.
 #[expect(
@@ -57,6 +77,10 @@ pub trait Stage {
     async fn crash(&self, label: &str) -> anyhow::Result<()>;
     /// Starts a stopped node again at its address.
     async fn restart(&self, label: &str) -> anyhow::Result<()>;
+    /// Asks every running node what it makes of reading `key`, a `String`
+    /// key of visible ASCII characters. The answers are in slot order; a node
+    /// that cannot answer keeps its place with the reason in words.
+    async fn explain(&self, key: &str) -> anyhow::Result<Explained>;
 }
 
 /// The node `step` removes without a goodbye and how the scenario names the
@@ -111,14 +135,15 @@ pub const fn is_fleet_action(step: &Step) -> bool {
     )
 }
 
-/// How long the await `step` waits: its `within`, or [`DEFAULT_WITHIN`]. `None`
-/// for a step that is not an await.
+/// How long the await or `explain` `step` waits: its `within`, or
+/// [`DEFAULT_WITHIN`]. `None` for any other step.
 #[must_use]
 pub const fn deadline(step: &Step) -> Option<Duration> {
     match step {
         Step::AwaitMembers { within, .. }
         | Step::AwaitStatus { within, .. }
-        | Step::AwaitSettled { within, .. } => Some(match within {
+        | Step::AwaitSettled { within, .. }
+        | Step::Explain { within, .. } => Some(match within {
             Some(within) => *within,
             None => DEFAULT_WITHIN,
         }),
@@ -181,6 +206,72 @@ pub fn next_action(
             }
         }
         _ => DirectorAction::Done,
+    }
+}
+
+/// How long an `explain` step waits before it asks again, `took` into a wait
+/// of `limit`: [`ASK_AGAIN`], or what is left of `limit` when that is less.
+/// `None` once `limit` has passed. The wait works on durations, so a `limit`
+/// no instant can hold is a wait that does not end.
+#[must_use]
+pub fn ask_again_in(took: Duration, limit: Duration) -> Option<Duration> {
+    let left = limit.saturating_sub(took);
+    (!left.is_zero()).then(|| ASK_AGAIN.min(left))
+}
+
+/// Where the lens places `key` in the cache the nodes explained: the cache
+/// the first reading names, in the ownership shares `digest` holds. `None`
+/// when no node read the key or the digest holds no shares of that cache.
+#[must_use]
+pub fn placement_in(digest: &ModelDigest, answers: &Explained, key: &KeySpec) -> Option<Placement> {
+    let (_, reading) = answers.readings().next()?;
+    let held = digest.ownership.get(reading.cache.as_str())?;
+    Some(Placement::of(&held.0, key))
+}
+
+/// Whether the nodes' `answers` pass: every node asked read the key and all
+/// agree with each other and with `placement`, the lens's own. `Ok` holds
+/// the overlay's sentence for it, `5 nodes agree, the lens computes the same`;
+/// `Err` says in words who gave no answer or what differs, without the
+/// overlay's hints about keys to press or blocks on screen.
+///
+/// # Errors
+///
+/// Returns why the answers do not pass: no node was asked, a node gave no
+/// explanation, or the [`Verdict`] is anything but agreement among all of
+/// them.
+pub fn judge(answers: &Explained, placement: Option<&Placement>) -> Result<String, String> {
+    let asked = answers.nodes.len();
+    if asked == 0 {
+        return Err("no node was asked".to_owned());
+    }
+    let silent: Vec<String> = answers
+        .nodes
+        .iter()
+        .filter_map(|answer| match &answer.outcome {
+            explained::Outcome::Failed(why) => Some(format!("{}: {why}", answer.label)),
+            explained::Outcome::Read(_) => None,
+        })
+        .collect();
+    if !silent.is_empty() {
+        return Err(format!(
+            "{} of {asked} {} gave no explanation: {}",
+            silent.len(),
+            if asked == 1 { "node" } else { "nodes" },
+            silent.join("; ")
+        ));
+    }
+    match verdict(answers, placement) {
+        agree @ Verdict::Agree { nodes } if nodes == asked => Ok(agree.words(false)),
+        Verdict::Agree { nodes } => Err(format!(
+            "only {nodes} of {asked} nodes gave a Distributed reading"
+        )),
+        Verdict::Moved { from, to } => Err(format!("view moved {from} -> {to}")),
+        Verdict::OtherCache { asked, shown } => Err(format!(
+            "the nodes explained cache {asked} and the lens places the key in cache {shown}: \
+             nothing to compare"
+        )),
+        other => Err(other.words(false)),
     }
 }
 
@@ -258,6 +349,28 @@ impl From<io::Error> for PlayError {
     }
 }
 
+/// How a step that ran ended.
+enum Ended {
+    /// It did what it was to do.
+    Done,
+    /// It waited for something that did not happen in time.
+    TimedOut(Timeout),
+    /// It failed, for the reason the error gives.
+    Failed(anyhow::Error),
+}
+
+/// A step that waits: where it sits in the scenario and when it began.
+struct Waiting<'a> {
+    /// The scenario line.
+    line: usize,
+    /// The step, as written.
+    text: &'a str,
+    /// When the step began.
+    began: Instant,
+    /// The origin of the run's stamps.
+    start: Instant,
+}
+
 /// Plays scenarios.
 #[derive(Debug)]
 pub struct Director<S> {
@@ -304,6 +417,7 @@ impl<S: Stage> Director<S> {
             Step::Select(label) => self.command(UiCommand::Select(label.as_str().into())),
             Step::Cache(name) => self.command(UiCommand::Cache(name.as_str().into())),
             Step::Help(open) => self.command(UiCommand::Help(*open)),
+            Step::ExplainClose => self.command(UiCommand::CloseExplain),
             Step::Quit => self.command(UiCommand::Quit),
             Step::Spawn { count, stagger } => self.stage.spawn(*count, *stagger).await?,
             Step::Fill(keys) => self.stage.fill(*keys).await?,
@@ -313,6 +427,7 @@ impl<S: Stage> Director<S> {
             Step::Crash(label) => self.stage.crash(label).await?,
             Step::Restart(label) => self.stage.restart(label).await?,
             Step::Pause(_)
+            | Step::Explain { .. }
             | Step::AwaitMembers { .. }
             | Step::AwaitStatus { .. }
             | Step::AwaitSettled { .. } => {}
@@ -379,36 +494,41 @@ impl<S: Stage> Director<S> {
             if is_fleet_action(step) {
                 state.baseline.clone_from(&self.digests.borrow().view_hash);
             }
-            if let Err(source) = self.act(step).await {
-                if self.options.headless {
-                    return Err(PlayError::Step {
-                        line,
-                        step: text,
-                        source,
-                    });
+            let ended = match self.act(step).await {
+                Ok(()) => self.finish(step, &state, start, line, &text, out).await?,
+                Err(source) => Ended::Failed(source),
+            };
+            match ended {
+                Ended::Done => {
+                    if let Some((label, how)) = abrupt_exit(step) {
+                        exited = Some((label.to_owned(), how, Instant::now()));
+                    }
+                    self.show_detection(step, exited.as_ref());
                 }
-                if !self.options.headless {
+                Ended::TimedOut(timeout) => {
+                    if self.options.headless {
+                        return Err(PlayError::TimedOut(timeout));
+                    }
+                    outcome.timeouts.push(timeout);
+                }
+                Ended::Failed(source) => {
+                    if self.options.headless {
+                        return Err(PlayError::Step {
+                            line,
+                            step: text,
+                            source,
+                        });
+                    }
                     tracing::warn!(line, step = %text, "step failed: {source:#}");
+                    writeln!(
+                        out,
+                        "[{:7.1}s]   failed: {source:#}",
+                        Instant::now()
+                            .saturating_duration_since(start)
+                            .as_secs_f64()
+                    )?;
+                    outcome.failures.push((line, format!("{source:#}")));
                 }
-                writeln!(
-                    out,
-                    "[{:7.1}s]   failed: {source:#}",
-                    Instant::now()
-                        .saturating_duration_since(start)
-                        .as_secs_f64()
-                )?;
-                outcome.failures.push((line, format!("{source:#}")));
-            } else if let Some(timeout) = self.finish(step, &state, start, line, &text, out).await?
-            {
-                if self.options.headless {
-                    return Err(PlayError::TimedOut(timeout));
-                }
-                outcome.timeouts.push(timeout);
-            } else {
-                if let Some((label, how)) = abrupt_exit(step) {
-                    exited = Some((label.to_owned(), how, Instant::now()));
-                }
-                self.show_detection(step, exited.as_ref());
             }
             outcome.steps += 1;
             if matches!(step, Step::Quit) {
@@ -452,9 +572,8 @@ impl<S: Stage> Director<S> {
         }
     }
 
-    /// Waits out a pause or an await. Returns the timeout when an await ran
-    /// out of time; `None` for every other end, including a step that does
-    /// not wait.
+    /// Waits out a pause, an await or an `explain`. A step that does not wait
+    /// is done at once.
     async fn finish<W: Write>(
         &self,
         step: &Step,
@@ -463,46 +582,152 @@ impl<S: Stage> Director<S> {
         line: usize,
         text: &str,
         out: &mut W,
-    ) -> io::Result<Option<Timeout>> {
+    ) -> io::Result<Ended> {
+        let waiting = Waiting {
+            line,
+            text,
+            began: state.step_started,
+            start,
+        };
+        if let Step::Explain { key, .. } = step {
+            let limit = deadline(step).unwrap_or(DEFAULT_WITHIN);
+            return self.await_answers(key, limit, &waiting, out).await;
+        }
         let pause = matches!(step, Step::Pause(_));
         if !pause && deadline(step).is_none() {
-            return Ok(None);
+            return Ok(Ended::Done);
         }
         let action = self.wait_for(step, state).await;
         if pause {
-            return Ok(None);
+            return Ok(Ended::Done);
         }
-        let now = Instant::now();
-        let took = now.saturating_duration_since(state.step_started);
-        let at = now.saturating_duration_since(start).as_secs_f64();
         if action == DirectorAction::TimedOut {
-            if !self.options.headless {
-                tracing::warn!(line, step = %text, "await timed out after {:.1}s", took.as_secs_f64());
-            }
-            writeln!(
-                out,
-                "[{at:7.1}s]   timed out after {:.1}s",
-                took.as_secs_f64()
-            )?;
-            self.command(UiCommand::Caption(Some(TIMED_OUT_CAPTION.to_owned())));
-            return Ok(Some(Timeout {
-                line,
-                step: text.to_owned(),
-            }));
+            return self.timed_out(&waiting, out);
         }
-        writeln!(out, "[{at:7.1}s]   ok after {:.1}s", took.as_secs_f64())?;
-        Ok(None)
+        let (at, took) = waiting.elapsed();
+        writeln!(out, "[{at:7.1}s]   ok after {took:.1}s")?;
+        Ok(Ended::Done)
+    }
+
+    /// Notes that a step ran out of time: a line in the log, a warning when
+    /// there is an interface, and a caption on it.
+    fn timed_out<W: Write>(&self, waiting: &Waiting<'_>, out: &mut W) -> io::Result<Ended> {
+        let (at, took) = waiting.elapsed();
+        if !self.options.headless {
+            tracing::warn!(
+                line = waiting.line,
+                step = %waiting.text,
+                "await timed out after {took:.1}s"
+            );
+        }
+        writeln!(out, "[{at:7.1}s]   timed out after {took:.1}s")?;
+        self.command(UiCommand::Caption(Some(TIMED_OUT_CAPTION.to_owned())));
+        Ok(Ended::TimedOut(Timeout {
+            line: waiting.line,
+            step: waiting.text.to_owned(),
+        }))
+    }
+
+    /// Asks the nodes about the key an `explain` step types, `typed`, until
+    /// their answers pass or `limit` has passed since the step began, asking
+    /// again every [`ASK_AGAIN`]. A stage that cannot ask fails the step at
+    /// once. When time runs out, the step has timed out if no ask was
+    /// answered, and has failed with the last reason if any was. The
+    /// interface gets the answers that ended the wait.
+    async fn await_answers<W: Write>(
+        &self,
+        typed: &str,
+        limit: Duration,
+        waiting: &Waiting<'_>,
+        out: &mut W,
+    ) -> io::Result<Ended> {
+        let mut last: Option<(Explained, String)> = None;
+        loop {
+            let left = limit.saturating_sub(waiting.took());
+            let Ok(asked) = tokio::time::timeout(left, self.ask(typed)).await else {
+                break;
+            };
+            let (answers, judged) = match asked {
+                Ok(asked) => asked,
+                Err(source) => return Ok(Ended::Failed(source)),
+            };
+            let why = match judged {
+                Ok(words) => {
+                    self.show_answers(typed, answers);
+                    let (at, took) = waiting.elapsed();
+                    writeln!(out, "[{at:7.1}s]   ok after {took:.1}s: {words}")?;
+                    return Ok(Ended::Done);
+                }
+                Err(why) => why,
+            };
+            if last.as_ref().is_none_or(|(_, before)| *before != why) {
+                let (at, took) = waiting.elapsed();
+                writeln!(out, "[{at:7.1}s]   not yet after {took:.1}s: {why}")?;
+            }
+            last = Some((answers, why));
+            let Some(wait) = ask_again_in(waiting.took(), limit) else {
+                break;
+            };
+            tokio::time::sleep(wait).await;
+        }
+        match last {
+            Some((answers, why)) => {
+                self.show_answers(typed, answers);
+                Ok(Ended::Failed(anyhow::Error::msg(why)))
+            }
+            None => self.timed_out(waiting, out),
+        }
+    }
+
+    /// Opens the explain overlay on the key `typed` with `answers` in.
+    fn show_answers(&self, typed: &str, answers: Explained) {
+        self.command(UiCommand::Explain {
+            key: typed.to_owned(),
+            answers: Box::new(answers),
+        });
+    }
+
+    /// Asks the stage's nodes about the key `typed` and judges the answers
+    /// against the placement in the digest as it stands once they are in.
+    async fn ask(&self, typed: &str) -> anyhow::Result<(Explained, Result<String, String>)> {
+        let spec = askable_key(typed).map_err(anyhow::Error::msg)?;
+        let answers = self.stage.explain(spec.text()).await?;
+        let placement = placement_in(&self.digests.borrow(), &answers, &spec);
+        let judged = judge(&answers, placement.as_ref());
+        Ok((answers, judged))
+    }
+}
+
+impl Waiting<'_> {
+    /// How long the step has taken.
+    fn took(&self) -> Duration {
+        Instant::now().saturating_duration_since(self.began)
+    }
+
+    /// The seconds from the origin of the run's stamps to now, and the
+    /// seconds the step has taken.
+    fn elapsed(&self) -> (f64, f64) {
+        let now = Instant::now();
+        (
+            now.saturating_duration_since(self.start).as_secs_f64(),
+            now.saturating_duration_since(self.began).as_secs_f64(),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::time::SystemTime;
 
     use sundog::observe::MemberStatus;
 
     use super::*;
-    use crate::scenario::{AwaitedStatus, parse};
+    use crate::ask::SCRIPTED_ID;
+    use crate::explained::{Outcome, fixture};
+    use crate::model::digest::HeldShares;
+    use crate::model::testkit;
+    use crate::scenario::{AwaitedStatus, Entry, parse};
 
     const S: fn(u64) -> Duration = Duration::from_secs;
 
@@ -570,6 +795,11 @@ mod tests {
             Step::Tab(crate::ui::View::Node),
             Step::Select("n1".into()),
             Step::Help(true),
+            Step::Explain {
+                key: "k1".into(),
+                within: Some(S(5)),
+            },
+            Step::ExplainClose,
             Step::Quit,
         ] {
             assert_eq!(
@@ -716,6 +946,17 @@ mod tests {
     }
 
     #[test]
+    fn an_explain_waits_for_its_answers_up_to_its_within_or_the_default() {
+        let explain = |within| Step::Explain {
+            key: "k1".into(),
+            within,
+        };
+        assert_eq!(deadline(&explain(Some(S(4)))), Some(S(4)));
+        assert_eq!(deadline(&explain(None)), Some(DEFAULT_WITHIN));
+        assert_eq!(deadline(&Step::ExplainClose), None);
+    }
+
+    #[test]
     fn only_steps_that_change_the_cluster_are_fleet_actions() {
         for line in ["spawn 2", "kill n1", "leave n1", "crash n1", "restart n1"] {
             let step = parse(line).unwrap().steps.remove(0).step;
@@ -727,6 +968,8 @@ mod tests {
             "pause 1s",
             "tab node",
             "await members 1",
+            "explain k1",
+            "explain close",
             "quit",
             "caption \"x\"",
         ] {
@@ -794,6 +1037,11 @@ mod tests {
             Step::Pause(S(1)),
             Step::Fill(1),
             Step::Load(true),
+            Step::ExplainClose,
+            Step::Explain {
+                key: "k1".into(),
+                within: None,
+            },
         ] {
             assert!(
                 condition_met(&step, &none, &ModelDigest::default()),
@@ -812,6 +1060,31 @@ mod tests {
         settle_after: Duration,
         /// After a kill or crash the node shows `Down` this much later.
         down_after: Option<Duration>,
+        /// What the nodes answer to `explain` once the script has run out.
+        nodes: Nodes,
+        /// What the nodes answer to the first asks, in order.
+        script: Mutex<std::collections::VecDeque<Nodes>>,
+    }
+
+    /// What the fake's nodes answer to `explain`: the five live nodes of the
+    /// fixture model, as a converged cluster gives them, unless it says
+    /// otherwise.
+    #[derive(Clone, Copy, Debug)]
+    enum Nodes {
+        /// Every node holds the lens's view and owners.
+        Agree,
+        /// Every node holds a view the lens does not.
+        Moved,
+        /// `n3` refuses the connection.
+        OneRefuses,
+        /// The answer holds no node.
+        Nobody,
+        /// Every node agrees, after this long.
+        Late(Duration),
+        /// Nobody answers.
+        Never,
+        /// The stage cannot ask.
+        Broken,
     }
 
     impl Fake {
@@ -822,6 +1095,8 @@ mod tests {
                 fail_kill: false,
                 settle_after: Duration::from_millis(500),
                 down_after: None,
+                nodes: Nodes::Agree,
+                script: Mutex::default(),
             }
         }
 
@@ -904,6 +1179,63 @@ mod tests {
             self.note(format!("restart {label}"));
             Ok(())
         }
+
+        async fn explain(&self, key: &str) -> anyhow::Result<Explained> {
+            self.note(format!("explain {key}"));
+            let nodes = self
+                .script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(self.nodes);
+            let mut answers = converged_answers(key);
+            match nodes {
+                Nodes::Agree => {}
+                Nodes::Moved => {
+                    for answer in &mut answers.nodes {
+                        if let Outcome::Read(reading) = &mut answer.outcome {
+                            reading
+                                .distributed
+                                .as_mut()
+                                .expect("the fixture reads are distributed")
+                                .view = "00c1a2f4e8b3195d".to_owned();
+                        }
+                    }
+                }
+                Nodes::OneRefuses => {
+                    answers.nodes[2].outcome =
+                        Outcome::Failed("no answer (connection refused)".to_owned());
+                }
+                Nodes::Nobody => answers.nodes.clear(),
+                Nodes::Late(after) => tokio::time::sleep(after).await,
+                Nodes::Never => std::future::pending().await,
+                Nodes::Broken => anyhow::bail!("no node is running to ask"),
+            }
+            Ok(answers)
+        }
+    }
+
+    /// The model of five live nodes ranking `it`, whose placement the fake's
+    /// answers and the digest's shares both come from. Ranking costs a few
+    /// hundred thousand hashes, so every test shares one.
+    fn cluster() -> &'static crate::model::Model {
+        static CLUSTER: std::sync::OnceLock<crate::model::Model> = std::sync::OnceLock::new();
+        CLUSTER.get_or_init(|| testkit::fixture_model(std::time::Instant::now()))
+    }
+
+    /// What five nodes that hold the lens's view answer about `key`.
+    fn converged_answers(key: &str) -> Explained {
+        fixture::explained(cluster(), SCRIPTED_ID, key, SystemTime::UNIX_EPOCH)
+    }
+
+    /// `digest` with the ownership shares of the model of [`cluster`].
+    fn with_cluster_shares(mut digest: ModelDigest) -> ModelDigest {
+        let ranked = cluster().ownership("it").expect("the fixture ranks it");
+        digest.ownership.insert(
+            "it".into(),
+            HeldShares(std::sync::Arc::clone(&ranked.shares)),
+        );
+        digest
     }
 
     struct Rig {
@@ -920,6 +1252,17 @@ mod tests {
             director: Director::new(fake, rx, Some(ui_tx), options),
             ui: ui_rx,
         }
+    }
+
+    /// A rig whose digest holds the cluster's shares and whose nodes answer
+    /// `nodes`.
+    fn explaining_rig(options: Options, nodes: Nodes) -> Rig {
+        let rig = rig(options, |fake| fake.nodes = nodes);
+        rig.director
+            .stage
+            .digests
+            .send_modify(|digest| *digest = with_cluster_shares(std::mem::take(digest)));
+        rig
     }
 
     const HEADLESS: Options = Options {
@@ -1295,19 +1638,26 @@ mod tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_run_with_an_interface_logs_a_warning_for_a_timeout_and_a_failed_step() {
-        let _logging = LOGGING.lock().await;
+    /// Collects what this thread's `tracing` events write, until the guard
+    /// drops. Held beside [`LOGGING`].
+    fn capture_logs() -> (Captured, tracing::subscriber::DefaultGuard) {
         let captured = Captured::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(captured.clone())
             .with_ansi(false)
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let guard = tracing::subscriber::set_default(subscriber);
         // Other tests of this module hit the same callsites on their own
         // threads, with no subscriber: recompute what each callsite is
         // interested in now that this thread has one.
         tracing::callsite::rebuild_interest_cache();
+        (captured, guard)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_run_with_an_interface_logs_a_warning_for_a_timeout_and_a_failed_step() {
+        let _logging = LOGGING.lock().await;
+        let (captured, _guard) = capture_logs();
         let scenario = parse("await members 9 within 2s\nkill n7\nquit").unwrap();
 
         let shown = rig(SHOW, |fake| fake.fail_kill = true);
@@ -1412,6 +1762,585 @@ mod tests {
         }
     }
 
+    /// What reached the interface, in order.
+    fn drain(ui: &mut mpsc::UnboundedReceiver<UiCommand>) -> Vec<UiCommand> {
+        let mut commands = Vec::new();
+        while let Ok(command) = ui.try_recv() {
+            commands.push(command);
+        }
+        commands
+    }
+
+    /// The overlays the commands open: the key typed, and the answers.
+    fn overlays(commands: &[UiCommand]) -> Vec<(&str, &Explained)> {
+        commands
+            .iter()
+            .filter_map(|command| match command {
+                UiCommand::Explain { key, answers } => Some((key.as_str(), answers.as_ref())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The commands as one word each.
+    fn kinds(commands: &[UiCommand]) -> Vec<&'static str> {
+        commands
+            .iter()
+            .map(|command| match command {
+                UiCommand::Explain { .. } => "explain",
+                UiCommand::CloseExplain => "close",
+                UiCommand::Caption(_) => "caption",
+                UiCommand::Quit => "quit",
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_explain_step_asks_every_node_and_hands_the_overlay_the_answers() {
+        let mut rig = explaining_rig(HEADLESS, Nodes::Agree);
+        let scenario = parse(
+            "explain k1 within 5s\n\
+             pause 1s\n\
+             explain close\n\
+             explain str:close\n\
+             explain close\n\
+             quit",
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        let outcome = rig
+            .director
+            .play(&scenario, Instant::now(), &mut out, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.steps, 6);
+        assert!(outcome.timeouts.is_empty() && outcome.failures.is_empty());
+        // The nodes are asked about the key after the overlay's prefix.
+        assert_eq!(rig.director.stage.calls(), ["explain k1", "explain close"]);
+
+        let commands = drain(&mut rig.ui);
+        assert_eq!(
+            kinds(&commands),
+            ["explain", "close", "explain", "close", "quit"]
+        );
+        let shown = overlays(&commands);
+        assert_eq!((shown[0].0, shown[0].1.key.as_str()), ("k1", "k1"));
+        assert_eq!(
+            (shown[1].0, shown[1].1.key.as_str()),
+            ("str:close", "close"),
+            "the overlay types the key as the scenario wrote it"
+        );
+        for (_, answers) in &shown {
+            assert_eq!(answers.id, SCRIPTED_ID);
+            let labels: Vec<&str> = answers.nodes.iter().map(|a| a.label.as_str()).collect();
+            assert_eq!(labels, ["n1", "n2", "n3", "n4", "n5"]);
+        }
+        let log = String::from_utf8(out).unwrap();
+        assert!(log.contains("] explain k1 within 5s"), "{log}");
+        assert!(
+            log.contains("ok after 0.0s: 5 nodes agree, the lens computes the same"),
+            "{log}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_explain_needs_no_interface_to_ask_and_judge() {
+        let (tx, rx) = watch::channel(with_cluster_shares(ModelDigest::default()));
+        let none = Director::new(Fake::new(tx), rx, None, HEADLESS);
+        let scenario = parse("explain k1\nexplain close").unwrap();
+        let mut out = Vec::new();
+        let outcome = none
+            .play(&scenario, Instant::now(), &mut out, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.steps, 2);
+        assert_eq!(none.stage.calls(), ["explain k1"]);
+        let log = String::from_utf8(out).unwrap();
+        assert!(
+            log.contains("5 nodes agree, the lens computes the same"),
+            "{log}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_explain_asks_again_until_every_node_answers_and_agrees() {
+        // Two nodes still opening their caches, then a view still moving,
+        // then the cluster agrees.
+        let mut rig = explaining_rig(HEADLESS, Nodes::Agree);
+        rig.director.stage.script.lock().unwrap().extend([
+            Nodes::OneRefuses,
+            Nodes::OneRefuses,
+            Nodes::Moved,
+        ]);
+        let scenario = parse("explain k1 within 5s\nquit").unwrap();
+        let mut out = Vec::new();
+        let outcome = rig
+            .director
+            .play(&scenario, Instant::now(), &mut out, None)
+            .await
+            .unwrap();
+        assert!(outcome.timeouts.is_empty() && outcome.failures.is_empty());
+        assert_eq!(rig.director.stage.calls(), ["explain k1"; 4]);
+        // One look at the digest after another, a quarter second apart.
+        assert!(outcome.elapsed >= ASK_AGAIN * 3, "{:?}", outcome.elapsed);
+        assert!(outcome.elapsed < ASK_AGAIN * 4, "{:?}", outcome.elapsed);
+        let log = String::from_utf8(out).unwrap();
+        // Each new reason is logged once, and the pass ends the wait.
+        assert_eq!(log.matches("not yet after").count(), 2, "{log}");
+        assert!(
+            log.contains(
+                "not yet after 0.0s: 1 of 5 nodes gave no explanation: \
+                 n3: no answer (connection refused)"
+            ),
+            "{log}"
+        );
+        assert!(log.contains("not yet after 0.5s: view moved "), "{log}");
+        assert!(
+            log.contains("ok after 0.8s: 5 nodes agree, the lens computes the same")
+                || log.contains("ok after 0.7s: 5 nodes agree, the lens computes the same"),
+            "{log}"
+        );
+        // The overlay opens once, on the answers that passed.
+        let commands = drain(&mut rig.ui);
+        assert_eq!(kinds(&commands), ["explain", "quit"]);
+        let shown = overlays(&commands);
+        assert_eq!(shown[0].1.readings().count(), 5);
+    }
+
+    #[test]
+    fn an_explain_asks_again_every_quarter_second_until_its_deadline() {
+        assert_eq!(ask_again_in(S(0), S(5)), Some(ASK_AGAIN));
+        assert_eq!(ask_again_in(S(4), S(5)), Some(ASK_AGAIN));
+        // Less than a quarter second left: wait out what is left.
+        let near = Duration::from_millis(4900);
+        assert_eq!(ask_again_in(near, S(5)), Some(Duration::from_millis(100)));
+        // At the deadline and past it: no more asks.
+        assert_eq!(ask_again_in(S(5), S(5)), None);
+        assert_eq!(ask_again_in(S(6), S(5)), None);
+        assert_eq!(ask_again_in(S(0), S(0)), None);
+        // A deadline no instant can hold is a wait that does not end.
+        assert_eq!(ask_again_in(S(1_000_000), Duration::MAX), Some(ASK_AGAIN));
+        assert_eq!(ask_again_in(Duration::MAX, Duration::MAX), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_explain_with_a_deadline_no_instant_can_hold_asks_until_the_answers_pass() {
+        let mut rig = explaining_rig(HEADLESS, Nodes::Agree);
+        rig.director
+            .stage
+            .script
+            .lock()
+            .unwrap()
+            .extend([Nodes::OneRefuses, Nodes::OneRefuses]);
+        let scenario = parse("explain k1 within 18446744073709551615s\nquit").unwrap();
+        let mut out = Vec::new();
+        let outcome = rig
+            .director
+            .play(&scenario, Instant::now(), &mut out, None)
+            .await
+            .unwrap();
+        assert!(outcome.timeouts.is_empty() && outcome.failures.is_empty());
+        assert_eq!(rig.director.stage.calls(), ["explain k1"; 3]);
+        assert!(outcome.elapsed >= ASK_AGAIN * 2, "{:?}", outcome.elapsed);
+        assert_eq!(kinds(&drain(&mut rig.ui)), ["explain", "quit"]);
+        let log = String::from_utf8(out).unwrap();
+        assert!(
+            log.contains("5 nodes agree, the lens computes the same"),
+            "{log}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_explain_waits_for_slow_answers_and_gives_up_at_its_deadline() {
+        let rig = explaining_rig(HEADLESS, Nodes::Late(S(3)));
+        let scenario = parse("explain k1 within 5s").unwrap();
+        let outcome = rig
+            .director
+            .play(&scenario, Instant::now(), &mut Vec::new(), None)
+            .await
+            .unwrap();
+        assert!(outcome.elapsed >= S(3), "{:?}", outcome.elapsed);
+        assert!(outcome.elapsed < S(4), "{:?}", outcome.elapsed);
+
+        let rig = explaining_rig(HEADLESS, Nodes::Late(S(3)));
+        let scenario = parse("explain k1 within 2s").unwrap();
+        let error = rig
+            .director
+            .play(&scenario, Instant::now(), &mut Vec::new(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PlayError::TimedOut(_)), "{error}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_explain_nobody_answers_times_out_like_an_await() {
+        // Headless, it is an error that names the line.
+        let rig = explaining_rig(HEADLESS, Nodes::Never);
+        let scenario = parse("pause 1s\nexplain k1 within 2s\nquit").unwrap();
+        let mut out = Vec::new();
+        let error = rig
+            .director
+            .play(&scenario, Instant::now(), &mut out, None)
+            .await
+            .unwrap_err();
+        match &error {
+            PlayError::TimedOut(Timeout { line, step }) => {
+                assert_eq!(*line, 2);
+                assert_eq!(step, "explain k1 within 2s");
+            }
+            other => panic!("not a timeout: {other}"),
+        }
+        assert_eq!(
+            error.to_string(),
+            "line 2: `explain k1 within 2s` timed out"
+        );
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("timed out after 2.0s")
+        );
+
+        // Without a `within` it waits the default.
+        let rig = explaining_rig(HEADLESS, Nodes::Never);
+        let mut out = Vec::new();
+        rig.director
+            .play(
+                &parse("explain k1").unwrap(),
+                Instant::now(),
+                &mut out,
+                None,
+            )
+            .await
+            .unwrap_err();
+        let log = String::from_utf8(out).unwrap();
+        assert!(log.contains("timed out after 30.0s"), "{log}");
+
+        // With an interface, the run warns, captions it and goes on.
+        let _logging = LOGGING.lock().await;
+        let (captured, _guard) = capture_logs();
+        let mut rig = explaining_rig(SHOW, Nodes::Never);
+        let scenario = parse("explain k1 within 2s\nfill 5\nquit").unwrap();
+        let outcome = rig
+            .director
+            .play(&scenario, Instant::now(), &mut Vec::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.steps, 3);
+        assert_eq!(
+            outcome.timeouts,
+            [Timeout {
+                line: 1,
+                step: "explain k1 within 2s".into()
+            }]
+        );
+        assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+        assert_eq!(rig.director.stage.calls(), ["explain k1", "fill 5"]);
+        assert_eq!(
+            drain(&mut rig.ui),
+            [
+                UiCommand::Caption(Some(TIMED_OUT_CAPTION.into())),
+                UiCommand::Quit
+            ]
+        );
+        let text = captured.text();
+        assert!(text.contains("WARN"), "{text}");
+        assert!(text.contains("await timed out after 2.0s"), "{text}");
+        assert!(text.contains("explain k1 within 2s"), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn answers_that_disagree_with_the_lens_fail_the_step_and_the_overlay_shows_them() {
+        let mut rig = explaining_rig(HEADLESS, Nodes::Moved);
+        let scenario = parse("fill 1\nexplain k1 within 5s\nexplain close\nquit").unwrap();
+        let error = rig
+            .director
+            .play(&scenario, Instant::now(), &mut Vec::new(), None)
+            .await
+            .unwrap_err();
+        let PlayError::Step { line, step, source } = &error else {
+            panic!("not a failed step: {error}");
+        };
+        assert_eq!((*line, step.as_str()), (2, "explain k1 within 5s"));
+        let why = source.to_string();
+        assert!(why.starts_with("view moved 00c1a2f4 -> "), "{why}");
+        assert!(!why.contains("Enter"), "no key to press in a run: {why}");
+        assert_eq!(
+            error.to_string(),
+            format!("line 2: `explain k1 within 5s` failed: {why}")
+        );
+        // The nodes were asked again until the deadline, the run stopped
+        // there, and the overlay was handed the last answers once.
+        let calls = rig.director.stage.calls();
+        assert_eq!(calls[0], "fill 1");
+        assert!(calls.len() > 3, "{calls:?}");
+        assert!(
+            calls[1..].iter().all(|call| call == "explain k1"),
+            "{calls:?}"
+        );
+        let commands = drain(&mut rig.ui);
+        assert_eq!(kinds(&commands), ["explain"]);
+
+        // With an interface the run warns of the failure and goes on.
+        let _logging = LOGGING.lock().await;
+        let (captured, _guard) = capture_logs();
+        let mut rig = explaining_rig(SHOW, Nodes::Moved);
+        let scenario = parse("explain k1\nexplain close\nquit").unwrap();
+        let mut out = Vec::new();
+        let outcome = rig
+            .director
+            .play(&scenario, Instant::now(), &mut out, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.steps, 3);
+        assert!(outcome.timeouts.is_empty(), "{:?}", outcome.timeouts);
+        assert_eq!(outcome.failures, [(1, why)]);
+        assert_eq!(
+            kinds(&drain(&mut rig.ui)),
+            ["explain", "close", "quit"],
+            "the overlay opens and closes as scripted"
+        );
+        let log = String::from_utf8(out).unwrap();
+        assert!(log.contains("failed: view moved 00c1a2f4 -> "), "{log}");
+        let text = captured.text();
+        assert!(text.contains("WARN"), "{text}");
+        assert!(
+            text.contains("step failed: view moved 00c1a2f4 -> "),
+            "{text}"
+        );
+        assert!(text.contains("explain k1"), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_explain_fails_when_a_node_gives_no_explanation_or_nobody_is_asked() {
+        for (nodes, expected) in [
+            (
+                Nodes::OneRefuses,
+                "1 of 5 nodes gave no explanation: n3: no answer (connection refused)",
+            ),
+            (Nodes::Nobody, "no node was asked"),
+            (Nodes::Broken, "no node is running to ask"),
+        ] {
+            let mut rig = explaining_rig(HEADLESS, nodes);
+            let error = rig
+                .director
+                .play(
+                    &parse("explain k1").unwrap(),
+                    Instant::now(),
+                    &mut Vec::new(),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            let PlayError::Step { source, .. } = &error else {
+                panic!("{nodes:?}: not a failed step: {error}");
+            };
+            assert_eq!(source.to_string(), expected, "{nodes:?}");
+            // A stage that cannot ask has no answers for the overlay.
+            let opened = overlays(&drain(&mut rig.ui)).len();
+            assert_eq!(opened, usize::from(!matches!(nodes, Nodes::Broken)));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_explain_without_a_placement_or_a_key_to_ask_fails() {
+        // The digest holds no shares of the cache the nodes explained.
+        let rig = rig(HEADLESS, |_| {});
+        let error = rig
+            .director
+            .play(
+                &parse("explain k1").unwrap(),
+                Instant::now(),
+                &mut Vec::new(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        let PlayError::Step { source, .. } = &error else {
+            panic!("not a failed step: {error}");
+        };
+        assert_eq!(
+            source.to_string(),
+            "the lens has no placement of the key to compare with"
+        );
+        let calls = rig.director.stage.calls();
+        assert!(calls.len() > 3, "asked again until the deadline: {calls:?}");
+
+        // The parser refuses a key a test node cannot be asked, so a step
+        // built by hand is the director's to refuse, before it asks anyone.
+        let rig = explaining_rig(HEADLESS, Nodes::Agree);
+        let scenario = Scenario {
+            steps: vec![Entry {
+                line: 7,
+                step: Step::Explain {
+                    key: "uint:5".into(),
+                    within: None,
+                },
+            }],
+        };
+        let error = rig
+            .director
+            .play(&scenario, Instant::now(), &mut Vec::new(), None)
+            .await
+            .unwrap_err();
+        let PlayError::Step { line, source, .. } = &error else {
+            panic!("not a failed step: {error}");
+        };
+        assert_eq!(*line, 7);
+        assert!(source.to_string().contains("cannot be asked"), "{source}");
+        let calls = rig.director.stage.calls();
+        assert!(calls.is_empty(), "{calls:?}");
+    }
+
+    /// The nodes' answers about `k1`, and the lens's placement of it.
+    fn k1() -> (Explained, Placement) {
+        let model = cluster();
+        let ranked = model.ownership("it").expect("the fixture ranks it");
+        let spec = KeySpec::parse("k1").unwrap();
+        (
+            fixture::explained(model, SCRIPTED_ID, "k1", SystemTime::UNIX_EPOCH),
+            Placement::of(&ranked.shares, &spec),
+        )
+    }
+
+    /// The reading of node `at` of `answers`.
+    fn reading_mut(answers: &mut Explained, at: usize) -> &mut crate::explained::Reading {
+        match &mut answers.nodes[at].outcome {
+            Outcome::Read(reading) => reading,
+            Outcome::Failed(why) => panic!("node {at} failed: {why}"),
+        }
+    }
+
+    #[test]
+    fn answers_pass_only_when_every_node_read_the_key_and_all_agree_with_the_lens() {
+        let (agreeing, placement) = k1();
+        let judged = |answers: &Explained| judge(answers, Some(&placement));
+        assert_eq!(
+            judged(&agreeing),
+            Ok("5 nodes agree, the lens computes the same".to_owned())
+        );
+
+        let mut nobody = agreeing.clone();
+        nobody.nodes.clear();
+        assert_eq!(judged(&nobody), Err("no node was asked".to_owned()));
+
+        let mut silent = agreeing.clone();
+        silent.nodes[1].outcome = Outcome::Failed("no answer within 3 s".to_owned());
+        silent.nodes[3].outcome = Outcome::Failed("no answer (connection refused)".to_owned());
+        assert_eq!(
+            judged(&silent),
+            Err(
+                "2 of 5 nodes gave no explanation: n2: no answer within 3 s; \
+                 n4: no answer (connection refused)"
+                    .to_owned()
+            )
+        );
+
+        let mut lone = agreeing.clone();
+        lone.nodes.truncate(1);
+        lone.nodes[0].outcome = Outcome::Failed("no answer (connection refused)".to_owned());
+        assert_eq!(
+            judged(&lone),
+            Err("1 of 1 node gave no explanation: n1: no answer (connection refused)".to_owned())
+        );
+
+        // Every node holds a view the lens no longer has.
+        let mut moved = agreeing.clone();
+        for at in 0..5 {
+            reading_mut(&mut moved, at)
+                .distributed
+                .as_mut()
+                .unwrap()
+                .view = "00c1a2f4e8b3195d".to_owned();
+        }
+        let why = judged(&moved).unwrap_err();
+        assert!(why.starts_with("view moved 00c1a2f4 -> "), "{why}");
+        assert!(!why.contains("Enter"), "no key to press in a run: {why}");
+
+        // One node holds another view than the rest.
+        let mut split = agreeing.clone();
+        reading_mut(&mut split, 2)
+            .distributed
+            .as_mut()
+            .unwrap()
+            .view = "00c1a2f4e8b3195d".to_owned();
+        let why = judged(&split).unwrap_err();
+        assert!(why.starts_with("n1 n2 n4 n5 hold "), "{why}");
+        assert!(why.ends_with(", n3 holds 00c1a2f4"), "{why}");
+
+        // One node lists the owners in another order.
+        let mut apart = agreeing.clone();
+        reading_mut(&mut apart, 4)
+            .distributed
+            .as_mut()
+            .unwrap()
+            .owners
+            .reverse();
+        let why = judged(&apart).unwrap_err();
+        assert!(
+            why.starts_with("n5 differs from the lens, which holds view "),
+            "{why}"
+        );
+
+        // One node's cache is not Distributed, so it compares nothing.
+        let mut mixed = agreeing.clone();
+        reading_mut(&mut mixed, 0).distributed = None;
+        assert_eq!(
+            judged(&mixed),
+            Err("only 4 of 5 nodes gave a Distributed reading".to_owned())
+        );
+
+        // The lens has no placement, or places the key in another cache.
+        assert_eq!(
+            judge(&agreeing, None),
+            Err("the lens has no placement of the key to compare with".to_owned())
+        );
+        let mut elsewhere = placement.clone();
+        elsewhere.cache = "other".into();
+        assert_eq!(
+            judge(&agreeing, Some(&elsewhere)),
+            Err(
+                "the nodes explained cache it and the lens places the key in cache other: \
+                 nothing to compare"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn a_key_is_placed_in_the_cache_the_nodes_explained() {
+        let (answers, expected) = k1();
+        let digest = with_cluster_shares(ModelDigest::default());
+        let spec = KeySpec::parse("k1").unwrap();
+        assert_eq!(
+            placement_in(&digest, &answers, &spec),
+            Some(expected.clone())
+        );
+
+        // Another key lands on its own part in the same view.
+        let k2 = KeySpec::parse("k2").unwrap();
+        let other = placement_in(&digest, &answers, &k2).expect("k2 is placed");
+        assert_eq!(other.part, sundog::store::PartId::of_key(k2.bytes()));
+        assert_eq!(
+            (other.cache.as_str(), other.view_hash),
+            ("it", expected.view_hash)
+        );
+
+        // No shares in the digest, no reading, or a cache the digest does not
+        // hold: nothing to place the key in.
+        assert_eq!(placement_in(&ModelDigest::default(), &answers, &spec), None);
+        let mut failed = answers.clone();
+        for answer in &mut failed.nodes {
+            answer.outcome = Outcome::Failed("no answer".to_owned());
+        }
+        assert_eq!(placement_in(&digest, &failed, &spec), None);
+        let mut elsewhere = answers.clone();
+        for at in 0..5 {
+            reading_mut(&mut elsewhere, at).cache = "other".to_owned();
+        }
+        assert_eq!(placement_in(&digest, &elsewhere, &spec), None);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn the_built_in_tour_runs_against_a_fake_cluster() {
         // A fake that follows the tour: it counts live members and moves the
@@ -1480,8 +2409,11 @@ mod tests {
                 self.status(label, MemberStatus::Live, 1);
                 Ok(())
             }
+            async fn explain(&self, key: &str) -> anyhow::Result<Explained> {
+                Ok(converged_answers(key))
+            }
         }
-        let (tx, rx) = watch::channel(ModelDigest::default());
+        let (tx, rx) = watch::channel(with_cluster_shares(ModelDigest::default()));
         let director = Director::new(Tour { digests: tx }, rx, None, HEADLESS);
         let scenario = parse(crate::scenario::TOUR).unwrap();
         let mut out = Vec::new();
@@ -1491,5 +2423,13 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.steps, scenario.steps.len());
         assert!(outcome.timeouts.is_empty(), "{:?}", outcome.timeouts);
+        assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+        // The tour's explain scene asks and passes.
+        let log = String::from_utf8(out).unwrap();
+        assert!(log.contains("] explain k1 within 10s"), "{log}");
+        assert!(
+            log.contains("5 nodes agree, the lens computes the same"),
+            "{log}"
+        );
     }
 }

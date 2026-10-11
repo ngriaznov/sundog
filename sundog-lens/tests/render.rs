@@ -726,6 +726,46 @@ fn the_splash_matches_the_golden() {
 }
 
 #[test]
+fn a_scripted_explain_draws_the_overlay_a_person_opens_and_close_removes_it() {
+    let model = live();
+    let typed = explaining(
+        &model,
+        View::Overview,
+        Stage::Answered,
+        ColorMode::Truecolor,
+    );
+    let mut scripted = App::new(AppConfig {
+        control: Some(control()),
+        ..config(ColorMode::Truecolor)
+    });
+    scripted.observe(&model, ctx_of(&model).now);
+    scripted.snap();
+    scripted.apply_director(UiCommand::Tab(View::Overview), &model);
+    let before = frame_text(&scripted, &model);
+    let asked = ctx_of(&model).wall - Duration::from_secs(3);
+    let answers = fixture::explained(&model, 0, "k1", asked);
+    scripted.apply_director(
+        UiCommand::Explain {
+            key: "k1".to_owned(),
+            answers: Box::new(answers),
+        },
+        &model,
+    );
+    let shown = frame_text(&scripted, &model);
+    assert_eq!(shown, frame_text(&typed, &model));
+    for landmark in [
+        "Explain a read · it · computed · asked",
+        "key    k1",
+        "5 nodes agree, the lens computes the same",
+        "n1 in detail",
+    ] {
+        assert!(shown.contains(landmark), "{landmark}\n{shown}");
+    }
+    scripted.apply_director(UiCommand::CloseExplain, &model);
+    assert_eq!(frame_text(&scripted, &model), before);
+}
+
+#[test]
 fn the_explain_overlay_matches_the_golden() {
     let model = live();
     let app = explaining(

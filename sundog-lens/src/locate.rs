@@ -17,7 +17,7 @@ use std::num::NonZeroU8;
 
 use smol_str::SmolStr;
 use sundog::NodeId;
-use sundog::observe::MemberStatus;
+use sundog::observe::{MemberStatus, OwnershipShares};
 use sundog::store::{Mode, PartId};
 
 use crate::key::{KeySpec, printable};
@@ -81,6 +81,50 @@ impl Located {
     #[must_use]
     pub fn part_text(&self) -> String {
         format!("{}/{}", self.part.bucket(), self.part.part())
+    }
+
+    /// What the nodes' answers are compared with: the cache, the part, the
+    /// view and the owners in fetch order.
+    #[must_use]
+    pub fn placement(&self) -> Placement {
+        Placement {
+            cache: self.cache.clone(),
+            part: self.part,
+            view_hash: self.view_hash,
+            owners: self.owners.iter().map(|owner| owner.node).collect(),
+        }
+    }
+}
+
+/// Where the lens places a key: the part, the hash of the view that ranks its
+/// owners, and the owners in fetch order. It is all a node's answer is
+/// compared with, so it needs the ownership shares and no model: the
+/// scenario director holds the shares in its digest and places a key with
+/// [`Placement::of`], and [`Located::placement`] gives the same placement of
+/// a located key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placement {
+    /// The cache.
+    pub cache: SmolStr,
+    /// The key's part: the low 16 bits of the hash of its bytes.
+    pub part: PartId,
+    /// The hash of the ownership view.
+    pub view_hash: u64,
+    /// The part's owners in fetch order.
+    pub owners: Vec<NodeId>,
+}
+
+impl Placement {
+    /// The placement of `key` in the view `shares` holds.
+    #[must_use]
+    pub fn of(shares: &OwnershipShares, key: &KeySpec) -> Self {
+        let part = PartId::of_key(key.bytes());
+        Self {
+            cache: shares.cache().into(),
+            part,
+            view_hash: shares.view_hash(),
+            owners: shares.owners_of(part).to_vec(),
+        }
     }
 }
 
@@ -412,6 +456,28 @@ mod tests {
             located.part_text(),
             format!("{}/{}", part.bucket(), part.part())
         );
+    }
+
+    #[test]
+    fn a_placement_from_the_shares_is_the_placement_of_the_located_key() {
+        let model = testkit::fixture_model(Instant::now());
+        let digest = model.ownership("it").expect("the fixture ranks it");
+        for text in ["k1", "k17", "uint:42", "int:-7", "hex:036b", "str:uint:1"] {
+            let spec = key(text);
+            let placement = Placement::of(&digest.shares, &spec);
+            let located = locate(&model, Some("it"), &spec).expect("the key is located");
+            assert_eq!(placement, located.placement(), "{text}");
+            assert_eq!(placement.cache, "it", "{text}");
+            assert_eq!(placement.view_hash, digest.view_hash, "{text}");
+            assert_eq!(placement.part, PartId::of_key(spec.bytes()), "{text}");
+            let expected = digest.shares.owners_of(placement.part);
+            assert_eq!(placement.owners, expected, "{text}");
+            assert_eq!(
+                placement.owners.len(),
+                2,
+                "{text}: the fixture has two owners"
+            );
+        }
     }
 
     #[test]

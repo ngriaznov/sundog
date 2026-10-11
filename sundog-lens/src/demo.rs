@@ -8,7 +8,9 @@
 //! With `--headless` nothing is drawn: the demo prints every step and every
 //! event to the standard output and exits 1 when an await times out. That run
 //! is the end-to-end check of the whole stack: real processes, gossip,
-//! scrape, model and director.
+//! scrape, model and director, and, when the scenario has an `explain` step,
+//! the round trip to every node's control port and the comparison of what
+//! the nodes answer with the lens's own placement of the key.
 
 use std::fs::File;
 use std::io::{self, Write};
@@ -547,7 +549,7 @@ mod tests {
         assert_eq!(targets.asked.len(), 5, "{targets:?}");
         assert_eq!(targets.asked[0].addr, "127.0.0.11:8080".parse().unwrap());
         assert!(targets.skipped.is_empty(), "{targets:?}");
-        // The interface opens the overlay on the key the fleet holds.
+        // The interface opens the overlay on a key the fleet filled.
         let mut app = App::new(config);
         let key = |c| {
             crossterm::event::KeyEvent::new(

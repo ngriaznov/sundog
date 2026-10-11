@@ -34,7 +34,9 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::Mutex;
 
 use crate::app::FleetCmd;
+use crate::ask::{self, Target};
 use crate::cli::FleetArgs;
+use crate::explained::Explained;
 use crate::scenario::director::Stage;
 use crate::source::http;
 use load::LoadHandle;
@@ -686,6 +688,22 @@ impl FleetStage {
         Ok(())
     }
 
+    /// Asks every running node about `key`, each allowed [`ask::TIMEOUT`], and
+    /// returns the answers in slot order. A node that does not answer keeps
+    /// its place with the reason in words. The request carries
+    /// [`ask::SCRIPTED_ID`]: it is a scenario's, not the overlay's.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no node runs to ask.
+    pub async fn explain(&self, key: &str) -> anyhow::Result<Explained> {
+        let targets = targets_of(&self.fleet.lock().await.running());
+        if targets.is_empty() {
+            bail!("no node is running to ask");
+        }
+        Ok(ask::ask_all(ask::SCRIPTED_ID, key, &targets, ask::TIMEOUT).await)
+    }
+
     /// Starts or stops the load.
     pub fn set_load(&self, on: bool) {
         if on {
@@ -752,6 +770,22 @@ impl Stage for FleetStage {
     async fn restart(&self, label: &str) -> anyhow::Result<()> {
         Self::restart(self, label).await
     }
+
+    async fn explain(&self, key: &str) -> anyhow::Result<Explained> {
+        Self::explain(self, key).await
+    }
+}
+
+/// The nodes `infos` name, as the targets of an ask: each slot's label and
+/// control address, in the order given.
+fn targets_of(infos: &[SlotInfo]) -> Vec<Target> {
+    infos
+        .iter()
+        .map(|info| Target {
+            label: info.label.clone(),
+            addr: info.control,
+        })
+        .collect()
 }
 
 /// The scrape URL template that reaches each node's exporter: the exporter
@@ -1028,6 +1062,36 @@ mod tests {
         // The second shared slot's control port, as the fleet documents it.
         let second = SlotInfo::new(Layout::Shared, 2).unwrap();
         assert_eq!(second.control, "127.0.0.1:8081".parse().unwrap());
+    }
+
+    #[test]
+    fn the_nodes_asked_are_the_slots_at_their_control_ports_in_order() {
+        let targets = |layout, slots: usize| {
+            let infos: Vec<SlotInfo> = (1..=slots)
+                .map(|slot| SlotInfo::new(layout, slot).unwrap())
+                .collect();
+            targets_of(&infos)
+                .into_iter()
+                .map(|target| (target.label.to_string(), target.addr.to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            targets(Layout::Shared, 3),
+            [
+                ("n1".to_owned(), "127.0.0.1:8080".to_owned()),
+                ("n2".to_owned(), "127.0.0.1:8081".to_owned()),
+                ("n3".to_owned(), "127.0.0.1:8082".to_owned()),
+            ]
+        );
+        assert_eq!(
+            targets(PER_ADDRESS, 2),
+            [
+                ("n1".to_owned(), "127.0.0.11:8080".to_owned()),
+                ("n2".to_owned(), "127.0.0.12:8080".to_owned()),
+            ]
+        );
+        let none = targets_of(&[]);
+        assert!(none.is_empty(), "{none:?}");
     }
 
     #[test]
@@ -1656,6 +1720,99 @@ mod process_tests {
         crash_pid.store(pid, std::sync::atomic::Ordering::Relaxed);
         Stage::crash(&stage, "n1").await.unwrap();
         assert!(!alive(pid));
+        stage.stop_all().await;
+        load.shutdown();
+    }
+
+    /// A control server on `addr` that answers every line with `reply` and
+    /// records the lines it reads.
+    async fn serve_replying(
+        addr: SocketAddr,
+        reply: &'static str,
+    ) -> Arc<std::sync::Mutex<Vec<String>>> {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+        let listener = TcpListener::bind(addr)
+            .await
+            .expect("the test address binds");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let record = Arc::clone(&record);
+                tokio::spawn(async move {
+                    let (reader, mut writer) = socket.into_split();
+                    let mut lines = BufReader::new(reader).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        record.lock().unwrap().push(line);
+                        let _ = writer.write_all(format!("{reply}\n").as_bytes()).await;
+                    }
+                });
+            }
+        });
+        seen
+    }
+
+    #[tokio::test]
+    async fn an_explain_asks_every_running_node_over_its_control_port() {
+        let dir = scratch("explain-stage");
+        let layout = Layout::PerAddress(Ipv4Addr::new(127, 0, 0, 186));
+        let n1 = SlotInfo::new(layout, 1).unwrap();
+        let n2 = SlotInfo::new(layout, 2).unwrap();
+        let _exporter = serve(n1.metrics, true).await;
+        let first = serve_replying(
+            n1.control,
+            include_str!("../../tests/fixtures/explain/owner.json").trim(),
+        )
+        .await;
+        let second = serve_replying(
+            n2.control,
+            include_str!("../../tests/fixtures/explain/non_owner.json").trim(),
+        )
+        .await;
+        let (load, handle) = load::Load::spawn(10, 10);
+        let stage = FleetStage::new(
+            Fleet::new(FleetConfig {
+                cluster: "c".to_owned(),
+                layout,
+                testnode: fake_node(&dir),
+                owners: NonZeroU8::new(2).unwrap(),
+                logs: dir.join("logs"),
+            }),
+            handle,
+        );
+        let error = Stage::explain(&stage, "k1").await.unwrap_err();
+        assert_eq!(error.to_string(), "no node is running to ask");
+
+        Stage::spawn(&stage, 2, None).await.unwrap();
+        let answers = Stage::explain(&stage, "k1").await.unwrap();
+        assert_eq!(
+            (answers.id, answers.key.as_str()),
+            (crate::ask::SCRIPTED_ID, "k1")
+        );
+        let nodes: Vec<(&str, &str)> = answers
+            .readings()
+            .map(|(label, reading)| (label.as_str(), reading.node.as_str()))
+            .collect();
+        assert_eq!(
+            nodes,
+            [("n1", "6f3ac1e29d54b807"), ("n2", "1b88e5d0a7c64f92")]
+        );
+        assert_eq!(first.lock().unwrap().as_slice(), ["explain k1"]);
+        assert_eq!(second.lock().unwrap().as_slice(), ["explain k1"]);
+
+        // A node that no longer runs is not asked.
+        Stage::kill(&stage, "n1").await.unwrap();
+        let answers = stage.explain("k2").await.unwrap();
+        let labels: Vec<&str> = answers.nodes.iter().map(|a| a.label.as_str()).collect();
+        assert_eq!(labels, ["n2"]);
+        assert_eq!(first.lock().unwrap().as_slice(), ["explain k1"]);
+        assert_eq!(
+            second.lock().unwrap().as_slice(),
+            ["explain k1", "explain k2"]
+        );
+
+        stage.kill("n2").await.unwrap();
+        assert!(stage.explain("k3").await.is_err(), "no node runs to ask");
         stage.stop_all().await;
         load.shutdown();
     }
