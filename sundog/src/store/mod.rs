@@ -2250,10 +2250,11 @@ where
     /// in the builder chain, right after [`Shard::with_weigher`] if both are
     /// used. [`Shard::with_weigher`] rebuilds the engine from scratch, and
     /// the tier attaches to whichever engine is current when this runs. A
-    /// hand-off the tier refuses leaves the victim resident, to be retried
-    /// by a later eviction pass, for a `Mode::Replicated` or
-    /// `Mode::Distributed` shard, and evicts it exactly as before for
-    /// `Mode::Local`/`Mode::Invalidation`.
+    /// write's eviction that the tier refuses leaves the victim resident, to
+    /// be retried by a later eviction pass, for a `Mode::Replicated` or
+    /// `Mode::Distributed` shard, and deletes it for
+    /// `Mode::Local`/`Mode::Invalidation`; a promotion's eviction leaves a
+    /// refused victim resident in every mode.
     ///
     /// # Errors
     ///
@@ -3029,10 +3030,12 @@ where
     /// counts `outcome = "hit"` and, iff it flips the entry back to
     /// residency, `sundog_spill_promotions_total{cache}`. The promotion
     /// evicts colder entries to make room within `max_capacity` first, and
-    /// does not happen without room: a tombstone or a newer write racing
-    /// the disk read, a `Mode::Replicated` or `Mode::Distributed` tier whose
-    /// full flush queue keeps every victim resident, or an entry heavier
-    /// than the whole cap leaves the entry on disk (see
+    /// never deletes one the spill tier refuses, in any mode: a refused
+    /// victim stays resident, so a full flush queue leaves the promotion
+    /// without room. The promotion does not happen without room: a
+    /// tombstone or a newer write racing the disk read, a tier that refuses
+    /// every victim, or an entry heavier than the whole cap leaves the
+    /// entry on disk, and the read still answers its value (see
     /// [`engine::Engine::promote_locked`]). No lock or permit is ever held
     /// across more than one `.await` point at a time, and no stripe lock is
     /// ever held across the disk read.
@@ -4346,6 +4349,25 @@ where
                 tier.close();
             }
         }
+    }
+
+    /// Test-only: takes every byte of the spill tier's flush-queue
+    /// admission, waiting up to five seconds for the flusher to hand back
+    /// what in-flight jobs hold, so every eviction hand-off is refused for a
+    /// full queue until the returned [`spill::Reservation`] drops. Nothing
+    /// is queued and nothing is written, so no entry is affected and no drop
+    /// is counted.
+    ///
+    /// # Panics
+    ///
+    /// Panics without a spill tier, or if the flusher does not drain in
+    /// time.
+    #[cfg(all(feature = "spill", test, not(feature = "sim")))]
+    pub(crate) async fn debug_hold_flush_queue(&self) -> spill::Reservation<'_> {
+        let tier = self.engine.spill().expect("a spill tier is attached");
+        tier.reserve(tier.whole_queue_permits(), Duration::from_secs(5))
+            .await
+            .expect("the flusher drains its queue")
     }
 
     /// Whether this shard's attached spill tier is closed by
@@ -12018,11 +12040,22 @@ mod tests {
         /// `max_capacity`. Returns the shard and its scratch directory,
         /// cleaned up by the caller.
         fn spill_shard(label: &str, max_capacity: u64) -> (Shard<u32, String>, PathBuf) {
+            spill_shard_in(label, "spill-test", Mode::Local, max_capacity)
+        }
+
+        /// [`spill_shard`] named `name`, which labels its metrics, under
+        /// `mode`.
+        fn spill_shard_in(
+            label: &str,
+            name: &str,
+            mode: Mode,
+            max_capacity: u64,
+        ) -> (Shard<u32, String>, PathBuf) {
             let dir = temp_dir(label);
             let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
             let shard = Shard::<u32, String>::new(
-                SmolStr::new("spill-test"),
-                Mode::Local,
+                SmolStr::new(name),
+                mode,
                 NodeId::from(1u64),
                 max_capacity,
                 None,
@@ -12039,7 +12072,7 @@ mod tests {
         /// still holds the entry and a local delete would just have
         /// anti-entropy, or a rebalance donor pull, repair it back in,
         /// `false` for `Mode::Local`, which has no peer to repair from and
-        /// so keeps the original delete fallback.
+        /// so deletes a refused victim on a write.
         #[test]
         fn with_spill_sets_keep_resident_when_refused_from_mode() {
             let dir = temp_dir("keep-resident-replicated");
@@ -13152,6 +13185,22 @@ mod tests {
                     })
                     .sum()
             };
+            let dropped_for = |reason: &str| -> u64 {
+                counters
+                    .iter()
+                    .filter(|(key, ..)| {
+                        key.key().name() == "sundog_spill_dropped_total"
+                            && key
+                                .key()
+                                .labels()
+                                .any(|l| l.key() == "reason" && l.value() == reason)
+                    })
+                    .map(|(.., value)| match value {
+                        DebugValue::Counter(n) => *n,
+                        _ => 0,
+                    })
+                    .sum()
+            };
             assert_eq!(
                 counter("sundog_spill_wait_timeouts_total"),
                 0,
@@ -13163,9 +13212,14 @@ mod tests {
                 "the closing pass brings the shard back to its cap"
             );
             assert_eq!(
-                counter("sundog_spill_dropped_total"),
+                dropped_for("queue_full"),
                 u64::from(KEYS - CAP),
                 "every victim the queue could never admit is dropped as queue_full"
+            );
+            assert_eq!(
+                counter("sundog_spill_dropped_total"),
+                dropped_for("queue_full"),
+                "a Local write's drops record no other reason, `deferred` among them"
             );
             assert!(
                 took < Duration::from_secs(2),
@@ -13290,6 +13344,117 @@ mod tests {
             }
             assert_eq!(shard.engine.debug_totals(), (1, 0));
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Spills all but the cap of `KEYS` keys in a shard of `mode`, takes
+        /// the whole flush queue, then reads every spilled key twice, first
+        /// with `get`, then with `get_or_load` and a loader that fails the
+        /// test if called: each read answers its value from disk, no entry
+        /// is deleted, the keys stay spilled for want of room, and the
+        /// refusals count as `deferred`, never as a delete reason: each read's
+        /// scan refuses the victim of each of the `CAP` resident stripes
+        /// once. With the queue free again, a read promotes.
+        async fn reads_behind_a_full_queue_delete_nothing(mode: Mode, name: &str) {
+            use crate::store::spill::dropped_since_last_snapshot;
+            const KEYS: u32 = 24;
+            const CAP: u32 = 4;
+            let recorder = metrics_util::debugging::DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let (shard, dir) = spill_shard_in(name, name, mode, u64::from(CAP));
+            shard
+                .insert_many((0..KEYS).map(|k| (k, format!("value-{k}"))))
+                .await
+                .expect("insert_many");
+            let resident = |shard: &Shard<u32, String>| {
+                (0..KEYS).filter(|k| shard.get_sync(k).is_some()).count()
+            };
+            assert!(
+                poll_until(POLL_TIMEOUT, || {
+                    resident(&shard) <= CAP as usize
+                        && shard.engine.debug_pending_spill_weight() == 0
+                })
+                .await,
+                "the writes spill all but the cap, every hand-off installed"
+            );
+            let spilled: Vec<u32> = (0..KEYS).filter(|k| shard.get_sync(k).is_none()).collect();
+            assert_eq!(spilled.len(), (KEYS - CAP) as usize);
+            assert!(
+                dropped_since_last_snapshot(&snapshotter, name).is_empty(),
+                "the writes drop nothing"
+            );
+
+            let hold = shard.debug_hold_flush_queue().await;
+            let loads = AtomicUsize::new(0);
+            for round in 1..=2 {
+                for &key in &spilled {
+                    let value = if round == 1 {
+                        shard.get(&key).await
+                    } else {
+                        shard
+                            .get_or_load(&key, async |_| {
+                                loads.fetch_add(1, Ordering::Relaxed);
+                                Ok::<_, std::io::Error>(String::new())
+                            })
+                            .await
+                            .ok()
+                    };
+                    assert_eq!(
+                        value,
+                        Some(format!("value-{key}")),
+                        "round {round}: key {key} answers from disk"
+                    );
+                }
+            }
+            assert_eq!(loads.load(Ordering::Relaxed), 0, "no read calls the loader");
+
+            assert_eq!(
+                shard.engine.debug_totals(),
+                (u64::from(KEYS), u64::from(CAP)),
+                "every key stays live and the resident weight is unchanged"
+            );
+            for key in 0..KEYS {
+                assert_eq!(
+                    shard.get_sync(&key).is_none(),
+                    spilled.contains(&key),
+                    "key {key} keeps its place, spilled or resident"
+                );
+            }
+            let dropped = dropped_since_last_snapshot(&snapshotter, name);
+            assert_eq!(
+                dropped.keys().collect::<Vec<_>>(),
+                ["deferred"],
+                "the refusals count as deferred and nothing else: {dropped:?}"
+            );
+            assert_eq!(
+                dropped["deferred"],
+                u64::from(CAP) * 2 * spilled.len() as u64,
+                "each read's scan refuses the victim of each resident stripe once"
+            );
+
+            drop(hold);
+            let key = spilled[0];
+            assert_eq!(shard.get(&key).await, Some(format!("value-{key}")));
+            assert!(
+                poll_until(POLL_TIMEOUT, || shard.get_sync(&key).is_some()).await,
+                "with room in the queue the read promotes"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[tokio::test]
+        async fn a_local_shard_reads_spilled_keys_behind_a_full_queue_without_deleting_any() {
+            reads_behind_a_full_queue_delete_nothing(Mode::Local, "reads-full-queue-local").await;
+        }
+
+        #[tokio::test]
+        async fn an_invalidation_shard_reads_spilled_keys_behind_a_full_queue_without_deleting_any()
+        {
+            reads_behind_a_full_queue_delete_nothing(
+                Mode::Invalidation,
+                "reads-full-queue-invalidation",
+            )
+            .await;
         }
 
         /// Concurrent `get_or_load` calls of a spilled key that its read

@@ -626,14 +626,18 @@ RAM.
 - `region_bytes`, the size of each region file in the ring (64 MiB default).
 - `read_concurrency`, how many spilled-value reads run at once (16 default).
 - `flush_queue_bytes`, the cap on how many queued-but-unwritten bytes a
-  lagging flusher may hold in RAM before eviction falls back to an ordinary
-  delete instead (one region's worth unless raised), which keeps a slow disk a
-  plain-eviction problem rather than an unbounded-RSS one.
+  lagging flusher may hold in RAM before a write's eviction in a `Local` or
+  `Invalidation` cache falls back to an ordinary delete instead (one region's
+  worth unless raised), which keeps a slow disk a plain-eviction problem
+  rather than an unbounded-RSS one.
 
-A `Replicated` cache keeps a refused victim resident, at its full weight, for
-a later eviction pass to retry instead, since every peer still holds the
-entry and a local delete would only have anti-entropy repair it back in. A
-`Local` or `Invalidation` cache evicts it as described above.
+A write's eviction in a `Replicated` or `Distributed` cache keeps a refused
+victim resident, at its full weight, for a later eviction pass to retry
+instead, since every peer still holds the entry and a local delete would only
+have anti-entropy repair it back in; in a `Local` or `Invalidation` cache it
+deletes the victim as described above. A read of a spilled key never deletes
+an entry, in any mode: with no room, the read answers from disk and leaves
+the entry spilled.
 
 With `SpillConfig::warm_reopen(true)` (default `false`, so a default tier's
 open and close cost stay what they are without this setting), a

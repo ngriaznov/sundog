@@ -97,11 +97,11 @@ past it move to a ring of region files on local disk. Only the value moves.
 A spilled entry keeps its slot, its index entry and its key in RAM, plus
 a 16-byte row in the reverse index of the region that holds its value. A
 read of a spilled entry reads the value back and promotes the entry into
-RAM, evicting colder entries first so RAM stays within `max_capacity`. A
-read that finds no room answers from disk and leaves the entry there: an
-entry heavier than the whole cap, or, in a `Replicated` or `Distributed`
-cache, a read behind a full flush queue, which keeps every victim
-resident.
+RAM, evicting colder entries first so RAM stays within `max_capacity`. The
+promotion never deletes another entry, in any mode: a victim the tier
+refuses, most often behind a full flush queue, stays resident. A read that
+finds no room answers from disk and leaves the entry there, as for an entry
+heavier than the whole cap.
 
 `SpillConfig::new(dir, capacity_bytes)` bounds the disk, and
 `capacity_bytes` must hold at least two regions of `region_bytes`, 64 MiB

@@ -9528,6 +9528,99 @@ mod tests {
             spill_composes_with_max_capacity(Mode::Invalidation, "compose-invalidation").await;
         }
 
+        /// A `Mode::Local` cache whose flush queue is full answers a read of
+        /// every spilled key from disk, with `get` or with `get_or_load`,
+        /// and deletes nothing: the read's promotion finds no room, because
+        /// the tier refuses every victim and a read never deletes one, so
+        /// the keys stay spilled, `entry_count` is unchanged and the loader
+        /// is never called.
+        #[tokio::test]
+        async fn a_local_cache_reads_spilled_keys_behind_a_full_queue_and_keeps_every_entry() {
+            full_queue_reads_keep_every_entry("cache-it-spill-full-queue-reads", false).await;
+        }
+
+        /// [`a_local_cache_reads_spilled_keys_behind_a_full_queue_and_keeps_every_entry`]
+        /// through `Cache::get_or_load`.
+        #[tokio::test]
+        async fn a_local_cache_get_or_load_behind_a_full_queue_keeps_every_entry_and_skips_the_loader()
+         {
+            full_queue_reads_keep_every_entry("cache-it-spill-full-queue-loads", true).await;
+        }
+
+        async fn full_queue_reads_keep_every_entry(name: &str, load: bool) {
+            const KEYS: u32 = 24;
+            const CAP: u64 = 4;
+            let cluster = Cluster::builder(name)
+                .seeds(std::iter::empty())
+                .config(loopback_config())
+                .build()
+                .await
+                .expect("build succeeds");
+            let dir = fresh_spill_dir(name);
+            let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+            let cache = cluster
+                .cache::<u32, String>("scratch")
+                .mode(Mode::Local)
+                .max_capacity(CAP)
+                .spill(cfg)
+                .open()
+                .await
+                .expect("opens with a spill tier");
+            cache
+                .insert_many((0..KEYS).map(|k| (k, format!("value-{k}"))))
+                .await
+                .expect("insert_many");
+            let resident = || (0..KEYS).filter(|k| cache.get_sync(k).is_some()).count();
+            assert!(
+                poll_until(Duration::from_secs(5), || resident() as u64 <= CAP).await,
+                "the writes spill all but the cap"
+            );
+            let spilled: Vec<u32> = (0..KEYS).filter(|k| cache.get_sync(k).is_none()).collect();
+            assert_eq!(spilled.len() as u64, u64::from(KEYS) - CAP);
+            assert_eq!(cache.entry_count().await, u64::from(KEYS));
+
+            let hold = cache.shard.debug_hold_flush_queue().await;
+            let loads = std::sync::atomic::AtomicUsize::new(0);
+            for &key in &spilled {
+                let value = if load {
+                    cache
+                        .get_or_load(&key, async |_| {
+                            loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            Ok::<_, std::io::Error>(String::new())
+                        })
+                        .await
+                        .ok()
+                } else {
+                    cache.get(&key).await
+                };
+                assert_eq!(
+                    value,
+                    Some(format!("value-{key}")),
+                    "key {key} answers from disk"
+                );
+            }
+            assert_eq!(
+                loads.load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "no read calls the loader"
+            );
+            assert_eq!(
+                cache.entry_count().await,
+                u64::from(KEYS),
+                "no read deleted an entry"
+            );
+            assert_eq!(
+                (0..KEYS).filter(|k| cache.get_sync(k).is_none()).count(),
+                spilled.len(),
+                "the reads left every spilled key on disk"
+            );
+            drop(hold);
+
+            cache.close().await;
+            cluster.shutdown().await;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         /// `Shard::attach_spill` runs only for the `open()` that wins the
         /// registry reservation, so the losing `open()` never touches the
         /// first cache's region files.

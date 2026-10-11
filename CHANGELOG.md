@@ -54,6 +54,16 @@ All notable changes to this project are documented in this file. Format follows
   `demo --headless` and `demo/record.sh`'s smoke run exercise `explain`
   before anything is filmed.
 
+### Changed
+
+- **A read of a spilled key never drops another entry, in any mode.** With
+  `spill`, a `Local` or `Invalidation` cache deleted the victim its tier
+  refused, most often behind a full flush queue, to make room for the read's
+  promotion. The victim now stays resident, as in `Replicated` and
+  `Distributed`; with no room, the read answers from disk and the entry stays
+  there. The refusal counts as `sundog_spill_dropped_total{reason="deferred"}`.
+  A write's eviction is unchanged.
+
 ### Fixed
 
 - **A fetch no longer vouches for a miss read before a pull landed.** In

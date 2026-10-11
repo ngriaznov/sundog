@@ -51,11 +51,12 @@ cache needs a tier to take a `max_capacity` at all.
 
 When the flusher falls behind, a batch write's eviction waits up to
 `spill_wait_timeout` for queue room; a single write's or a read's takes
-room only when it is free. A `Local` or `Invalidation` cache then evicts
-the entry outright. A `Replicated` cache keeps it resident for a later
-pass instead, since deleting it locally would only have anti-entropy pull
-it back, and a read of a spilled key behind that full queue answers from
-disk.
+room only when it is free. A write's eviction then deletes the victim in a
+`Local` or `Invalidation` cache. A `Replicated` or `Distributed` cache
+keeps it resident for a later pass instead, since deleting it locally
+would only have anti-entropy pull it back. A read's eviction keeps its
+victim in every mode, so a read of a spilled key behind a full queue finds
+no room, answers from disk and leaves its own entry spilled.
 
 ### Warm reopen
 

@@ -60,8 +60,8 @@ use super::part::PartSet;
 pub(crate) use super::spill::Reservation;
 #[cfg(feature = "spill")]
 use super::spill::{
-    Admission, ReclaimRef, SpillJob, SpillLoc, SpillSink, SpillTier, spill_record_len,
-    spilled_is_current,
+    Admission, ReclaimRef, SpillJob, SpillLoc, SpillSink, SpillTier, keeps_refused_victim_resident,
+    spill_record_len, spilled_is_current,
 };
 use super::{
     BUCKET_COUNT, BucketEntries, BucketPart, ConflictResolver, Incoming, KeyVersion, Merged,
@@ -601,6 +601,30 @@ impl Written {
     fn holds<K, V>(&self, live: &Live<K, V>) -> bool {
         !self.0.is_empty() && self.contains(hash_key_bytes(record_key(&live.record)))
     }
+}
+
+/// What an eviction pass does with a victim its spill tier refuses
+/// ([`Admission::RefusedFinal`](super::spill::Admission): the flush queue is
+/// full, the record is too large for a region, or the tier is closed).
+/// [`keeps_refused_victim_resident`] combines it with the tier's own flag.
+/// Without a spill tier, no victim is ever refused and the choice is moot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OnRefusal {
+    /// The tier decides: a `Mode::Replicated` or `Mode::Distributed` tier
+    /// leaves a refused victim resident, any other mode deletes it. A write's
+    /// eviction runs under this policy.
+    TierPolicy,
+    /// A refused victim stays resident whatever the mode, and the pass
+    /// reports it as refused. A promotion's eviction runs under this policy:
+    /// a spilled-key read never deletes an entry.
+    #[cfg_attr(
+        not(feature = "spill"),
+        allow(
+            dead_code,
+            reason = "only the promotion path constructs it, and promotion is spill-only"
+        )
+    )]
+    KeepResident,
 }
 
 /// Whether `live`'s record is currently spilled: the mirror of
@@ -2024,7 +2048,7 @@ enum VictimOutcome {
     Removed(u32),
     /// Committed to a configured spill tier: still `Resident` in `live`, at
     /// weight `0`, the entry's fate already decided under the stripe lock
-    /// via [`SpillTier::would_accept`], but the channel send itself,
+    /// via [`SpillTier::would_accept_under`], but the channel send itself,
     /// [`SpillTier::enqueue`], deliberately deferred until the lock is
     /// released; see [`Engine::try_spill_victim`]. `weight` is what the
     /// entry carried right before hand-off, already zeroed on the entry
@@ -2039,10 +2063,12 @@ enum VictimOutcome {
     #[cfg(feature = "spill")]
     PendingSpill(u32, SpillJob),
     /// A configured spill tier refused this victim's hand-off
-    /// ([`SpillTier::would_accept`] declining: too large, closed, or the
+    /// ([`SpillTier::would_accept_under`] declining: too large, closed, or the
     /// flush queue is full), and `keep_resident` says to leave it
-    /// resident rather than delete it, the `Mode::Replicated`/
-    /// `Mode::Distributed` policy `Shard::attach_spill` sets on the tier.
+    /// resident rather than delete it: the `Mode::Replicated`/
+    /// `Mode::Distributed` policy `Shard::attach_spill` sets on the tier, or
+    /// [`OnRefusal::KeepResident`], which a promotion's eviction passes in
+    /// every mode.
     /// `stripe.live` is untouched: the entry keeps its full weight and
     /// stays a spill candidate for a later eviction pass to sample and
     /// retry, once the tier has room again.
@@ -2051,7 +2077,7 @@ enum VictimOutcome {
     /// constructed under `feature = "spill"`.
     #[cfg(feature = "spill")]
     Deferred,
-    /// [`SpillTier::would_accept`] returned [`Admission::RefusedPending`];
+    /// [`SpillTier::would_accept_under`] returned [`Admission::RefusedPending`];
     /// `stripe.live` is untouched, like [`VictimOutcome::Deferred`].
     #[cfg(feature = "spill")]
     PendingReservation(u32),
@@ -2066,10 +2092,11 @@ enum SpillAttempt {
     /// The tier commits to taking the victim; see
     /// [`Engine::try_spill_victim`]'s docs for what the two fields mean.
     Committed(u32, SpillJob),
-    /// [`SpillTier::would_accept`] returned [`Admission::RefusedFinal`].
-    /// `keep_resident` is the tier's policy at refusal time.
+    /// [`SpillTier::would_accept_under`] returned [`Admission::RefusedFinal`].
+    /// `keep_resident` is [`keeps_refused_victim_resident`] of the pass's
+    /// [`OnRefusal`] and the tier's policy at refusal time.
     Refused { keep_resident: bool },
-    /// [`SpillTier::would_accept`] returned [`Admission::RefusedPending`].
+    /// [`SpillTier::would_accept_under`] returned [`Admission::RefusedPending`].
     /// `deficit` is how many more reserved bytes would have covered it.
     Pending { deficit: u32 },
     /// No tier configured, or the victim raced away, removed or not
@@ -3805,15 +3832,16 @@ where
     /// place of physically removing it. [`SpillAttempt::NotApplicable`] when
     /// no tier is configured or the victim is not [`EntryState::Resident`]
     /// anymore; [`SpillAttempt::Refused`] when
-    /// [`SpillTier::would_accept`] declines (too large, closed, flush queue
+    /// [`SpillTier::would_accept_under`] declines (too large, closed, flush queue
     /// full), leaving [`Engine::evict_victim_locked`] to decide the
-    /// victim's fate from `keep_resident`. On
-    /// [`SpillAttempt::Committed`], the weight returned is already zeroed
-    /// on the entry in place, and the job is the caller's to hand to
-    /// [`Engine::finish_spill_handoff`] once the stripe lock is released;
-    /// [`SpillTier::enqueue`] itself runs later, off this lock, and a full
-    /// queue found there is handled like any downstream write failure via
-    /// [`SpillSink::abandon`].
+    /// victim's fate from `keep_resident`; `on_refusal` is the pass's
+    /// policy, which also picks the reason [`SpillTier::would_accept_under`]
+    /// records the refusal under. On [`SpillAttempt::Committed`], the
+    /// weight returned is already zeroed on the entry in place, and the job
+    /// is the caller's to hand to [`Engine::finish_spill_handoff`] once the
+    /// stripe lock is released; [`SpillTier::enqueue`] itself runs later,
+    /// off this lock, and a full queue found there is handled like any
+    /// downstream write failure via [`SpillSink::abandon`].
     #[cfg(feature = "spill")]
     fn try_spill_victim(
         &self,
@@ -3822,6 +3850,7 @@ where
         hash: u64,
         victim_bytes: &Bytes,
         reservation: Option<&mut Reservation<'_>>,
+        on_refusal: OnRefusal,
     ) -> SpillAttempt {
         let Some(tier) = self.spill() else {
             return SpillAttempt::NotApplicable;
@@ -3836,10 +3865,13 @@ where
             return SpillAttempt::NotApplicable;
         }
         let encoded = record_value_bytes(&live.record);
-        match tier.would_accept(reservation, victim_bytes.len(), encoded.len()) {
+        match tier.would_accept_under(on_refusal, reservation, victim_bytes.len(), encoded.len()) {
             Admission::RefusedFinal => {
                 return SpillAttempt::Refused {
-                    keep_resident: tier.keep_resident_when_refused(),
+                    keep_resident: keeps_refused_victim_resident(
+                        on_refusal,
+                        tier.keep_resident_when_refused(),
+                    ),
                 };
             }
             Admission::RefusedPending => {
@@ -3876,17 +3908,19 @@ where
     /// channel, [`SpillTier::enqueue`]. A full queue gets `job` back with
     /// its key bytes, and [`SpillSink::abandon`] restores the victim's
     /// weight exactly as it would for a write or install failure
-    /// discovered later downstream. No tier configured is unreachable
-    /// here, but still handled rather than assumed.
+    /// discovered later downstream. `on_refusal` is the pass's policy, which
+    /// picks the reason [`SpillTier::enqueue`] records that failure under. No
+    /// tier configured is unreachable here, but still handled rather than
+    /// assumed.
     #[cfg(feature = "spill")]
-    fn finish_spill_handoff(&self, job: SpillJob) {
+    fn finish_spill_handoff(&self, on_refusal: OnRefusal, job: SpillJob) {
         let Some(tier) = self.spill() else { return };
         let stripe_idx = job.stripe_idx;
         let hash = job.hash;
         let ver = job.ver;
         let weight = job.weight;
         let admitted_bytes = job.admitted_bytes;
-        if let Err(job) = tier.enqueue(job) {
+        if let Err(job) = tier.enqueue(on_refusal, job) {
             // A job that never reaches the flusher must not permanently
             // shrink `admit`'s total, so release its bytes before abandon.
             tier.release(admitted_bytes);
@@ -3901,7 +3935,8 @@ where
     /// to it: weight zeroed in place, reported as
     /// [`VictimOutcome::PendingSpill`], while `stripe.live`, the digest,
     /// and `live_count` stay untouched until the flusher installs it. On a
-    /// refusal, `keep_resident` picks between
+    /// refusal, `keep_resident` (`on_refusal` combined with the tier's own
+    /// policy, see [`keeps_refused_victim_resident`]) picks between
     /// [`VictimOutcome::Deferred`] (victim stays resident, untouched
     /// weight) and the ordinary remove-and-XOR path,
     /// [`VictimOutcome::Removed`]; a vanished entry reports
@@ -3909,15 +3944,16 @@ where
     /// caller's job; a [`VictimOutcome::PendingSpill`] job still needs
     /// [`Engine::finish_spill_handoff`] once `stripe` is dropped.
     /// `reservation`, forwarded to [`Engine::try_spill_victim`], is the
-    /// pre-lock budget a caller carried in; unused once `spill` is off.
+    /// pre-lock budget a caller carried in; unused once `spill` is off, as
+    /// is `on_refusal`.
     #[cfg_attr(
         not(feature = "spill"),
         allow(
             unused_variables,
             clippy::needless_pass_by_value,
-            reason = "`reservation` is never read once `try_spill_victim` compiles out; kept \
-                      as a real parameter so every caller keeps one signature across both \
-                      builds"
+            reason = "`reservation` and `on_refusal` are never read once `try_spill_victim` \
+                      compiles out; kept as real parameters so every caller keeps one \
+                      signature across both builds"
         )
     )]
     fn evict_victim_locked(
@@ -3926,10 +3962,11 @@ where
         bucket: usize,
         victim_bytes: &Bytes,
         reservation: Option<&mut Reservation<'_>>,
+        on_refusal: OnRefusal,
     ) -> VictimOutcome {
         let hash = hash_key_bytes(victim_bytes.as_ref());
         #[cfg(feature = "spill")]
-        match self.try_spill_victim(stripe, bucket, hash, victim_bytes, reservation) {
+        match self.try_spill_victim(stripe, bucket, hash, victim_bytes, reservation, on_refusal) {
             SpillAttempt::Committed(weight, job) => {
                 return VictimOutcome::PendingSpill(weight, job);
             }
@@ -4003,17 +4040,24 @@ where
         )
     )]
     fn evict_one_sampled(&self, bucket: usize, now_ms: u64) -> EvictOutcome {
-        self.evict_one_sampled_with_reservation(bucket, None, &Written::default(), now_ms)
+        self.evict_one_sampled_with_reservation(
+            bucket,
+            None,
+            &Written::default(),
+            OnRefusal::TierPolicy,
+            now_ms,
+        )
     }
 
-    /// [`Engine::evict_one_sampled`], threading `reservation` through to
-    /// [`Engine::evict_victim_locked`] and passing over the entries
-    /// `written` holds.
+    /// [`Engine::evict_one_sampled`], threading `reservation` and
+    /// `on_refusal` through to [`Engine::evict_victim_locked`] and passing
+    /// over the entries `written` holds.
     fn evict_one_sampled_with_reservation(
         &self,
         bucket: usize,
         reservation: Option<&mut Reservation<'_>>,
         written: &Written,
+        on_refusal: OnRefusal,
         now_ms: u64,
     ) -> EvictOutcome {
         self.note_eviction_lock_acquisition();
@@ -4025,7 +4069,8 @@ where
         else {
             return EvictOutcome::default();
         };
-        let outcome = self.evict_victim_locked(&mut stripe, bucket, &victim_bytes, reservation);
+        let outcome =
+            self.evict_victim_locked(&mut stripe, bucket, &victim_bytes, reservation, on_refusal);
         drop(stripe);
         match outcome {
             VictimOutcome::Removed(weight) => {
@@ -4044,7 +4089,7 @@ where
                     .fetch_sub(u64::from(weight), Ordering::Relaxed);
                 self.pending_spill_weight
                     .fetch_add(u64::from(weight), Ordering::Relaxed);
-                self.finish_spill_handoff(job);
+                self.finish_spill_handoff(on_refusal, job);
                 EvictOutcome {
                     removed_weight: u64::from(weight),
                     deficit: 0,
@@ -4079,8 +4124,14 @@ where
         )
     )]
     fn evict_one_scanning(&self, bucket: usize, now_ms: u64) -> Option<EvictOutcome> {
-        self.evict_one_scanning_with_reservation(bucket, None, &Written::default(), now_ms)
-            .map(|(_, outcome)| outcome)
+        self.evict_one_scanning_with_reservation(
+            bucket,
+            None,
+            &Written::default(),
+            OnRefusal::TierPolicy,
+            now_ms,
+        )
+        .map(|(_, outcome)| outcome)
     }
 
     /// [`Engine::evict_one_scanning`], reborrowing `reservation` into each
@@ -4092,11 +4143,13 @@ where
     /// flight, the case [`defer_to_flusher`] leaves to the flusher. Passes
     /// over the entries `written` holds, so `None` means every stripe holds
     /// nothing else to evict. `Some` carries the stripe it stopped at.
+    /// `on_refusal` applies to every victim the scan tries.
     fn evict_one_scanning_with_reservation(
         &self,
         bucket: usize,
         mut reservation: Option<&mut Reservation<'_>>,
         written: &Written,
+        on_refusal: OnRefusal,
         now_ms: u64,
     ) -> Option<(usize, EvictOutcome)> {
         (0..BUCKET_COUNT)
@@ -4106,6 +4159,7 @@ where
                     candidate,
                     reservation.as_deref_mut(),
                     written,
+                    on_refusal,
                     now_ms,
                 );
                 let refused_while_busy = outcome.refused && self.pending_spill_weight_or_zero() > 0;
@@ -4136,6 +4190,7 @@ where
             None,
             &Written::default(),
             false,
+            OnRefusal::TierPolicy,
             now_ms,
         )
     }
@@ -4147,6 +4202,12 @@ where
     /// `now_ms`, correct across a `last_access_ms` rollover. With
     /// `only_if_dense`, a sample of fewer than [`EVICTION_SAMPLE`]
     /// candidates gives up nothing, so a sparse stripe is never drained.
+    /// `on_refusal` applies to every victim of the batch.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one caller per eviction pass; the policy and the density flag are separate \
+                  per-pass decisions, and a struct would not make either call site clearer"
+    )]
     fn evict_batch_sampled_with_reservation(
         &self,
         bucket: usize,
@@ -4154,6 +4215,7 @@ where
         mut reservation: Option<&mut Reservation<'_>>,
         written: &Written,
         only_if_dense: bool,
+        on_refusal: OnRefusal,
         now_ms: u64,
     ) -> EvictOutcome {
         self.note_eviction_lock_acquisition();
@@ -4203,6 +4265,7 @@ where
                 bucket,
                 &key_bytes,
                 reservation.as_deref_mut(),
+                on_refusal,
             ) {
                 VictimOutcome::Removed(weight) => {
                     removed_weight += u64::from(weight);
@@ -4237,7 +4300,7 @@ where
         // off the lock.
         #[cfg(feature = "spill")]
         for job in pending_spills {
-            self.finish_spill_handoff(job);
+            self.finish_spill_handoff(on_refusal, job);
         }
         if removed_weight > 0 {
             self.total_weight
@@ -4316,6 +4379,7 @@ where
             start_bucket,
             reservation,
             written,
+            OnRefusal::TierPolicy,
             now_ms,
         )
     }
@@ -4328,12 +4392,19 @@ where
     /// `written` holds until a scan finds nothing else to evict, then
     /// clears `written` and goes back to `start_bucket`, where the write
     /// that triggered this call landed.
+    ///
+    /// `on_refusal` is what every victim the tier refuses meets. Under
+    /// [`OnRefusal::KeepResident`] a refused victim is never deleted, so the
+    /// loop can end over `limit`: it returns once a pass defers to the
+    /// flusher or a scan of every stripe finds nothing to evict, and the
+    /// caller sees the weight still over the limit.
     fn evict_down_to(
         &self,
         limit: u64,
         start_bucket: usize,
         mut reservation: Option<&mut Reservation<'_>>,
         written: &mut Written,
+        on_refusal: OnRefusal,
         now_ms: u64,
     ) -> u64 {
         if self.max_capacity == u64::MAX {
@@ -4358,6 +4429,7 @@ where
                 reservation.as_deref_mut(),
                 written,
                 after_scan,
+                on_refusal,
                 now_ms,
             );
             if batch_outcome.deficit > 0 {
@@ -4379,6 +4451,7 @@ where
                     bucket,
                     reservation.as_deref_mut(),
                     written,
+                    on_refusal,
                     now_ms,
                 ) {
                     // Only the writes' own entries are left: they go too,
@@ -5160,18 +5233,19 @@ where
     ///
     /// Makes room first: while the entry is still spilled, and so never an
     /// eviction candidate, [`Engine::evict_down_to`] evicts down to
-    /// `max_capacity` less the entry's weight. The entry's weight then goes
-    /// back to `total_weight` only if it fits within the cap
-    /// ([`claimed_total`]), claimed atomically so concurrent promotions
-    /// never take the same room twice. Without room, the read stands and
-    /// the entry stays on disk: an entry heavier than the whole cap
-    /// ([`promotion_fits`]), a keep-resident tier (`Mode::Replicated`,
-    /// `Mode::Distributed`) refusing every victim, most often for a full
-    /// flush queue, or a concurrent promotion that claimed the room first.
-    /// A tier that is not keep-resident drops a victim its full queue
-    /// refuses, as a single write's eviction does, so the room is made. A
-    /// promotion therefore never takes `total_weight` past the cap, and
-    /// never evicts the entry it reads.
+    /// `max_capacity` less the entry's weight, under
+    /// [`OnRefusal::KeepResident`] in every mode: a victim the tier refuses,
+    /// most often for a full flush queue, stays resident, never deleted,
+    /// and is recorded under `sundog_spill_dropped_total{reason="deferred"}`.
+    /// The entry's weight then goes back to `total_weight` only if it fits
+    /// within the cap ([`claimed_total`]), claimed atomically so concurrent
+    /// promotions never take the same room twice. Without room, the read
+    /// stands and the entry stays on disk: an entry heavier than the whole
+    /// cap ([`promotion_fits`]), a tier refusing every victim, or a
+    /// concurrent promotion that claimed the room first. A promotion
+    /// therefore never takes `total_weight` past the cap, never evicts the
+    /// entry it reads, and never deletes another entry, whatever the
+    /// cache's mode; a write's eviction keeps the tier's own policy.
     ///
     /// **Never touches the digest or `live_count`**: same key, same `ver`,
     /// same fingerprint, so nothing about the entry's replicated identity
@@ -5203,6 +5277,7 @@ where
             bucket,
             None,
             &mut Written::default(),
+            OnRefusal::KeepResident,
             now_ms,
         );
         if !self.claim_weight(weight) {
@@ -7803,6 +7878,7 @@ mod tests {
                 None,
                 &Written::default(),
                 only_if_dense,
+                OnRefusal::TierPolicy,
                 100,
             )
         };
@@ -7887,13 +7963,19 @@ mod tests {
 
         assert!(
             engine
-                .evict_one_scanning_with_reservation(bucket, None, &both, 0)
+                .evict_one_scanning_with_reservation(bucket, None, &both, OnRefusal::TierPolicy, 0)
                 .is_none(),
             "a scan finds nothing but written entries to evict"
         );
         assert!(
             engine
-                .evict_one_scanning_with_reservation(bucket, None, &Written::of(hash_of(first)), 0)
+                .evict_one_scanning_with_reservation(
+                    bucket,
+                    None,
+                    &Written::of(hash_of(first)),
+                    OnRefusal::TierPolicy,
+                    0,
+                )
                 .is_some()
         );
         assert_eq!(engine.get(&first, 0), Some(first.to_string()));
@@ -11661,7 +11743,7 @@ mod tests {
                         // to enqueue to exercise the channel's slot limit.
                         admitted_bytes: 0,
                     };
-                    tier.enqueue(filler)
+                    tier.enqueue(OnRefusal::TierPolicy, filler)
                         .unwrap_or_else(|_| panic!("channel has room for filler {i}"));
                 }
 
@@ -11983,12 +12065,29 @@ mod tests {
                 std::path::PathBuf,
                 u32,
             ) {
+                engine_with_a_full_queue_on(label, cap, true)
+            }
+
+            /// [`engine_with_a_full_queue`] over a tier whose own policy is
+            /// `keep_resident`: `false` is a `Mode::Local` or
+            /// `Mode::Invalidation` tier, which deletes the victim a write's
+            /// eviction finds refused.
+            fn engine_with_a_full_queue_on(
+                label: &str,
+                cap: u64,
+                keep_resident: bool,
+            ) -> (
+                Arc<Engine<u32, String>>,
+                Arc<SpillTier>,
+                std::path::PathBuf,
+                u32,
+            ) {
                 let dir = temp_dir(label);
                 let cfg = SpillConfig::new(&dir, 1 << 20)
                     .region_bytes(4096)
                     .flush_queue_bytes(300);
                 let tier = Arc::new(SpillTier::open(&cfg, label).expect("tier opens"));
-                tier.set_keep_resident_when_refused(true);
+                tier.set_keep_resident_when_refused(keep_resident);
                 tier.pause_flusher();
                 let weigher: Weigher<u32, String> =
                     Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
@@ -12060,6 +12159,388 @@ mod tests {
                 );
 
                 tier.resume_flusher();
+                drop(engine);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// A promotion's eviction never deletes the victim its tier
+            /// refuses, whatever the tier's own policy: behind a full flush
+            /// queue on a tier that deletes (`Mode::Local`,
+            /// `Mode::Invalidation`), every resident entry stays resident,
+            /// the promotion finds no room, and the refusal counts as
+            /// `deferred`, never `queue_full`.
+            #[test]
+            fn a_promotion_behind_a_full_queue_keeps_every_refused_victim_resident_on_a_tier_that_deletes()
+             {
+                let recorder = metrics_util::debugging::DebuggingRecorder::new();
+                let snapshotter = recorder.snapshotter();
+                let _guard = metrics::set_default_local_recorder(&recorder);
+                let label = "promote-keeps-victims";
+                let (engine, tier, dir, stuck) = engine_with_a_full_queue_on(label, 50, false);
+                assert!(
+                    !tier.keep_resident_when_refused(),
+                    "the tier deletes on a write"
+                );
+                for key in [3u32, 4] {
+                    let _ = put(
+                        &engine,
+                        key,
+                        key_bytes(key),
+                        "w".repeat(200),
+                        hlc(u64::from(key), 1),
+                        None,
+                        1,
+                    );
+                }
+                let value = "z".repeat(10);
+                let encoded = spilled_entry(&engine, 7, &value);
+                let kb = key_bytes(7);
+                let hash = hash_key_bytes(kb.as_ref());
+                let totals_before = engine.debug_totals();
+                assert_eq!(totals_before.1, 600, "three resident 200-byte entries");
+
+                assert!(!engine.promote_locked(kb.as_ref(), hash, hlc(10, 1), &value, &encoded, 3));
+
+                assert_eq!(
+                    engine.debug_totals(),
+                    totals_before,
+                    "no entry was deleted and none was added"
+                );
+                assert!(is_spilled(&engine, &kb), "the read's entry stays on disk");
+                for (key, ch) in [(stuck, 'y'), (3, 'w'), (4, 'w')] {
+                    assert_eq!(
+                        engine.get(&key, 3),
+                        Some(ch.to_string().repeat(200)),
+                        "key {key} stays resident"
+                    );
+                }
+                assert_eq!(
+                    crate::store::spill::dropped_since_last_snapshot(&snapshotter, label),
+                    std::collections::BTreeMap::from([("deferred".to_string(), 1)]),
+                    "the full queue refuses the one victim of the pass and ends it; \
+                     nothing counts as dropped under a delete reason"
+                );
+
+                tier.resume_flusher();
+                drop(engine);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// The write-side guard for
+            /// `a_promotion_behind_a_full_queue_keeps_every_refused_victim_resident_on_a_tier_that_deletes`:
+            /// on the same full queue and the same tier, a write's eviction
+            /// keeps the tier's policy, deleting the victim it finds
+            /// refused and counting it `queue_full`, never `deferred`.
+            #[test]
+            fn a_write_behind_a_full_queue_still_drops_its_refused_victim_as_queue_full_on_a_tier_that_deletes()
+             {
+                let recorder = metrics_util::debugging::DebuggingRecorder::new();
+                let snapshotter = recorder.snapshotter();
+                let _guard = metrics::set_default_local_recorder(&recorder);
+                let label = "write-drops-victim";
+                let (engine, tier, dir, stuck) = engine_with_a_full_queue_on(label, 50, false);
+                let bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(stuck).as_ref()));
+
+                engine.enforce_capacity(bucket, &mut Written::default(), 2);
+
+                assert_eq!(
+                    engine.get(&stuck, 2),
+                    None,
+                    "the tier's policy deletes the refused victim"
+                );
+                assert_eq!(engine.debug_totals().1, 0);
+                assert_eq!(
+                    crate::store::spill::dropped_since_last_snapshot(&snapshotter, label),
+                    std::collections::BTreeMap::from([("queue_full".to_string(), 1)]),
+                );
+
+                tier.resume_flusher();
+                drop(engine);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// The batch pass is the first and main path of a promotion whose
+            /// stripe holds other residents: two residents sharing the read
+            /// key's stripe make the pass sample the colder one, the full
+            /// queue refuses it, and a tier that deletes on a write keeps it
+            /// resident, counted `deferred`, with the pending hand-off
+            /// ending the pass before any scan.
+            #[test]
+            fn a_promotion_keeps_the_refused_victim_its_own_stripe_batch_samples() {
+                let recorder = metrics_util::debugging::DebuggingRecorder::new();
+                let snapshotter = recorder.snapshotter();
+                let _guard = metrics::set_default_local_recorder(&recorder);
+                let label = "promote-batch-keeps";
+                let (engine, tier, dir, stuck) = engine_with_a_full_queue_on(label, 50, false);
+                let value = "z".repeat(10);
+                let encoded = spilled_entry(&engine, 7, &value);
+                let kb = key_bytes(7);
+                let hash = hash_key_bytes(kb.as_ref());
+                let read_stripe = stripe_index_from_hash(hash);
+                let sharing: Vec<u32> = (100u32..)
+                    .filter(|&key| {
+                        stripe_index_from_hash(hash_key_bytes(key_bytes(key).as_ref()))
+                            == read_stripe
+                    })
+                    .take(2)
+                    .collect();
+                for &key in &sharing {
+                    let _ = put(
+                        &engine,
+                        key,
+                        key_bytes(key),
+                        "w".repeat(200),
+                        hlc(u64::from(key), 1),
+                        None,
+                        1,
+                    );
+                }
+                let totals_before = engine.debug_totals();
+                assert_eq!(totals_before.1, 600);
+
+                assert!(!engine.promote_locked(kb.as_ref(), hash, hlc(10, 1), &value, &encoded, 3));
+
+                assert_eq!(engine.debug_totals(), totals_before);
+                assert!(is_spilled(&engine, &kb), "the read's entry stays on disk");
+                for &key in &sharing {
+                    assert_eq!(engine.get(&key, 3), Some("w".repeat(200)));
+                }
+                assert_eq!(engine.get(&stuck, 3), Some("y".repeat(200)));
+                assert_eq!(
+                    crate::store::spill::dropped_since_last_snapshot(&snapshotter, label),
+                    std::collections::BTreeMap::from([("deferred".to_string(), 1)]),
+                    "the batch evicts the colder half of two candidates, one victim, and the \
+                     refusal under a pending hand-off ends the pass"
+                );
+
+                tier.resume_flusher();
+                drop(engine);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// [`Engine::evict_batch_sampled_with_reservation`] and
+            /// [`Engine::evict_one_sampled_with_reservation`] apply the
+            /// pass's [`OnRefusal`] to the victim a full queue refuses, on a
+            /// tier that deletes on a write: `KeepResident` leaves it
+            /// resident, reports the pass as refused and counts `deferred`;
+            /// `TierPolicy` removes it and counts `queue_full`.
+            #[test]
+            fn the_batch_and_single_passes_apply_the_on_refusal_policy_to_a_refused_victim() {
+                let recorder = metrics_util::debugging::DebuggingRecorder::new();
+                let snapshotter = recorder.snapshotter();
+                let _guard = metrics::set_default_local_recorder(&recorder);
+                for (pass, batch) in [("batch", true), ("one", false)] {
+                    for (on_refusal, kept, reason) in [
+                        (OnRefusal::KeepResident, true, "deferred"),
+                        (OnRefusal::TierPolicy, false, "queue_full"),
+                    ] {
+                        let label = format!("on-refusal-{pass}-{reason}");
+                        let (engine, tier, dir, stuck) =
+                            engine_with_a_full_queue_on(&label, 50, false);
+                        let bucket =
+                            stripe_index_from_hash(hash_key_bytes(key_bytes(stuck).as_ref()));
+                        let written = Written::default();
+                        let outcome = if batch {
+                            engine.evict_batch_sampled_with_reservation(
+                                bucket, 150, None, &written, false, on_refusal, 3,
+                            )
+                        } else {
+                            engine.evict_one_sampled_with_reservation(
+                                bucket, None, &written, on_refusal, 3,
+                            )
+                        };
+                        let what = format!("{pass} pass, {on_refusal:?}");
+                        assert_eq!(outcome.refused, kept, "{what}");
+                        assert_eq!(outcome.removed_weight, if kept { 0 } else { 200 }, "{what}");
+                        assert_eq!(
+                            engine.get(&stuck, 3),
+                            kept.then(|| "y".repeat(200)),
+                            "{what}"
+                        );
+                        assert_eq!(
+                            crate::store::spill::dropped_since_last_snapshot(&snapshotter, &label),
+                            std::collections::BTreeMap::from([(reason.to_string(), 1)]),
+                            "{what}"
+                        );
+                        tier.resume_flusher();
+                        drop(engine);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+                }
+            }
+
+            /// A hand-off a promotion's eviction is admitted for can still
+            /// fail at the channel, once its slots run out before the byte
+            /// budget does. Nothing is deleted, the abandoned victim stays
+            /// resident, and the failure counts `deferred` for a keep-resident
+            /// pass on a tier that deletes, `queue_full` for the tier's own
+            /// policy.
+            #[test]
+            fn a_hand_off_failing_at_the_channel_records_the_reason_of_the_pass() {
+                let recorder = metrics_util::debugging::DebuggingRecorder::new();
+                let snapshotter = recorder.snapshotter();
+                let _guard = metrics::set_default_local_recorder(&recorder);
+                for (on_refusal, reason) in [
+                    (OnRefusal::KeepResident, "deferred"),
+                    (OnRefusal::TierPolicy, "queue_full"),
+                ] {
+                    let label = format!("channel-full-{reason}");
+                    let dir = temp_dir(&label);
+                    let cfg = SpillConfig::new(&dir, 1 << 20)
+                        .region_bytes(4096)
+                        .flush_queue_bytes(1 << 20);
+                    let slots =
+                        crate::store::spill::flush_queue_slots(cfg.flush_queue_bytes_value());
+                    let tier = Arc::new(SpillTier::open(&cfg, &label).expect("tier opens"));
+                    assert!(!tier.keep_resident_when_refused());
+                    tier.pause_flusher();
+                    let weigher: Weigher<u32, String> =
+                        Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
+                    let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher), None);
+                    engine.set_spill(Arc::clone(&tier));
+                    let engine = Arc::new(engine);
+                    tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
+                    for i in 0..slots {
+                        let filler = SpillJob {
+                            stripe_idx: 0,
+                            hash: 0,
+                            key_bytes: Bytes::from(format!("filler-{i}")),
+                            ver: hlc(0, 0),
+                            expires_at_ms: None,
+                            encoded: Bytes::from_static(b"f"),
+                            weight: 1,
+                            admitted_bytes: 0,
+                        };
+                        tier.enqueue(OnRefusal::TierPolicy, filler)
+                            .unwrap_or_else(|_| panic!("channel has room for filler {i}"));
+                    }
+                    assert_eq!(
+                        crate::store::spill::dropped_since_last_snapshot(&snapshotter, &label),
+                        std::collections::BTreeMap::new(),
+                        "the fillers fit"
+                    );
+
+                    let key = 1u32;
+                    let bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(key).as_ref()));
+                    let _ = put(
+                        &engine,
+                        key,
+                        key_bytes(key),
+                        "x".repeat(30),
+                        hlc(1, 1),
+                        None,
+                        0,
+                    );
+                    let _ = engine.evict_one_sampled_with_reservation(
+                        bucket,
+                        None,
+                        &Written::default(),
+                        on_refusal,
+                        0,
+                    );
+
+                    assert_eq!(engine.get(&key, 0), Some("x".repeat(30)), "{on_refusal:?}");
+                    assert_eq!(engine.debug_totals().1, 30, "{on_refusal:?}");
+                    assert_eq!(
+                        crate::store::spill::dropped_since_last_snapshot(&snapshotter, &label),
+                        std::collections::BTreeMap::from([(reason.to_string(), 1)]),
+                        "{on_refusal:?}"
+                    );
+                    drop(engine);
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+            }
+
+            /// A refusal no flusher install can resolve, a record larger
+            /// than a region with no hand-off in flight, leaves a
+            /// promotion's eviction nothing to wait for: its scan visits
+            /// every stripe once, defers each victim, and returns with
+            /// every entry resident and the read's entry still on disk,
+            /// on a tier that deletes as on one that keeps.
+            #[test]
+            fn a_promotion_whose_victims_are_too_large_for_a_region_ends_with_every_entry_resident()
+            {
+                let recorder = Arc::new(metrics_util::debugging::DebuggingRecorder::new());
+                let snapshotter = recorder.snapshotter();
+                let label = "promote-too-large";
+                let dir = temp_dir(label);
+                let cfg = SpillConfig::new(&dir, 128).region_bytes(64);
+                let tier = Arc::new(SpillTier::open(&cfg, label).expect("tier opens"));
+                assert!(!tier.keep_resident_when_refused());
+                let weigher: Weigher<u32, String> =
+                    Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
+                let engine = Engine::<u32, String>::new(50, None, Some(weigher), None);
+                engine.set_spill(Arc::clone(&tier));
+                let engine = Arc::new(engine);
+                tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
+
+                let value = "z".repeat(10);
+                let encoded = spilled_entry(&engine, 7, &value);
+                let kb = key_bytes(7);
+                let hash = hash_key_bytes(kb.as_ref());
+                // Three resident entries, each alone in a stripe other than
+                // the read's: the pass's first batch finds an empty stripe,
+                // and the scan refuses one victim per resident.
+                let mut taken = vec![stripe_index_from_hash(hash)];
+                let mut residents = Vec::new();
+                for key in 100u32.. {
+                    let bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(key).as_ref()));
+                    if !taken.contains(&bucket) {
+                        taken.push(bucket);
+                        residents.push(key);
+                    }
+                    if residents.len() == 3 {
+                        break;
+                    }
+                }
+                for &key in &residents {
+                    let _ = put(
+                        &engine,
+                        key,
+                        key_bytes(key),
+                        "w".repeat(200),
+                        hlc(u64::from(key), 1),
+                        None,
+                        1,
+                    );
+                }
+                let totals_before = engine.debug_totals();
+
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                let promoting = Arc::clone(&engine);
+                let (promote_kb, promote_value, promote_encoded) =
+                    (kb.clone(), value.clone(), encoded.clone());
+                let thread_recorder = Arc::clone(&recorder);
+                std::thread::spawn(move || {
+                    // The recorder is per thread.
+                    let _guard = metrics::set_default_local_recorder(&*thread_recorder);
+                    let promoted = promoting.promote_locked(
+                        promote_kb.as_ref(),
+                        hash,
+                        hlc(10, 1),
+                        &promote_value,
+                        &promote_encoded,
+                        3,
+                    );
+                    let _ = done_tx.send(promoted);
+                });
+                assert_eq!(
+                    done_rx.recv_timeout(Duration::from_secs(10)),
+                    Ok(false),
+                    "the promotion returns without room rather than loop over the refusals"
+                );
+
+                assert_eq!(engine.debug_totals(), totals_before);
+                assert!(is_spilled(&engine, &kb));
+                for &key in &residents {
+                    assert_eq!(engine.get(&key, 3), Some("w".repeat(200)));
+                }
+                assert_eq!(
+                    crate::store::spill::dropped_since_last_snapshot(&snapshotter, label),
+                    std::collections::BTreeMap::from([("deferred".to_string(), 3)]),
+                    "one deferred victim per resident stripe the scan visits"
+                );
+
                 drop(engine);
                 let _ = std::fs::remove_dir_all(&dir);
             }
@@ -12181,7 +12662,7 @@ mod tests {
                         weight: 1,
                         admitted_bytes: 0,
                     };
-                    tier.enqueue(filler)
+                    tier.enqueue(OnRefusal::TierPolicy, filler)
                         .unwrap_or_else(|_| panic!("channel has room for filler {i}"));
                 }
 
@@ -12262,6 +12743,7 @@ mod tests {
                     bucket,
                     Some(&mut reservation),
                     &Written::default(),
+                    OnRefusal::TierPolicy,
                     0,
                 );
                 assert_eq!(
@@ -12353,6 +12835,7 @@ mod tests {
                     bucket,
                     Some(&mut reservation),
                     &Written::default(),
+                    OnRefusal::TierPolicy,
                     2,
                 );
                 assert_eq!(
@@ -12364,6 +12847,7 @@ mod tests {
                     bucket,
                     Some(&mut reservation),
                     &Written::default(),
+                    OnRefusal::TierPolicy,
                     2,
                 );
                 assert_eq!(

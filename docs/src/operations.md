@@ -235,6 +235,11 @@ the disk fails writes. The `reason` label says which. Check disk latency,
 raise `SpillConfig::flush_queue_bytes`, or raise `max_capacity` to spill
 less.
 
+`reason="deferred"` counts refusals that deleted nothing: the entry stays
+resident for a later eviction to retry. A `Replicated` or `Distributed`
+cache records every refusal there, and any cache records the refusals of a
+spilled-key read's eviction there, since that read never deletes an entry.
+
 ### A restart comes back cold
 
 `sundog_spill_reopen_total{outcome="cold_fallback"}` names why in
