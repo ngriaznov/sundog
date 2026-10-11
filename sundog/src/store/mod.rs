@@ -12003,6 +12003,17 @@ mod tests {
 
         const POLL_TIMEOUT: Duration = Duration::from_secs(5);
 
+        /// Takes every one of `shard`'s spill read permits, so no disk read
+        /// of its own starts until the returned permit drops.
+        async fn hold_spill_reads(shard: &Shard<u32, String>) -> tokio::sync::OwnedSemaphorePermit {
+            let semaphore = Arc::clone(&shard.spill_read.get().expect("a spill tier").semaphore);
+            let permits = u32::try_from(semaphore.available_permits()).expect("a small count");
+            semaphore
+                .acquire_many_owned(permits)
+                .await
+                .expect("the read semaphore is open")
+        }
+
         /// A `Mode::Local` shard with a real spill tier attached, under
         /// `max_capacity`. Returns the shard and its scratch directory,
         /// cleaned up by the caller.
@@ -13171,6 +13182,10 @@ mod tests {
         /// cap of four, each key is alone in its stripe, so a pass that
         /// sampled the promoted entry's own stripe after reinstalling it
         /// would evict that entry straight back to disk.
+        ///
+        /// Every hand-off installs before the last key is read. A last key
+        /// still in a hand-off reads as a RAM hit, and the flusher's later
+        /// install leaves it on disk however the read behaves.
         #[tokio::test]
         async fn reading_spilled_keys_keeps_the_shard_within_its_cap() {
             const KEYS: u32 = 24;
@@ -13190,6 +13205,15 @@ mod tests {
 
             let loads = AtomicUsize::new(0);
             for k in 0..KEYS {
+                if k == KEYS - 1 {
+                    assert!(
+                        poll_until(POLL_TIMEOUT, || {
+                            shard.engine.debug_pending_spill_weight() == 0
+                        })
+                        .await,
+                        "every hand-off installs before the last key is read"
+                    );
+                }
                 let value = if k % 2 == 0 {
                     shard.get(&k).await
                 } else {
@@ -13272,6 +13296,12 @@ mod tests {
         /// cannot promote, one heavier than the whole cap, still collapse
         /// to one disk read: the owner hands the value to every joined
         /// waiter instead of leaving each to read the disk again.
+        ///
+        /// The test holds every read permit until all the calls have
+        /// started, so the owner waits for a permit while the others join
+        /// it. Unheld, a blocking thread that finishes the read before the
+        /// owner first polls it ends the owner's load inside that poll, and
+        /// the next call starts a load of its own.
         #[tokio::test]
         async fn concurrent_loads_of_an_unpromotable_spilled_key_read_the_disk_once() {
             use metrics_util::debugging::{DebugValue, DebuggingRecorder};
@@ -13302,14 +13332,20 @@ mod tests {
             );
             let _ = snapshotter.snapshot();
 
+            let held = hold_spill_reads(&shard).await;
             let loads = AtomicUsize::new(0);
-            let answers = futures::future::join_all((0..CALLS).map(|_| {
+            let mut calls = std::pin::pin!(futures::future::join_all((0..CALLS).map(|_| {
                 shard.get_or_load(&1, async |_| {
                     loads.fetch_add(1, Ordering::Relaxed);
                     Ok::<_, std::io::Error>(String::new())
                 })
-            }))
-            .await;
+            })));
+            assert!(
+                futures::poll!(calls.as_mut()).is_pending(),
+                "the owner waits for a read permit and every other call joins its load"
+            );
+            drop(held);
+            let answers = calls.await;
             assert!(
                 answers
                     .iter()
@@ -13341,7 +13377,8 @@ mod tests {
         /// `load_many`'s counterpart of
         /// [`concurrent_loads_of_an_unpromotable_spilled_key_read_the_disk_once`]:
         /// concurrent calls of a spilled key too heavy to promote share the
-        /// owner's one disk read and never reach the loader.
+        /// owner's one disk read and never reach the loader. The read
+        /// permits are held while the calls start, for the same reason.
         #[tokio::test]
         async fn concurrent_load_manys_of_an_unpromotable_spilled_key_read_the_disk_once() {
             use metrics_util::debugging::{DebugValue, DebuggingRecorder};
@@ -13380,8 +13417,16 @@ mod tests {
             );
             let _ = snapshotter.snapshot();
 
-            let answers =
-                futures::future::join_all((0..CALLS).map(|_| shard.load_many([1u32]))).await;
+            let held = hold_spill_reads(&shard).await;
+            let mut calls = std::pin::pin!(futures::future::join_all(
+                (0..CALLS).map(|_| shard.load_many([1u32]))
+            ));
+            assert!(
+                futures::poll!(calls.as_mut()).is_pending(),
+                "the owner waits for a read permit and every other call joins its load"
+            );
+            drop(held);
+            let answers = calls.await;
             assert!(
                 answers.iter().all(
                     |answer| answer.as_ref().ok().and_then(|found| found.get(&1)) == Some(&big)
@@ -13457,12 +13502,7 @@ mod tests {
             );
             let spilled = if shard.get_sync(&2).is_none() { 2 } else { 3 };
 
-            let semaphore = Arc::clone(&shard.spill_read.get().expect("a spill tier").semaphore);
-            let permits = u32::try_from(semaphore.available_permits()).expect("a small count");
-            let held = semaphore
-                .acquire_many_owned(permits)
-                .await
-                .expect("the read semaphore is open");
+            let held = hold_spill_reads(&shard).await;
             assert!(
                 tokio::time::timeout(Duration::from_millis(100), shard.load_many([1, spilled]))
                     .await
