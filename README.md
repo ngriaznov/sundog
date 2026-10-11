@@ -304,8 +304,8 @@ is the network-aware read, trying live owners in rendezvous order and
 returning `Ok(None)` for a genuine miss or `CacheError::FetchUnavailable` once
 every owner has timed out inside `fetch_timeout`, or while the part is still
 cold on every owner that answered. `owners_of` reports a key's
-current owners in that same order, and `explain` shows why a read of a key
-answers what it answers. `owners` must be 2 or more
+current owners in that same order, and [`explain`](#explaining-a-read) shows
+why a read of a key answers what it answers. `owners` must be 2 or more
 (`CacheError::TooFewOwners` otherwise), a finite `max_capacity` needs a
 `spill` tier the same way `Replicated` does, `tti` is rejected outright, and
 two peers disagreeing on `owners` for the same cache name hit
@@ -337,6 +337,55 @@ match prices.fetch(&sku).await? {
 Every node gossips the mode of each cache it has open. Opening a name under a
 mode that conflicts with a live peer fails with `CacheError::ModeMismatch`. TTL
 and capacity are local knobs, free to differ.
+
+## Explaining a read
+
+`cache.explain(&key).await` says why a read of one key answers what it answers
+on this node. The `ReadExplanation` it returns names the cache, this node, the
+mode and the key's part, and says what this node stores for the key: nothing, a
+tombstone, a live entry, or an entry a read no longer returns because it
+expired or went idle. `source` predicts where a `fetch` takes its answer: this
+node, the first owner whose probe is a held record or a miss, or none, which a
+fetch reports as `CacheError::FetchUnavailable`. The explanation counts a
+declined probe, a stale view and an unreached owner as no answer. Under
+`Mode::Distributed`, `distributed` adds how a `fetch` of the key decides: the
+owners in the order `fetch` asks them, under the hash of the ownership view they
+come from (and the hash the view moved to, if it moved while the owners were
+asked), this node's residency marks for the part, what its own copy makes of a
+fetch, what it answers a peer's fetch, and each other owner's answer. In the
+other modes `fetch` answers from this node's copy, so `distributed` is `None`
+and `source` is that copy.
+
+```rust
+use sundog::explain::ReadSource;
+
+let explanation = prices.explain(&sku).await?;
+println!("{explanation}"); // a few lines for a log or an incident note
+
+if let Some(read) = &explanation.distributed {
+    for probe in read.probes.iter().filter(|probe| !probe.answer.answers()) {
+        println!("{} counts as no answer: {}", probe.node, probe.answer);
+    }
+}
+if explanation.source == ReadSource::Unavailable {
+    // a fetch is predicted to return `CacheError::FetchUnavailable`
+}
+```
+
+`explain` is not a read. It calls no `get`, `fetch` or loader, counts no hit,
+miss, fetch or loader metric, opens no `sundog.fetch` span, touches no idle
+timer on this node's copy, starts no refresh and promotes no spilled entry.
+It costs one request to each other owner, the fetch a read sends, all at once,
+each bounded by `fetch_timeout` and never retried, so the call returns within
+about one `fetch_timeout`. A probe may dial a connection and counts as wire
+traffic on both nodes, and an owner holding the key spilled reads it from disk
+to answer. A cache outside `Distributed` sends nothing. An owner that declines
+or times out is part of the explanation, not an error. `source` predicts the
+fetch, which also retries an owner whose view differs, and the `Display`
+text's layout is not semver-stable, so act on the fields.
+[Explaining one read](docs/src/operations.md#explaining-one-read) walks them,
+and [Reads while ownership moves](docs/src/guarantees.md#reads-while-ownership-moves)
+lists the cases a read is in.
 
 ## Loading through your source
 
