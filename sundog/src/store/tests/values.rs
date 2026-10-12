@@ -1,6 +1,7 @@
 //! Value types and pure functions: fingerprints, version functions, `Mode` tokens, `Origin` and the fan-out helpers.
 
 use super::*;
+use crate::store::fan_out::{fan_out_over_capacity, fill_fans_out};
 
 /// `xxh3(key_bytes ‖ postcard(ver))` spelled out, the definition
 /// [`entry_fingerprint`] computes.
