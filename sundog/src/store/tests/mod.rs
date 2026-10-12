@@ -1,9 +1,10 @@
 //! Unit tests for [`Shard`](super::Shard) and the store's pure functions, grouped by topic.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU8;
 use std::sync::atomic::Ordering;
 
+use futures::stream::StreamExt;
 use rand::{RngExt as _, SeedableRng as _, rngs::StdRng};
 use tokio::sync::watch;
 
@@ -11,6 +12,7 @@ use super::*;
 use crate::config::ClusterConfig;
 use crate::error::CacheError;
 use crate::explain::{LocalRecord, Residency};
+use crate::ownership::{Granularity, OwnershipView};
 
 mod apply;
 mod builders;
