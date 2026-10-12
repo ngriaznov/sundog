@@ -16,6 +16,8 @@ use super::expiry::{
 use super::housekeeping::should_shrink_stripe;
 use super::inflight::fill_supersedes;
 use super::prefold::BatchEntry;
+#[cfg(feature = "spill")]
+use super::promote::{claimed_total, promotion_fits};
 use super::record::{
     ENTRY_OVERHEAD_BYTES, build_key_only_record, build_resident_record, decode_key, decode_value,
     record_value, split_record,
