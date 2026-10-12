@@ -8,6 +8,8 @@ use zerocopy::IntoBytes;
 
 use crate::hlc::Hlc;
 
+#[cfg(doc)]
+use super::flusher::flush_batch;
 use super::flusher::rotate;
 use super::record::{pwrite_all, record_checksum};
 use super::rules::{next_region_index, record_too_large, records_fitting_region, spill_record_len};
@@ -20,7 +22,7 @@ use super::{
 impl SpillTier {
     /// The checkpoint half of a warm-reopen-enabled close: blocks until the
     /// flusher thread [`SpillTier::attach`] started drains its queue and
-    /// exits (the only place this module joins that thread; run this in a
+    /// exits (the only place the spill module joins that thread; run this in a
     /// blocking context), then writes `entries`, the caller's
     /// currently-resident records, into the region ring via
     /// [`flush_batch`]'s framing, without calling [`SpillSink::install`]
@@ -78,7 +80,7 @@ impl SpillTier {
 }
 
 /// Writes `entries`, the checkpoint's currently-resident live records,
-/// into the region ring using [`write_segment`]'s framing, batched by
+/// into the region ring using `write_segment`'s framing, batched by
 /// [`records_fitting_region`] and rotated with [`rotate`], but never
 /// through [`SpillSink::install`] (see [`SpillTier::checkpoint_flush`]).
 /// An oversized entry is skipped; a failed region write is logged and its

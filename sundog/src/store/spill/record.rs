@@ -11,6 +11,8 @@ use zerocopy::FromBytes;
 use crate::hlc::Hlc;
 use crate::node::NodeId;
 
+#[cfg(doc)]
+use super::SpillTier;
 use super::{SPILL_MAGIC, SpillJob, SpillRecordHeader, SpilledBytes};
 
 pub(super) fn record_checksum(key_bytes: &[u8], value_bytes: &[u8]) -> u64 {

@@ -56,6 +56,13 @@ mod test_support;
 
 pub use config::SpillConfig;
 
+#[cfg(doc)]
+use crate::store::engine::OnRefusal;
+#[cfg(doc)]
+use flusher::flusher_loop;
+#[cfg(doc)]
+use rules::{FLUSH_QUEUE_CAPACITY, record_too_large, refusal_drop_reason};
+
 use record::{decode_record, pread_exact};
 #[cfg(all(test, not(feature = "sim")))]
 pub(crate) use rules::flush_queue_slots;
@@ -325,7 +332,7 @@ struct Inner {
     /// [`SpillTier::checkpoint_flush`] diffs this around its join to
     /// report this drain's count.
     flusher_jobs_drained: AtomicU64,
-    /// Lifetime count of jobs [`write_segment`] abandoned rather than
+    /// Lifetime count of jobs `write_segment` abandoned rather than
     /// installed (`reason = "disk_error"`). Diffed the same way as
     /// `flusher_jobs_drained`.
     flusher_jobs_abandoned: AtomicU64,
@@ -546,7 +553,7 @@ impl SpillTier {
     }
 
     /// The cache name this tier is [`SpillTier::open`]ed under. The
-    /// `cache` label every metric this module or its `SpillSink` caller,
+    /// `cache` label every metric the spill module or its `SpillSink` caller,
     /// `engine::Engine`, publishes carries.
     pub(crate) fn cache_name(&self) -> &str {
         &self.inner.cache_name

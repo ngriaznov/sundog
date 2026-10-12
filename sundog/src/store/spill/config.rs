@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::HEADER_LEN;
+#[cfg(doc)]
+use super::SpillTier;
 
 /// Region size a [`SpillConfig`] uses when [`SpillConfig::region_bytes`] is
 /// never called.
@@ -11,7 +13,7 @@ const DEFAULT_REGION_BYTES: u64 = 64 * 1024 * 1024;
 /// Concurrent-disk-read bound a [`SpillConfig`] uses when
 /// [`SpillConfig::read_concurrency`] is never called. Consulted by the
 /// engine's read path, `spawn_blocking` behind a semaphore of this size,
-/// not by anything in this module.
+/// not by anything in the spill module.
 const DEFAULT_READ_CONCURRENCY: usize = 16;
 /// Wait bound used when [`SpillConfig::spill_wait_timeout`] is never
 /// called: 2s, leaving margin over the ~8s

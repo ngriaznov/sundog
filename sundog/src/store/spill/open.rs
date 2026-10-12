@@ -14,6 +14,8 @@ use super::record::{
     decode_record_with_key, pread_exact, region_file_name, remove_stale_region_files,
 };
 use super::rules::region_count_for;
+#[cfg(doc)]
+use super::snapshot::SNAPSHOT_FORMAT_VERSION;
 use super::snapshot::{delete_snapshot, remove_stale_snapshot_files, snapshot_eligibility};
 use super::{
     Inner, ReclaimRef, RegionState, SnapshotEntry, SpillConfig, SpillLoc, SpillSink, SpillTier,
@@ -56,7 +58,7 @@ impl SpillTier {
     /// fails deterministically, EBADF rather than any real filesystem
     /// permission, without needing root or leaving the test's own process
     /// unable to preallocate the file in the first place. Test-only: lets a
-    /// test force [`write_segment`]'s write to fail and prove every job in
+    /// test force `write_segment`'s write to fail and prove every job in
     /// that segment reaches [`SpillSink::abandon`].
     ///
     /// # Errors
@@ -86,7 +88,7 @@ impl SpillTier {
 
         let region_bytes = cfg.region_bytes_value();
         // `validate` already guarantees this fits; the fallback keeps this
-        // conversion total rather than panicking on a config this module did
+        // conversion total rather than panicking on a config the spill module did
         // not itself validate, such as a direct, non-`validate`d test caller.
         let region_bytes_u32 = u32::try_from(region_bytes).unwrap_or(u32::MAX);
         let region_count = region_count_for(cfg.capacity_bytes, region_bytes).max(2);

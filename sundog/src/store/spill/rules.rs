@@ -4,6 +4,10 @@ use crate::hlc::Hlc;
 use crate::store::engine::OnRefusal;
 
 use super::HEADER_LEN;
+#[cfg(doc)]
+use super::flusher::flush_batch;
+#[cfg(doc)]
+use super::{SpillConfig, SpillTier};
 
 /// Floor on the flusher's job queue slot count. [`SpillTier::attach`]
 /// sizes the channel from `flush_queue_bytes_value() / HEADER_LEN`,

@@ -6,6 +6,10 @@ use std::time::{Duration, Instant};
 
 use crate::store::engine::OnRefusal;
 
+#[cfg(doc)]
+use super::SpillConfig;
+#[cfg(doc)]
+use super::flusher::flusher_loop;
 use super::rules::{
     keeps_refused_victim_resident, record_too_large, refusal_drop_reason, spill_record_len,
 };
@@ -68,7 +72,7 @@ impl SpillTier {
     /// which `Engine::try_spill_victim` calls separately instead: the first,
     /// cheap and lock-hold-safe, decides eviction's fallback right there
     /// under the stripe lock, while the second, the only part that touches
-    /// the channel, runs after the lock is released. See the module docs.
+    /// the channel, runs after the lock is released. See the `spill` module docs.
     /// Test-only: production has exactly one caller of either half, and it
     /// needs them split.
     #[cfg(all(test, not(feature = "sim")))]

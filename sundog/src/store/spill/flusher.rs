@@ -10,6 +10,8 @@ use std::time::Duration;
 use zerocopy::IntoBytes;
 
 use super::record::{build_header, pwrite_all};
+#[cfg(doc)]
+use super::rules::FLUSH_QUEUE_CAPACITY;
 use super::rules::{flush_queue_slots, next_region_index, records_fitting_region};
 use super::{HEADER_LEN, Inner, ReclaimRef, SpillJob, SpillLoc, SpillSink, SpillTier};
 

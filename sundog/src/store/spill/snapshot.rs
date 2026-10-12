@@ -10,6 +10,10 @@ use xxhash_rust::xxh3::Xxh3Default;
 use crate::hlc::Hlc;
 use crate::node::NodeId;
 
+#[cfg(doc)]
+use super::open::ReopenOutcome;
+#[cfg(doc)]
+use super::{SPILL_MAGIC, SpillRecordHeader, SpillTier};
 use super::{SnapshotEntry, SnapshotHeader, SpillLoc};
 
 /// Corruption/format-skew guard at the front of every [`SnapshotHeader`],

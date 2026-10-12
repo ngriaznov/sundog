@@ -21,7 +21,7 @@ mod reserve;
 
 /// Polls `cond` until it returns `true` or `timeout` elapses,
 /// returning the final result either way. Never a fixed sleep: every
-/// timing-sensitive assertion in this module goes through this.
+/// timing-sensitive assertion in the `io` tests goes through this.
 fn poll_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
     let start = Instant::now();
     loop {
@@ -457,7 +457,7 @@ fn checkpoint_write_resident_drops_entries_its_own_wraparound_overwrites_and_reo
 
 /// Captures `sundog_spill_writes_total{cache}` increments for one
 /// dedicated cache name, ignoring every other metric: the
-/// write-count counterpart to [`DropCounts`]/[`DropRecorder`] below.
+/// write-count counterpart to [`DropCounts`]/[`DropRecorder`] in `reasons`.
 #[derive(Clone, Default)]
 struct WriteCounts(Arc<StdMutex<u64>>);
 
@@ -553,7 +553,7 @@ fn flusher_batches_two_thousand_records_and_installs_every_one_byte_exact() {
 
     let write_counts = WriteCounts::default();
     // Same single-process-global-slot race every other metrics-
-    // reading test in this module tolerates: if another test already
+    // reading test in the `io` tests tolerates: if another test already
     // won the slot, this one skips the counter assertion below.
     let recorder_installed = metrics::set_global_recorder(WriteRecorder {
         counts: write_counts.clone(),
