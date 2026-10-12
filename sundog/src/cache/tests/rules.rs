@@ -2,6 +2,9 @@
 //! and config validation.
 
 use super::*;
+use crate::cache::reconcile::{
+    RECONCILE_MAX_ROUNDS, ReconcileBudget, retry_delay, should_keep_reconciling, split_round_result,
+};
 
 /// `record_reads` names what `decode_live_value` makes of a fetched
 /// record: a value exactly when it decodes one, and otherwise why not.

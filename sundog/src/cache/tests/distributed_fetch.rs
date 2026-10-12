@@ -1,6 +1,7 @@
 //! Tests of the distributed read path: `fetch` against local, remote, cold and unavailable owners.
 
 use super::*;
+use crate::store::part::PartSet;
 
 #[tokio::test]
 async fn fetch_returns_local_value_without_a_network_request_when_this_node_owns_the_bucket() {
