@@ -13,6 +13,7 @@
 //!     cargo test --release -p sundog --test containers -- --test-threads=1
 //! ```
 
+#[path = "../container_util/mod.rs"]
 mod container_util;
 
 use std::sync::Arc;
@@ -20,8 +21,8 @@ use std::time::Duration;
 
 use container_util::{
     CRDT_RETIRE_AFTER_SECS_ENV, DISTRIBUTED_RUST_LOG, Fleet, METRICS_PORT, Node,
-    PREVIOUS_RELEASE_PROTOCOL, build_previous_testnode, build_testnode, container_tests_enabled,
-    eventually, eventually_reporting, eventually_with_logs, seed, spawn_trio, wait_for_peers,
+    PREVIOUS_RELEASE_PROTOCOL, build_previous_testnode, build_testnode, eventually,
+    eventually_reporting, eventually_with_logs, seed, spawn_trio, wait_for_peers,
 };
 use futures::stream::{self, StreamExt as _};
 use rand::rngs::StdRng;
@@ -42,7 +43,7 @@ const CRDT_COMPACT_WAIT: Duration = Duration::from_secs(240);
 /// set.
 macro_rules! require_containers {
     () => {
-        if !container_tests_enabled() {
+        if !$crate::container_util::container_tests_enabled() {
             eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
             return;
         }
