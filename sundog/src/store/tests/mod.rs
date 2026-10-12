@@ -9,6 +9,7 @@ use tokio::sync::watch;
 
 use super::*;
 use crate::config::ClusterConfig;
+use crate::error::CacheError;
 use crate::explain::{LocalRecord, Residency};
 
 mod apply;

@@ -3,6 +3,8 @@
 use super::*;
 use crate::store::fan_out::{fan_out_over_capacity, fill_fans_out};
 use crate::store::shard_build::clock_jumped;
+#[cfg(feature = "spill")]
+use crate::store::shard_write::retry_round_is_futile;
 
 /// `xxh3(key_bytes ‖ postcard(ver))` spelled out, the definition
 /// [`entry_fingerprint`] computes.

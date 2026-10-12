@@ -1,6 +1,7 @@
 //! The write and enumeration API: bulk writes, fan-out backpressure, `keys`, `clear` and the sync variants.
 
 use super::*;
+use crate::net::REPLICATE_BATCH_COUNT;
 
 #[tokio::test]
 async fn contains_key_reflects_insert_remove_and_ttl_expiry() {
