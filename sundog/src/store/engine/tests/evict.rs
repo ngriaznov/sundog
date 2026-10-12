@@ -1,5 +1,7 @@
 //! Tests for capacity eviction: sampling, scans, batches, deferral to the flusher and the eviction helpers.
 
+use std::collections::HashSet;
+
 use super::*;
 
 #[test]

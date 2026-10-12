@@ -1,5 +1,7 @@
 //! Tests for single-flight loads: joining a load, completing or abandoning it, and the fill guards.
 
+use std::sync::atomic::AtomicUsize;
+
 use super::*;
 
 #[tokio::test]
