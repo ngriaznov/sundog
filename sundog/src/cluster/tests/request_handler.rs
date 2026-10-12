@@ -1,15 +1,17 @@
 //! Tests for the cluster request handler: fetch, state-transfer and anti-entropy serving.
 
 use super::*;
+use crate::cluster::handler::{ClusterRequestHandler, serve_reply};
 use crate::explain::ServeVerdict;
 use crate::hlc::Hlc;
 use crate::net::{AeServeOutcome, FetchServe, StServe};
 use crate::ownership::Granularity;
 use crate::store::{BucketDigest, BucketLen, BucketPart, BucketPartDigests, KeyVersion, PartMask};
+use crate::verdict;
 use crate::wire::WireRecord;
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use futures::stream::BoxStream;
+use futures::stream::{BoxStream, StreamExt as _};
 
 #[tokio::test]
 async fn records_for_hashes_answers_exactly_the_records_whose_hash_matches() {

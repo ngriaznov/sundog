@@ -1,13 +1,14 @@
 //! Tests for serve ordering and state-transfer chunking against recording shards.
 
 use super::*;
+use crate::cluster::handler::{bucket_runs, serve_order, st_bucket_key_sub_batches};
 use crate::hlc::Hlc;
 use crate::ownership::Granularity;
 use crate::store::{BucketDigest, BucketLen, BucketPart, BucketPartDigests, KeyVersion};
 use crate::wire::WireRecord;
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use futures::stream::BoxStream;
+use futures::stream::{BoxStream, StreamExt as _};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
