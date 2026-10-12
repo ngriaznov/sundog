@@ -93,6 +93,8 @@ use shard_build::SettlingResolver;
 use shard_merge::drain_due_deadlines;
 pub use shard_ops::ShardOps;
 pub(crate) use shard_ops::{Scope, ScopedDigests};
+#[cfg(all(doc, feature = "spill"))]
+use shard_serve::read_spilled_batch;
 pub use types::{
     BucketDigest, BucketEntries, BucketLen, BucketPart, BucketPartDigests, CompactPassOutcome,
     CompactionBounds, Event, KeyVersion, Mode, Origin, PartEntries, Quiescence, Ttl,

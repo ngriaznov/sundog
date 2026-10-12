@@ -283,7 +283,7 @@ where
 /// nothing here promotes. Returns `Vec::new()` with no read attempted if
 /// this shard never attached a tier.
 #[cfg(feature = "spill")]
-async fn read_spilled_batch<K, V>(
+pub(super) async fn read_spilled_batch<K, V>(
     engine: &engine::Engine<K, V>,
     spill_read: Option<&SpillRead>,
     cache_name: &str,
