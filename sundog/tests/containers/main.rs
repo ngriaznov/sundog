@@ -16,20 +16,20 @@
 #[path = "../container_util/mod.rs"]
 mod container_util;
 
-use std::sync::Arc;
-use std::time::Duration;
-
-use container_util::{
+use crate::container_util::{
     CRDT_RETIRE_AFTER_SECS_ENV, DISTRIBUTED_RUST_LOG, Fleet, METRICS_PORT, Node,
     PREVIOUS_RELEASE_PROTOCOL, build_previous_testnode, build_testnode, eventually,
     eventually_reporting, eventually_with_logs, seed, spawn_trio, wait_for_peers,
 };
-use futures::stream::{self, StreamExt as _};
+use crate::support::{CONVERGE_WAIT, scrape_metric};
+use futures::stream;
+use futures::stream::StreamExt as _;
 use rand::rngs::StdRng;
 use rand::{RngExt as _, SeedableRng as _};
 use rightsize::{Network, Wait};
+use std::sync::Arc;
+use std::time::Duration;
 
-const CONVERGE_WAIT: Duration = Duration::from_secs(20);
 /// Bound for a CRDT compaction wait: the sweep's own cadence
 /// (`ClusterConfig::crdt_sweep_period`) is `(crdt_retire_after / 4).max(30s)`,
 /// so with the test node's 5s bound a writer retires on one 30s-floor tick,
@@ -49,6 +49,8 @@ macro_rules! require_containers {
         }
     };
 }
+
+mod support;
 
 #[tokio::test]
 async fn convergence_across_three_nodes_with_distinct_writers() {
@@ -1888,24 +1890,6 @@ async fn the_previous_release_stores_and_serves_a_merge_derived_version_from_the
     net.close().await.expect("network closes");
 }
 
-/// Finds `metric{...,label="value",...} <number>` in Prometheus
-/// text-exposition `body`, tolerant of label ordering and
-/// integer-vs-float rendering. Mirrors `tests/spill_replication.rs`'s own
-/// copy, kept local since integration test binaries don't share code beyond
-/// `mod container_util`.
-fn metric_value(body: &str, metric: &str, label: (&str, &str)) -> Option<f64> {
-    let wanted = format!("{}=\"{}\"", label.0, label.1);
-    body.lines().find_map(|line| {
-        let rest = line.strip_prefix(metric)?;
-        let rest = rest.strip_prefix('{')?;
-        let (labels, value) = rest.split_once('}')?;
-        if !labels.split(',').any(|pair| pair == wanted) {
-            return None;
-        }
-        value.trim().parse::<f64>().ok()
-    })
-}
-
 /// Scrapes `node`'s `/metrics` and reads one `metric{label}` value, `0` if
 /// the scrape fails or the series has never been touched (a metric with no
 /// writes yet is absent from the exposition, not printed as zero). Every
@@ -1952,21 +1936,6 @@ async fn ae_outcomes_on_both(a: &Node, b: &Node) -> AeOutcomes {
         total = total.zip_with(one, |x, y| x + y);
     }
     total
-}
-
-async fn scrape_metric(node: &Node, metric: &str, label: (&str, &str)) -> u64 {
-    let value = node
-        .metrics()
-        .await
-        .ok()
-        .and_then(|body| metric_value(&body, metric, label));
-    #[allow(
-        clippy::cast_sign_loss,
-        clippy::cast_possible_truncation,
-        reason = "every metric read here is a nonnegative counter or gauge"
-    )]
-    let count = value.unwrap_or(0.0).round() as u64;
-    count
 }
 
 /// Sum of [`fill`][Node::fill]'s `k{i}`/`v{i}` UTF-8 byte lengths (key plus
