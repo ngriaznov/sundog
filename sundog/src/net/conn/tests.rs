@@ -41,7 +41,7 @@ fn loaded_replies_split_past_the_budget_and_keep_every_entry() {
         rec(b"k3", b"cccc"),
     ];
     let uncached = vec![(Bytes::from_static(b"k4"), Bytes::from_static(b"dddd"))];
-    let replies = super::loaded_replies(found.clone(), uncached.clone(), 12);
+    let replies = super::serve::loaded_replies(found.clone(), uncached.clone(), 12);
     assert_eq!(
         reply_sizes(&replies),
         vec![12, 12],
@@ -61,13 +61,13 @@ fn loaded_replies_split_past_the_budget_and_keep_every_entry() {
 #[test]
 fn loaded_replies_send_one_reply_for_nothing_and_an_oversized_entry_alone() {
     assert_eq!(
-        super::loaded_replies(Vec::new(), Vec::new(), 12),
+        super::serve::loaded_replies(Vec::new(), Vec::new(), 12),
         vec![Msg::Loaded {
             found: Vec::new(),
             uncached: Vec::new()
         }]
     );
-    let replies = super::loaded_replies(
+    let replies = super::serve::loaded_replies(
         vec![rec(b"k1", b"aaaaaaaaaaaaaaaa"), rec(b"k2", b"bb")],
         Vec::new(),
         8,
@@ -87,14 +87,14 @@ fn listing_or_sketch_crosses_over_past_min_bucket() {
     };
     let small: Vec<_> = (0..3).map(entry).collect();
     assert_eq!(
-        super::listing_or_sketch(small.clone(), 3, 6),
-        super::ListingOrSketch::Listing(small),
+        super::serve::listing_or_sketch(small.clone(), 3, 6),
+        super::serve::ListingOrSketch::Listing(small),
         "up to min_bucket entries stay a listing"
     );
     let large: Vec<_> = (0..4).map(entry).collect();
-    match super::listing_or_sketch(large, 3, 6) {
-        super::ListingOrSketch::Sketch(cells) => assert_eq!(cells.len(), 6),
-        other @ super::ListingOrSketch::Listing(_) => {
+    match super::serve::listing_or_sketch(large, 3, 6) {
+        super::serve::ListingOrSketch::Sketch(cells) => assert_eq!(cells.len(), 6),
+        other @ super::serve::ListingOrSketch::Listing(_) => {
             panic!("expected a sketch, got {other:?}")
         }
     }
@@ -447,7 +447,7 @@ async fn serve_state_transfer_stops_promptly_once_cancelled() {
 
     let served = tokio::spawn(async move {
         let mut framed = framed;
-        super::serve_state_transfer(
+        super::serve::serve_state_transfer(
             &mut framed,
             SmolStr::new("c"),
             &NeverRespondingHandler,
@@ -704,7 +704,7 @@ async fn collect_ae_buckets_skips_an_unrelated_hello_mid_reply() {
 fn a_declined_scoped_round_replies_stale_view_or_nothing() {
     let cache = SmolStr::new("users");
     assert_eq!(
-        super::declined_replies(
+        super::serve::declined_replies(
             cache.clone(),
             &crate::net::AeServeOutcome::<()>::Stale {
                 responder_view_hash: 7
@@ -715,12 +715,13 @@ fn a_declined_scoped_round_replies_stale_view_or_nothing() {
             responder_view_hash: 7
         }]
     );
-    let unavailable_replies = super::declined_replies(
+    let unavailable_replies = super::serve::declined_replies(
         cache.clone(),
         &crate::net::AeServeOutcome::<()>::Unavailable,
     );
     assert!(unavailable_replies.is_empty(), "{unavailable_replies:?}");
-    let digests_replies = super::declined_replies(cache, &crate::net::AeServeOutcome::Digests(()));
+    let digests_replies =
+        super::serve::declined_replies(cache, &crate::net::AeServeOutcome::Digests(()));
     assert!(digests_replies.is_empty(), "{digests_replies:?}");
 }
 
@@ -1218,7 +1219,7 @@ async fn serve_st_buckets_sends_bucket_done_after_the_last_chunk_and_reads_a_mid
     let cancel_for_task = cancel.clone();
     let served = tokio::spawn(async move {
         let mut server_framed = super::framing::new_framed(as_mesh_stream(server_stream));
-        super::serve_st_buckets(
+        super::serve::serve_st_buckets(
             &mut server_framed,
             cache_for_task,
             vec![0, 1],

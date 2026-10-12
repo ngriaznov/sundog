@@ -1,5 +1,8 @@
 //! Requester-side reply readers and lazy streams.
 
+#[cfg(doc)]
+use super::serve::serve_st_buckets;
+
 use std::sync::Arc;
 
 use futures::SinkExt as _;
