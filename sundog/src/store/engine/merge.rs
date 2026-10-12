@@ -9,9 +9,9 @@ use crate::node::NodeId;
 use crate::store::{ConflictResolver, Incoming, Merged, RecordView, Winner};
 
 #[cfg(doc)]
-use super::apply_locked;
+use super::apply::apply_locked;
 #[cfg(all(doc, feature = "spill"))]
-use super::read_spilled_for_conflict;
+use super::apply::read_spilled_for_conflict;
 
 /// What consulting the resolver on a real key collision decided, the
 /// [`ConflictResolver`]-consultation half of [`apply_locked`]'s decision. See

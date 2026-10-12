@@ -13,15 +13,17 @@ use crate::store::{ConflictResolver, Incoming};
 #[cfg(feature = "spill")]
 use super::EntryState;
 use super::Stripe;
+#[cfg(doc)]
+use super::apply::apply_locked;
+#[cfg(all(doc, feature = "spill"))]
+use super::apply::prefetch_spilled_conflict_bytes;
 use super::expiry::decode_expiry;
 use super::merge::resolve_and_rebind;
 #[cfg(doc)]
 use super::merge::resolve_conflict;
-#[cfg(all(doc, feature = "spill"))]
-use super::prefetch_spilled_conflict_bytes;
 use super::record::{record_key, record_value_bytes};
 #[cfg(doc)]
-use super::{ApplyOutcome, Engine, apply_locked};
+use super::{ApplyOutcome, Engine};
 
 /// One [`Engine::apply_many`] batch entry, before or after pre-fold:
 /// precomputed hash, the typed key, its wire-encoded bytes, the write's
