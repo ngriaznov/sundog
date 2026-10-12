@@ -1,6 +1,7 @@
 //! Tests of the registered loader, batch windows and refresh-ahead.
 
 use super::*;
+use crate::error::RemoteLoaderError;
 
 #[tokio::test]
 async fn load_and_load_many_read_through_the_registered_loader() {

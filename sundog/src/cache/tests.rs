@@ -18,6 +18,7 @@ mod writes;
 use std::net::{Ipv4Addr, SocketAddr};
 
 use super::*;
+use crate::cache::load::{LoadTarget, load_target};
 use crate::cluster::test_support::wait_until;
 use crate::cluster::{Cluster, anti_entropy};
 use crate::explain::{
