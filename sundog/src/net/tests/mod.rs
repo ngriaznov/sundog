@@ -8,11 +8,17 @@ use tokio_util::codec::LengthDelimitedCodec;
 use futures::SinkExt as _;
 
 use super::*;
+use crate::error::CodecError;
+use crate::hlc::Hlc;
 use crate::node::NodeName;
 use crate::store::PartMask;
 use crate::store::{BucketDigest, BucketLen, BucketPart, BucketPartDigests, KeyVersion};
+use crate::wire::WireRecord;
 use crate::wire::{self, MAX_FRAME};
+use bytes::Bytes;
 use futures::future::BoxFuture;
+use futures::stream::BoxStream;
+use std::io;
 use xxhash_rust::xxh3::xxh3_64;
 
 mod anti_entropy;

@@ -1,4 +1,5 @@
 use super::*;
+use crate::net::request::with_request_timeout;
 
 /// The kind of a [`CodecError::Io`]; any other error shape fails the test.
 fn io_kind(err: &CodecError) -> io::ErrorKind {

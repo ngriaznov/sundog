@@ -1,4 +1,5 @@
 use super::*;
+use crate::net::request::{REQUEST_TIMEOUT, with_request_timeout};
 
 #[test]
 fn ae_part_reply_names_its_bucket_and_part_in_either_shape() {
@@ -438,7 +439,7 @@ async fn ae_round_times_out_against_a_peer_that_accepts_but_never_responds() {
     mesh.update_peers(vec![peer_at(NodeId::from(2), addr)]);
 
     let result = tokio::time::timeout(
-        super::REQUEST_TIMEOUT + Duration::from_secs(5),
+        REQUEST_TIMEOUT + Duration::from_secs(5),
         mesh.ae_round(NodeId::from(2), SmolStr::new("users"), Vec::new()),
     )
     .await
