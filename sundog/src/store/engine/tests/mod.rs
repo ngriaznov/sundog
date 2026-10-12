@@ -12,7 +12,9 @@ use super::*;
 use crate::explain::{Lapse, LocalRecord};
 use crate::hlc::HlcClock;
 use crate::node::NodeId;
-use crate::store::{Incoming, LwwResolver, Merged, RecordView, Ttl, Winner};
+use crate::store::{
+    BucketPart, Incoming, KeyVersion, LwwResolver, Merged, RecordView, Ttl, Winner,
+};
 use xxhash_rust::xxh3::xxh3_64;
 
 fn engine_u32_string(max_capacity: u64, tti: Option<Duration>) -> Engine<u32, String> {
