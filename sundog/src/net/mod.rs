@@ -18,6 +18,7 @@
 mod conn;
 
 pub(crate) use conn::{REPLICATE_BATCH_BUDGET, REPLICATE_BATCH_COUNT};
+mod frames;
 mod handler;
 mod outbox;
 mod tcp;
@@ -27,6 +28,9 @@ pub(crate) mod test_support;
 mod tls;
 mod types;
 
+use frames::record_frame_sent; // consumed by conn::framing via crate::net::record_frame_sent
+pub(crate) use frames::{OutFrame, batch_forward, batch_replicate};
+pub use frames::{bytes_sent_total, frames_sent_total};
 pub use handler::RequestHandler;
 pub use types::{AeMismatch, AePartReply, InboundMsg, MsgClass};
 pub(crate) use types::{
@@ -55,23 +59,6 @@ use crate::membership::Peer;
 use crate::node::NodeId;
 use crate::wire::{self, Msg, WireRecord};
 use outbox::DropOldestQueue;
-
-/// A queued outbound message paired with its already-encoded wire frame,
-/// cheaply cloned into each peer's outbox so the writer never re-encodes
-/// byte-identical content. `msg` stays alongside `frame` because
-/// `Replicate`-class traffic coalesces consecutive queued entries by it.
-#[derive(Debug, Clone)]
-pub(crate) struct OutFrame {
-    pub(crate) msg: Msg,
-    pub(crate) frame: Bytes,
-}
-
-impl OutFrame {
-    pub(crate) fn new(msg: Msg) -> Result<Self, CodecError> {
-        let frame = wire::encode(&msg)?;
-        Ok(Self { msg, frame })
-    }
-}
 
 #[cfg(all(feature = "tls", not(feature = "sim")))]
 pub use tls::MESH_SERVER_NAME;
@@ -143,97 +130,6 @@ const OUTBOX_FLUSH_TAIL: Duration = Duration::from_millis(20);
 /// time a live peer's send may take.
 pub(crate) const FAN_OUT_SEND_DEADLINE: Duration = Duration::from_secs(2);
 
-/// Process-wide wire-frame counters, incremented at [`conn::send_msg`], the
-/// single choke point every outbound frame passes through:
-/// [`frames_sent_total`] and [`bytes_sent_total`] sum every `Mesh` in this
-/// process.
-static FRAMES_SENT: AtomicU64 = AtomicU64::new(0);
-static BYTES_SENT: AtomicU64 = AtomicU64::new(0);
-
-/// Records one frame of `len` bytes written to the wire: bumps the
-/// process-wide [`frames_sent_total`]/[`bytes_sent_total`] counters and
-/// mirrors them to `metrics` for a live Prometheus scrape.
-pub(super) fn record_frame_sent(len: usize) {
-    FRAMES_SENT.fetch_add(1, Ordering::Relaxed);
-    BYTES_SENT.fetch_add(len as u64, Ordering::Relaxed);
-    metrics::counter!("sundog_frames_sent_total").increment(1);
-    metrics::counter!("sundog_bytes_sent_total").increment(len as u64);
-}
-
-/// Splits a run of records into chunks by the same budget and count cap
-/// `net::conn`'s coalescer enforces
-/// ([`REPLICATE_BATCH_BUDGET`]/[`REPLICATE_BATCH_COUNT`]), the shared core
-/// of [`batch_replicate`] and [`batch_forward`].
-fn chunk_records(cache_name: &SmolStr, records: Vec<WireRecord>) -> Vec<Vec<WireRecord>> {
-    let mut chunks: Vec<Vec<WireRecord>> = Vec::new();
-    let mut current: Vec<WireRecord> = Vec::new();
-    let mut current_bytes = 0usize;
-    for rec in records {
-        let rec_bytes = wire::replicate_frame_len(
-            cache_name.len(),
-            rec.key.len(),
-            rec.value.as_ref().map_or(0, Bytes::len),
-        );
-        if !current.is_empty()
-            && (current.len() >= REPLICATE_BATCH_COUNT
-                || current_bytes + rec_bytes > REPLICATE_BATCH_BUDGET)
-        {
-            chunks.push(std::mem::take(&mut current));
-            current_bytes = 0;
-        }
-        current_bytes += rec_bytes;
-        current.push(rec);
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
-}
-
-/// Splits a run of records into `Msg::ReplicateBatch` chunks by the same
-/// budget and count cap `net::conn`'s coalescer enforces
-/// ([`REPLICATE_BATCH_BUDGET`]/[`REPLICATE_BATCH_COUNT`]). A chunk of
-/// exactly one record stays a plain [`Msg::Replicate`].
-pub(crate) fn batch_replicate(cache_name: &SmolStr, records: Vec<WireRecord>) -> Vec<Msg> {
-    chunk_records(cache_name, records)
-        .into_iter()
-        .map(|mut recs| {
-            if recs.len() == 1 {
-                Msg::Replicate {
-                    cache: cache_name.clone(),
-                    rec: recs.pop().expect("invariant: length checked above"),
-                }
-            } else {
-                Msg::ReplicateBatch {
-                    cache: cache_name.clone(),
-                    recs,
-                }
-            }
-        })
-        .collect()
-}
-
-/// [`batch_replicate`] for a `Mode::Distributed` fan-out: every chunk is a
-/// [`Msg::ForwardBatch`] stamped with the sender's `view_hash` and `hops`,
-/// a lone record included, so the receiver always sees the view the batch
-/// routes under.
-pub(crate) fn batch_forward(
-    cache_name: &SmolStr,
-    view_hash: u64,
-    hops: u8,
-    records: Vec<WireRecord>,
-) -> Vec<Msg> {
-    chunk_records(cache_name, records)
-        .into_iter()
-        .map(|recs| Msg::ForwardBatch {
-            cache: cache_name.clone(),
-            view_hash,
-            hops,
-            recs,
-        })
-        .collect()
-}
-
 /// Milliseconds since the first call in this process, a monotonic stamp
 /// for "how recently" bookkeeping that never needs wall-clock meaning.
 pub(crate) fn mono_ms() -> u64 {
@@ -243,22 +139,6 @@ pub(crate) fn mono_ms() -> u64 {
 
 fn duration_to_ms(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
-}
-
-/// Total wire frames sent by this process since start, across every
-/// [`Mesh`] it has spawned. A cheap diagnostic for benchmarking replication
-/// cost.
-#[must_use]
-pub fn frames_sent_total() -> u64 {
-    FRAMES_SENT.load(Ordering::Relaxed)
-}
-
-/// Total wire-frame bytes sent by this process since start, across every
-/// [`Mesh`] it has spawned. A cheap diagnostic for benchmarking replication
-/// cost.
-#[must_use]
-pub fn bytes_sent_total() -> u64 {
-    BYTES_SENT.load(Ordering::Relaxed)
 }
 
 /// Bound on one request/response exchange over a fresh connection, end to
