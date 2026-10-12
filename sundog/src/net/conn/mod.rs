@@ -1,0 +1,30 @@
+//! Framing and connection tasks: the accept-side demux between persistent
+//! mesh traffic and pooled request/response, and the per-peer dial-and-write
+//! loop over the broadcast outboxes.
+//!
+//! - `accept`: the accept loop and per-connection dispatch.
+//! - `framing`: framed IO primitives and TLS layering.
+//! - `pool`: the per-peer request connection pool and reuse probe.
+//! - `reply`: requester-side reply readers and lazy streams.
+//! - `serve`: responder-side handlers.
+//! - `writer`: dial, the persistent per-peer writer and the replicate coalescer.
+
+mod accept;
+mod framing;
+mod pool;
+mod reply;
+mod serve;
+#[cfg(test)]
+mod tests;
+mod writer;
+
+pub(super) use accept::accept_loop;
+pub(super) use framing::{recv_msg, send_msg};
+pub(super) use pool::{ReqPool, ReusedProbe, probe_reused};
+pub(super) use reply::{
+    Reply, bucket_stream, collect_ae_buckets, collect_ae_mismatches, collect_ae_part_replies,
+    collect_ae_round_scoped, collect_fetch_reply, collect_load_reply, collect_pulled_records,
+    state_stream,
+};
+pub(crate) use writer::{REPLICATE_BATCH_BUDGET, REPLICATE_BATCH_COUNT};
+pub(super) use writer::{dial_with_hello_and, run_peer_writer};
