@@ -20,7 +20,7 @@ use super::prefold::BatchEntry;
 use super::promote::{claimed_total, promotion_fits};
 use super::record::{
     ENTRY_OVERHEAD_BYTES, build_key_only_record, build_resident_record, decode_key, decode_value,
-    record_value, split_record,
+    record_key_bytes, record_value, record_value_bytes, split_record,
 };
 use super::*;
 use crate::explain::{Lapse, LocalRecord};

@@ -29,6 +29,17 @@
 //!
 //! Under `feature = "spill"`, a live entry can move to disk instead of
 //! being evicted; see [`super::spill::SpillTier`] for that mechanism.
+//!
+//! This module holds the data model: [`Live`], [`Stripe`], [`Written`],
+//! [`Inflight`] and the [`Engine`] struct with its constructor and
+//! accounting. The behavior lives in child modules. `keys`, `record`,
+//! `expiry` and `slab` hold the entry representation and the hash
+//! arithmetic. `merge`, `prefold` and `apply` hold the versioned write path.
+//! `read`, `serve`, `removal`, `inflight`, `housekeeping` and `evict` hold
+//! the `Engine` methods for point reads, anti-entropy serving, invalidation
+//! and ownership release, loads, sweeping and compaction, and capacity
+//! eviction. `checkpoint`, `promote` and `sink` hold the spill-only
+//! methods, and `debug` the test-only accessors.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -70,6 +81,9 @@ mod evict;
 mod expiry;
 mod housekeeping;
 mod inflight;
+/// Kani proofs over the engine's pure arithmetic: every input, not a sample.
+#[cfg(kani)]
+mod kani_proofs;
 mod keys;
 mod merge;
 mod prefold;
@@ -77,11 +91,17 @@ mod prefold;
 mod promote;
 mod read;
 mod record;
+#[cfg(test)]
+mod record_tests;
 mod removal;
 mod serve;
 #[cfg(feature = "spill")]
 mod sink;
 mod slab;
+#[cfg(test)]
+mod slab_tests;
+#[cfg(test)]
+mod tests;
 
 #[cfg(doc)]
 use self::apply::apply_locked;
@@ -104,15 +124,11 @@ pub(crate) use self::keys::{hash_key_bytes, stripe_index_from_hash};
 use self::merge::{merge_version, resolve_conflict};
 #[cfg(doc)]
 use self::prefold::peek_stored_seed;
-#[cfg(test)]
-use self::record::record_key_bytes;
-#[cfg(any(test, doc))]
-use self::record::record_value_bytes;
 use self::record::{Record, record_key};
 #[cfg(doc)]
 use self::record::{
     build_key_only_record, build_resident_record, decode_key, decode_value, entry_bytes,
-    record_value, set_record,
+    record_value, record_value_bytes, set_record,
 };
 use self::slab::{Slab, SlabEntry};
 
@@ -125,8 +141,6 @@ use self::slab::{Slab, SlabEntry};
     reason = "never constructed on this build; see the doc comment above"
 )]
 pub(crate) struct Reservation<'a>(PhantomData<&'a ()>);
-#[cfg(test)]
-mod record_tests;
 
 /// One live entry. Stores only `record`'s raw postcard bytes, never a
 /// decoded key or value; a reader decodes on demand
@@ -432,9 +446,6 @@ impl<K, V> Stripe<K, V> {
         }
     }
 }
-
-#[cfg(test)]
-mod slab_tests;
 
 /// What [`remove_live`] reports about the entry it took out of `live`:
 /// its weight, already `0` for a [`EntryState::Spilled`] entry, its
@@ -831,10 +842,3 @@ where
 fn count_f64(n: usize) -> f64 {
     n as f64
 }
-
-#[cfg(test)]
-mod tests;
-
-/// Kani proofs over the engine's pure arithmetic: every input, not a sample.
-#[cfg(kani)]
-mod kani_proofs;
