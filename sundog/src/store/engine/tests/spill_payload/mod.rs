@@ -1,7 +1,7 @@
 //! Tests for the engine over a spill tier: spilled reads, conflicts, promotion and the hand-off to the flusher.
 
 use super::*;
-use crate::store::spill::{ReclaimRef, SpillSink};
+use crate::store::spill::{Admission, ReclaimRef, SpillJob, SpillSink, spill_record_len};
 #[cfg(not(feature = "sim"))]
 use crate::store::spill::{SpillConfig, SpillTier};
 

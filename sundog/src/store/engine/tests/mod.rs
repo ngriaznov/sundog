@@ -5,8 +5,13 @@ use std::time::Duration;
 #[cfg(feature = "spill")]
 use super::apply::prefetch_spilled_conflict_bytes;
 use super::apply::{ApplyCtx, EntryKey, apply_locked};
+use super::evict::{
+    EVICTION_BATCH, EVICTION_BATCH_SAMPLE, EVICTION_SAMPLE, EvictOutcome, defer_to_flusher,
+    deficit_once_still_over_capacity, eviction_batch_size,
+};
 use super::expiry::{
-    LONG_TTL, MAX_INLINE_TTL_MS, NEVER_EXPIRES, decode_expiry, encode_expiry, lapse_cause,
+    LONG_TTL, MAX_INLINE_TTL_MS, NEVER_EXPIRES, decode_expiry, encode_expiry, idle_elapsed_ms,
+    lapse_cause,
 };
 use super::housekeeping::should_shrink_stripe;
 use super::inflight::fill_supersedes;
