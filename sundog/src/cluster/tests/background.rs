@@ -1,6 +1,7 @@
 //! Tests for the cluster background tasks: inbound activity, mode-conflict reporting and re-forward grouping.
 
 use super::*;
+use crate::cluster::inbound::{MAX_FORWARD_HOPS, reforward_groups};
 use crate::hlc::Hlc;
 use crate::wire::WireRecord;
 use bytes::Bytes;
