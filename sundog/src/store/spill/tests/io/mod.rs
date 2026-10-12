@@ -4,6 +4,7 @@ use std::collections::HashMap as StdHashMap;
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 
+use super::snapshot::{SNAPSHOT_FORMAT_VERSION, parse_snapshot, snapshot_path, snapshot_tmp_path};
 use super::*;
 
 mod reasons;
