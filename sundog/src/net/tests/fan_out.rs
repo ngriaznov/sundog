@@ -1,3 +1,5 @@
+//! Replicate batching and fan-out send tests.
+
 use super::*;
 
 #[test]

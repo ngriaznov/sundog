@@ -1,7 +1,7 @@
 //! Shared real-transport test helpers for other modules' tests that need a
 //! live [`Mesh`] pair, notably `cluster::rebalance`'s bucket-pull tests:
-//! `net::mod`'s own `mod tests` builds a richer `FixtureHandler` for its own
-//! use, but that module is private to `net`, so a cross-module test gets its
+//! `net::tests` builds a richer `FixtureHandler` for its own use, but that
+//! module is private to `net`, so a cross-module test gets its
 //! own minimal fixture here instead of duplicating `net`'s.
 
 use std::net::SocketAddr;
@@ -24,8 +24,8 @@ use crate::store::{
 use crate::wire::{self, WireRecord};
 
 /// Binds a `Mesh` on loopback with `handler` answering requests: the donor
-/// or requester side of a real two-mesh test, mirroring `net::mod`'s own
-/// private `spawn_mesh` test helper.
+/// or requester side of a real two-mesh test, mirroring the private
+/// `spawn_mesh` test helper in `net::tests`.
 pub(crate) async fn spawn_mesh(
     node: NodeId,
     handler: Arc<dyn RequestHandler>,

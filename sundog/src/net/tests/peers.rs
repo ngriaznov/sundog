@@ -1,3 +1,5 @@
+//! Peer table, outbox, listener and send-side tests.
+
 use super::*;
 
 #[tokio::test]

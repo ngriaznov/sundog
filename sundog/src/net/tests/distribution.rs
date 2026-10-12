@@ -1,3 +1,5 @@
+//! Distribution-mode request tests: fetch, load, and scoped or masked anti-entropy rounds.
+
 use super::*;
 use crate::net::request::with_request_timeout;
 

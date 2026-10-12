@@ -1,3 +1,5 @@
+//! Anti-entropy request tests.
+
 use super::*;
 use crate::net::request::{REQUEST_TIMEOUT, with_request_timeout};
 

@@ -1,3 +1,5 @@
+//! Unit tests for the data plane: the shared fixtures and the topic modules.
+
 use std::sync::Mutex;
 use std::time::Duration;
 

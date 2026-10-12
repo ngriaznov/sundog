@@ -1,3 +1,5 @@
+//! State-transfer and bucket-stream request tests.
+
 use super::*;
 
 #[tokio::test]
