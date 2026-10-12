@@ -149,11 +149,11 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(not(feature = "sim"))]
 use super::Reply;
-use super::coalesce_replicate;
 #[cfg(not(feature = "sim"))]
 use super::framing::PeerFramed;
 #[cfg(not(feature = "sim"))]
 use super::pool::ReqPool;
+use super::writer::coalesce_replicate;
 #[cfg(not(feature = "sim"))]
 use crate::error::CodecError;
 use crate::hlc::Hlc;
@@ -987,7 +987,7 @@ async fn run_peer_writer_exits_promptly_when_cancelled_while_retrying() {
         incarnation: 1,
         cluster: wire::UNNAMED_CLUSTER,
     };
-    let handle = tokio::spawn(super::run_peer_writer(
+    let handle = tokio::spawn(super::writer::run_peer_writer(
         greeting,
         unreachable,
         invalidate,
