@@ -1,5 +1,9 @@
 //! Kani proofs over the `Hlc`, expiry, hash-slot, merge and stripe-shrink arithmetic.
 
+use super::expiry::{
+    LONG_TTL, MAX_INLINE_TTL_MS, NEVER_EXPIRES, clamp_tti_ms, encode_expiry, idle_elapsed_ms,
+    touch_stamp,
+};
 use super::keys::{digest_slot, part_index_from_hash, stripe_index_from_hash};
 use super::*;
 

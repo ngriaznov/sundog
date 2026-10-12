@@ -1,5 +1,6 @@
 //! Unit tests for `Slab`, its entries and the arena growth rule.
 
+use super::expiry::NEVER_EXPIRES;
 use super::*;
 
 fn key_bytes(key: u32) -> Bytes {

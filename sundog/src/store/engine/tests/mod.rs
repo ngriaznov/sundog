@@ -2,8 +2,10 @@
 
 use std::time::Duration;
 
+use super::expiry::{MAX_INLINE_TTL_MS, NEVER_EXPIRES};
 use super::record::{ENTRY_OVERHEAD_BYTES, build_key_only_record, split_record};
 use super::*;
+use crate::explain::Lapse;
 use crate::hlc::HlcClock;
 use crate::node::NodeId;
 use crate::store::LwwResolver;
