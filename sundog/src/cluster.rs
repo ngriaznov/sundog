@@ -44,8 +44,6 @@ use crate::discovery::statics::Static;
 use crate::discovery::{Discovery, DiscoveryKind};
 use crate::error::JoinError;
 use crate::explain::ServeVerdict;
-#[cfg(all(test, not(feature = "sim")))]
-use crate::hlc::Hlc;
 use crate::membership::{CacheModes, Membership, Peer};
 use crate::net::{
     AeServeOutcome, BoundListener, FetchServe, Greeting, InboundMsg, LoadServe, Mesh, OutFrame,
