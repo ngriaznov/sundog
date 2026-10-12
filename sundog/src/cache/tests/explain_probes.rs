@@ -1,6 +1,7 @@
 //! Tests of the owner probes behind `Cache::explain`: values, declines, crashes and stale views.
 
 use super::*;
+use crate::explain::ProbedRecord;
 
 /// Three `Mode::distributed()` nodes of `name` and two keys the first node
 /// does not own, whose two owners hold their parts warm under one view on

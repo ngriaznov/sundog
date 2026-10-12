@@ -1,6 +1,7 @@
 //! Tests of `Cache::explain` over residency states, views and modes, and its agreement with `fetch`.
 
 use super::*;
+use crate::explain::Residency;
 
 /// A one-node cluster named `name` on `config`, with no seeds and no
 /// peers, for a hand-built cache to read through.
