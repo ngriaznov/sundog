@@ -5,14 +5,14 @@ use std::time::Duration;
 #[cfg(feature = "spill")]
 use super::apply::prefetch_spilled_conflict_bytes;
 use super::apply::{ApplyCtx, EntryKey, apply_locked};
-use super::expiry::{MAX_INLINE_TTL_MS, NEVER_EXPIRES};
+use super::expiry::{MAX_INLINE_TTL_MS, NEVER_EXPIRES, lapse_cause};
 use super::prefold::BatchEntry;
 use super::record::{ENTRY_OVERHEAD_BYTES, build_key_only_record, split_record};
 use super::*;
-use crate::explain::Lapse;
+use crate::explain::{Lapse, LocalRecord};
 use crate::hlc::HlcClock;
 use crate::node::NodeId;
-use crate::store::{Incoming, LwwResolver, Merged, RecordView, Winner};
+use crate::store::{Incoming, LwwResolver, Merged, RecordView, Ttl, Winner};
 use xxhash_rust::xxh3::xxh3_64;
 
 fn engine_u32_string(max_capacity: u64, tti: Option<Duration>) -> Engine<u32, String> {
