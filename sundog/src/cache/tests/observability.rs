@@ -1,6 +1,7 @@
 //! Tests of the fetch span and the read metrics, and that `explain` leaves both untouched.
 
 use super::*;
+use crate::cache::fetch::record_fetch_outcome;
 
 /// One closed span's name and recorded fields.
 type ClosedSpan = (&'static str, HashMap<&'static str, String>);

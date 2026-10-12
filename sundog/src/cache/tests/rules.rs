@@ -2,6 +2,7 @@
 //! and config validation.
 
 use super::*;
+use crate::cache::fetch::{decode_live_value, record_reads};
 use crate::cache::reconcile::{
     RECONCILE_MAX_ROUNDS, ReconcileBudget, retry_delay, should_keep_reconciling, split_round_result,
 };

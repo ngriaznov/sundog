@@ -20,9 +20,12 @@ use std::net::{Ipv4Addr, SocketAddr};
 use super::*;
 use crate::cluster::test_support::wait_until;
 use crate::cluster::{Cluster, anti_entropy};
-use crate::explain::{LocalRead, LocalRecord, ProbeAnswer, ServeVerdict, Unreached};
+use crate::explain::{
+    LocalRead, LocalRecord, OwnerProbe, ProbeAnswer, Reads, ServeVerdict, Unreached,
+};
 use crate::store::bucket_of;
 use crate::store::crdt::{PnCounter, PnCounterResolver};
+use crate::wire::WireRecord;
 
 fn loopback_config() -> ClusterConfig {
     let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
