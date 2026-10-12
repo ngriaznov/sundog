@@ -1,5 +1,6 @@
 //! Kani proofs over the spill tier's sizing arithmetic.
 
+use super::record::split_record;
 use super::*;
 
 /// Any capacity and region size give at least one region without panicking.

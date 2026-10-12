@@ -1,5 +1,6 @@
 //! Unit tests for the spill tier: pure rules, then the on-disk I/O tests in `io`.
 
+use super::record::split_record;
 use super::*;
 
 // --- Pure functions: no I/O, no tokio, safe under every feature combo. ---
