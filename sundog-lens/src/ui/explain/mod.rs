@@ -2198,9 +2198,10 @@ mod tests {
             "{rows:?}"
         );
         let request = ask(&mut app, &model);
-        let reading =
-            crate::explained::parse_reply(include_str!("../../tests/fixtures/explain/owner.json"))
-                .expect("the fixture parses");
+        let reading = crate::explained::parse_reply(include_str!(
+            "../../../tests/fixtures/explain/owner.json"
+        ))
+        .expect("the fixture parses");
         let answers = Explained {
             id: request.id,
             key: request.key.clone(),
