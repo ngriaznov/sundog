@@ -54,9 +54,11 @@ use super::ConflictResolver;
 #[cfg(feature = "spill")]
 pub(crate) use super::spill::Reservation;
 #[cfg(all(doc, feature = "spill"))]
+use super::spill::SpillSink;
+#[cfg(all(doc, feature = "spill"))]
 use super::spill::keeps_refused_victim_resident;
 #[cfg(feature = "spill")]
-use super::spill::{ReclaimRef, SpillLoc, SpillSink, SpillTier, spilled_is_current};
+use super::spill::{SpillLoc, SpillTier};
 use super::{BUCKET_COUNT, PART_COUNT, Tombstone, Weigher, entry_fingerprint};
 
 mod apply;
@@ -75,6 +77,8 @@ mod read;
 mod record;
 mod removal;
 mod serve;
+#[cfg(feature = "spill")]
+mod sink;
 mod slab;
 
 #[cfg(doc)]
@@ -83,14 +87,14 @@ use self::apply::apply_locked;
 pub(crate) use self::checkpoint::CheckpointFinalizeCounts;
 #[cfg(doc)]
 use self::evict::VictimOutcome;
-#[cfg(any(feature = "spill", doc))]
+#[cfg(any(all(feature = "spill", test), doc))]
 use self::expiry::encode_expiry;
 #[cfg(doc)]
 use self::expiry::{LONG_TTL, decode_expiry, idle_elapsed_ms};
 use self::expiry::{absent_at, clamp_tti_ms, touch_stamp};
 pub(crate) use self::housekeeping::{CompactCandidate, CompactReplace, CompactScan};
 pub(crate) use self::inflight::{FillOutcome, FreshLoad, JoinOutcome};
-#[cfg(any(feature = "spill", test, doc))]
+#[cfg(any(test, kani, doc))]
 pub(crate) use self::keys::part_index_from_hash;
 use self::keys::{digest_slot, hasher_for};
 pub(crate) use self::keys::{hash_key_bytes, stripe_index_from_hash};
@@ -98,7 +102,7 @@ pub(crate) use self::keys::{hash_key_bytes, stripe_index_from_hash};
 use self::merge::{merge_version, resolve_conflict};
 #[cfg(doc)]
 use self::prefold::peek_stored_seed;
-#[cfg(feature = "spill")]
+#[cfg(all(feature = "spill", test))]
 use self::record::build_key_only_record;
 #[cfg(any(test, doc))]
 use self::record::entry_bytes;
@@ -106,11 +110,9 @@ use self::record::entry_bytes;
 use self::record::record_key_bytes;
 #[cfg(any(test, doc))]
 use self::record::record_value_bytes;
-#[cfg(any(feature = "spill", doc))]
-use self::record::set_record;
 use self::record::{Record, record_key};
 #[cfg(doc)]
-use self::record::{build_resident_record, decode_key, decode_value, record_value};
+use self::record::{build_resident_record, decode_key, decode_value, record_value, set_record};
 use self::slab::{Slab, SlabEntry};
 
 /// A never-constructed placeholder for
@@ -832,201 +834,6 @@ where
             self.live_count.fetch_sub(1, Ordering::Relaxed);
         }
         self.note_spill_departure(removed.was_spilled);
-    }
-}
-
-/// The engine-side callback surface [`SpillTier`]'s flusher drives, so
-/// installing a flushed record and reclaiming a rotated-out region both flip
-/// existing `live` entries in place rather than routing back through
-/// `apply_locked`'s fan-out/event machinery: neither changes a key's
-/// version, value, or expiry, so nothing about it differs from the
-/// cluster's point of view.
-#[cfg(feature = "spill")]
-impl<K, V> SpillSink for Engine<K, V>
-where
-    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-{
-    /// Resolves the job either way: `weight` leaves `pending_spill_weight`
-    /// whether the flip happens or the key moved on, so a write, tombstone,
-    /// or expiry that displaced a pending key never strands its share.
-    fn install(
-        &self,
-        stripe_idx: usize,
-        key_bytes: &Bytes,
-        hash: u64,
-        ver: Hlc,
-        loc: SpillLoc,
-        weight: u32,
-    ) -> bool {
-        let flipped = {
-            let mut stripe = self.stripes[stripe_idx].write();
-            let stored_tombstone_ver = stripe.tombstones.get(key_bytes.as_ref()).map(|t| t.ver);
-            match stripe
-                .live
-                .find_mut(hash, |l| record_key(&l.record) == key_bytes.as_ref())
-            {
-                Some(live)
-                    if spilled_is_current(stored_tombstone_ver, Some(live.ver()), ver)
-                        && live.weight == 0
-                        && matches!(live.state, EntryState::Resident) =>
-                {
-                    // A fresh copy of the key half, never a slice of the
-                    // record (which would keep its value bytes resident).
-                    let key_only = build_key_only_record(record_key(&live.record));
-                    set_record(live, key_only, self.resident_bytes.as_deref());
-                    live.state = EntryState::Spilled(loc);
-                    true
-                }
-                _ => false,
-            }
-        };
-        self.pending_spill_weight
-            .fetch_sub(u64::from(weight), Ordering::Relaxed);
-        if flipped {
-            self.note_spill_arrival();
-        }
-        flipped
-    }
-
-    /// Originates a fresh entry straight from an on-disk [`SpillLoc`], with
-    /// no value bytes ever read into RAM: the warm tier-reopen replay
-    /// primitive, distinct from `install`, which only flips an
-    /// already-present entry. `record` holds only the key half
-    /// ([`build_key_only_record`]); the entry starts at weight `0` like a
-    /// freshly installed one (a later [`Engine::promote_locked`] recomputes
-    /// the real weight). `weight` mirrors `install`'s parameter for
-    /// signature symmetry and is never folded into `total_weight`.
-    ///
-    /// Never overwrites a key already present, live or tombstoned: `false`
-    /// and a no-op either way, so this can never resurrect a deleted key or
-    /// clobber a fresher write. Folds the fresh entry's fingerprint into
-    /// the bucket's digest like every other insert path.
-    #[allow(clippy::too_many_arguments)]
-    fn install_new(
-        &self,
-        stripe_idx: usize,
-        key_bytes: &Bytes,
-        hash: u64,
-        ver: Hlc,
-        expires_at_ms: Option<u64>,
-        loc: SpillLoc,
-        _weight: u32,
-    ) -> bool {
-        let part = part_index_from_hash(hash);
-        let inserted = {
-            let mut stripe = self.stripes[stripe_idx].write();
-            if stripe.tombstones.contains_key(key_bytes.as_ref())
-                || stripe
-                    .live
-                    .find(hash, |l| record_key(&l.record) == key_bytes.as_ref())
-                    .is_some()
-            {
-                false
-            } else {
-                let (expiry, long_ttl_value) = encode_expiry(ver.wall_ms, expires_at_ms);
-                if let Some(deadline) = long_ttl_value {
-                    stripe.long_ttl.insert(key_bytes.clone(), deadline);
-                }
-                stripe.live.insert_unique(
-                    hash,
-                    Live::new(
-                        build_key_only_record(key_bytes.as_ref()),
-                        ver,
-                        expiry,
-                        0,
-                        ver.wall_ms,
-                        EntryState::Spilled(loc),
-                    ),
-                    hasher_for,
-                );
-                if let Some(exp) = expires_at_ms {
-                    stripe.next_expiry_ms = stripe.next_expiry_ms.min(exp);
-                }
-                true
-            }
-        };
-        if inserted {
-            self.digest[digest_slot(stripe_idx, part)].fetch_xor(
-                entry_fingerprint(key_bytes.as_ref(), ver),
-                Ordering::Relaxed,
-            );
-            self.live_count.fetch_add(1, Ordering::Relaxed);
-            self.note_spill_arrival();
-        }
-        inserted
-    }
-
-    /// Resolves a job the tier could not write: `weight` leaves
-    /// `pending_spill_weight` unconditionally, and goes back onto the entry
-    /// and `total_weight` only while the entry is still the pending one.
-    fn abandon(&self, stripe_idx: usize, key_bytes: &Bytes, hash: u64, ver: Hlc, weight: u32) {
-        let restored = {
-            let mut stripe = self.stripes[stripe_idx].write();
-            match stripe
-                .live
-                .find_mut(hash, |l| record_key(&l.record) == key_bytes.as_ref())
-            {
-                Some(live)
-                    if live.ver() == ver
-                        && live.weight == 0
-                        && matches!(live.state, EntryState::Resident) =>
-                {
-                    live.weight = weight;
-                    true
-                }
-                _ => false,
-            }
-        };
-        self.pending_spill_weight
-            .fetch_sub(u64::from(weight), Ordering::Relaxed);
-        if restored {
-            self.total_weight
-                .fetch_add(u64::from(weight), Ordering::Relaxed);
-        }
-    }
-
-    fn reclaim(&self, region: u32, generation: u32, rows: &[ReclaimRef]) -> usize {
-        let mut removed = 0usize;
-        for row in rows {
-            let bucket = usize::from(row.stripe);
-            let removed_this = {
-                let mut stripe = self.stripes[bucket].write();
-                // Location identifies the entry: one record occupies one
-                // offset of one region generation, so no key compare is
-                // needed, and an entry since overwritten, promoted or
-                // spilled again elsewhere no longer matches.
-                let SlabEntry::Occupied(occ) = stripe.live.entry(
-                    row.hash,
-                    |l| {
-                        matches!(
-                            &l.state,
-                            EntryState::Spilled(loc) if loc.region == region
-                                && loc.generation == generation
-                                && loc.offset == row.offset
-                        )
-                    },
-                    hasher_for,
-                ) else {
-                    continue;
-                };
-                let (removed_entry, _vacant) = occ.remove();
-                let key_bytes = record_key(&removed_entry.record);
-                stripe.long_ttl.remove(key_bytes);
-                let part = part_index_from_hash(row.hash);
-                self.digest[digest_slot(bucket, part)].fetch_xor(
-                    entry_fingerprint(key_bytes, removed_entry.ver()),
-                    Ordering::Relaxed,
-                );
-                true
-            };
-            if removed_this {
-                self.live_count.fetch_sub(1, Ordering::Relaxed);
-                removed += 1;
-            }
-        }
-        self.note_spill_departures(removed);
-        removed
     }
 }
 
