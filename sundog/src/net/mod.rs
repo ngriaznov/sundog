@@ -40,6 +40,9 @@ pub(crate) use types::{
     LoadOutcome, LoadServe, StServe,
 };
 
+#[cfg(doc)]
+use crate::membership::Peer;
+
 use std::collections::{HashMap, HashSet};
 #[cfg(all(feature = "tls", not(feature = "sim")))]
 use std::io;
