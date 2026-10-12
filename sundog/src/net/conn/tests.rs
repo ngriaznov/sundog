@@ -100,7 +100,7 @@ fn listing_or_sketch_crosses_over_past_min_bucket() {
     }
 }
 
-/// Below [`super::REQ_POOL_MAX_IDLE`] a pooled connection stays fresh;
+/// Below [`super::pool::REQ_POOL_MAX_IDLE`] a pooled connection stays fresh;
 /// at or past it, `ReqPool::checkout` must treat it as stale. Uses
 /// tokio's paused clock so the boundary is exact rather than
 /// timing-dependent.
@@ -108,19 +108,19 @@ fn listing_or_sketch_crosses_over_past_min_bucket() {
 async fn pooled_is_fresh_expires_at_the_max_idle_boundary() {
     let checked_in = tokio::time::Instant::now().into();
     tokio::time::advance(
-        super::REQ_POOL_MAX_IDLE
+        super::pool::REQ_POOL_MAX_IDLE
             .checked_sub(Duration::from_millis(1))
             .expect("invariant: REQ_POOL_MAX_IDLE exceeds one millisecond"),
     )
     .await;
     assert!(
-        super::pooled_is_fresh(checked_in, tokio::time::Instant::now().into()),
+        super::pool::pooled_is_fresh(checked_in, tokio::time::Instant::now().into()),
         "narrowly under REQ_POOL_MAX_IDLE must stay fresh"
     );
 
     tokio::time::advance(Duration::from_millis(1)).await;
     assert!(
-        !super::pooled_is_fresh(checked_in, tokio::time::Instant::now().into()),
+        !super::pool::pooled_is_fresh(checked_in, tokio::time::Instant::now().into()),
         "at REQ_POOL_MAX_IDLE must be stale"
     );
 }
@@ -147,11 +147,13 @@ use tokio_util::codec::LengthDelimitedCodec;
 #[cfg(not(feature = "sim"))]
 use tokio_util::sync::CancellationToken;
 
+#[cfg(not(feature = "sim"))]
+use super::Reply;
 use super::coalesce_replicate;
 #[cfg(not(feature = "sim"))]
 use super::framing::PeerFramed;
 #[cfg(not(feature = "sim"))]
-use super::{Reply, ReqPool};
+use super::pool::ReqPool;
 #[cfg(not(feature = "sim"))]
 use crate::error::CodecError;
 use crate::hlc::Hlc;
@@ -566,14 +568,14 @@ async fn dial_fake_donor(prelude: Vec<Msg>) -> PeerFramed {
     super::framing::new_framed(as_mesh_stream(client))
 }
 
-/// Polls [`super::probe_reused`] until it stops reporting `Pending`, for
+/// Polls [`super::pool::probe_reused`] until it stops reporting `Pending`, for
 /// a connection whose peer has already acted.
 #[cfg(not(feature = "sim"))]
-async fn probe_settled(framed: &mut PeerFramed) -> super::ReusedProbe {
+async fn probe_settled(framed: &mut PeerFramed) -> super::pool::ReusedProbe {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            match super::probe_reused(framed) {
-                super::ReusedProbe::Pending => {
+            match super::pool::probe_reused(framed) {
+                super::pool::ReusedProbe::Pending => {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
                 settled => return settled,
@@ -590,13 +592,13 @@ async fn probe_reused_tells_a_waiting_reply_from_a_closed_peer_and_a_quiet_one()
     let mut replied = dial_fake_donor(vec![Msg::ReqDone]).await;
     assert!(matches!(
         probe_settled(&mut replied).await,
-        super::ReusedProbe::Ready(Msg::ReqDone)
+        super::pool::ReusedProbe::Ready(Msg::ReqDone)
     ));
 
     let mut closed = dial_fake_donor(Vec::new()).await;
     assert!(matches!(
         probe_settled(&mut closed).await,
-        super::ReusedProbe::Stale
+        super::pool::ReusedProbe::Stale
     ));
 
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -611,8 +613,8 @@ async fn probe_reused_tells_a_waiting_reply_from_a_closed_peer_and_a_quiet_one()
     let mut quiet = super::framing::new_framed(as_mesh_stream(client));
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(matches!(
-        super::probe_reused(&mut quiet),
-        super::ReusedProbe::Pending
+        super::pool::probe_reused(&mut quiet),
+        super::pool::ReusedProbe::Pending
     ));
 }
 
