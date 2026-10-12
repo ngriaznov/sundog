@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use super::record::{ENTRY_OVERHEAD_BYTES, build_key_only_record, split_record};
 use super::*;
 use crate::hlc::HlcClock;
 use crate::node::NodeId;
