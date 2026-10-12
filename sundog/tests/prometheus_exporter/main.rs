@@ -10,6 +10,7 @@
 
 #![cfg(all(feature = "prometheus", not(feature = "sim")))]
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use std::net::{Ipv4Addr, SocketAddr};
