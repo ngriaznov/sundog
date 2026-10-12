@@ -885,7 +885,7 @@ async fn req_done_and_ae_bucket_after_hello_are_not_served_or_forwarded() {
     let handler: Arc<dyn crate::net::RequestHandler> = Arc::new(EmptyHandler);
     // `handle_accepted` takes the pre-TLS raw stream, not `MeshStream`;
     // it layers TLS on internally via `establish_accept`.
-    let accepted_task = tokio::spawn(super::handle_accepted(
+    let accepted_task = tokio::spawn(super::accept::handle_accepted(
         server_stream,
         inbound_tx,
         handler,
@@ -1322,7 +1322,7 @@ async fn handle_accepted_records_a_bucket_ack_that_arrives_after_any_serve_st_bu
     let cancel = CancellationToken::new();
     let handler: Arc<dyn crate::net::RequestHandler> = Arc::new(EmptyHandler);
     let mesh = crate::net::MeshInner::for_tests(no_tls(), cancel.clone());
-    let accepted_task = tokio::spawn(super::handle_accepted(
+    let accepted_task = tokio::spawn(super::accept::handle_accepted(
         server_stream,
         inbound_tx,
         handler,
