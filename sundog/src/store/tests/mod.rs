@@ -2,11 +2,13 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroU8;
+use std::sync::atomic::Ordering;
 
 use rand::{RngExt as _, SeedableRng as _, rngs::StdRng};
 use tokio::sync::watch;
 
 use super::*;
+use crate::config::ClusterConfig;
 
 mod apply;
 mod builders;
