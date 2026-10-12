@@ -15,8 +15,12 @@ use crate::cluster::Cluster;
 use crate::store::{Mode, PartId, Shard, ShardOps, now_ms};
 
 use super::load::refresh_task;
+#[cfg(doc)]
+use super::open::await_initial_peers;
 use super::open::{DistributedContext, trust_sole_owner_at_open};
 use super::reconcile::reconcile_warm_buckets;
+#[cfg(doc)]
+use super::{Cache, CacheBuilder};
 
 /// The background loops one opened cache runs: fan-out for a clustered
 /// mode, warm-up and anti-entropy for `Replicated`, the analogous
@@ -170,7 +174,7 @@ where
 /// a timed-out wait never vouches for a replay's stale ownership echo.
 ///
 /// [`state_transfer::warm_up_task`]: crate::cluster::state_transfer::warm_up_task
-async fn distributed_warm_and_rebalance(
+pub(super) async fn distributed_warm_and_rebalance(
     cluster: &Cluster,
     shard_ops: Arc<dyn ShardOps>,
     name: &SmolStr,

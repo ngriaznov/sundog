@@ -19,6 +19,13 @@ use crate::ownership::{OwnershipTracker, OwnershipView, ResidencySet};
 use crate::store::spill::SpillConfig;
 use crate::store::{Mode, PartId, Shard, refresh_permille};
 
+#[cfg(doc)]
+use super::tasks::distributed_warm_and_rebalance;
+#[cfg(doc)]
+use super::{Cache, CacheBuilder};
+#[cfg(doc)]
+use crate::store::ConflictResolver;
+
 /// [`CacheBuilder::open`]'s spill-attach step: a no-op when `spill` is
 /// `None`, otherwise [`Shard::attach_spill`], recording the warm-reloaded
 /// parts into `distributed`'s [`DistributedContext::warm_reloaded_parts`].

@@ -10,10 +10,15 @@
 //! coalesces consecutive `merge` calls to one key into a single record per
 //! window instead of one per call.
 
+// The owner read path: asking the owners of a key and decoding their answers.
 mod fetch;
+// Load routing: choosing the node a miss loads on, and the refresh-ahead task.
 mod load;
+// The checks and setup `CacheBuilder::open` runs before it spawns the loops.
 mod open;
+// Warm-reopen reconciliation of spill-reloaded buckets against their peers.
 mod reconcile;
+// The background loops a cache runs: fan-out, merge coalescing, warm-up, rebalancing.
 mod tasks;
 
 use std::collections::HashMap;
@@ -30,6 +35,8 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::cluster::Cluster;
+#[cfg(doc)]
+use crate::config::ClusterConfig;
 use crate::error::CacheError;
 use crate::explain::{DistributedRead, ReadExplanation, ReadSource};
 use crate::node::NodeId;

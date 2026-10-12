@@ -11,6 +11,8 @@ use smol_str::SmolStr;
 use tokio_util::sync::CancellationToken;
 
 use super::Cache;
+#[cfg(doc)]
+use super::CacheBuilder;
 use crate::cluster::Cluster;
 use crate::error::RemoteLoaderError;
 use crate::net::LoadOutcome;
