@@ -2,7 +2,7 @@
 
 use crate::node::NodeId;
 
-use super::record::split_record;
+use super::record::{build_header, split_record};
 use super::rules::{FLUSH_QUEUE_CAPACITY, FLUSH_QUEUE_SLOTS_MAX, record_fits, record_fits_queue};
 use super::*;
 
