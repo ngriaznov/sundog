@@ -81,6 +81,7 @@
 //!   role's `NodeId` incarnation and times the compaction sweep's
 //!   retirement of the dead incarnations.
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use std::future::Future;
@@ -107,7 +108,7 @@ fn bench_enabled() -> bool {
 /// Returns from the calling scenario fn unless `SUNDOG_BENCH=1` is set.
 macro_rules! require_bench {
     () => {
-        if !bench_enabled() {
+        if !$crate::bench_enabled() {
             eprintln!("skipping: SUNDOG_BENCH=1 not set");
             return;
         }
