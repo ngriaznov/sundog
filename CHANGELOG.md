@@ -63,6 +63,10 @@ All notable changes to this project are documented in this file. Format follows
   `Distributed`; with no room, the read answers from disk and the entry stays
   there. The refusal counts as `sundog_spill_dropped_total{reason="deferred"}`.
   A write's eviction is unchanged.
+- **Source files are split into modules of at most about 1,500 lines, with no
+  behaviour change.** Tracing events from moved code carry deeper module
+  targets, such as `sundog::cache::open`; prefix filters such as
+  `RUST_LOG=sundog::cache=debug` still match them.
 
 ### Fixed
 
