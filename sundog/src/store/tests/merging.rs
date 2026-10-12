@@ -74,7 +74,7 @@ async fn merge_against_a_tombstone_is_never_consulted_and_falls_back_to_hlc_orde
 }
 
 /// A spilled stored side carries a real value once `apply_locked`
-/// reads its bytes back off disk (see `engine::read_spilled_for_conflict`):
+/// reads its bytes back off disk (see `engine::apply::read_spilled_for_conflict`):
 /// `AlwaysMerge`'s `merge` always returns `Some`, and now that both
 /// sides have real values, `resolve_conflict`'s guard has nothing to
 /// stop it, so the merge applies exactly as it would against a resident
@@ -348,7 +348,7 @@ async fn merge_a_losing_calls_own_version_never_overwrites_the_pending_entrys_ve
     );
 }
 
-/// [`Engine::apply_many`]'s pre-fold (`engine::prefold_batch`) collapses
+/// [`Engine::apply_many`]'s pre-fold (`engine::prefold::prefold_batch`) collapses
 /// several same-key records in one `apply_remote_batch` call into one
 /// real apply, so a fan-out batch carrying distinct origin nodes'
 /// writes to the same key publishes exactly one event, not one per

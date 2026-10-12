@@ -1,4 +1,4 @@
-//! Shared harness for `tests/tls.rs` and `tests/prometheus_exporter.rs`: a
+//! Shared harness for `tests/tls.rs` and `tests/prometheus_exporter/`: a
 //! fast-cycling [`ClusterConfig`] and a bounded-wait polling helper, both
 //! files build their own real, loopback-`Static`-discovery [`Cluster`]s
 //! around.

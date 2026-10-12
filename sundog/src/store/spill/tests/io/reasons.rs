@@ -195,7 +195,7 @@ fn try_spill_and_flush_record_the_documented_drop_reason_for_each_case() {
     // `metrics::set_global_recorder` is a single process-global
     // slot: if another test in this binary already won it, this one
     // silently observes nothing and skips its assertions, the same
-    // way `tests/prometheus_exporter.rs`'s own tests tolerate
+    // way the `tests/prometheus_exporter/` suite's own tests tolerate
     // losing that race rather than assuming they run first.
     let installed = metrics::set_global_recorder(DropRecorder {
         counts: counts.clone(),

@@ -103,7 +103,7 @@ pub use telemetry::{BuildError, PrometheusHandle, prometheus_handle};
 
 /// `cluster::sketch` and `cluster::anti_entropy` are `pub(crate)`; nothing
 /// outside `cluster.rs`'s own composition normally names an IBLT, its
-/// diffing, or a raw anti-entropy round directly. `tests/sim.rs` drives
+/// diffing, or a raw anti-entropy round directly. `tests/sim/` drives
 /// `net::Mesh` and `store::ShardOps` directly rather than through a whole
 /// `Cluster`, so it needs `cluster::anti_entropy::run_round_against`,
 /// [`diff_decoded`], and [`mismatched_parts`] to run and reconcile real
@@ -119,7 +119,7 @@ pub use cluster::sketch::{Decoded, Elem, Iblt, Undecodable};
 
 /// `ownership` is `pub(crate)`; nothing outside the crate's own composition
 /// normally builds or reads a `Mode::Distributed` cache's ownership view
-/// directly. `tests/sim.rs` drives `store::Shard` directly rather than
+/// directly. `tests/sim/` drives `store::Shard` directly rather than
 /// through `Cluster`, so it needs these to seed and republish a shard's
 /// ownership view and residency set the way `cluster::rebalance` reacts to
 /// a real membership change. `#[doc(hidden)]` and gated on `feature =

@@ -32,7 +32,7 @@ const SKETCH_PATH_KEYS_DEFAULT: u32 = 200;
 /// far under [`SKETCH_PATH_KEYS_DEFAULT`], so the one dense bucket this
 /// scenario builds always clears it and takes the sketch path rather than
 /// `ClusterConfig::default`'s 384-entry listing threshold, mirroring
-/// `tests/sim.rs`'s own forced `ae_sketch_min_bucket` of 4 for the same
+/// the `tests/sim/` suite's own forced `ae_sketch_min_bucket` of 4 for the same
 /// reason.
 const SKETCH_PATH_MIN_BUCKET: usize = 4;
 
@@ -43,7 +43,7 @@ const SKETCH_PATH_MIN_BUCKET: usize = 4;
 const SKETCH_PATH_INVALIDATE_FRACTION: usize = 4;
 
 /// The anti-entropy bucket a `u32` key hashes into, mirroring
-/// `store::stripe_index_from_hash`'s formula; `tests/prometheus_exporter.rs`
+/// `store::stripe_index_from_hash`'s formula; `tests/prometheus_exporter/`
 /// carries the identical helper for the same reason (copied locally,
 /// since integration test binaries share nothing beyond `mod common`).
 fn sketch_path_bucket_of(key: u32) -> u16 {
@@ -112,7 +112,7 @@ struct SketchPathRepMetrics {
 /// is lowered to [`SKETCH_PATH_MIN_BUCKET`], and every one of `keys`
 /// filler entries is forced into the *same* anti-entropy bucket
 /// ([`keys_in_one_bucket`], the same deterministic technique
-/// `tests/prometheus_exporter.rs`'s own `keys_in_one_bucket`/`bucket_of`
+/// the `tests/prometheus_exporter/` suite's own `keys_in_one_bucket`/`bucket_of`
 /// pair uses to force a dense bucket, copied locally since integration
 /// test binaries share nothing beyond `mod common`), so that one bucket
 /// clears the lowered threshold regardless of `store::BUCKET_COUNT`'s
@@ -126,7 +126,7 @@ struct SketchPathRepMetrics {
 /// of it on `cache_b` only, an escape hatch that removes a local copy
 /// without a tombstone or fan-out, creating a real bucket digest mismatch
 /// with no write race involved, mirroring
-/// `tests/prometheus_exporter.rs`'s own `seed_sketch_mismatch`. The next
+/// the `tests/prometheus_exporter/` suite's own `seed_sketch_mismatch`. The next
 /// anti-entropy round against a threshold this low answers with a sketch.
 /// `lww` (default `LwwResolver`, non-merging) and `pn_counter`
 /// (`PnCounterResolver`, merging) both run this, so `pn_counter`'s own

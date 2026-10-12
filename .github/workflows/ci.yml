@@ -49,7 +49,7 @@ jobs:
         run: cargo clippy --package sundog --all-targets --features spill -- -D warnings -W clippy::pedantic
 
       # `spill,prometheus` together. The exporter pin test in
-      # tests/prometheus_exporter.rs's spill metrics scenario compiles only
+      # the tests/prometheus_exporter/ spill metrics scenario compiles only
       # under both features at once, so this lane lints it.
       - name: cargo clippy (spill,prometheus features)
         run: cargo clippy --package sundog --all-targets --features spill,prometheus -- -D warnings -W clippy::pedantic
@@ -71,7 +71,7 @@ jobs:
       - name: cargo test (turmoil simulation suite)
         run: cargo test --package sundog --features sim --test 'sim*'
 
-      # Exercises tests/tls.rs and tests/prometheus_exporter.rs (silent no-ops
+      # Exercises tests/tls.rs and tests/prometheus_exporter/ (silent no-ops
       # otherwise, each `#![cfg(feature = "...")]`-gated) alongside the full
       # default suite. Not `--all-features`: `sim` swaps the entire transport
       # to turmoil (`net::tcp`'s seam), which every plain `#[tokio::test]`
@@ -83,7 +83,7 @@ jobs:
       - name: cargo test (tls,prometheus features)
         run: cargo test --package sundog --features tls,prometheus
 
-      # Exercises tests/prometheus_exporter.rs's spill metrics pin alongside
+      # Exercises the tests/prometheus_exporter/ spill metrics pin alongside
       # the tier's own unit and engine/shard suites. Not combined with
       # `sim`, for the same reason as the lane above. Spill's flusher thread
       # does real filesystem I/O that a turmoil `Sim` gives no determinism

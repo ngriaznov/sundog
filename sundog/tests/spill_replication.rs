@@ -36,7 +36,7 @@ fn metrics_handle() -> &'static PrometheusHandle {
 
 /// Finds `metric{...,label="value",...} <number>` in Prometheus
 /// text-exposition `body`, tolerant of label ordering and
-/// integer-vs-float rendering. Mirrors `tests/prometheus_exporter.rs`'s own
+/// integer-vs-float rendering. Mirrors the `tests/prometheus_exporter/` suite's own
 /// `scraped_metric_value`, kept local since integration test binaries don't
 /// share code beyond `mod common`.
 fn metric_value(body: &str, metric: &str, label: (&str, &str)) -> Option<f64> {

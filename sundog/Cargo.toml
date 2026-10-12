@@ -83,7 +83,7 @@ prometheus = ["dep:metrics-exporter-prometheus"]
 # Turmoil deterministic-simulation seam: swaps `net`'s transport seam
 # (`src/net/tcp.rs`) from `tokio::net` to `turmoil::net`, so the mesh can
 # be driven inside a turmoil `Sim`. Off by default — non-sim builds never pull
-# in turmoil at all. See `tests/sim.rs`.
+# in turmoil at all. See `tests/sim/`.
 sim = ["dep:turmoil"]
 # Exposes `store::model`, the stateful reference model of the apply path
 # (`sundog/fuzz`'s hook for its sequence-driven fuzz targets); no effect on

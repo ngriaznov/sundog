@@ -31,7 +31,8 @@ struct PrefoldRepMetrics {
 }
 
 /// Scenario 9, `apply_many_prefold`: Lever A, batch pre-folding ahead of
-/// the stripe lock (`Engine::apply_many`, `sundog/src/store/engine.rs`).
+/// the stripe lock (`Engine::apply_many`, `sundog/src/store/engine/apply.rs`
+/// and `engine/prefold.rs`).
 /// No network: a fresh single-node `Mode::Local` cluster per rep, matching
 /// scenario 5's own isolation of apply cost from all network/AE noise. Two
 /// batch shapes, both of `batch_size` (`SUNDOG_BENCH_KEYS`, default 1,000)

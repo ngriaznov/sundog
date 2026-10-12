@@ -134,7 +134,7 @@ impl Cell {
 /// ([`crate::wire::Msg::AePullHashes`]), never by key.
 ///
 /// Reachable outside `cluster::sketch` only because `crate::diff_decoded`
-/// (a `feature = "sim"`-gated re-export `tests/sim.rs` drives directly)
+/// (a `feature = "sim"`-gated re-export `tests/sim/` drives directly)
 /// carries [`Decoded`], which carries this; every field stays crate-visible
 /// in spirit even though `pub` is what the re-export requires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -149,7 +149,7 @@ pub struct Elem {
 ///
 /// Reachable outside `cluster::sketch` only because [`Iblt::peel`] returns
 /// it and `crate::diff_decoded` takes it, both re-exported (the latter
-/// under its `crate::` path) for `tests/sim.rs` under `feature = "sim"`;
+/// under its `crate::` path) for `tests/sim/` under `feature = "sim"`;
 /// see this module's docs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Decoded {
@@ -171,9 +171,9 @@ pub struct Undecodable;
 ///
 /// Reachable outside `cluster::sketch` only because
 /// [`crate::wire::Msg::AeSketch`]'s peer needs the same construction on the
-/// initiator's side; `tests/sim.rs` re-exports it as `crate::Iblt` under
+/// initiator's side; `tests/sim/` re-exports it as `crate::Iblt` under
 /// `feature = "sim"` to build and peel its own comparison sketch, the same
-/// way `net::conn::serve_ae_digest` does on the responder's side.
+/// way `net::conn::serve::serve_ae_digest` does on the responder's side.
 #[derive(Debug, Clone)]
 pub struct Iblt {
     cells: Vec<Cell>,

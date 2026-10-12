@@ -231,7 +231,7 @@ impl RequestHandler for ClusterRequestHandler {
         _buckets: Vec<BucketDigest>,
     ) -> BoxFuture<'_, AeServeOutcome<Vec<BucketDigest>>> {
         // The requester's buckets only matter once its epoch is confirmed
-        // current; `conn::serve_ae_digest_scoped` classifies them.
+        // current; `conn::serve::serve_ae_digest_scoped` classifies them.
         Box::pin(async move {
             match self.matching_view(&cache, view_hash) {
                 Ok(shard) => AeServeOutcome::Digests(shard.digests().await),

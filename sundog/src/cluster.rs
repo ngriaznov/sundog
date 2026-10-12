@@ -120,7 +120,7 @@ struct ClusterInner {
     /// list. `open()` waits briefly for a first peer only when this is
     /// `true` and `Cluster::peers` is still empty; a seedless cluster is a
     /// legitimate one-node cluster, not a membership race to wait out. See
-    /// `cache::should_await_first_peer`.
+    /// `cache::open::should_await_first_peer`.
     has_seeds: bool,
     mesh: Mesh,
     shards: ShardRegistry,

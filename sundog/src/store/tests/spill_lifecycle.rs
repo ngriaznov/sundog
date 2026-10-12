@@ -430,7 +430,7 @@ async fn a_deleted_spilled_key_never_resurrects_across_a_checkpointed_reopen() {
     );
 
     // Deleted while still spilled: a delete never rewrites the on-disk
-    // region bytes (see `engine::apply_tombstone`), so a scan-based
+    // region bytes (see `engine::apply::apply_tombstone`), so a scan-based
     // reopen would still find them.
     shard1.remove(&key).await.expect("remove the spilled key");
 
