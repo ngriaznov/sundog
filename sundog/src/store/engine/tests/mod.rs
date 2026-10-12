@@ -6,8 +6,11 @@ use std::time::Duration;
 use super::apply::prefetch_spilled_conflict_bytes;
 use super::apply::{ApplyCtx, EntryKey, apply_locked};
 use super::expiry::{MAX_INLINE_TTL_MS, NEVER_EXPIRES, lapse_cause};
+use super::inflight::fill_supersedes;
 use super::prefold::BatchEntry;
-use super::record::{ENTRY_OVERHEAD_BYTES, build_key_only_record, split_record};
+use super::record::{
+    ENTRY_OVERHEAD_BYTES, build_key_only_record, decode_value, record_value, split_record,
+};
 use super::*;
 use crate::explain::{Lapse, LocalRecord};
 use crate::hlc::HlcClock;
