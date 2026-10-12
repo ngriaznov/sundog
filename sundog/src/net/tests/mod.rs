@@ -10,6 +10,7 @@ use futures::SinkExt as _;
 use super::*;
 use crate::error::CodecError;
 use crate::hlc::Hlc;
+use crate::membership::Peer;
 use crate::node::NodeName;
 use crate::store::PartMask;
 use crate::store::{BucketDigest, BucketLen, BucketPart, BucketPartDigests, KeyVersion};
