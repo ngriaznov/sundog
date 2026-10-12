@@ -24,6 +24,8 @@ use tokio::sync::watch;
 
 use super::*;
 use crate::cache::load::{LoadTarget, load_target};
+use crate::cache::open::{DistributedContext, trust_sole_owner_at_open};
+use crate::cache::reconcile::reconcile_warm_buckets;
 use crate::cluster::test_support::wait_until;
 use crate::cluster::{Cluster, anti_entropy};
 use crate::config::ClusterConfig;
@@ -31,8 +33,8 @@ use crate::explain::{
     LocalRead, LocalRecord, OwnerProbe, ProbeAnswer, Reads, ServeVerdict, Unreached,
 };
 use crate::ownership::OwnershipView;
-use crate::store::bucket_of;
 use crate::store::crdt::{PnCounter, PnCounterResolver};
+use crate::store::{bucket_of, now_ms};
 use crate::wire::WireRecord;
 
 fn loopback_config() -> ClusterConfig {
