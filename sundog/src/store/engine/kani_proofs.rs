@@ -5,6 +5,7 @@ use super::expiry::{
     touch_stamp,
 };
 use super::keys::{digest_slot, part_index_from_hash, stripe_index_from_hash};
+use super::merge::{MergedVersion, merge_decision, mint_stamp};
 use super::*;
 
 fn any_hlc() -> Hlc {

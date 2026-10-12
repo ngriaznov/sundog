@@ -8,7 +8,8 @@ use super::*;
 use crate::explain::Lapse;
 use crate::hlc::HlcClock;
 use crate::node::NodeId;
-use crate::store::LwwResolver;
+use crate::store::{LwwResolver, Merged, RecordView, Winner};
+use xxhash_rust::xxh3::xxh3_64;
 
 fn engine_u32_string(max_capacity: u64, tti: Option<Duration>) -> Engine<u32, String> {
     Engine::new(max_capacity, tti, None, None)

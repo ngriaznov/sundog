@@ -2,6 +2,7 @@
 
 use proptest::prelude::*;
 
+use super::super::merge::{MergedVersion, merge_version, mint_stamp};
 use super::*;
 
 /// A real single-writer stamp: `wall_ms`/`logical` unconstrained,
