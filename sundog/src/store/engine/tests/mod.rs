@@ -13,7 +13,7 @@ use crate::explain::{Lapse, LocalRecord};
 use crate::hlc::HlcClock;
 use crate::node::NodeId;
 use crate::store::{
-    BucketPart, Incoming, KeyVersion, LwwResolver, Merged, RecordView, Ttl, Winner,
+    BucketPart, Incoming, KeyVersion, LwwResolver, Merged, PartId, RecordView, Ttl, Winner,
 };
 use xxhash_rust::xxh3::xxh3_64;
 
