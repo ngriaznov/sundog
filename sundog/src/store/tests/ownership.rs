@@ -1,6 +1,7 @@
 //! Ownership views, per-part residency and the scoped digests a shard answers under them.
 
 use super::*;
+use crate::store::shard_ops::MaskedDigest;
 
 /// [`distributed_shard`] under a part-granular view.
 fn part_distributed_shard(
