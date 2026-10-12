@@ -990,10 +990,11 @@ mod tests {
 
     use super::*;
 
-    const OWNER_LINE: &str = include_str!("../tests/fixtures/explain/owner.json");
-    const NON_OWNER_LINE: &str = include_str!("../tests/fixtures/explain/non_owner.json");
-    const CRASHED_OWNER_LINE: &str = include_str!("../tests/fixtures/explain/crashed_owner.json");
-    const LAPSED_STALE_LINE: &str = include_str!("../tests/fixtures/explain/lapsed_stale.json");
+    const OWNER_LINE: &str = include_str!("../../tests/fixtures/explain/owner.json");
+    const NON_OWNER_LINE: &str = include_str!("../../tests/fixtures/explain/non_owner.json");
+    const CRASHED_OWNER_LINE: &str =
+        include_str!("../../tests/fixtures/explain/crashed_owner.json");
+    const LAPSED_STALE_LINE: &str = include_str!("../../tests/fixtures/explain/lapsed_stale.json");
 
     const A: &str = "6f3ac1e29d54b807";
     const B: &str = "c40d9e7a15f2338b";
