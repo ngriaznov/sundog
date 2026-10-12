@@ -1,7 +1,10 @@
 //! Kani proofs over the spill tier's sizing arithmetic.
 
+use super::open::snapshot_loc_end;
 use super::record::split_record;
-use super::rules::{FLUSH_QUEUE_CAPACITY, FLUSH_QUEUE_SLOTS_MAX, record_fits};
+use super::rules::{
+    FLUSH_QUEUE_CAPACITY, FLUSH_QUEUE_SLOTS_MAX, flush_queue_slots, record_fits, region_count_for,
+};
 use super::*;
 
 /// Any capacity and region size give at least one region without panicking.
