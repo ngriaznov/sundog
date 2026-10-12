@@ -29,6 +29,9 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all --check
 
+      - name: No Rust file over 2,000 lines
+        run: git ls-files -z '*.rs' | xargs -0 wc -l | awk '$2 != "total" && $1 > 2000 {print; bad=1} END {exit bad}'
+
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings -W clippy::pedantic
 
