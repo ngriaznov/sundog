@@ -1,6 +1,7 @@
 //! Unit tests for [`Shard`](super::Shard) and the store's pure functions, grouped by topic.
 
 use std::collections::HashMap;
+use std::num::NonZeroU8;
 
 use rand::{RngExt as _, SeedableRng as _, rngs::StdRng};
 use tokio::sync::watch;
