@@ -47,7 +47,7 @@
 //! no peers, isolating per-apply CPU cost from all network/AE noise. No
 //! key ever expires or is removed in any scenario, since TTL is
 //! irrelevant here. Every numeric field is the median of at least
-//! [`repetitions`] independent runs, so a single noisy run never skews a
+//! [`support::repetitions`] independent runs, so a single noisy run never skews a
 //! reported number.
 //!
 //! Scenarios 9-12 isolate a merging resolver's two write-path levers

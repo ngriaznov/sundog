@@ -162,7 +162,7 @@ async fn run_churn_writer_round(
 /// 30-second-floor ticks (`(crdt_retire_after / 4).max(30s)`,
 /// `crdt_compact_task`, `sundog/src/cluster.rs`). That fixed floor, not
 /// `CHURN_COUNTERS` or `CHURN_REPLACEMENTS`, dominates this scenario's
-/// wall-clock cost, so unlike every scenario above it this one reports a
+/// wall-clock cost, so unlike every other scenario this one reports a
 /// single run rather than a median over [`repetitions`].
 ///
 /// Reports one counter's encoded record size (`PnCounter::encode().len()`),

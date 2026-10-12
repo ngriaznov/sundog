@@ -2,7 +2,7 @@
 //! `store::Shard`/`ShardOps` directly inside a `turmoil` simulation, against
 //! a hand-scripted membership feed built from `Peer` values, with no real
 //! UDP or TCP. `cluster.rs`'s composition is `pub(crate)` and unusable from
-//! here, so this file reimplements the relevant slice against the same
+//! here, so this suite reimplements the relevant slice against the same
 //! public `Mesh`/`ShardOps` surface `cluster.rs` itself drives.
 //!
 //! `turmoil`'s simulated TCP objects must be created and driven from within

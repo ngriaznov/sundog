@@ -344,7 +344,7 @@ pub(super) fn run_partition_heal(cfg: HealConfig) -> HealMetrics {
         .max(ClusterConfig::default().outbox_capacity);
     let ae_rounds = Arc::new(AtomicU64::new(0));
 
-    // Zero message latency, unlike every other scenario in this file: with
+    // Zero message latency, unlike every other scenario in the suite: with
     // it at the usual few milliseconds, the exact number of rounds counted
     // before convergence is detected depends on how many random-latency
     // draws a run's own frame count consumes -- itself a function of key

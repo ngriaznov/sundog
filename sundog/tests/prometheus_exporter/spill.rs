@@ -35,7 +35,7 @@ fn fresh_spill_dir(label: &str) -> std::path::PathBuf {
 /// Runs inside `metrics_endpoint_serves_sundog_metrics_after_cache_ops`
 /// rather than as its own `#[tokio::test]`, for the same reason
 /// `seed_sketch_mismatch`/`seed_part_mismatch`/`count_hits_and_misses`
-/// above do: a cache's `hits`/`misses`-style `metrics::Counter` handles
+/// in `seeds` and `pins` do: a cache's `hits`/`misses`-style `metrics::Counter` handles
 /// bind to whichever recorder is installed at the moment
 /// `Shard::new`/`Shard::attach_spill` calls `metrics::counter!`, not
 /// whatever gets installed later. Only the one test in this binary that
@@ -189,7 +189,7 @@ pub(crate) async fn spill_writes_and_promotes_pin_metrics(
 /// `no_snapshot` (never closed), `config_mismatch` (`region_bytes`
 /// changed), `downtime_exceeded` (past `tombstone_ttl`), and `bad_region`
 /// (a truncated region file). `reason="disabled"` is pinned off the
-/// `"spilled"` cache's first open elsewhere in this file;
+/// `"spilled"` cache's first open in `main.rs`;
 /// `reason="stale_snapshot"` is pinned at the unit level, since forging a
 /// snapshot with a wrong `format_version` has no legitimate construction
 /// here.

@@ -186,7 +186,7 @@ async fn replicated_cluster_serves_spilled_entries_and_settles_without_repair_lo
     // Quiescence check: with nothing left to reconcile, `sundog_ae_repaired_
     // total` must not move across several further anti-entropy intervals. A
     // bounded poll cannot express "nothing happens for a while", so these
-    // two fixed windows are a deliberate exception to this file's own
+    // two fixed windows are a deliberate exception to this suite's own
     // bounded-poll rule. sundog-testnode's `ae_interval` is 2s; two 6s
     // windows span three rounds each. Each node's repair count travels as a
     // `(a, b)` pair rather than four similarly-named bindings.

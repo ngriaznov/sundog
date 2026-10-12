@@ -105,7 +105,7 @@ pub(crate) fn node_config(gossip_bind_addr: SocketAddr) -> sundog::ClusterConfig
         // `crdt_compact_task` ticks at `(crdt_retire_after / 4).max(30s)`;
         // shrinking `crdt_retire_after` well under 120s pins that cadence to
         // its 30s floor instead of the default's six hours. No cache opened
-        // in this file besides `seed_crdt_compaction_metrics`'s `counters`
+        // in this binary besides `seed_crdt_compaction_metrics`'s `counters`
         // ever merges, so this is otherwise inert.
         c.crdt_retire_after = Duration::from_secs(1);
     })

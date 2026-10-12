@@ -339,7 +339,7 @@ async fn bulk_fill_replicates_without_anti_entropy_duplicating_it() {
 /// Scrapes `node`'s `/metrics` and reads one `metric{label}` value, `0` if
 /// the scrape fails or the series has never been touched (a metric with no
 /// writes yet is absent from the exposition, not printed as zero). Every
-/// `sundog_spill_*`/`sundog_ae_repaired_total` series this file reads is an
+/// `sundog_spill_*`/`sundog_ae_repaired_total` series this suite reads is an
 /// exact-integer count, so rounding it to `u64` here sidesteps
 /// `clippy::float_cmp` entirely: every comparison below compares `u64`s,
 /// never `f64`s, mirroring `tests/spill_bench.rs`'s `metric_count`.

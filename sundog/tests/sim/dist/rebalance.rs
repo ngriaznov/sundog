@@ -182,7 +182,7 @@ fn rebalance_under_churn(granularity: Granularity) {
     // Phase 3: let every disown grace fully elapse. `ResidencySet`'s grace
     // clock is stamped from real `Instant::now()`, not turmoil's virtual
     // clock (matching tombstone retention's own real-time deadline
-    // elsewhere in this file), so real time, not simulated steps, must
+    // elsewhere in the suite), so real time, not simulated steps, must
     // pass before a rebalance tick has anything to release; the
     // ticks themselves then need simulated time. Both are repeated until
     // no node has a bucket left mid grace, bounded, since a bounced

@@ -26,7 +26,7 @@ pub(crate) fn sim_seed(default: u64) -> u64 {
 }
 
 const CACHE: &str = "sim-users";
-/// Simulated time per `Sim::step()`, small relative to every interval below.
+/// Simulated time per `Sim::step()`, small relative to every interval in the suite.
 pub(crate) const TICK: Duration = Duration::from_millis(5);
 /// Bounds every request/response network call in this harness. Turmoil's
 /// `fail_rate` drops a message outright with no retransmission, so a
@@ -47,8 +47,8 @@ pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     futures::executor::block_on(fut)
 }
 
-/// [`KeyVersion`]s to this file's own `(key, version)` tuple shape, at the
-/// boundary where a [`ShardOps`]/[`AeMismatch`] result meets this file's
+/// [`KeyVersion`]s to this suite's own `(key, version)` tuple shape, at the
+/// boundary where a [`ShardOps`]/[`AeMismatch`] result meets this suite's
 /// tuple-based classification helpers, reimplementing
 /// `cluster::anti_entropy`'s own such boundary.
 pub(crate) fn kv_to_tuples(entries: Vec<KeyVersion>) -> Vec<(Bytes, Hlc)> {

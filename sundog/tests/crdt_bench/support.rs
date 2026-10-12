@@ -90,7 +90,7 @@ pub(crate) async fn local_cluster(name: &str) -> Cluster {
 
 /// A synthetic, fixed-incarnation writer identity for a benchmark's own
 /// simulated writer index `id`. Every scenario before the churn scenario at
-/// the end of this file assigns each concurrent writer a distinct `NodeId`
+/// the end of the suite assigns each concurrent writer a distinct `NodeId`
 /// that is never a real cluster member and never restarts, so pairing it
 /// with a fixed incarnation of `1` is exact, not an approximation: none of
 /// those scenarios runs anywhere near the compaction sweep's own
@@ -252,7 +252,7 @@ pub(crate) fn median_field_u64<T>(items: &[T], f: impl Fn(&T) -> u64) -> u64 {
 // already stored publishes nothing, per `merge_version`'s own no-op arm, so
 // this is the one public-API signal for how many times the engine
 // applied, the "engine applies" field on
-// every `BENCH` line below. Runs until the cache's sender side drops (the
+// every `BENCH` line. Runs until the cache's sender side drops (the
 // cache closes) or the caller aborts the returned handle; a lagged receiver
 // (the counting task falling behind the publish rate) adds the lagged count
 // rather than losing it, so a slow poll still reports the true total.

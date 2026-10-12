@@ -7,14 +7,14 @@
 //
 // `OwnershipTracker`, `OwnershipView`, `ResidencySet`,
 // `ownership::ownership_diff`, `Shard::with_ownership`, and a shard's
-// fan-out queue are all `pub(crate)`; the pieces this file needs are
+// fan-out queue are all `pub(crate)`; the pieces these scenarios need are
 // re-exported under the `sim` feature the same way `cluster::anti_entropy`'s
-// pieces are above: `sundog::{OwnershipTracker, OwnershipView,
+// pieces are in `ae_round`: `sundog::{OwnershipTracker, OwnershipView,
 // ResidencySet, ownership_diff}`, `Shard::with_ownership_for_sim`,
 // `Shard::drain_fan_out_for_sim`, and `store::SimFanOut`.
 //
-// Ownership itself is driven the same way membership already is in this
-// file: hand-scripted from the test, via each node's own
+// Ownership itself is driven the same way membership already is in the
+// suite: hand-scripted from the test, via each node's own
 // `watch::Sender<Arc<OwnershipView>>`, rather than through a live
 // `refresh_task`/gossip loop this harness has no chitchat layer to run.
 // `republish_view` mirrors `cluster::rebalance::rebalance_task`'s own
@@ -22,7 +22,7 @@
 // newly regained ones, so residency behaves exactly as it does in
 // production. Bucket transfer to a newly owning node goes through the same
 // self-healing anti-entropy backstop `cluster::rebalance`'s own doc calls
-// out, `ae_round_with_sketch` above, rather than an eager
+// out, `ae_round_with_sketch` (in `ae_round`), rather than an eager
 // `Mesh::request_buckets` pull (`pub(crate)`, out of reach here): once a
 // gained bucket starts appearing in the new owner's own `ShardOps::digests`,
 // the previous owner's own round shows a mismatch and the ordinary push
@@ -208,7 +208,7 @@ fn send_to_owners(mesh: &Mesh, view: &OwnershipView, self_node: NodeId, rec: &Wi
 
 /// Drains the shard's fan-out queue: an `Applied` item re-fetches its
 /// current record via `ShardOps::records_for`, exactly as `Replicated`
-/// mode's own [`fan_out`] helper above does, and is sent once (a lost send
+/// mode's own [`fan_out`] helper in `handler` does, and is sent once (a lost send
 /// still self-heals via anti-entropy, since the writing owner keeps its
 /// own copy to push again next round); a `Forward` item already carries
 /// its record, since a non-owner write is never applied to `engine` in the
@@ -419,7 +419,7 @@ async fn dist_node_loop(
 
 /// Whether every live node's local content is contained in its own current
 /// owned (and, when `allow_releasing`, also releasing) bucket set. Shared by
-/// the churn and non-owner-property scenarios below.
+/// the churn and non-owner-property scenarios in `rebalance` and `guards`.
 fn assert_holds_only_owned_or_releasing(
     label: &str,
     nodes: &[DistNode],
@@ -449,7 +449,7 @@ fn assert_holds_only_owned_or_releasing(
 /// currently owns its bucket: the data-safety convergence signal churn
 /// scenarios wait on, since distinct nodes legitimately hold different
 /// buckets and a plain digest-equality check (as the replicated-mode
-/// scenarios above use) does not apply.
+/// scenarios elsewhere in the suite use) does not apply.
 fn dist_data_settled(nodes: &[DistNode], expected: &HashSet<u32>) -> bool {
     expected.iter().all(|&key| {
         let part = part_of_u32(key);

@@ -230,7 +230,7 @@ pub(crate) async fn seed_crdt_compaction_metrics(cluster: &Cluster, metrics_addr
     .await;
 
     // `crdt_compact_task` ticks at most every 30s (its own cadence floor,
-    // see `node_config`'s comment above). Give the next real tick after the
+    // see the comment in `node_config`). Give the next real tick after the
     // incarnation mismatch above becomes visible ample room to land.
     common::eventually(Duration::from_secs(120), || async {
         scrape_metrics(metrics_addr).await.is_some_and(|body| {

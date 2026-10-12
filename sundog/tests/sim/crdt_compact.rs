@@ -27,8 +27,8 @@ use turmoil::{Builder, Sim};
 // real cluster calls them
 // (`cluster.rs::crdt_writer_is_retirement_eligible`/`crdt_cache_is_quiet`)
 // are `pub(crate)` and unreachable from an integration test, so -- exactly
-// as this file already reimplements `cluster::rebalance`'s reaction to a
-// membership change in `republish_view` above -- this section reimplements
+// as `dist` already reimplements `cluster::rebalance`'s reaction to a
+// membership change in `republish_view` -- this section reimplements
 // that eligibility rule directly against a hand-scripted membership
 // timeline. `now_ms` is read from [`turmoil::Sim::elapsed`], so a "short
 // `crdt_retire_after`" means short virtual time, not real wall-clock time.
@@ -94,7 +94,7 @@ fn elapsed_ms(sim: &Sim<'_>) -> u64 {
 /// `local`, which never retires its own slot) and `quiet` from
 /// [`crdt_cache_is_quiet`], then drives [`ShardOps::compact_pass`] directly
 /// from the test thread -- the same "drive the production task's own logic
-/// by hand" idiom [`republish_view`] already uses for rebalance above.
+/// by hand" idiom [`republish_view`] already uses for rebalance in `dist`.
 fn run_compact_tick<S: ShardOps>(
     shard: &S,
     local: NodeId,
@@ -127,7 +127,7 @@ fn run_compact_tick<S: ShardOps>(
 /// -- every write and every compaction sweep in these scenarios is driven
 /// directly from the test thread against the very same `Arc<Shard<..>>`
 /// this loop shares, exactly as [`run_partition_heal`]'s own `write_side`
-/// does against [`HealNode`] above. `incarnation` is read once per
+/// does against [`HealNode`] in `heal`. `incarnation` is read once per
 /// (re)spawn, so [`Sim::bounce`] re-running this host's closure after the
 /// test driver bumps it is what gives a restarted node a fresh membership
 /// incarnation, mirroring how, in production, `Cluster::local_incarnation`
@@ -222,7 +222,7 @@ where
 #[allow(
     clippy::too_many_lines,
     reason = "one scenario's full churn schedule and assertions read best kept together, \
-              mirroring distributed_rebalance_under_churn's own allow above"
+              mirroring distributed_rebalance_under_churn's own allow in dist::rebalance"
 )]
 fn crdt_compaction_pncounter_churn_and_restart_retires_and_folds_exactly() {
     const PORT: u16 = 5210;

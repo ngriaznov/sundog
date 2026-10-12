@@ -658,8 +658,8 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         // sundog_spill_wait_timeouts_total: pinned at the unit level
         // (spill.rs) via `pause_flusher`, unreachable here. This tiny
         // scenario never saturates its flush queue, so the series is
-        // correctly never registered; reserve_timeout_pin_metric below
-        // pins a genuine nonzero count instead.
+        // correctly never registered; reserve_timeout_pin_metric pins
+        // a genuine nonzero count instead.
         assert_eq!(
             scraped_metric_value(
                 &body,
@@ -709,7 +709,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
          body:\n{body}"
     );
 
-    // `users` warmed during `seed_sketch_mismatch` above: `is_ready()` and
+    // `users` warmed during `seed_sketch_mismatch`: `is_ready()` and
     // `/readyz` on the same listener must both already agree.
     assert!(cluster.is_ready(), "the open Replicated caches are warm");
     let readyz_status = scrape_status(metrics_addr, "/readyz")

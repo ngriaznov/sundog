@@ -101,8 +101,7 @@ fn heal_sim_full() -> bool {
     std::env::var("SUNDOG_SIM_FULL").is_ok_and(|v| v == "1")
 }
 
-/// One partition-heal scenario's full parameterization; see the module doc
-/// comment above [`run_partition_heal`] for what each field drives.
+/// One partition-heal scenario's full parameterization; see [`run_partition_heal`] for what each field drives.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct HealConfig {
     seed: u64,
