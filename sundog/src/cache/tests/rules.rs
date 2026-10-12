@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::cache::fetch::{decode_live_value, record_reads};
+use crate::cache::open::should_await_first_peer;
 use crate::cache::reconcile::{
     RECONCILE_MAX_ROUNDS, ReconcileBudget, retry_delay, should_keep_reconciling, split_round_result,
 };
