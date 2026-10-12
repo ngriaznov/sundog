@@ -1,4 +1,4 @@
-//! Tests for the entry layout: `Live`, `Record` building and splitting, key and value decoding and capacity hints.
+//! Tests for the entry layout: `Live`, `Record` construction, key and value decoding and capacity hints.
 
 use super::*;
 

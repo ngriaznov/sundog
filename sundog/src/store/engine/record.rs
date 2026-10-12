@@ -1,4 +1,4 @@
-//! The `Record` byte buffer of a live entry and the helpers that build, split, decode and account for it.
+//! The `Record` byte buffer of a live entry and the helpers that build, decode and account for it and read its key and value halves.
 
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
