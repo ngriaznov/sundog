@@ -384,7 +384,7 @@ where
     }
 
     /// Test-only mirror of [`Shard::with_ownership`], reachable from
-    /// `tests/sim.rs`, which lives outside this crate and cannot otherwise
+    /// `tests/sim/`, which lives outside this crate and cannot otherwise
     /// reach a `pub(crate)` builder method. Never call this outside the sim
     /// harness.
     #[cfg(feature = "sim")]
@@ -401,7 +401,7 @@ where
     /// Test-only mirror of [`Shard::fan_out_queue`]'s drain, translating
     /// each [`FanOutItem`] into the sim-visible [`SimFanOut`] shape so the
     /// harness never needs `FanOutItem`/`FanOutQueue` themselves made
-    /// reachable. Reachable from `tests/sim.rs` for the same reason as
+    /// reachable. Reachable from `tests/sim/` for the same reason as
     /// [`Shard::with_ownership_for_sim`].
     #[cfg(feature = "sim")]
     #[doc(hidden)]

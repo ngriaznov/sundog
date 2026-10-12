@@ -4,7 +4,7 @@ use super::*;
 
 #[tokio::test]
 async fn long_key_round_trips_through_the_heap_encoding_path() {
-    // Longer than engine::KEY_STACK_BUF (128 bytes) once postcard-encoded,
+    // Longer than engine::keys::KEY_STACK_BUF (128 bytes) once postcard-encoded,
     // so both the write and the read fall back to a heap allocation.
     let s = shard::<String, String>(1);
     let key = "k".repeat(200);

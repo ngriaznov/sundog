@@ -163,7 +163,7 @@ async fn insert_chunks(cache: &Cache<u32, String>, entries: u32, chunk: u32) {
 /// installed lazily on first use and shared by every benchmark that runs
 /// after it. `None` if this process somehow lost the race for the slot
 /// (never expected for a single-purpose test binary, but tolerated the way
-/// `tests/prometheus_exporter.rs` tolerates it): every metric read below
+/// `tests/prometheus_exporter/` tolerates it): every metric read below
 /// then reads back as zero instead of panicking.
 static METRICS_HANDLE: OnceLock<Option<PrometheusHandle>> = OnceLock::new();
 
@@ -175,7 +175,7 @@ fn metrics_handle() -> Option<&'static PrometheusHandle> {
 
 /// Finds `metric{label1="value1",...} <number>` in Prometheus
 /// text-exposition `body`, tolerant of label ordering and
-/// integer-vs-float rendering. Mirrors `tests/prometheus_exporter.rs`'s own
+/// integer-vs-float rendering. Mirrors the `tests/prometheus_exporter/` suite's own
 /// `scraped_metric_value`, kept local since integration test binaries don't
 /// share code beyond `mod common`.
 fn scraped_metric(body: &str, metric: &str, labels: &[(&str, &str)]) -> Option<f64> {

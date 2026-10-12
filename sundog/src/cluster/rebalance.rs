@@ -407,7 +407,7 @@ pub(crate) struct PullRequest<'a> {
     /// `true` for every routine call, where the ownership view is the
     /// library's normal live-updating one.
     ///
-    /// For `Cache::open`'s initial pull, `crate::cache::trust_sole_owner_at_open`
+    /// For `Cache::open`'s initial pull, `crate::cache::open::trust_sole_owner_at_open`
     /// computes this: a cold open passes `true` regardless, since a
     /// sole-owned part there is this node's own data. A warm
     /// reopen whose membership wait timed out passes `false`, since "no

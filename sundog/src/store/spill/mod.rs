@@ -85,7 +85,7 @@ const HEADER_LEN: usize = size_of::<SpillRecordHeader>();
 /// stamped with the region's generation at write time. A read whose region
 /// generation has since moved on treats the record as gone. `Hash` lets a
 /// caller key a prefetched-bytes map by location, e.g.
-/// `engine::prefetch_spilled_conflict_bytes`.
+/// `engine::apply::prefetch_spilled_conflict_bytes`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct SpillLoc {
     pub(crate) region: u32,

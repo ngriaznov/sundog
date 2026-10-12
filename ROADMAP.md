@@ -117,12 +117,12 @@ peer the way a join does.
 ### Owner-side atomic update
 
 `Cache::merge` combines values that commute. Everything else that needs
-read-modify-write does a get and an insert, and a test in `cluster.rs`
-documents that this loses updates under last-write-wins. In `Distributed`
-mode a non-owner's write already forwards to the owners, so an
-`update_with` closure forwards the same way and runs on the owner under the
-stripe lock: compare-and-set, insert-if-absent and increments without a
-resolver. A wire change with the usual bump.
+read-modify-write does a get and an insert, and a test in
+`cluster/tests/resolvers.rs` documents that this loses updates under
+last-write-wins. In `Distributed` mode a non-owner's write already forwards to
+the owners, so an `update_with` closure forwards the same way and runs on the
+owner under the stripe lock: compare-and-set, insert-if-absent and increments
+without a resolver. A wire change with the usual bump.
 
 ### Admission by frequency
 

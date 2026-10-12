@@ -32,7 +32,7 @@ const READY_LOG: &str = "testnode-ready";
 /// process died.
 const CRASH_WAIT: Duration = Duration::from_secs(30);
 
-/// Gate for `tests/containers.rs`: `false` unless `SUNDOG_CONTAINER_TESTS=1`,
+/// Gate for `tests/containers/`: `false` unless `SUNDOG_CONTAINER_TESTS=1`,
 /// so a plain `cargo test --workspace` stays hermetic.
 #[must_use]
 pub fn container_tests_enabled() -> bool {

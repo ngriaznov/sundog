@@ -656,7 +656,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
              resolves; got body:\n{body}"
         );
         // sundog_spill_wait_timeouts_total: pinned at the unit level
-        // (spill.rs) via `pause_flusher`, unreachable here. This tiny
+        // (`store::spill`) via `pause_flusher`, unreachable here. This tiny
         // scenario never saturates its flush queue, so the series is
         // correctly never registered; reserve_timeout_pin_metric pins
         // a genuine nonzero count instead.
@@ -701,7 +701,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     // sundog_fan_out_wait_seconds_total{peer}: only bumps when a
     // per-peer outbox stays full past a whole deadline slice; every real
     // peer here drains loopback traffic far faster than that, so this
-    // series is correctly never registered. net/mod.rs's own unit tests
+    // series is correctly never registered. `net/tests/fan_out.rs`
     // pin the actual increment against an outbox held full by construction.
     assert!(
         !body.contains("sundog_fan_out_wait_seconds_total"),

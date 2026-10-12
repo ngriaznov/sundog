@@ -214,7 +214,7 @@ pub(crate) enum FanOutItem<K> {
     Forward(WireRecord),
 }
 
-/// Sim-only mirror of [`FanOutItem`], reachable from `tests/sim.rs` under
+/// Sim-only mirror of [`FanOutItem`], reachable from `tests/sim/` under
 /// the `sim` feature since `FanOutItem` itself is not; see
 /// [`Shard::drain_fan_out_for_sim`].
 #[cfg(feature = "sim")]

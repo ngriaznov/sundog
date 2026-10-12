@@ -2,7 +2,7 @@
 //! (`SpillTier::reserve`/`Reservation`) through the public API only: a
 //! bulk `insert_many` over a deliberately tiny flush queue drops nothing.
 //! `pause_flusher`/`resume_flusher` are `pub(crate)` test-only hooks used
-//! by `spill.rs`'s unit tests and unreachable here, so this drives a real
+//! by `store::spill`'s unit tests and unreachable here, so this drives a real
 //! `Cluster` and on-disk `SpillTier` and saturates the admission
 //! semaphore against real disk and channel throughput instead.
 //!

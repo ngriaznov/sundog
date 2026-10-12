@@ -176,7 +176,7 @@ pub enum RoundOutcome {
 /// [`ShardOps::ownership_view_hash`] for the epoch check; a `Stale` reply
 /// ends the round at once, counted in `sundog_stale_view_total`.
 ///
-/// Takes `mesh` directly, not a whole `&Cluster`: `tests/sim.rs` drives
+/// Takes `mesh` directly, not a whole `&Cluster`: `tests/sim/` drives
 /// this same seam under `feature = "sim"` against a hand-built
 /// `Mesh`/`ShardOps` pair, skipping a real `Cluster`'s gossip and discovery.
 #[tracing::instrument(skip_all, fields(cache = %cache, peer = %peer))]
@@ -1106,7 +1106,7 @@ fn peel_sketch_into(
 /// a misbehaving peer sends, treats any index either side lacks as mismatched
 /// rather than panicking or silently skipping it.
 ///
-/// Reachable outside `cluster::anti_entropy` only because `tests/sim.rs`
+/// Reachable outside `cluster::anti_entropy` only because `tests/sim/`
 /// re-exports it as `crate::mismatched_parts` under `feature = "sim"`, to
 /// classify a peer's `AeMismatch::PartDigests` reply the same way
 /// `run_round_against` does here, without duplicating this comparison.
@@ -1202,7 +1202,7 @@ fn diff_bucket(
 /// resolves its hash back to `local_entries` first, to queue the actual key
 /// bytes.
 ///
-/// Reachable outside `cluster::anti_entropy` only because `tests/sim.rs`
+/// Reachable outside `cluster::anti_entropy` only because `tests/sim/`
 /// re-exports it as `crate::diff_decoded` under `feature = "sim"`, to
 /// reconcile a peeled sketch the same way `handle_sketch_mismatch` does
 /// here, without duplicating this classification.

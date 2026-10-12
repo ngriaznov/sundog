@@ -38,7 +38,7 @@ mod spill_lifecycle;
 /// `Shard`-layer coverage of the spill read path: every method here
 /// goes through a real [`crate::store::spill::SpillTier`] and its
 /// dedicated flusher thread, never a synthetic engine-level shortcut, so
-/// I/O tests are gated like `spill.rs`'s own.
+/// I/O tests are gated like `store::spill`'s own.
 #[cfg(all(feature = "spill", not(feature = "sim")))]
 mod spill_reads;
 mod ttl;
@@ -187,7 +187,7 @@ impl ConflictResolver for AlwaysA {
 /// A resolver whose `merge` always claims to have folded both sides into
 /// fixed bytes, regardless of whether those bytes decode as the shard's
 /// value type, and whose `winner` falls back to plain `Hlc` order, like
-/// `LwwResolver`. `resolve_conflict` itself is private to `engine.rs`, so
+/// `LwwResolver`. `resolve_conflict` itself is private to `engine/merge.rs`, so
 /// this is how its engine-enforced value-presence guard and
 /// decode-failure rejection get exercised from out here, through the
 /// public `Shard`/`ShardOps` surface only.

@@ -501,7 +501,7 @@ where
     pending_merges: Box<[StdMutex<PendingMergeStripe<K, V>>]>,
     /// Notified whenever [`Shard::merge`] opens a fresh coalescing window
     /// (a key with nothing already pending), so
-    /// `crate::cache::merge_coalesce_task`'s sweep can recompute its
+    /// `crate::cache::tasks::merge_coalesce_task`'s sweep can recompute its
     /// sleep-until instead of parking past a deadline that did not exist
     /// yet when it last checked.
     merge_wake: Notify,

@@ -113,7 +113,7 @@ pub enum Origin {
     /// contributors' `NodeId`s are folded into the stored content but never
     /// surface on the event stream. This is an accepted cost of folding a
     /// batch's own same-key records together before the stripe lock (see
-    /// `engine::prefold_batch`), not a bug: the alternative is one event
+    /// `engine::prefold::prefold_batch`), not a bug: the alternative is one event
     /// per contributing record, which is what pre-fold exists to avoid.
     Remote(NodeId),
 }

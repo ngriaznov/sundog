@@ -53,7 +53,8 @@
 //! Scenarios 9-12 isolate a merging resolver's two write-path levers
 //! through the real `CacheBuilder::prefold_enabled` and
 //! `merge_coalesce_window` toggles rather than approximating either: Lever
-//! A (`Engine::apply_many`'s batch pre-fold, `sundog/src/store/engine.rs`)
+//! A (`Engine::apply_many`'s batch pre-fold, `sundog/src/store/engine/apply.rs`
+//! and `engine/prefold.rs`)
 //! in scenarios 9 and 10, Lever B (`Cache::merge`'s coalescing window) in
 //! scenarios 11 and 12. All four report "engine applies" as
 //! `Cache::events()`'s own count: one event per non-no-op apply, the only

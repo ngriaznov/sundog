@@ -113,7 +113,7 @@ pub(crate) fn node_config(gossip_bind_addr: SocketAddr) -> sundog::ClusterConfig
 
 /// The anti-entropy bucket a `u32` key hashes into, mirroring
 /// `store::stripe_index_from_hash`'s formula; `cluster.rs`'s and
-/// `tests/sim.rs`'s own tests carry the identical helper for the same
+/// the `tests/sim/` suite's own tests carry the identical helper for the same
 /// reason.
 fn bucket_of(key: u32) -> u16 {
     let bytes = postcard::to_stdvec(&key).expect("u32 key encodes");

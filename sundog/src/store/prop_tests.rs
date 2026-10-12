@@ -1019,7 +1019,7 @@ proptest! {
 /// the lesser side. A single call processes every pair exactly once.
 ///
 /// This converges the whole set in that one pass, not merely each pair in
-/// isolation: `engine::merge_version`'s doc proves any two replicas that
+/// isolation: `engine::merge::merge_version`'s doc proves any two replicas that
 /// trade records this way land on an identical `(version, bytes)` pair in
 /// one exchange regardless of which arm fires (the content merge and the
 /// `wall_ms`/`logical` max are both symmetric in the two inputs, and the
@@ -1058,7 +1058,7 @@ proptest! {
     /// through exactly one [`bidirectional_gossip_pass`] instead of a
     /// bounded loop of unidirectional rounds. Every pair of shards must hold
     /// an identical `(version, bytes)` pair after that one pass, the
-    /// one-round convergence property `engine::merge_version`'s doc proves
+    /// one-round convergence property `engine::merge::merge_version`'s doc proves
     /// for a symmetric bidirectional exchange, and that shared value must
     /// be the exact sum of every generated increment, with no lost updates.
     #[test]

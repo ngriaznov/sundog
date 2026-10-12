@@ -1,7 +1,7 @@
 //! Entry diet acceptance bench: real, single-node, loopback [`Mode::Local`]
 //! caches, public API only. Not a correctness suite; it measures, prints,
 //! and asserts the numbers `Live<K, V>`'s record diet
-//! (`sundog/src/store/engine.rs`) is scored against.
+//! (`sundog/src/store/engine/mod.rs`) is scored against.
 //!
 //! Gated on `SUNDOG_BENCH=1`; a plain `cargo test` run still compiles
 //! without the wall-clock cost:

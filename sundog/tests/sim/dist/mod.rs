@@ -69,7 +69,7 @@ struct DistNode {
 /// Builds one `Mode::Distributed` node: a fresh shard with an ownership
 /// tracker and residency set attached via `Shard::with_ownership_for_sim`,
 /// seeded to the solo view `OwnershipTracker::seed` always starts from;
-/// see the `distributed_shard` fixture in `store/mod.rs`'s own tests for
+/// see the `distributed_shard` fixture in `store/tests/mod.rs` for
 /// the identical construction. The caller republishes the scenario's real
 /// starting view immediately after, via `republish_view`/`republish_all`.
 fn new_dist_node(node: NodeId, host: &'static str, port: u16, owners: u8) -> DistNode {

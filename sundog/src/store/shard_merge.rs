@@ -80,7 +80,7 @@ where
     /// at its default zero, every call applies at once. With a non-zero
     /// window, consecutive calls to the same key fold into an in-memory
     /// pending value instead, applying once when the window that opened at
-    /// the first call elapses (`crate::cache::merge_coalesce_task`,
+    /// the first call elapses (`crate::cache::tasks::merge_coalesce_task`,
     /// `Cache::close`, and this shard's `Drop` all guarantee a flush);
     /// replication and every [`Event`] then see exactly one record, the
     /// fold, not each call.
@@ -245,7 +245,7 @@ where
     /// out of its deadline-ordered index, never one lock (or one linear
     /// scan) for the whole shard's pending state, so many keys coalescing
     /// at once don't serialize this sweep on each other. The background
-    /// sweep (`crate::cache::merge_coalesce_task`) is the only production
+    /// sweep (`crate::cache::tasks::merge_coalesce_task`) is the only production
     /// caller; `pub(crate)` so `crate::cache` can drive it without owning
     /// the pending map itself.
     pub(crate) fn flush_due_pending_merges(&self, now_ms: u64) {
@@ -285,7 +285,7 @@ where
 
     /// The earliest deadline among every currently pending coalesced merge
     /// across every stripe, or `None` when nothing is pending anywhere.
-    /// `crate::cache::merge_coalesce_task` sleeps until this to flush right
+    /// `crate::cache::tasks::merge_coalesce_task` sleeps until this to flush right
     /// at the window's edge instead of polling. Each stripe's own earliest
     /// deadline is its `by_deadline` index's first key, no scan of that
     /// stripe's entries needed, so this costs one brief lock per stripe,
@@ -307,7 +307,7 @@ where
 
     /// Resolves the next time a [`Shard::merge`] call opens a fresh
     /// coalescing window (a key with nothing already pending), so
-    /// `crate::cache::merge_coalesce_task` can recompute its sleep-until
+    /// `crate::cache::tasks::merge_coalesce_task` can recompute its sleep-until
     /// instead of parking past a deadline that did not exist yet when it
     /// last checked.
     pub(crate) fn merge_wake_notified(&self) -> impl Future<Output = ()> + '_ {

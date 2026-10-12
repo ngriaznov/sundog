@@ -25,7 +25,7 @@ pub(crate) async fn dispatch_inbound<S: ShardOps>(shard: &S, msg: Msg) {
 }
 
 /// Wraps a shared `Shard` as the `net::RequestHandler` a `Mesh` answers
-/// inbound requests through, standing in for `cluster.rs`'s handler.
+/// inbound requests through, standing in for `cluster/handler.rs`'s handler.
 /// `ae_sketch_min_bucket`/`ae_part_min_bucket` mirror the fields of the same
 /// name on `ClusterConfig`, letting a scenario force a low threshold so a
 /// mismatched bucket answers with `AeMismatch::Sketch`/`PartDigests` instead
