@@ -64,7 +64,7 @@ use flusher::flusher_loop;
 use rules::{FLUSH_QUEUE_CAPACITY, record_too_large, refusal_drop_reason};
 
 use record::{decode_record, pread_exact};
-#[cfg(all(test, not(feature = "sim")))]
+#[cfg(test)]
 pub(crate) use rules::flush_queue_slots;
 #[cfg(test)]
 pub(crate) use rules::region_count_for;
