@@ -1,6 +1,7 @@
 //! Merge resolution at the shard layer: stored merges, the coalesce window and pending-merge flushes.
 
 use super::*;
+use crate::store::shard_merge::{drain_due_deadlines, merge_deadline_ms, merge_window_elapsed};
 
 #[tokio::test]
 async fn merge_against_a_tombstone_is_never_consulted_and_falls_back_to_hlc_order() {
