@@ -5,8 +5,8 @@ use crate::store::engine::OnRefusal;
 
 use super::record::{build_header, split_record};
 use super::rules::{
-    FLUSH_QUEUE_CAPACITY, FLUSH_QUEUE_SLOTS_MAX, record_fits, record_fits_queue,
-    refusal_drop_reason,
+    FLUSH_QUEUE_CAPACITY, FLUSH_QUEUE_SLOTS_MAX, next_region_index, record_fits, record_fits_queue,
+    record_too_large, records_fitting_region, refusal_drop_reason,
 };
 use super::*;
 
