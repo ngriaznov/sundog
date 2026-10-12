@@ -147,14 +147,17 @@ use tokio_util::codec::LengthDelimitedCodec;
 #[cfg(not(feature = "sim"))]
 use tokio_util::sync::CancellationToken;
 
+use super::coalesce_replicate;
 #[cfg(not(feature = "sim"))]
-use super::{InboundMsg, PeerFramed, Reply, ReqPool};
-use super::{OutFrame, coalesce_replicate};
+use super::framing::PeerFramed;
+#[cfg(not(feature = "sim"))]
+use super::{Reply, ReqPool};
 #[cfg(not(feature = "sim"))]
 use crate::error::CodecError;
 use crate::hlc::Hlc;
+use crate::net::OutFrame;
 #[cfg(not(feature = "sim"))]
-use crate::net::{AeMismatch, AePartReply, BucketStreamItem};
+use crate::net::{AeMismatch, AePartReply, BucketStreamItem, InboundMsg};
 use crate::node::NodeId;
 use crate::wire::{self, MAX_FRAME, Msg, WireRecord};
 
@@ -360,11 +363,11 @@ async fn codec_roundtrips_a_message_through_a_real_socket_pair() {
 // `MeshStream` is a different concrete type per feature, so this test
 // exercises the real transport directly and is skipped under `sim`.
 #[cfg(all(feature = "tls", not(feature = "sim")))]
-fn as_mesh_stream(stream: tokio::net::TcpStream) -> super::MeshStream {
-    super::MeshStream::Plain(stream)
+fn as_mesh_stream(stream: tokio::net::TcpStream) -> crate::net::MeshStream {
+    crate::net::MeshStream::Plain(stream)
 }
 #[cfg(all(not(feature = "tls"), not(feature = "sim")))]
-fn as_mesh_stream(stream: tokio::net::TcpStream) -> super::MeshStream {
+fn as_mesh_stream(stream: tokio::net::TcpStream) -> crate::net::MeshStream {
     stream
 }
 
@@ -377,7 +380,7 @@ async fn serve_state_transfer_stops_promptly_once_cancelled() {
     use tokio_util::sync::CancellationToken;
 
     struct NeverRespondingHandler;
-    impl super::RequestHandler for NeverRespondingHandler {
+    impl crate::net::RequestHandler for NeverRespondingHandler {
         fn snapshot_chunks(&self, _cache: SmolStr) -> BoxStream<'static, Vec<wire::WireRecord>> {
             Box::pin(futures::stream::pending())
         }
@@ -436,7 +439,7 @@ async fn serve_state_transfer_stops_promptly_once_cancelled() {
     let _client = TcpStream::connect(addr).await.expect("connect");
     let server_stream = accept.await.expect("connection accepted");
 
-    let framed = super::new_framed(as_mesh_stream(server_stream));
+    let framed = super::framing::new_framed(as_mesh_stream(server_stream));
     let cancel = CancellationToken::new();
     let cancel_for_task = cancel.clone();
 
@@ -466,12 +469,12 @@ async fn serve_state_transfer_stops_promptly_once_cancelled() {
 /// `TlsCtx` for a plain (non-TLS) accepted/dialed connection in a test,
 /// matching whichever concrete shape the active feature set gives it.
 #[cfg(all(feature = "tls", not(feature = "sim")))]
-fn no_tls() -> super::TlsCtx {
+fn no_tls() -> crate::net::TlsCtx {
     None
 }
 #[cfg(all(not(feature = "tls"), not(feature = "sim")))]
-fn no_tls() -> super::TlsCtx {
-    super::TlsCtx
+fn no_tls() -> crate::net::TlsCtx {
+    crate::net::TlsCtx
 }
 
 /// A `RequestHandler` with nothing to serve: every lookup comes back
@@ -480,7 +483,7 @@ fn no_tls() -> super::TlsCtx {
 #[cfg(not(feature = "sim"))]
 struct EmptyHandler;
 #[cfg(not(feature = "sim"))]
-impl super::RequestHandler for EmptyHandler {
+impl crate::net::RequestHandler for EmptyHandler {
     fn snapshot_chunks(
         &self,
         _cache: SmolStr,
@@ -560,7 +563,7 @@ async fn dial_fake_donor(prelude: Vec<Msg>) -> PeerFramed {
         // `Msg::ReqDone`.
     });
     let client = TcpStream::connect(addr).await.expect("connect");
-    super::new_framed(as_mesh_stream(client))
+    super::framing::new_framed(as_mesh_stream(client))
 }
 
 /// Polls [`super::probe_reused`] until it stops reporting `Pending`, for
@@ -605,7 +608,7 @@ async fn probe_reused_tells_a_waiting_reply_from_a_closed_peer_and_a_quiet_one()
         std::future::pending::<()>().await;
     });
     let client = TcpStream::connect(addr).await.expect("connect");
-    let mut quiet = super::new_framed(as_mesh_stream(client));
+    let mut quiet = super::framing::new_framed(as_mesh_stream(client));
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(matches!(
         super::probe_reused(&mut quiet),
@@ -689,7 +692,10 @@ async fn collect_ae_buckets_skips_an_unrelated_hello_mid_reply() {
     let got = super::collect_ae_buckets(reply(framed))
         .await
         .expect("the stray Hello must be skipped, not break the reply");
-    assert_eq!(got, vec![(3, super::wire_to_key_versions(entries))]);
+    assert_eq!(
+        got,
+        vec![(3, super::framing::wire_to_key_versions(entries))]
+    );
 }
 
 #[test]
@@ -844,7 +850,7 @@ async fn collect_ae_part_replies_reports_listings_and_sketches() {
             AePartReply::Listing {
                 bucket: 3,
                 part: 7,
-                entries: super::wire_to_key_versions(entries),
+                entries: super::framing::wire_to_key_versions(entries),
             },
             AePartReply::Sketch {
                 bucket: 3,
@@ -873,14 +879,14 @@ async fn req_done_and_ae_bucket_after_hello_are_not_served_or_forwarded() {
 
     let (inbound_tx, mut inbound_rx) = mpsc::channel(8);
     let cancel = CancellationToken::new();
-    let handler: Arc<dyn super::RequestHandler> = Arc::new(EmptyHandler);
+    let handler: Arc<dyn crate::net::RequestHandler> = Arc::new(EmptyHandler);
     // `handle_accepted` takes the pre-TLS raw stream, not `MeshStream`;
     // it layers TLS on internally via `establish_accept`.
     let accepted_task = tokio::spawn(super::handle_accepted(
         server_stream,
         inbound_tx,
         handler,
-        super::MeshInner::for_tests(no_tls(), cancel.clone()),
+        crate::net::MeshInner::for_tests(no_tls(), cancel.clone()),
     ));
 
     let mut client = LengthDelimitedCodec::builder()
@@ -960,7 +966,7 @@ async fn disable_nagle_logs_and_does_not_panic_when_set_nodelay_fails() {
     // stream is forgotten below so its own `Drop` never double-closes it.
     drop(unsafe { OwnedFd::from_raw_fd(fd) });
 
-    super::disable_nagle(&stream); // must log, not panic
+    super::framing::disable_nagle(&stream); // must log, not panic
     std::mem::forget(stream);
 }
 
@@ -971,10 +977,10 @@ async fn run_peer_writer_exits_promptly_when_cancelled_while_retrying() {
     // immediately, so the writer cycles through its reconnect backoff
     // instead of hanging on a slow connect.
     let unreachable: SocketAddr = "127.0.0.1:1".parse().expect("valid addr");
-    let invalidate = Arc::new(super::DropOldestQueue::new(4));
+    let invalidate = Arc::new(crate::net::outbox::DropOldestQueue::new(4));
     let (_replicate_tx, replicate_rx) = mpsc::channel(4);
     let cancel = CancellationToken::new();
-    let greeting = super::Greeting {
+    let greeting = crate::net::Greeting {
         node: NodeId::from(1),
         incarnation: 1,
         cluster: wire::UNNAMED_CLUSTER,
@@ -1109,7 +1115,7 @@ async fn bucket_stream_yields_nothing_new_when_the_peer_does_not_support_bucket_
 #[cfg(not(feature = "sim"))]
 struct TwoBucketHandler;
 #[cfg(not(feature = "sim"))]
-impl super::RequestHandler for TwoBucketHandler {
+impl crate::net::RequestHandler for TwoBucketHandler {
     fn snapshot_chunks(
         &self,
         _cache: SmolStr,
@@ -1200,16 +1206,16 @@ async fn serve_st_buckets_sends_bucket_done_after_the_last_chunk_and_reads_a_mid
     let accept = tokio::spawn(async move { listener.accept().await.expect("accept").0 });
     let client_stream = TcpStream::connect(addr).await.expect("connect");
     let server_stream = accept.await.expect("connection accepted");
-    let mut client_framed = super::new_framed(as_mesh_stream(client_stream));
+    let mut client_framed = super::framing::new_framed(as_mesh_stream(client_stream));
 
-    let mesh = super::MeshInner::for_tests(no_tls(), CancellationToken::new());
+    let mesh = crate::net::MeshInner::for_tests(no_tls(), CancellationToken::new());
     let mesh_for_task = Arc::clone(&mesh);
     let cache = SmolStr::new("users");
     let cache_for_task = cache.clone();
     let cancel = CancellationToken::new();
     let cancel_for_task = cancel.clone();
     let served = tokio::spawn(async move {
-        let mut server_framed = super::new_framed(as_mesh_stream(server_stream));
+        let mut server_framed = super::framing::new_framed(as_mesh_stream(server_stream));
         super::serve_st_buckets(
             &mut server_framed,
             cache_for_task,
@@ -1224,7 +1230,7 @@ async fn serve_st_buckets_sends_bucket_done_after_the_last_chunk_and_reads_a_mid
         .await
     });
 
-    let first = super::recv_msg(&mut client_framed)
+    let first = super::framing::recv_msg(&mut client_framed)
         .await
         .expect("frame arrives")
         .expect("decodes");
@@ -1232,7 +1238,7 @@ async fn serve_st_buckets_sends_bucket_done_after_the_last_chunk_and_reads_a_mid
         matches!(&first, Msg::StBucketChunk{ recs, done: false, .. } if recs.len() == 1),
         "bucket 0's chunk comes first: {first:?}"
     );
-    let second = super::recv_msg(&mut client_framed)
+    let second = super::framing::recv_msg(&mut client_framed)
         .await
         .expect("frame arrives")
         .expect("decodes");
@@ -1245,7 +1251,7 @@ async fn serve_st_buckets_sends_bucket_done_after_the_last_chunk_and_reads_a_mid
     };
     assert_eq!(bucket, 0);
     // Ack it now, mid-stream, before bucket 1's own chunk/done arrive.
-    super::send_msg(
+    super::framing::send_msg(
         &mut client_framed,
         &Msg::StBucketAck {
             cache: ack_cache,
@@ -1256,7 +1262,7 @@ async fn serve_st_buckets_sends_bucket_done_after_the_last_chunk_and_reads_a_mid
     .await
     .expect("send ack");
 
-    let third = super::recv_msg(&mut client_framed)
+    let third = super::framing::recv_msg(&mut client_framed)
         .await
         .expect("frame arrives")
         .expect("decodes");
@@ -1264,7 +1270,7 @@ async fn serve_st_buckets_sends_bucket_done_after_the_last_chunk_and_reads_a_mid
         matches!(&third, Msg::StBucketChunk{ recs, done: false, .. } if recs.len() == 1),
         "bucket 1's chunk follows: {third:?}"
     );
-    let fourth = super::recv_msg(&mut client_framed)
+    let fourth = super::framing::recv_msg(&mut client_framed)
         .await
         .expect("frame arrives")
         .expect("decodes");
@@ -1272,7 +1278,7 @@ async fn serve_st_buckets_sends_bucket_done_after_the_last_chunk_and_reads_a_mid
         matches!(fourth, Msg::StBucketDone { bucket: 1, .. }),
         "bucket 1's done follows its chunk: {fourth:?}"
     );
-    let fifth = super::recv_msg(&mut client_framed)
+    let fifth = super::framing::recv_msg(&mut client_framed)
         .await
         .expect("frame arrives")
         .expect("decodes");
@@ -1311,8 +1317,8 @@ async fn handle_accepted_records_a_bucket_ack_that_arrives_after_any_serve_st_bu
 
     let (inbound_tx, _inbound_rx) = mpsc::channel(8);
     let cancel = CancellationToken::new();
-    let handler: Arc<dyn super::RequestHandler> = Arc::new(EmptyHandler);
-    let mesh = super::MeshInner::for_tests(no_tls(), cancel.clone());
+    let handler: Arc<dyn crate::net::RequestHandler> = Arc::new(EmptyHandler);
+    let mesh = crate::net::MeshInner::for_tests(no_tls(), cancel.clone());
     let accepted_task = tokio::spawn(super::handle_accepted(
         server_stream,
         inbound_tx,

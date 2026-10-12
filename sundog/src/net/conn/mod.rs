@@ -2,6 +2,10 @@
 //! mesh traffic and pooled request/response, and the per-peer dial-and-write
 //! loop over the broadcast outboxes.
 
+mod framing;
+#[cfg(test)]
+mod tests;
+
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -11,117 +15,25 @@ use bytes::Bytes;
 use futures::{FutureExt as _, SinkExt as _, StreamExt as _};
 use smol_str::SmolStr;
 use tokio::sync::mpsc;
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tokio_util::sync::CancellationToken;
 
 use super::outbox::DropOldestQueue;
 use super::tcp::{TcpListener, TcpStream};
 use super::{
     AeMismatch, AePartReply, AeRoundOutcome, AeServeOutcome, BucketStreamItem, FetchOutcome,
-    Greeting, InboundMsg, LoadOutcome, LoadServe, MeshInner, MeshStream, OutFrame, RequestHandler,
-    TlsCtx,
+    Greeting, InboundMsg, LoadOutcome, LoadServe, MeshInner, OutFrame, RequestHandler, TlsCtx,
 };
 use crate::error::CodecError;
-use crate::hlc::Hlc;
 use crate::node::NodeId;
 use crate::store::{BucketDigest, BucketPart, BucketPartDigests, KeyVersion};
 use crate::wire::{self, MAX_FRAME, Msg, WireRecord};
+use framing::{
+    PeerFramed, disable_nagle, establish_accept, establish_dial, feed_msg, key_versions_to_wire,
+    new_framed, send_batch, send_batch_or_cancelled, send_frames, send_or_cancelled,
+    wire_to_key_versions,
+};
 
-pub(super) type PeerFramed = Framed<MeshStream, LengthDelimitedCodec>;
-
-/// Disables Nagle's algorithm on a freshly dialed/accepted socket. Every
-/// wire message here is already a deliberately-sized batch, and Nagle's
-/// interaction with delayed ACKs is a classic multi-millisecond stall.
-/// Best-effort: a failure here surfaces on the next real read/write instead.
-fn disable_nagle(stream: &TcpStream) {
-    if let Err(error) = stream.set_nodelay(true) {
-        tracing::debug!(%error, "set_nodelay failed; leaving Nagle's algorithm enabled");
-    }
-}
-
-pub(super) fn new_framed(stream: MeshStream) -> PeerFramed {
-    LengthDelimitedCodec::builder()
-        .max_frame_length(MAX_FRAME)
-        .new_framed(stream)
-}
-
-/// Layers TLS onto a freshly dialed `stream` per `tls`, a no-op passthrough
-/// whenever TLS isn't compiled in for this transport.
-#[cfg(all(feature = "tls", not(feature = "sim")))]
-async fn establish_dial(stream: TcpStream, tls: &TlsCtx) -> std::io::Result<MeshStream> {
-    match tls {
-        Some(ctx) => ctx.connect(stream).await,
-        None => Ok(MeshStream::Plain(stream)),
-    }
-}
-// A genuine `.await`, not `Ok(stream)` alone, keeps this `async fn` like
-// the TLS-active branch above, so every caller writes `.await` unconditionally.
-#[cfg(not(all(feature = "tls", not(feature = "sim"))))]
-async fn establish_dial(stream: TcpStream, _tls: &TlsCtx) -> std::io::Result<MeshStream> {
-    std::future::ready(Ok(stream)).await
-}
-
-/// Layers TLS onto a freshly accepted `stream`, the accept-side counterpart of
-/// [`establish_dial`].
-#[cfg(all(feature = "tls", not(feature = "sim")))]
-async fn establish_accept(stream: TcpStream, tls: &TlsCtx) -> std::io::Result<MeshStream> {
-    match tls {
-        Some(ctx) => ctx.accept(stream).await,
-        None => Ok(MeshStream::Plain(stream)),
-    }
-}
-#[cfg(not(all(feature = "tls", not(feature = "sim"))))]
-async fn establish_accept(stream: TcpStream, _tls: &TlsCtx) -> std::io::Result<MeshStream> {
-    std::future::ready(Ok(stream)).await
-}
-
-pub(super) async fn send_msg(framed: &mut PeerFramed, msg: &Msg) -> Result<(), CodecError> {
-    let frame = wire::encode(msg)?;
-    let len = frame.len();
-    framed.send(frame).await.map_err(CodecError::Io)?;
-    super::record_frame_sent(len);
-    Ok(())
-}
-
-/// Writes `msg` into `framed`'s buffer without flushing it: the caller
-/// flushes once for a run of messages.
-async fn feed_msg(framed: &mut PeerFramed, msg: &Msg) -> Result<(), CodecError> {
-    let frame = wire::encode(msg)?;
-    let len = frame.len();
-    framed.feed(frame).await.map_err(CodecError::Io)?;
-    super::record_frame_sent(len);
-    Ok(())
-}
-
-/// Sends every message in `msgs` and flushes once at the end. Used for
-/// control-plane replies and `Hello`-plus-first-request dials, which build
-/// their own `Msg`s rather than reusing an [`OutFrame`] like [`send_frames`].
-async fn send_batch(framed: &mut PeerFramed, msgs: &[Msg]) -> Result<(), CodecError> {
-    for msg in msgs {
-        let frame = wire::encode(msg)?;
-        let len = frame.len();
-        framed.feed(frame).await.map_err(CodecError::Io)?;
-        super::record_frame_sent(len);
-    }
-    framed.flush().await.map_err(CodecError::Io)?;
-    Ok(())
-}
-
-/// [`send_batch`], but for already-encoded frames: the per-peer writer's
-/// broadcast-class drain feeds these straight onto the wire. The frame is
-/// built once, upstream, and shared as a `Bytes` clone per peer.
-async fn send_frames(
-    framed: &mut PeerFramed,
-    encoded: impl IntoIterator<Item = Bytes>,
-) -> Result<(), CodecError> {
-    for frame in encoded {
-        let len = frame.len();
-        framed.feed(frame).await.map_err(CodecError::Io)?;
-        super::record_frame_sent(len);
-    }
-    framed.flush().await.map_err(CodecError::Io)?;
-    Ok(())
-}
+pub(super) use framing::{recv_msg, send_msg};
 
 /// Byte budget for one coalesced [`Msg::ReplicateBatch`] frame, well under
 /// [`MAX_FRAME`]. Shared with the fan-out layer (`cluster::fan_out_batch`),
@@ -229,22 +141,6 @@ fn coalesce_replicate(drained: Vec<OutFrame>) -> Vec<Bytes> {
     out
 }
 
-/// [`send_or_cancelled`], but for a whole in-memory reply rather than one
-/// message at a time: feeds every message in `msgs` and flushes once,
-/// racing the whole batch against `cancel`. Returns `true` when this
-/// connection is done.
-async fn send_batch_or_cancelled(
-    framed: &mut PeerFramed,
-    msgs: &[Msg],
-    cancel: &CancellationToken,
-) -> bool {
-    tokio::select! {
-        biased;
-        () = cancel.cancelled() => true,
-        sent = send_batch(framed, msgs) => sent.is_err(),
-    }
-}
-
 /// Reads the next message off `framed`, bounded by `idle_timeout` when set.
 /// Used only once a connection has served at least one request/response
 /// exchange; a persistent broadcast link never goes through this path.
@@ -258,14 +154,6 @@ async fn recv_msg_or_idle_timeout(
             .await
             .unwrap_or(None),
         None => recv_msg(framed).await,
-    }
-}
-
-pub(super) async fn recv_msg(framed: &mut PeerFramed) -> Option<Result<Msg, CodecError>> {
-    match framed.next().await {
-        Some(Ok(bytes)) => Some(wire::decode(&bytes.freeze())),
-        Some(Err(source)) => Some(Err(CodecError::Io(source))),
-        None => None,
     }
 }
 
@@ -755,16 +643,6 @@ async fn dispatch_one(
         | Msg::LoadFailed { .. }
         | Msg::LoadDeclined { .. }
         | Msg::ReqDone => false,
-    }
-}
-
-/// Sends `msg`, racing the write against `cancel`. Returns `true` when this
-/// connection is done.
-async fn send_or_cancelled(framed: &mut PeerFramed, msg: &Msg, cancel: &CancellationToken) -> bool {
-    tokio::select! {
-        biased;
-        () = cancel.cancelled() => true,
-        sent = send_msg(framed, msg) => sent.is_err(),
     }
 }
 
@@ -1445,21 +1323,6 @@ fn listing_or_sketch(
     }
 }
 
-/// [`KeyVersion`]s to the wire's own `(key, version)` tuple shape, for a
-/// [`Msg::AeBucket`]/[`Msg::AePart`] reply.
-fn key_versions_to_wire(entries: Vec<KeyVersion>) -> Vec<(Bytes, Hlc)> {
-    entries.into_iter().map(|kv| (kv.key, kv.version)).collect()
-}
-
-/// The wire's `(key, version)` tuple shape back to [`KeyVersion`]s, decoding
-/// a [`Msg::AeBucket`]/[`Msg::AePart`] reply.
-fn wire_to_key_versions(entries: Vec<(Bytes, Hlc)>) -> Vec<KeyVersion> {
-    entries
-        .into_iter()
-        .map(|(key, version)| KeyVersion { key, version })
-        .collect()
-}
-
 /// Serves an `AeEntries` request: the sketch fallback, full listings for the
 /// named `buckets`, requested explicitly rather than chosen by the responder.
 async fn serve_ae_entries(
@@ -1848,6 +1711,3 @@ pub(super) fn bucket_stream(
         },
     ))
 }
-
-#[cfg(test)]
-mod tests;
