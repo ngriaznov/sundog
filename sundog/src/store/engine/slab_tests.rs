@@ -1,7 +1,7 @@
 //! Unit tests for `Slab`, its entries and the arena growth rule.
 
 use super::expiry::NEVER_EXPIRES;
-use super::record::record_value;
+use super::record::{build_resident_record, decode_key, record_value};
 use super::slab::{ARENA_MIN_GROWTH, arena_growth};
 use super::*;
 

@@ -1,0 +1,324 @@
+//! Housekeeping on `Engine`: tombstone collection, the expiry sweep and the compaction scan and replace.
+
+use std::hash::Hash;
+use std::sync::atomic::Ordering;
+
+use bytes::Bytes;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+use crate::hlc::Hlc;
+use crate::store::{
+    BUCKET_COUNT, CompactionBounds, ConflictResolver, Quiescence, crdt, entry_fingerprint,
+};
+
+#[cfg(all(doc, feature = "spill"))]
+use super::EntryState;
+use super::expiry::{LONG_TTL, decode_expiry, encode_expiry};
+use super::keys::{
+    digest_slot, hash_key_bytes, hasher_for, part_index_from_hash, stripe_index_from_hash,
+};
+use super::record::{
+    build_resident_record, decode_key, record_key, record_key_bytes, record_value_bytes, set_record,
+};
+#[cfg(doc)]
+use super::slab::Slab;
+use super::{Engine, Stripe, is_resident, is_spilled};
+
+/// One record [`Engine::compact`]'s scan found a compacted form for.
+pub(crate) struct CompactCandidate<K> {
+    pub(crate) key: K,
+    pub(crate) key_bytes: Bytes,
+    pub(crate) stale_ver: Hlc,
+    pub(crate) new_encoded: Bytes,
+}
+
+/// One [`Engine::compact`] call's result: the records whose resolver
+/// produced a compacted form, each with the version it is read at, and
+/// how many stripes the call walked before its entry budget ran out. A
+/// caller that wants the whole keyspace examined keeps calling until the
+/// visited stripes add up to [`BUCKET_COUNT`](crate::store::BUCKET_COUNT).
+pub(crate) struct CompactScan<K> {
+    pub(crate) candidates: Vec<CompactCandidate<K>>,
+    pub(crate) stripes_visited: usize,
+}
+
+/// [`Engine::compact`]'s paced shrink-pass rule: `true` once a stripe's
+/// live count `len` sits at or below an eighth of its slab `capacity`,
+/// the point past which the arena wastes at least seven times what it
+/// holds. Well under the range an unhinted `Vec`'s own amortized growth
+/// settles into, so a naturally growing stripe is never shrunk out from
+/// under itself; this only fires for an oversized `capacity_hint` or a
+/// stripe drained by ownership rebalancing. Pure; unit tested directly.
+pub(super) fn should_shrink_stripe(len: usize, capacity: usize) -> bool {
+    capacity > 0 && len <= capacity / 8
+}
+
+/// One [`Engine::compact_replace_if_current`] call's write.
+pub(crate) struct CompactReplace<'a, K, V> {
+    pub(crate) key: &'a K,
+    pub(crate) key_bytes: &'a [u8],
+    pub(crate) hash: u64,
+    pub(crate) expected_ver: Hlc,
+    pub(crate) new_ver: Hlc,
+    pub(crate) value: V,
+    pub(crate) encoded: Bytes,
+}
+
+impl<K, V> Engine<K, V>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    /// Drops tombstones past `tombstone_ttl`, or past the hard cap
+    /// `tombstone_max_ttl` while `any_member_absent`, correcting the
+    /// digest.
+    pub(crate) fn gc_tombstones(&self, any_member_absent: bool, now_ms: u64) {
+        for (idx, stripe_lock) in self.stripes.iter().enumerate() {
+            let mut stripe = stripe_lock.write();
+            stripe.tombstones.retain(|key_bytes, t| {
+                let past_ttl = now_ms >= t.ttl_deadline_ms;
+                let past_max = now_ms >= t.max_deadline_ms;
+                let collect = past_ttl && (!any_member_absent || past_max);
+                if collect {
+                    let part = part_index_from_hash(hash_key_bytes(key_bytes));
+                    self.digest[digest_slot(idx, part)]
+                        .fetch_xor(entry_fingerprint(key_bytes, t.ver), Ordering::Relaxed);
+                }
+                !collect
+            });
+        }
+    }
+
+    /// The engine's only free-running housekeeping: visits every stripe whose
+    /// `next_expiry_ms` is due, or every stripe if TTI is configured,
+    /// removes expired/idle live entries, corrects the digest and total
+    /// weight, and recomputes `next_expiry_ms` exactly.
+    pub(crate) fn sweep(&self, now_ms: u64) {
+        for (idx, stripe_lock) in self.stripes.iter().enumerate() {
+            let due = stripe_lock.read().next_expiry_ms <= now_ms;
+            if !due && self.tti_ms.is_none() {
+                continue;
+            }
+            let mut guard = stripe_lock.write();
+            // One explicit reborrow, so stripe.live/stripe.long_ttl below
+            // are disjoint field projections the borrow checker can split.
+            let stripe: &mut Stripe<K, V> = &mut guard;
+            let mut removed_weight = 0u64;
+            let mut removed_count = 0u64;
+            let mut removed_spilled = 0usize;
+            let mut new_next = u64::MAX;
+            let mut cleared_long_ttl: Vec<Bytes> = Vec::new();
+            stripe.live.retain(hasher_for, |live| {
+                let key_bytes = record_key(&live.record);
+                if self.is_absent(live, key_bytes, &stripe.long_ttl, now_ms) {
+                    let part = part_index_from_hash(hash_key_bytes(key_bytes));
+                    self.digest[digest_slot(idx, part)]
+                        .fetch_xor(entry_fingerprint(key_bytes, live.ver()), Ordering::Relaxed);
+                    removed_weight += u64::from(live.weight);
+                    removed_count += 1;
+                    if is_spilled(live) {
+                        removed_spilled += 1;
+                    }
+                    if live.expiry == LONG_TTL {
+                        cleared_long_ttl.push(Bytes::copy_from_slice(key_bytes));
+                    }
+                    false
+                } else {
+                    if let Some(exp) =
+                        decode_expiry(live.wall_ms, live.expiry, key_bytes, &stripe.long_ttl)
+                    {
+                        new_next = new_next.min(exp);
+                    }
+                    true
+                }
+            });
+            for key_bytes in &cleared_long_ttl {
+                stripe.long_ttl.remove(key_bytes.as_ref());
+            }
+            stripe.next_expiry_ms = new_next;
+            drop(guard);
+            if removed_weight > 0 {
+                self.total_weight
+                    .fetch_sub(removed_weight, Ordering::Relaxed);
+            }
+            if removed_count > 0 {
+                self.live_count.fetch_sub(removed_count, Ordering::Relaxed);
+            }
+            self.note_spill_departures(removed_spilled);
+        }
+    }
+
+    /// One rate-limited pass of the CRDT writer-retirement sweep: visits
+    /// stripes from [`Engine::compact_cursor`] under a read lock each,
+    /// calling `resolver.compact(key_bytes, encoded, now_ms, retire, quiet,
+    /// bounds)` on every resident live entry and collecting the `Some`
+    /// results; never mutates a stripe's live entries, versions, or keys
+    /// this way, and [`super::super::ShardOps::compact_pass`] applies each
+    /// candidate separately, via [`Engine::compact_replace_if_current`]. A
+    /// [`EntryState::Spilled`] entry is skipped until promoted back to
+    /// `Resident`.
+    ///
+    /// Once a visited stripe's scan finishes, [`should_shrink_stripe`]
+    /// decides whether its `live` slab is worth reclaiming (an oversized
+    /// `capacity_hint` or a stripe drained by rebalancing): if so, this
+    /// pass takes a separate write lock and calls [`Slab::shrink_to_fit`].
+    ///
+    /// `max_entries` bounds entries examined, not entries eligible; a
+    /// stripe already in progress always finishes. The cursor advances past
+    /// every visited stripe, wrapping at `BUCKET_COUNT`; `max_entries == 0`
+    /// visits nothing. Returns the candidates and how many stripes were
+    /// walked.
+    pub(crate) fn compact(
+        &self,
+        resolver: &dyn ConflictResolver,
+        now_ms: u64,
+        retire: &dyn Fn(crdt::WriterId) -> bool,
+        quiet: Quiescence,
+        bounds: CompactionBounds,
+        max_entries: usize,
+    ) -> CompactScan<K> {
+        if max_entries == 0 {
+            return CompactScan {
+                candidates: Vec::new(),
+                stripes_visited: 0,
+            };
+        }
+        let start = stripe_index_from_hash(self.compact_cursor.load(Ordering::Relaxed));
+        let mut out = Vec::new();
+        let mut examined = 0usize;
+        let mut visited = 0usize;
+        let mut next_start = start;
+        while visited < BUCKET_COUNT {
+            let idx = (start + visited) % BUCKET_COUNT;
+            visited += 1;
+            next_start = (idx + 1) % BUCKET_COUNT;
+            let stripe = self.stripes[idx].read();
+            self.note_compact_lock_acquisition();
+            for live in stripe.live.iter() {
+                // Never compacted off-lock: reading its bytes back in would
+                // cost a disk read this sweep does not pay for.
+                if !is_resident(live) {
+                    continue;
+                }
+                let encoded = record_value_bytes(&live.record);
+                examined += 1;
+                if let Some(new_encoded) = resolver.compact(
+                    record_key(&live.record),
+                    encoded.as_ref(),
+                    now_ms,
+                    retire,
+                    quiet,
+                    bounds,
+                ) {
+                    out.push(CompactCandidate {
+                        key: decode_key(record_key(&live.record)),
+                        key_bytes: record_key_bytes(&live.record),
+                        stale_ver: live.ver(),
+                        new_encoded,
+                    });
+                }
+            }
+            let shrink = should_shrink_stripe(stripe.live.len(), stripe.live.capacity());
+            drop(stripe);
+            // A separate write lock: reclaiming is rare enough that a
+            // second lock here beats holding one for the whole scan.
+            if shrink {
+                self.stripes[idx].write().live.shrink_to_fit(hasher_for);
+            }
+            if examined >= max_entries {
+                break;
+            }
+        }
+        self.compact_cursor
+            .store(next_start as u64, Ordering::Relaxed);
+        CompactScan {
+            candidates: out,
+            stripes_visited: visited,
+        }
+    }
+
+    /// Replaces a live, resident entry's payload and version with
+    /// `replace.value`/`replace.encoded`/`replace.new_ver` iff it is still
+    /// exactly at `replace.expected_ver`: the version-gated, no-merge write
+    /// [`super::super::ShardOps::compact_pass`] uses for every [`Self::compact`]
+    /// candidate, in place of the ordinary merge-based apply path. A
+    /// merge-based apply would silently restore the receipt a compaction
+    /// pass pruned, since [`ConflictResolver::merge`] only ever unions
+    /// state, so this replaces directly instead. Mints a fresh version from
+    /// the compacted bytes ([`super::super::compacted_version`]) rather than
+    /// reusing `expected_ver`, since two different contents must never
+    /// share one version; see
+    /// `pn_counter_compaction_under_gossip_keeps_the_exact_total` in
+    /// `store::prop_tests` for why this still converges. Returns `false`, a
+    /// no-op, once the entry has moved on: a different version, not live,
+    /// or currently spilled.
+    pub(crate) fn compact_replace_if_current(&self, replace: CompactReplace<'_, K, V>) -> bool {
+        let CompactReplace {
+            key,
+            key_bytes,
+            hash,
+            expected_ver,
+            new_ver,
+            value,
+            encoded,
+        } = replace;
+        let bucket = stripe_index_from_hash(hash);
+        let part = part_index_from_hash(hash);
+        let (old_weight, new_weight) = {
+            let mut guard = self.stripes[bucket].write();
+            // One explicit reborrow, as in `sweep`, so the fields below
+            // borrow disjointly.
+            let stripe: &mut Stripe<K, V> = &mut guard;
+            let Some(live) = stripe
+                .live
+                .find_mut(hash, |l| record_key(&l.record) == key_bytes)
+            else {
+                return false;
+            };
+            if live.ver() != expected_ver || !is_resident(live) {
+                return false;
+            }
+            let new_weight = self.weigher.as_ref().map_or(1, |w| w(key, &value));
+            let old_weight = live.weight;
+            let old_wall_ms = live.wall_ms;
+            let old_expiry = live.expiry;
+            let record = build_resident_record(record_key(&live.record), encoded.as_ref());
+            set_record(live, record, self.resident_bytes.as_deref());
+            live.weight = new_weight;
+            live.set_ver(new_ver);
+            // new_ver carries a new wall_ms; re-deriving expiry from the
+            // real absolute deadline keeps it exact across the version bump.
+            let abs_expiry = decode_expiry(old_wall_ms, old_expiry, key_bytes, &stripe.long_ttl);
+            let (expiry, long_ttl_value) = encode_expiry(new_ver.wall_ms, abs_expiry);
+            live.expiry = expiry;
+            match long_ttl_value {
+                Some(deadline) => {
+                    stripe
+                        .long_ttl
+                        .insert(Bytes::copy_from_slice(key_bytes), deadline);
+                }
+                None => {
+                    stripe.long_ttl.remove(key_bytes);
+                }
+            }
+            (old_weight, new_weight)
+        };
+        self.digest[digest_slot(bucket, part)].fetch_xor(
+            entry_fingerprint(key_bytes, expected_ver) ^ entry_fingerprint(key_bytes, new_ver),
+            Ordering::Relaxed,
+        );
+        self.total_weight
+            .fetch_add(u64::from(new_weight), Ordering::Relaxed);
+        self.total_weight
+            .fetch_sub(u64::from(old_weight), Ordering::Relaxed);
+        true
+    }
+
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn note_compact_lock_acquisition(&self) {
+        #[cfg(test)]
+        self.compact_lock_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}

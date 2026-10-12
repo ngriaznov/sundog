@@ -5,18 +5,23 @@ use std::time::Duration;
 #[cfg(feature = "spill")]
 use super::apply::prefetch_spilled_conflict_bytes;
 use super::apply::{ApplyCtx, EntryKey, apply_locked};
-use super::expiry::{MAX_INLINE_TTL_MS, NEVER_EXPIRES, lapse_cause};
+use super::expiry::{
+    LONG_TTL, MAX_INLINE_TTL_MS, NEVER_EXPIRES, decode_expiry, encode_expiry, lapse_cause,
+};
+use super::housekeeping::should_shrink_stripe;
 use super::inflight::fill_supersedes;
 use super::prefold::BatchEntry;
 use super::record::{
-    ENTRY_OVERHEAD_BYTES, build_key_only_record, decode_value, record_value, split_record,
+    ENTRY_OVERHEAD_BYTES, build_key_only_record, build_resident_record, decode_key, decode_value,
+    record_value, split_record,
 };
 use super::*;
 use crate::explain::{Lapse, LocalRecord};
 use crate::hlc::HlcClock;
 use crate::node::NodeId;
 use crate::store::{
-    BucketPart, Incoming, KeyVersion, LwwResolver, Merged, PartId, RecordView, Ttl, Winner,
+    BucketPart, ConflictResolver, Incoming, KeyVersion, LwwResolver, Merged, PartId, Quiescence,
+    RecordView, Ttl, Winner,
 };
 use xxhash_rust::xxh3::xxh3_64;
 

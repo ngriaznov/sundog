@@ -4,6 +4,7 @@ use super::expiry::{
     LONG_TTL, MAX_INLINE_TTL_MS, NEVER_EXPIRES, clamp_tti_ms, encode_expiry, idle_elapsed_ms,
     touch_stamp,
 };
+use super::housekeeping::should_shrink_stripe;
 use super::keys::{digest_slot, part_index_from_hash, stripe_index_from_hash};
 use super::merge::{MergedVersion, merge_decision, mint_stamp};
 use super::*;
