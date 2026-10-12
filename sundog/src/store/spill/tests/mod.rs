@@ -1,9 +1,13 @@
 //! Unit tests for the spill tier: pure rules, then the on-disk I/O tests in `io`.
 
 use crate::node::NodeId;
+use crate::store::engine::OnRefusal;
 
 use super::record::{build_header, split_record};
-use super::rules::{FLUSH_QUEUE_CAPACITY, FLUSH_QUEUE_SLOTS_MAX, record_fits, record_fits_queue};
+use super::rules::{
+    FLUSH_QUEUE_CAPACITY, FLUSH_QUEUE_SLOTS_MAX, record_fits, record_fits_queue,
+    refusal_drop_reason,
+};
 use super::*;
 
 // --- Pure functions: no I/O, no tokio, safe under every feature combo. ---

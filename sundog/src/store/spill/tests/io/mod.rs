@@ -1,6 +1,7 @@
 //! Real-disk tests of the spill tier: flush, read, rotation, close and the shared recorders.
 
 use std::collections::HashMap as StdHashMap;
+use std::sync::mpsc;
 use std::sync::{Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
