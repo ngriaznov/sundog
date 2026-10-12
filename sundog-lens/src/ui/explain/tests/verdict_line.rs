@@ -1,4 +1,4 @@
-//! The popup frame, the verdict line, moved and frozen views, mono mode and answers about another cache.
+//! The popup frame, the verdict line, changed and frozen views, mono mode and answers about another cache.
 
 use ratatui::style::Color;
 
