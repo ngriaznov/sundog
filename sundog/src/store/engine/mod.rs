@@ -47,7 +47,6 @@ use serde::de::DeserializeOwned;
 use tokio::sync::watch;
 use xxhash_rust::xxh3::xxh3_64;
 
-use crate::error::CodecError;
 use crate::explain::{Lapse, LocalRecord};
 use crate::hlc::Hlc;
 use crate::node::NodeId;
@@ -68,8 +67,11 @@ use super::{
     entry_fingerprint,
 };
 
+mod keys;
 mod record;
 
+use self::keys::{digest_slot, encode_key_for_read, hasher_for};
+pub(crate) use self::keys::{hash_key_bytes, part_index_from_hash, stripe_index_from_hash};
 #[cfg(feature = "spill")]
 use self::record::build_key_only_record;
 use self::record::{
@@ -87,11 +89,6 @@ use self::record::{
 )]
 pub(crate) struct Reservation<'a>(PhantomData<&'a ()>);
 
-/// Stack-buffer size for a key's postcard encoding on the read path, large
-/// enough for every key type this crate ships and most user key types. A key
-/// that doesn't fit falls back to one heap allocation.
-const KEY_STACK_BUF: usize = 128;
-
 /// How many live entries one capacity-eviction pass weighs before evicting the
 /// least recently read of them.
 const EVICTION_SAMPLE: usize = 8;
@@ -100,42 +97,6 @@ const EVICTION_SAMPLE: usize = 8;
 /// at most how many of the coldest it evicts.
 const EVICTION_BATCH_SAMPLE: usize = 32;
 const EVICTION_BATCH: usize = 8;
-
-/// Holds one postcard-encoded key: on the stack when it fits [`KEY_STACK_BUF`],
-/// on the heap otherwise.
-enum KeyBuf {
-    Stack([u8; KEY_STACK_BUF], usize),
-    Heap(Vec<u8>),
-}
-
-impl KeyBuf {
-    fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Stack(buf, len) => &buf[..*len],
-            Self::Heap(v) => v,
-        }
-    }
-}
-
-/// Encodes `key` for a read, on the stack when it fits.
-fn encode_key_for_read<K: Serialize>(key: &K) -> Result<KeyBuf, CodecError> {
-    let mut buf = [0u8; KEY_STACK_BUF];
-    let stack_len = match postcard::to_slice(key, &mut buf) {
-        Ok(written) => Some(written.len()),
-        Err(_) => None,
-    };
-    match stack_len {
-        Some(len) => Ok(KeyBuf::Stack(buf, len)),
-        None => Ok(KeyBuf::Heap(postcard::to_stdvec(key)?)),
-    }
-}
-
-/// The 64-bit xxh3 of a key's encoded bytes, computed once per operation and
-/// reused as both the stripe index ([`stripe_index_from_hash`]) and the hash
-/// [`hashbrown::HashTable`] stores each entry under.
-pub(crate) fn hash_key_bytes(key_bytes: &[u8]) -> u64 {
-    xxh3_64(key_bytes)
-}
 
 /// One record [`Engine::compact`]'s scan found a compacted form for.
 pub(crate) struct CompactCandidate<K> {
@@ -153,29 +114,6 @@ pub(crate) struct CompactCandidate<K> {
 pub(crate) struct CompactScan<K> {
     pub(crate) candidates: Vec<CompactCandidate<K>>,
     pub(crate) stripes_visited: usize,
-}
-
-/// The stripe, an anti-entropy bucket, a precomputed key hash belongs to.
-pub(crate) fn stripe_index_from_hash(hash: u64) -> usize {
-    usize::try_from(hash & (BUCKET_COUNT as u64 - 1))
-        .expect("invariant: masked to BUCKET_COUNT - 1, always fits in usize")
-}
-
-/// The second-level anti-entropy part, one of [`PART_COUNT`], a precomputed
-/// key hash belongs to within its bucket: the six hash bits above the ten
-/// [`stripe_index_from_hash`] consumes.
-pub(crate) fn part_index_from_hash(hash: u64) -> usize {
-    ((hash >> 10) & 63) as usize
-}
-
-/// The flat index into `Engine::digest`, `BUCKET_COUNT * PART_COUNT` atomics
-/// long, holding `bucket`'s `part`th part digest.
-fn digest_slot(bucket: usize, part: usize) -> usize {
-    bucket * PART_COUNT + part
-}
-
-fn hasher_for<K, V>(live: &Live<K, V>) -> u64 {
-    xxh3_64(record_key(&live.record))
 }
 
 /// Sentinel [`Live::expiry`] marking "never expires".

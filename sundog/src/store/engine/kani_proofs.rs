@@ -1,5 +1,6 @@
 //! Kani proofs over the `Hlc`, expiry, hash-slot, merge and stripe-shrink arithmetic.
 
+use super::keys::{digest_slot, part_index_from_hash, stripe_index_from_hash};
 use super::*;
 
 fn any_hlc() -> Hlc {
