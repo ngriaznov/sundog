@@ -148,11 +148,11 @@ use tokio_util::codec::LengthDelimitedCodec;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(not(feature = "sim"))]
-use super::Reply;
-#[cfg(not(feature = "sim"))]
 use super::framing::PeerFramed;
 #[cfg(not(feature = "sim"))]
 use super::pool::ReqPool;
+#[cfg(not(feature = "sim"))]
+use super::reply::Reply;
 use super::writer::coalesce_replicate;
 #[cfg(not(feature = "sim"))]
 use crate::error::CodecError;
@@ -639,7 +639,7 @@ fn assert_unexpected_eof(err: &CodecError) {
 #[tokio::test]
 async fn collect_ae_buckets_errors_on_a_connection_closed_before_req_done() {
     let framed = dial_fake_donor(Vec::new()).await;
-    let err = super::collect_ae_buckets(reply(framed))
+    let err = super::reply::collect_ae_buckets(reply(framed))
         .await
         .expect_err("a connection closed before ReqDone must error");
     assert_unexpected_eof(&err);
@@ -649,7 +649,7 @@ async fn collect_ae_buckets_errors_on_a_connection_closed_before_req_done() {
 #[tokio::test]
 async fn collect_ae_mismatches_errors_on_a_connection_closed_before_req_done() {
     let framed = dial_fake_donor(Vec::new()).await;
-    let err = super::collect_ae_mismatches(reply(framed))
+    let err = super::reply::collect_ae_mismatches(reply(framed))
         .await
         .expect_err("a connection closed before ReqDone must error");
     assert_unexpected_eof(&err);
@@ -659,7 +659,7 @@ async fn collect_ae_mismatches_errors_on_a_connection_closed_before_req_done() {
 #[tokio::test]
 async fn collect_pulled_records_errors_on_a_connection_closed_before_req_done() {
     let framed = dial_fake_donor(Vec::new()).await;
-    let err = super::collect_pulled_records(reply(framed))
+    let err = super::reply::collect_pulled_records(reply(framed))
         .await
         .expect_err("a connection closed before ReqDone must error");
     assert_unexpected_eof(&err);
@@ -691,7 +691,7 @@ async fn collect_ae_buckets_skips_an_unrelated_hello_mid_reply() {
         Msg::ReqDone,
     ])
     .await;
-    let got = super::collect_ae_buckets(reply(framed))
+    let got = super::reply::collect_ae_buckets(reply(framed))
         .await
         .expect("the stray Hello must be skipped, not break the reply");
     assert_eq!(
@@ -742,7 +742,7 @@ async fn collect_ae_mismatches_skips_an_unrelated_hello_mid_reply() {
         Msg::ReqDone,
     ])
     .await;
-    let got = super::collect_ae_mismatches(reply(framed))
+    let got = super::reply::collect_ae_mismatches(reply(framed))
         .await
         .expect("the stray Hello must be skipped, not break the reply");
     assert_eq!(got, vec![AeMismatch::Sketch(2, Vec::new())]);
@@ -775,7 +775,7 @@ async fn collect_pulled_records_skips_an_unrelated_hello_mid_reply() {
         Msg::ReqDone,
     ])
     .await;
-    let got = super::collect_pulled_records(reply(framed))
+    let got = super::reply::collect_pulled_records(reply(framed))
         .await
         .expect("the stray Hello must be skipped, not break the reply");
     assert_eq!(got, vec![rec]);
@@ -794,7 +794,7 @@ async fn collect_ae_mismatches_reports_part_digests_replies() {
         Msg::ReqDone,
     ])
     .await;
-    let got = super::collect_ae_mismatches(reply(framed))
+    let got = super::reply::collect_ae_mismatches(reply(framed))
         .await
         .expect("collects the AePartDigests reply");
     assert_eq!(got, vec![AeMismatch::PartDigests(5, digests)]);
@@ -804,7 +804,7 @@ async fn collect_ae_mismatches_reports_part_digests_replies() {
 #[tokio::test]
 async fn collect_ae_part_replies_errors_on_a_connection_closed_before_req_done() {
     let framed = dial_fake_donor(Vec::new()).await;
-    let err = super::collect_ae_part_replies(reply(framed))
+    let err = super::reply::collect_ae_part_replies(reply(framed))
         .await
         .expect_err("a connection closed before ReqDone must error");
     assert_unexpected_eof(&err);
@@ -843,7 +843,7 @@ async fn collect_ae_part_replies_reports_listings_and_sketches() {
         Msg::ReqDone,
     ])
     .await;
-    let got = super::collect_ae_part_replies(reply(framed))
+    let got = super::reply::collect_ae_part_replies(reply(framed))
         .await
         .expect("the stray Hello must be skipped, not break the reply");
     assert_eq!(
@@ -1056,7 +1056,7 @@ async fn bucket_stream_yields_bucket_done_between_and_after_chunks_when_the_peer
     ])
     .await;
 
-    let mut stream = super::bucket_stream(
+    let mut stream = super::reply::bucket_stream(
         framed,
         Arc::new(ReqPool::new()),
         None,
@@ -1096,7 +1096,7 @@ async fn bucket_stream_yields_nothing_new_when_the_peer_does_not_support_bucket_
     ])
     .await;
 
-    let mut stream = super::bucket_stream(
+    let mut stream = super::reply::bucket_stream(
         framed,
         Arc::new(ReqPool::new()),
         None,
