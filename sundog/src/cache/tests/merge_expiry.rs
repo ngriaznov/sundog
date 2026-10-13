@@ -114,6 +114,18 @@ async fn wait_for_warm_owners(nodes: &CounterNodes) {
     .await;
 }
 
+/// Asserts every node's sweep removes the expired entry: no node holds a
+/// key that outlived its deadline.
+async fn assert_swept(nodes: &CounterNodes) {
+    for (index, (_, cache)) in nodes.iter().enumerate() {
+        assert_eq!(
+            cache.entry_count().await,
+            0,
+            "node {index}'s sweep removed the expired entry"
+        );
+    }
+}
+
 /// Waits past the deadline of everything written so far.
 async fn outlive_the_lifetime() {
     tokio::time::sleep(LIFETIME + Duration::from_millis(500)).await;
@@ -131,6 +143,7 @@ async fn a_merged_local_counter_expires_and_a_merge_after_expiry_starts_a_new_va
     );
 
     outlive_the_lifetime().await;
+    assert_swept(&nodes).await;
     assert_eq!(value(&nodes, 0).await, None, "the merged counter expired");
     add(&nodes, 0, 1).await;
     assert_eq!(
@@ -155,6 +168,7 @@ async fn a_merged_replicated_counter_expires_on_every_node_and_stays_dead() {
     }
 
     outlive_the_lifetime().await;
+    assert_swept(&nodes).await;
     wait_for_value(&nodes, None, "the merged counter expires on every node").await;
 
     add(&nodes, 2, 1).await;
@@ -172,8 +186,18 @@ async fn a_merged_distributed_counter_expires_on_its_owners_and_stays_dead() {
     add(&nodes, 0, 3).await;
     add(&nodes, 1, 4).await;
     wait_for_value(&nodes, Some(7), "every node reads the merged total").await;
+    let owners = nodes[0].1.owners_of(&KEY);
+    for (cluster, cache) in &nodes {
+        if owners.contains(&cluster.node_id()) {
+            assert!(
+                matches!(cache.ttl_of(&KEY), Some(Ttl::Remaining(_))),
+                "every owner carries the merged deadline"
+            );
+        }
+    }
 
     outlive_the_lifetime().await;
+    assert_swept(&nodes).await;
     wait_for_value(&nodes, None, "the merged counter expires on its owners").await;
 
     add(&nodes, 2, 1).await;
