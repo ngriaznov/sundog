@@ -34,6 +34,9 @@ where
     /// first. Returns whether a live entry was here. A `Mode::Distributed`
     /// shard answers `false` for a key in a part it does not hold warm, as
     /// [`Shard::get`] misses there; `Cache::expire` asks the owners instead.
+    /// Under a merging resolver the resolver sets the re-put record's
+    /// expiry: the shipped `crdt` resolvers keep the later of the two
+    /// deadlines, so `expire` extends a deadline and never shortens it.
     ///
     /// # Errors
     ///
@@ -46,6 +49,8 @@ where
 
     /// [`Shard::expire`] with the shard's default TTL: the entry's lifespan
     /// restarts from now, and on a shard with no default it stops expiring.
+    /// Under a merging resolver the deadline moves only when the new one is
+    /// later, as [`Shard::expire`] describes.
     ///
     /// # Errors
     ///
@@ -55,7 +60,8 @@ where
         Ok(rearmed == LocalRearm::Rearmed)
     }
 
-    /// [`Shard::expire`] with no lifespan: the entry stops expiring.
+    /// [`Shard::expire`] with no lifespan: the entry stops expiring. Under a
+    /// merging resolver the deadline stays, as [`Shard::expire`] describes.
     ///
     /// # Errors
     ///

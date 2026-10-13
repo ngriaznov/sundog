@@ -7,8 +7,8 @@
 //!
 //! [`Cache::merge`] folds a value into the configured
 //! [`ConflictResolver`] without a read; [`CacheBuilder::merge_coalesce_window`]
-//! coalesces consecutive `merge` calls to one key into a single record per
-//! window instead of one per call.
+//! coalesces consecutive `merge` and `merge_with_ttl` calls to one key into a
+//! single record per window instead of one per call.
 
 // The owner read path: asking the owners of a key and decoding their answers.
 mod fetch;
@@ -184,13 +184,14 @@ where
         self
     }
 
-    /// Sets the window [`Cache::merge`] coalesces consecutive calls to one
-    /// key within: instead of each call applying (and replicating) on its
-    /// own, they fold in memory through the configured
-    /// [`CacheBuilder::resolver`] and apply once, when the window that
-    /// opened at the first of those calls elapses. Default: zero, so every
-    /// `Cache::merge` call applies at once, equivalent to [`Cache::insert`]
-    /// under a merging resolver.
+    /// Sets the window [`Cache::merge`] and [`Cache::merge_with_ttl`]
+    /// coalesce consecutive calls to one key within: instead of each call
+    /// applying (and replicating) on its own, they fold in memory through
+    /// the configured [`CacheBuilder::resolver`], each call carrying its own
+    /// deadline, and apply once, when the window that opened at the first of
+    /// those calls elapses. Default: zero, so every `Cache::merge` call
+    /// applies at once, equivalent to [`Cache::insert`] under a merging
+    /// resolver.
     ///
     /// [`CacheBuilder::open`] returns
     /// [`CacheError::MergeWindowRequiresMergingResolver`] for a nonzero
@@ -985,7 +986,11 @@ where
     /// does not own the key's part warm asks an owner for the record, as
     /// [`Cache::fetch`] does, and forwards the write to the owners. Under a
     /// merging [`CacheBuilder::resolver`], the resolver sets the merged
-    /// record's expiry, and the `crate::crdt` resolvers keep none.
+    /// record's expiry: the `crate::crdt` resolvers keep the later of the two
+    /// deadlines, an unset side deferring to the other, so `expire` extends a
+    /// deadline and never shortens it, [`Cache::touch`] moves it to the
+    /// default TTL from now when that is later, and [`Cache::persist`] leaves
+    /// it.
     ///
     /// # Errors
     ///
@@ -998,7 +1003,8 @@ where
 
     /// [`Cache::expire`] with the cache's default TTL: the entry's lifespan
     /// restarts from now, and on a cache with no [`CacheBuilder::ttl`] it
-    /// stops expiring.
+    /// stops expiring. Under a merging resolver the deadline moves only when
+    /// the new one is later, as [`Cache::expire`] describes.
     ///
     /// # Errors
     ///
@@ -1007,7 +1013,8 @@ where
         self.rearm(key, Lifetime::Default).await
     }
 
-    /// [`Cache::expire`] with no lifespan: the entry stops expiring.
+    /// [`Cache::expire`] with no lifespan: the entry stops expiring. Under a
+    /// merging resolver the deadline stays, as [`Cache::expire`] describes.
     ///
     /// # Errors
     ///

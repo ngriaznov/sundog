@@ -29,7 +29,7 @@ anti-entropy once their clocks catch up with its stamp.
 A value that combines, a counter or a set, does not have to lose writes. A
 `ConflictResolver` that implements `merge` folds the stored and incoming
 records into a third value, and every node reaches the same result in any
-order. `sundog::crdt` ships two: `PnCounter` with `PnCounterResolver` and
+order, as long as no deadline lapses between the writes. `sundog::crdt` ships two: `PnCounter` with `PnCounterResolver` and
 `OrSet` with `OrSetResolver`. Every mode merges. [Choosing a
 resolver](resolvers.md) says when a merging resolver fits, how to write its
 values, and how they expire.
@@ -40,18 +40,20 @@ values, and how they expire.
 
 `Cache::merge` writes through the resolver without a read.
 `CacheBuilder::merge_coalesce_window` folds a writer's consecutive merges
-to one key into one applied record per window, and a read does not see a
+(`merge` and `merge_with_ttl`) to one key into one applied record per window, and a read does not see a
 fold still pending inside its window.
 
 Each writer owns a slot in a merged value. A background sweep retires the
-slot of a writer gone longer than `ClusterConfig::crdt_retire_after`, 24
-hours by default, and folds it away once the retirement has aged past twice
-that bound with every peer quiet. Each fold leaves a receipt that every
-merge honors for three times `crdt_retire_after` past the retirement. A
-replica cut off from before the fold until after the receipt expires,
-still holding the slot every other replica has folded, counts that
-writer's contribution twice when it reconnects. The limit matches the one
-`tombstone_max_ttl` sets for deletes, below.
+slot of a writer whose node has been absent longer than
+`ClusterConfig::crdt_retire_after`, 24 hours by default, or has restarted
+under a new incarnation, and folds it away once the retirement has aged
+past twice that bound with every peer quiet. Each fold leaves a receipt that
+every merge honors for three times `crdt_retire_after` past the retirement,
+longer when the sweep period is more than half that bound. A replica cut
+off from before the fold until after the receipt expires, still holding the
+slot every other replica has folded, counts that writer's contribution
+twice when it reconnects. Like `tombstone_max_ttl` for deletes, below, the
+bound trusts that a replica gone this long no longer holds the state.
 
 ## Deletes
 

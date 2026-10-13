@@ -6,7 +6,8 @@ that resolver for its lifetime. The default, `LwwResolver`, keeps the write
 with the later version and drops the other. A merging resolver folds both
 writes into one value instead: the value is a CRDT, a conflict-free
 replicated data type, and every node that receives the same writes reaches
-the same value in any order. `sundog::crdt` ships two:
+the same value in any order, as long as no deadline lapses between them
+([Expiry and deletes](#expiry-and-deletes)). `sundog::crdt` ships two:
 
 - `PnCounter` with `PnCounterResolver`, a counter that goes up and down.
 - `OrSet<T>` with `OrSetResolver::<T>::new()`, a set of members where an
@@ -112,6 +113,15 @@ give merged values a lifetime as they give any other value one:
   starts a new value; the expired value never folds into it. On the node
   applying a write, a value that reads as absent there, expired or idle
   past `tti`, never folds either.
+- **Nodes agree while no deadline lapses between the writes.** Dropping an
+  expired value is not a merge, so once a deadline falls between writes the
+  order they arrive in can change the result. A merged value keeps the
+  longest lifetime among its parts, so a longer-lived record can carry a
+  contribution back to a node that had already dropped it as expired.
+  `merge_coalesce_window` changes which contributions survive for the same
+  reason. Anti-entropy settles replicas that hold the key; `Invalidation`
+  runs none, so there the difference stays until the next write or the
+  expiry.
 - **Expiry ends a value, not a writer's running total.** A writer that
   keeps counting after the deadline sends its whole total again, and the
   new value starts from that total. To count per period, write one key per
@@ -129,14 +139,14 @@ give merged values a lifetime as they give any other value one:
   both records of a mismatched key instead of one.
 - **Every write that meets a stored value decodes both, merges them and
   encodes the result.** `CacheBuilder::merge_coalesce_window` folds a key's
-  consecutive `Cache::merge` calls in memory and applies them once per
+  consecutive `Cache::merge` and `Cache::merge_with_ttl` calls in memory and applies them once per
   window. A read does not see a fold still waiting in its window, and a
   crash loses it. `insert` never waits in a window, and `open` refuses a
   nonzero window for a resolver that does not merge.
 - **The value grows with its writers.** Each writer, one run of one node,
-  owns a slot, so every restart adds one. The slots of writers gone longer
-  than `ClusterConfig::crdt_retire_after`, 24 hours by default, retire and
-  later fold into one total. A replica cut off while that happens can count
+  owns a slot, so every restart adds one. The slots of writers whose node is
+  gone longer than `ClusterConfig::crdt_retire_after`, 24 hours by default,
+  or has restarted, retire and later fold into one total. A replica cut off while that happens can count
   a folded writer twice; [Guarantees](guarantees.md#values-that-merge) has
   the bound. Folding an `OrSet` drops only its bookkeeping, never an add.
   An `OrSet` writer, once retired, adds nothing new; its node adds again

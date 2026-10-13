@@ -319,8 +319,8 @@ where
         self
     }
 
-    /// Sets the window [`Shard::merge`] coalesces consecutive calls to one
-    /// key within: they fold in memory instead of each applying on its own,
+    /// Sets the window [`Shard::merge`] and [`Shard::merge_with_ttl`]
+    /// coalesce consecutive calls to one key within: they fold in memory instead of each applying on its own,
     /// and the fold applies once, when the window elapses. Zero, the
     /// default, applies every `merge` call at once. A raw setter that
     /// trusts the caller to have already checked the resolver merges;

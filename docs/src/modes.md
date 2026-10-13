@@ -28,7 +28,7 @@ Values cross the network only when the cache's resolver merges, as
 instead of the bare invalidation. A peer that holds the key folds the record
 into its copy, so no node loses the contribution only it held. A peer that
 does not hold the key ignores the record and stores nothing, which keeps
-each node's cache to its own working set. A removal still drops the copy on
+each node's cache to its own working set. A removal drops the copy on
 every peer, and a peer on a release before protocol 8 gets the bare
 invalidation for every write. [Choosing a resolver](resolvers.md) has the
 detail.

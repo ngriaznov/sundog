@@ -52,7 +52,8 @@ pub struct Merged {
 /// A merged value therefore keeps the longest lifetime any contribution
 /// asked for: [`crate::cache::Cache::persist`] leaves its deadline unchanged,
 /// [`crate::cache::Cache::expire`] extends it but never shortens it, and
-/// [`crate::cache::Cache::touch`] extends it by the default TTL.
+/// [`crate::cache::Cache::touch`] moves it to the default TTL from now when
+/// that is later.
 #[must_use]
 pub fn later_deadline(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     a.max(b)
@@ -78,7 +79,12 @@ pub fn later_deadline(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 /// `merges` does. The engine never folds a lapsed side (a record whose
 /// deadline is at or before the other side's write, or a stored entry that
 /// reads as absent on the applying node), so a resolver need not check
-/// deadlines itself. The engine, never the resolver, mints the merge
+/// deadlines itself. Dropping a lapsed side is not a join, so replicas that
+/// apply the same writes in different orders can differ once a deadline
+/// falls between them: a merged record keeps the longest lifetime among its
+/// parts, so a longer-lived record can carry a lapsed contribution back to a
+/// replica that dropped it, and the merge coalescing window changes which
+/// contributions survive. The engine, never the resolver, mints the merge
 /// outcome's version. Configuration is local per `Shard`, never
 /// wire-negotiated: every node must run an identical resolver for a given
 /// cache.
@@ -101,25 +107,26 @@ pub trait ConflictResolver: Send + Sync + 'static {
     /// Whether this resolver's [`ConflictResolver::merge`] can ever return
     /// `Some`. Defaults to `false`, matching [`LwwResolver`] and any other
     /// pick-a-side-only resolver. A resolver that overrides `merge` to
-    /// return `Some` must override this to `true`; nothing enforces the
-    /// override, but `ShardOps::merges` (via `Shard::with_resolver`)
-    /// forwards it straight into anti-entropy's direction rule, so a
-    /// resolver claiming `false` while `merge` returns `Some` only loses the
-    /// optimization below, never correctness.
+    /// return `Some` must override this to `true`: the engine runs `merge`
+    /// only while this is `true`, and nothing enforces the override.
     ///
-    /// Anti-entropy's `diff_bucket`/`diff_decoded` push only the greater of
-    /// two differently-versioned records to the lesser side by default,
-    /// costing a merging resolver two rounds per divergent key: the lesser
-    /// side merges and mints a version above both inputs, and only the next
-    /// round carries the fuller content back (see `merge_version`'s doc for
-    /// why the mint always dominates both inputs). When `merges` is `true`,
-    /// anti-entropy instead exchanges both records on a version mismatch,
+    /// The answer also decides what an `Invalidation` cache sends: a
+    /// merging resolver's writes travel as records that a holding peer
+    /// folds in, any other resolver's as invalidations. Return `true` only
+    /// for a resolver whose `merge` can return `Some`.
+    ///
+    /// Anti-entropy reads the answer too. Its `diff_bucket`/`diff_decoded`
+    /// push only the greater of two differently-versioned records to the
+    /// lesser side by default, which costs a merging resolver two rounds per
+    /// divergent key: the lesser side merges and mints a version above both
+    /// inputs, and only the next round carries the fuller content back (see
+    /// `merge_version`'s doc for why the mint always dominates both inputs).
+    /// When `merges` is `true`, anti-entropy instead exchanges both records
+    /// on a version mismatch,
     /// each side folding the other's record into its own, so both sides
     /// mint (or adopt) the identical result in the same round: see
     /// `merge_version`'s doc for why the mint arm is symmetric in its two
-    /// input stamps. `true` is always correct to return, even for a
-    /// resolver whose `merge` never returns `Some`; it only ever costs an
-    /// extra exchange, never a correctness issue.
+    /// input stamps.
     fn merges(&self) -> bool {
         false
     }

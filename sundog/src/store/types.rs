@@ -22,8 +22,10 @@ use crate::config::ClusterConfig;
 pub enum Mode {
     /// No cluster traffic; entries live only on this node.
     Local,
-    /// Every node caches independently; writes broadcast an
-    /// [`crate::wire::Msg::Invalidate`].
+    /// Every node caches independently; a write broadcasts a
+    /// [`crate::wire::Msg::Invalidate`], or under a merging resolver the
+    /// writer's merged record as a [`crate::wire::Msg::Replicate`] that a
+    /// peer holding the key folds in and a peer without it ignores.
     Invalidation,
     /// Every node holds every entry; writes broadcast the full
     /// [`crate::wire::Msg::Replicate`].

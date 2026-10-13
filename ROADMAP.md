@@ -72,16 +72,16 @@ test node for its own `Cache::explain` over the control port the fleet
 already uses. A production node has no control port, so there `explain`
 stays a library call.
 
-The production surface is a protocol 8 request, built when the trigger
-shows. `PROTOCOL_EXPLAIN` follows `PROTOCOL_LOAD` and raises
-`PROTOCOL_VERSION` to 8. `Msg::Explain` asks an owner for its marks of a
+The production surface is a protocol 9 request, built when the trigger
+shows. `PROTOCOL_EXPLAIN` follows `PROTOCOL_INVALIDATION_FOLD` and raises
+`PROTOCOL_VERSION` to 9. `Msg::Explain` asks an owner for its marks of a
 key's part, and `Msg::ExplainReply` answers with them, the owner's view
 hash, what it makes of a fetch and why it declines; both append to `Msg`.
 The reply tells a cache that is not open, a cache that is not
 `Distributed` and a part tracker not yet attached apart, which `Declined`
 does not. A responder answers the request only to a peer whose hello
-speaks protocol 8, and the observer sends it only to owners whose gossiped
-protocol is 8 or more, so release N interoperates with N-1. The observer
+speaks protocol 9, and the observer sends it only to owners whose gossiped
+protocol is 9 or more, so release N interoperates with N-1. The observer
 then dials data ports, which it does not do today, and the lens's `e`
 asks the owners it computes in place of a control port.
 
@@ -185,8 +185,9 @@ whose RAM is bound by them.
 
 `CacheBuilder::refresh_ahead` reloads a read key on the one node its loads
 gather on, and the new value travels to every node that holds it. An
-`Invalidation` cache sends no values, so each node holding a key would need
-its own reload, gathered on the loader node without that node answering from
+`Invalidation` cache sends no values unless its resolver merges, and a merged
+record folds only into a key the receiver holds, so each node holding a key
+would need its own reload, gathered on the loader node without that node answering from
 its own cached copy. That takes a load request that bypasses the responder's
 cache: a new message kind with the usual bump.
 

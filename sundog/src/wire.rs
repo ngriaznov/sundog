@@ -124,7 +124,8 @@ pub const PROTOCOL_LOAD: u16 = 7;
 /// `Invalidation` cache folds such a record into the key it holds and
 /// ignores it for a key it does not. A sender gives a peer on an older
 /// protocol [`Msg::Invalidate`] for every write, since that peer would store
-/// the record as an ordinary replicated entry. No message kind is new.
+/// the record as an ordinary replicated entry. A merged record uses the
+/// existing replicate frames.
 pub const PROTOCOL_INVALIDATION_FOLD: u16 = 8;
 
 /// The `cluster` a [`Msg::Hello`] carries when its sender names none: a
