@@ -91,13 +91,18 @@ All notable changes to this project are documented in this file. Format follows
   `touch` moves its deadline to the cache's TTL from now when that is
   later, and `persist` leaves it. A merged record's version hashes its
   deadline along with its bytes, and two records that differ only in their
-  deadline are different records.
+  deadline are different records. A merging cache counts a write's deadline
+  from the later of the system clock and the write's own stamp, so a node
+  whose stamps run ahead of its clock after absorbing a fast peer's still
+  folds writes whose TTL is shorter than the lead.
 - **An `Invalidation` cache under a merging resolver ships merged values.**
   A write sends the writer's merged record instead of an invalidation; a
   peer holding the key folds it into its copy through the resolver, and a
   peer without the key ignores it and stores nothing. A remove still sends
   an invalidation. Wire protocol 8 (`wire::PROTOCOL_INVALIDATION_FOLD`); a
-  peer on protocol 7 or older receives an invalidation for every write.
+  peer on protocol 7 or older receives an invalidation for every write, and
+  a merged record too large for one frame travels as an invalidation to
+  every peer.
 
 ### Fixed
 
@@ -134,6 +139,12 @@ All notable changes to this project are documented in this file. Format follows
   value, judged by the deadline against the write's own version, so every
   node decides alike; on the node applying a write, a value that reads as
   absent there, expired or idle past `tti`, never folds either.
+- **A batch of merges over a deleted or unreadable key applies entry by
+  entry.** A run of consecutive writes to a key whose stored side is a
+  tombstone, or a spilled entry whose bytes are not prefetched, folded into
+  one record that carried an entry older than the tombstone past it. Each
+  entry is now decided against the stored side on its own, as one-by-one
+  application decides it.
 
 ## [0.6.6] – 2026-10-09
 
