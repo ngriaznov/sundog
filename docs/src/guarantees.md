@@ -111,8 +111,9 @@ to `Local` and `Invalidation` caches.
 | `Replicated` | its own copy of every entry, a moment behind a write elsewhere | anti-entropy reconciles every entry by version |
 | `Distributed` | via `fetch`, the owners' copy | owners reconcile by version; each side of the partition accepted writes for its own view |
 
-An `Invalidation` cache sends values nowhere and runs no anti-entropy, so a
-TTL is its bound on staleness. Set one on every `Invalidation` cache.
+An `Invalidation` cache runs no anti-entropy and sends a value only when its
+resolver merges, so a TTL is its bound on staleness. Set one on every
+`Invalidation` cache.
 
 A `Distributed` cache has no quorum. During a partition each side computes
 its own owners and accepts writes, and the two sides settle by version

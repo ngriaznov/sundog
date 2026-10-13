@@ -16,7 +16,7 @@ use super::SpillRead;
 use super::shard_ops::MaskedDigest;
 use super::{
     BUCKET_COUNT, BucketDigest, BucketEntries, BucketLen, BucketPart, BucketPartDigests,
-    CompactPassOutcome, CompactionBounds, Event, FanOutItem, Incoming, KeyVersion, Origin,
+    CompactPassOutcome, CompactionBounds, Event, FanOutItem, Incoming, KeyVersion, Mode, Origin,
     PartEntries, PartId, PartMask, Quiescence, Scope, ScopedDigests, Shard, ShardOps,
     chunk_records_for_snapshot, compacted_version, crdt, encode_key, engine,
 };
@@ -31,6 +31,17 @@ use crate::wire::WireRecord;
 /// precomputed hash, typed key, raw key bytes, version, and the value or
 /// tombstone it carries, plus which peer (or local call) it came from.
 type RemoteEntry<K, V> = (u64, K, Bytes, Hlc, Incoming<V>, Origin);
+
+/// Which inbound records a shard in `mode` stores. An `Invalidation` cache
+/// holds only what it read or wrote itself, so a peer's merged record folds
+/// into a key it holds and is ignored for any other; every other mode stores
+/// what the resolver picks. Pure; unit tested directly.
+pub(super) const fn inbound_scope(mode: Mode) -> engine::ApplyScope {
+    match mode {
+        Mode::Invalidation => engine::ApplyScope::HeldOnly,
+        Mode::Local | Mode::Replicated | Mode::Distributed { .. } => engine::ApplyScope::Any,
+    }
+}
 
 #[allow(
     clippy::unused_async,
@@ -362,6 +373,19 @@ where
             // never applied here and never dropped. A record for a bucket
             // this node never held is dropped and counted.
             let recs = self.guard_inbound(recs);
+            // An `Invalidation` cache takes a tombstone record as the
+            // invalidation it stands for: the copy goes, and a load in
+            // flight for the key stores nothing.
+            let scope = inbound_scope(self.mode);
+            let (recs, removals) = match scope {
+                engine::ApplyScope::HeldOnly => {
+                    recs.into_iter().partition(|rec| !rec.is_tombstone())
+                }
+                engine::ApplyScope::Any => (recs, Vec::new()),
+            };
+            for rec in removals {
+                self.invalidate(rec.key, rec.ver).await;
+            }
             let mut decoded: Vec<RemoteEntry<K, V>> = Vec::with_capacity(recs.len());
             for rec in recs {
                 if !self.observe_remote(rec.ver) {
@@ -431,7 +455,8 @@ where
                             (hash, key, key_bytes, ver, incoming)
                         })
                         .collect();
-                    let (outcomes, bucket_deficit) = self.engine.apply_many_with_reservation(
+                    let (outcomes, bucket_deficit) = self.engine.apply_many_in(
+                        scope,
                         bucket,
                         entries,
                         self.resolver.as_ref(),

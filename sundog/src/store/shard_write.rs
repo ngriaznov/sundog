@@ -293,7 +293,9 @@ where
     }
 
     /// Stamps and applies a local write, then fans it out per [`Mode`]:
-    /// `Invalidate` for `Mode::Invalidation`, `Replicate` for
+    /// `Invalidate` for `Mode::Invalidation` (the merged record as
+    /// `Replicate` when the resolver merges and the peer speaks
+    /// [`crate::wire::PROTOCOL_INVALIDATION_FOLD`]), `Replicate` for
     /// `Mode::Replicated`, nothing for `Mode::Local`, through the
     /// composition layer's subscription to [`Shard::events`]. Under
     /// `Mode::Distributed` a write for a bucket this node does not own is

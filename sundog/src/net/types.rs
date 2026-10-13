@@ -17,8 +17,9 @@ use crate::wire::{Cell, Msg, WireRecord};
 /// policy on outbox overflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MsgClass {
-    /// Overflow drops the oldest queued invalidation: a storm on a dead peer
-    /// must never stall writers.
+    /// Overflow drops the oldest queued invalidation, or merged record of an
+    /// `Invalidation` cache: a storm on a dead peer must never stall writers,
+    /// and a newer write supersedes an older one.
     Invalidate,
     /// Overflow drops the new message and marks the peer dirty so the next
     /// anti-entropy round targets it first.

@@ -85,7 +85,9 @@ pub trait ShardOps: Send + Sync {
     fn apply_remote(&self, rec: WireRecord) -> BoxFuture<'_, ()>;
 
     /// [`ShardOps::apply_remote`] for a whole batch, one lock acquisition per
-    /// touched stripe rather than one per record.
+    /// touched stripe rather than one per record. A `Mode::Invalidation`
+    /// shard folds a live record only into a key it holds, ignores one for
+    /// any other key, and treats a tombstone record as [`ShardOps::invalidate`].
     fn apply_remote_batch(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, ()>;
 
     /// Drops the local copy of `key` iff `ver` is newer than the locally stored

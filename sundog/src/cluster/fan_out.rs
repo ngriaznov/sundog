@@ -18,7 +18,7 @@ use crate::net::{MsgClass, OutFrame, batch_forward, batch_replicate};
 use crate::node::NodeId;
 use crate::ownership::OwnershipView;
 use crate::store::{FanOutItem, FanOutQueue, Mode, PartId, Shard, ShardOps};
-use crate::wire::{Msg, WireRecord};
+use crate::wire::{self, Msg, WireRecord};
 
 /// Drains one opened cache's queue of locally written keys and fans them out
 /// over the mesh per [`Mode`]; `Shard` holds no handle to `net::Mesh`. A
@@ -88,6 +88,40 @@ pub(super) fn group_by_owner_set(
     .into_iter()
     .map(|(owners, records)| OwnerGroup { owners, records })
     .collect()
+}
+
+/// Whether a `Mode::Invalidation` write travels to a peer speaking
+/// `peer_protocol` as the writer's merged record instead of a bare
+/// [`Msg::Invalidate`]: the cache's resolver merges, and the peer speaks
+/// [`wire::PROTOCOL_INVALIDATION_FOLD`], so it folds the record into a key it
+/// holds and ignores it otherwise. Any other peer, and any cache whose
+/// resolver does not merge, gets the invalidation. Pure; unit tested
+/// directly.
+pub(super) const fn invalidation_ships_values(merges: bool, peer_protocol: u16) -> bool {
+    merges && wire::peer_supports(peer_protocol, wire::PROTOCOL_INVALIDATION_FOLD)
+}
+
+/// One [`Msg::Invalidate`] per record in `records`.
+fn invalidations(cache_name: &SmolStr, records: Vec<WireRecord>) -> Vec<Msg> {
+    records
+        .into_iter()
+        .map(|rec| Msg::Invalidate {
+            cache: cache_name.clone(),
+            key: rec.key,
+            ver: rec.ver,
+        })
+        .collect()
+}
+
+/// What a peer that folds receives for `records`: each live record as a
+/// replicate frame, batched, and each tombstone as an invalidation. Pure;
+/// unit tested directly.
+fn fold_msgs(cache_name: &SmolStr, records: Vec<WireRecord>) -> Vec<Msg> {
+    let (tombstones, live): (Vec<_>, Vec<_>) =
+        records.into_iter().partition(WireRecord::is_tombstone);
+    let mut msgs = batch_replicate(cache_name, live);
+    msgs.extend(invalidations(cache_name, tombstones));
+    msgs
 }
 
 /// Encodes each of `msgs` into an [`OutFrame`], dropping (and logging) any
@@ -211,28 +245,38 @@ async fn fan_out_batch<K, V>(
         return;
     }
 
-    let peers = cluster.live_peer_ids();
     match mode {
         // Distributed is handled, and returned, above.
         Mode::Local | Mode::Distributed { .. } => (),
         Mode::Invalidation => {
-            // No value ever rides an invalidation, so there is nothing a
-            // low-protocol peer could misdecode: every peer gets the same
-            // frames, exactly as before.
-            let frames = encode_frames(
-                records
-                    .into_iter()
-                    .map(|rec| Msg::Invalidate {
-                        cache: cache_name.clone(),
-                        key: rec.key,
-                        ver: rec.ver,
-                    })
-                    .collect(),
-            );
-            for &peer in &peers {
-                cluster
-                    .mesh()
-                    .send_frames(peer, MsgClass::Invalidate, frames.iter().cloned());
+            let merges = shard.merges();
+            let (folding, dropping): (Vec<_>, Vec<_>) = cluster
+                .peers()
+                .into_iter()
+                .partition(|peer| invalidation_ships_values(merges, peer.protocol));
+            // A peer that folds gets each live record as a replicate frame
+            // and each tombstone as an invalidation; every other peer
+            // gets an invalidation per record, which a low-protocol peer
+            // can never misdecode, exactly as before.
+            if !folding.is_empty() {
+                let frames = encode_frames(fold_msgs(cache_name, records.clone()));
+                for peer in folding {
+                    cluster.mesh().send_frames(
+                        peer.node,
+                        MsgClass::Invalidate,
+                        frames.iter().cloned(),
+                    );
+                }
+            }
+            if !dropping.is_empty() {
+                let frames = encode_frames(invalidations(cache_name, records));
+                for peer in dropping {
+                    cluster.mesh().send_frames(
+                        peer.node,
+                        MsgClass::Invalidate,
+                        frames.iter().cloned(),
+                    );
+                }
             }
         }
         // Pre-batched by the same budget/count rules `net::conn`'s writer
@@ -241,7 +285,7 @@ async fn fan_out_batch<K, V>(
         // writes arriving one drained event at a time.
         Mode::Replicated => {
             let frames = encode_frames(batch_replicate(cache_name, records));
-            for &peer in &peers {
+            for peer in cluster.live_peer_ids() {
                 cluster
                     .mesh()
                     .send_frames(peer, MsgClass::Replicate, frames.iter().cloned());
@@ -361,5 +405,100 @@ mod tests {
             records.len(),
             "no record is lost or duplicated by grouping"
         );
+    }
+
+    #[test]
+    fn a_merging_cache_ships_values_only_to_a_peer_that_folds_them() {
+        assert!(invalidation_ships_values(
+            true,
+            wire::PROTOCOL_INVALIDATION_FOLD
+        ));
+        assert!(invalidation_ships_values(true, wire::PROTOCOL_VERSION));
+        assert!(
+            !invalidation_ships_values(true, wire::PROTOCOL_INVALIDATION_FOLD - 1),
+            "a peer older than the fold protocol gets an invalidation"
+        );
+        assert!(!invalidation_ships_values(true, wire::MIN_PROTOCOL_VERSION));
+        assert!(!invalidation_ships_values(true, 0));
+    }
+
+    #[test]
+    fn a_cache_whose_resolver_does_not_merge_ships_no_value_to_any_peer() {
+        for protocol in [
+            0,
+            wire::MIN_PROTOCOL_VERSION,
+            wire::PROTOCOL_INVALIDATION_FOLD - 1,
+            wire::PROTOCOL_INVALIDATION_FOLD,
+            wire::PROTOCOL_VERSION,
+            wire::PROTOCOL_VERSION + 1,
+        ] {
+            assert!(
+                !invalidation_ships_values(false, protocol),
+                "protocol {protocol}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_peer_newer_than_this_build_still_folds() {
+        assert!(invalidation_ships_values(true, wire::PROTOCOL_VERSION + 1));
+    }
+
+    #[test]
+    fn a_folding_peer_gets_live_records_as_replicates_and_tombstones_as_invalidations() {
+        let live_one = wire_record_for_u32(1);
+        let live_two = wire_record_for_u32(2);
+        let removed = WireRecord {
+            value: None,
+            ..wire_record_for_u32(3)
+        };
+        let cache = SmolStr::new("c");
+
+        let msgs = fold_msgs(
+            &cache,
+            vec![live_one.clone(), removed.clone(), live_two.clone()],
+        );
+
+        assert_eq!(
+            msgs,
+            vec![
+                Msg::ReplicateBatch {
+                    cache: cache.clone(),
+                    recs: vec![live_one, live_two],
+                },
+                Msg::Invalidate {
+                    cache,
+                    key: removed.key,
+                    ver: removed.ver,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_lone_live_record_travels_as_a_plain_replicate() {
+        let rec = wire_record_for_u32(1);
+        let cache = SmolStr::new("c");
+        assert_eq!(
+            fold_msgs(&cache, vec![rec.clone()]),
+            vec![Msg::Replicate { cache, rec }]
+        );
+    }
+
+    #[test]
+    fn invalidations_name_each_records_key_and_version() {
+        let recs: Vec<WireRecord> = (0u32..3).map(wire_record_for_u32).collect();
+        let msgs = invalidations(&SmolStr::new("c"), recs.clone());
+        assert_eq!(msgs.len(), recs.len());
+        for (msg, rec) in msgs.iter().zip(&recs) {
+            assert_eq!(
+                msg,
+                &Msg::Invalidate {
+                    cache: SmolStr::new("c"),
+                    key: rec.key.clone(),
+                    ver: rec.ver,
+                }
+            );
+        }
     }
 }

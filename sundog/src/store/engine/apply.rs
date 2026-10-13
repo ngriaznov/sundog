@@ -92,6 +92,16 @@ pub(super) fn prefetch_spilled_conflict_bytes<'a, K, V>(
         .collect()
 }
 
+/// Which writes a batch apply ([`Engine::apply_many_in`]) stores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApplyScope {
+    /// Every write the resolver picks.
+    Any,
+    /// A write only as a fold into a key held visible; every other write is
+    /// rejected.
+    HeldOnly,
+}
+
 /// One entry's identity for the versioned-apply path, in place of three positional parameters.
 pub(crate) struct EntryKey<K> {
     pub(super) hash: u64,
@@ -122,6 +132,9 @@ pub(crate) struct ApplyCtx<'a, K, V> {
     pub(super) tombstone_ttl_ms: u64,
     pub(super) tombstone_max_ttl_ms: u64,
     pub(super) now_ms: u64,
+    /// Applies a write only as a fold into a visible live entry; see
+    /// [`ApplyScope::HeldOnly`].
+    pub(super) held_only: bool,
 }
 
 /// The live entry [`apply_locked`] finds for a key, as the collision
@@ -182,7 +195,9 @@ fn read_stored_live<K, V>(
 /// any other `Put`. A stored entry that reads as absent at `now_ms` is not
 /// read from disk and never folds ([`resolve_conflict`] treats it as
 /// absent), nor does a side that lapsed before the other side's write.
-/// Synchronous under the caller's write lock on `stripe`;
+/// With [`ApplyCtx::held_only`] set, a write that does not fold into a
+/// visible live entry is [`ApplyOutcome::Rejected`] and stores nothing; see
+/// [`reject_unheld`]. Synchronous under the caller's write lock on `stripe`;
 /// no disk I/O of its own. `prefetched_spilled` (`spill` builds) is
 /// [`prefetch_spilled_conflict_bytes`]'s off-lock read of the stored side's
 /// bytes; a lookup miss falls back to [`read_spilled_for_conflict`] under
@@ -214,6 +229,20 @@ where
     let stored_ver = prior_tombstone
         .map(|t| t.ver)
         .or_else(|| stored_live.as_ref().map(|s| s.ver));
+
+    if ctx.held_only {
+        let holds = stored_live.as_ref().is_some_and(|s| s.visible);
+        if reject_unheld(
+            stripe,
+            key_bytes.as_ref(),
+            stored_ver,
+            ver,
+            &incoming,
+            holds,
+        ) {
+            return (ApplyOutcome::Rejected, false);
+        }
+    }
 
     if let Some(sv) = stored_ver {
         let stored_encoded = stored_live.as_ref().and_then(|s| s.encoded.as_deref());
@@ -280,6 +309,33 @@ where
         ),
         Incoming::Tombstone => apply_tombstone(stripe, ctx, entry, ver, had_live),
     }
+}
+
+/// The held-only gate of [`apply_locked`]: whether the write at `ver` is
+/// refused because it cannot fold into a visible live entry (`holds`). It
+/// folds only a [`Incoming::Put`] into such an entry; a tombstone reaches
+/// the engine through [`Engine::invalidate`] instead. A refused write
+/// newer than whatever is stored for the key (a tombstone, a live entry
+/// that reads as absent, or nothing) marks a load in flight for the key
+/// invalidated, exactly as [`Engine::invalidate`] does, so a fill racing it
+/// stores nothing stale. Stores nothing itself.
+fn reject_unheld<K, V>(
+    stripe: &Stripe<K, V>,
+    key_bytes: &[u8],
+    stored_ver: Option<Hlc>,
+    ver: Hlc,
+    incoming: &Incoming<V>,
+    holds: bool,
+) -> bool {
+    if holds && matches!(incoming, Incoming::Put { .. }) {
+        return false;
+    }
+    if stored_ver.is_none_or(|sv| ver > sv)
+        && let Some(inflight) = stripe.inflight.get(key_bytes)
+    {
+        inflight.invalidated.store(true, Ordering::Relaxed);
+    }
+    true
 }
 
 /// The `Incoming::Put` half of [`apply_locked`]'s write: installs the new
@@ -487,8 +543,51 @@ where
         reservation: Option<&mut Reservation<'_>>,
         written: &mut Written,
     ) -> (Vec<ApplyOutcome<K, V>>, u64) {
+        self.apply_many_in(
+            ApplyScope::Any,
+            bucket,
+            entries,
+            resolver,
+            tombstone_ttl_ms,
+            tombstone_max_ttl_ms,
+            now_ms,
+            reservation,
+            written,
+        )
+    }
+
+    /// [`Engine::apply_many_with_reservation`] with the batch's
+    /// [`ApplyScope`] given. [`ApplyScope::Any`] is that method;
+    /// [`ApplyScope::HeldOnly`] applies each entry only as a fold into a key
+    /// this engine holds visible, for an `Invalidation`-mode cache receiving
+    /// a peer's merged record. No live entry, a tombstone, an expired or
+    /// idle entry, or a tombstone record is [`ApplyOutcome::Rejected`] and
+    /// stores nothing, and a load in flight for the key is marked
+    /// invalidated when the rejected write is newer than what is stored
+    /// ([`reject_unheld`]). The held check and the apply share the stripe
+    /// write lock, so no removal lands between them. Every entry applies on
+    /// its own, with no pre-fold, so each one's effect on an in-flight load
+    /// is its own.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the same call shape as `apply_many_with_reservation`, plus the scope"
+    )]
+    pub(crate) fn apply_many_in(
+        &self,
+        scope: ApplyScope,
+        bucket: usize,
+        entries: Vec<BatchEntry<K, V>>,
+        resolver: &dyn ConflictResolver,
+        tombstone_ttl_ms: u64,
+        tombstone_max_ttl_ms: u64,
+        now_ms: u64,
+        reservation: Option<&mut Reservation<'_>>,
+        written: &mut Written,
+    ) -> (Vec<ApplyOutcome<K, V>>, u64) {
+        let held_only = scope == ApplyScope::HeldOnly;
         let capped = self.max_capacity != u64::MAX;
-        let prefold = resolver.merges() && self.prefold_enabled.load(Ordering::Relaxed);
+        let prefold =
+            resolver.merges() && !held_only && self.prefold_enabled.load(Ordering::Relaxed);
         #[cfg(feature = "spill")]
         let prefetched_spilled = prefetch_spilled_conflict_bytes(
             &self.stripes[bucket],
@@ -543,6 +642,7 @@ where
                     tombstone_ttl_ms,
                     tombstone_max_ttl_ms,
                     now_ms,
+                    held_only,
                 };
                 let (outcome, displaced_spilled) = apply_locked(
                     &mut stripe,
@@ -620,6 +720,7 @@ where
                 tombstone_ttl_ms,
                 tombstone_max_ttl_ms,
                 now_ms,
+                held_only: false,
             };
             let (outcome, displaced_spilled) = apply_locked(
                 &mut stripe,

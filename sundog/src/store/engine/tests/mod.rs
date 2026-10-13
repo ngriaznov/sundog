@@ -86,6 +86,7 @@ fn test_ctx<'a, K, V>(
         tombstone_ttl_ms,
         tombstone_max_ttl_ms,
         now_ms,
+        held_only: false,
     }
 }
 
@@ -146,6 +147,7 @@ where
         tombstone_ttl_ms: 60_000,
         tombstone_max_ttl_ms: 600_000,
         now_ms,
+        held_only: false,
     };
     let _ = apply_locked(
         &mut stripe,
@@ -206,6 +208,7 @@ where
         tombstone_ttl_ms: 60_000,
         tombstone_max_ttl_ms: 600_000,
         now_ms,
+        held_only: false,
     };
     let (outcome, displaced_spilled) = {
         let mut stripe = engine.stripes[bucket].write();
@@ -354,6 +357,7 @@ mod apply;
 mod entry;
 mod evict;
 mod expiry;
+mod held_only;
 mod housekeeping;
 mod inflight;
 mod read;

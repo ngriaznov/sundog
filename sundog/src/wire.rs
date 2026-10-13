@@ -61,7 +61,10 @@ pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 /// - 7: Loading through another node's loader. Adds [`Msg::Load`],
 ///   [`Msg::Loaded`], [`Msg::LoadFailed`], [`Msg::LoadDeclined`] and
 ///   [`Msg::RefreshHint`]. See [`PROTOCOL_LOAD`].
-pub const PROTOCOL_VERSION: u16 = 7;
+/// - 8: A merging `Mode::Invalidation` cache sends [`Msg::Replicate`] and
+///   [`Msg::ReplicateBatch`] records in place of [`Msg::Invalidate`]. See
+///   [`PROTOCOL_INVALIDATION_FOLD`].
+pub const PROTOCOL_VERSION: u16 = 8;
 
 /// The oldest peer protocol this build still serves in full.
 pub const MIN_PROTOCOL_VERSION: u16 = 1;
@@ -114,6 +117,15 @@ pub const PROTOCOL_CLUSTER_ID: u16 = 6;
 /// picks a peer to load or refresh a key only among peers that speak it,
 /// and the wire layer refuses to send either to an older peer regardless.
 pub const PROTOCOL_LOAD: u16 = 7;
+
+/// The protocol under which a `Mode::Invalidation` cache whose resolver
+/// merges ships its live records as [`Msg::Replicate`] and
+/// [`Msg::ReplicateBatch`] instead of [`Msg::Invalidate`]. A receiving
+/// `Invalidation` cache folds such a record into the key it holds and
+/// ignores it for a key it does not. A sender gives a peer speaking less
+/// [`Msg::Invalidate`] for every write, since that peer would store the
+/// record as an ordinary replicated entry. No message kind is new.
+pub const PROTOCOL_INVALIDATION_FOLD: u16 = 8;
 
 /// The `cluster` a [`Msg::Hello`] carries when its sender names none: a
 /// peer older than [`PROTOCOL_CLUSTER_ID`], or a bare [`crate::net::Mesh`]
@@ -187,14 +199,21 @@ pub enum Msg {
         cluster: u64,
     },
     /// Invalidation-mode fan-out: "the entry at `key` changed, drop your
-    /// copy." `key` is postcard-encoded; `ver` is the write's version.
+    /// copy." `key` is postcard-encoded; `ver` is the write's version. An
+    /// `Invalidation` cache whose resolver merges sends it for a removal,
+    /// and for every write to a peer older than
+    /// [`PROTOCOL_INVALIDATION_FOLD`]; its other writes travel as
+    /// [`Msg::Replicate`] records.
     Invalidate {
         cache: SmolStr,
         key: Bytes,
         ver: Hlc,
     },
     /// Replication-mode fan-out: the full record. Raw-record layout, not
-    /// postcard.
+    /// postcard. An `Invalidation` cache whose resolver merges sends its
+    /// live records this way to a peer speaking
+    /// [`PROTOCOL_INVALIDATION_FOLD`], and the peer folds one into a key it
+    /// holds and ignores it otherwise.
     Replicate { cache: SmolStr, rec: WireRecord },
     /// Requests a full snapshot stream of a cache, for state transfer on join.
     StRequest { cache: SmolStr },
@@ -225,6 +244,8 @@ pub enum Msg {
     /// together. `net::conn`'s per-peer writer coalesces consecutive
     /// same-cache queued [`Msg::Replicate`] messages into this; the batch
     /// applies under one lock acquisition. Raw-record layout, not postcard.
+    /// Carries merged `Invalidation` records the same way [`Msg::Replicate`]
+    /// does.
     ReplicateBatch {
         cache: SmolStr,
         recs: Vec<WireRecord>,
@@ -1300,6 +1321,28 @@ mod tests {
     fn a_protocol_6_peer_supports_no_load_message() {
         assert!(!peer_supports(6, PROTOCOL_LOAD));
         assert!(peer_supports(PROTOCOL_VERSION, PROTOCOL_LOAD));
+    }
+
+    #[test]
+    fn a_protocol_7_peer_supports_no_merged_invalidation_record() {
+        const { assert!(PROTOCOL_VERSION >= PROTOCOL_INVALIDATION_FOLD) };
+        assert!(!peer_supports(7, PROTOCOL_INVALIDATION_FOLD));
+        assert!(!peer_supports(PROTOCOL_LOAD, PROTOCOL_INVALIDATION_FOLD));
+        assert!(peer_supports(8, PROTOCOL_INVALIDATION_FOLD));
+        assert!(peer_supports(PROTOCOL_VERSION, PROTOCOL_INVALIDATION_FOLD));
+    }
+
+    #[test]
+    fn a_merged_invalidation_record_is_an_ordinary_replicate_frame() {
+        roundtrip(&Msg::Replicate {
+            cache: SmolStr::new("counters"),
+            rec: sample_record(Some("v1")),
+        });
+        roundtrip(&Msg::Invalidate {
+            cache: SmolStr::new("counters"),
+            key: Bytes::from_static(b"k1"),
+            ver: sample_record(Some("v1")).ver,
+        });
     }
 
     #[test]

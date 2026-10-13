@@ -20,8 +20,17 @@ wants sundog's expiry, eviction and read-through.
 ## Invalidation
 
 A write on one node sends the key and its new version to every peer, and
-each peer drops its older copy. Values never cross the network. Every node
-fills its own copy from its loader or its own writes.
+each peer drops its older copy. Every node fills its own copy from its
+loader or its own writes.
+
+Values cross the network only when the cache's resolver merges, as
+`PnCounterResolver` does. The write then ships the writer's merged record
+instead of the bare invalidation. A peer that holds the key folds the record
+into its copy, so no node loses the contribution only it held. A peer that
+does not hold the key ignores the record and stores nothing, which keeps
+each node's cache to its own working set. A removal still drops the copy on
+every peer, and a peer on a release before protocol 8 gets the bare
+invalidation for every write.
 
 This is the mode for a large or expensive dataset: each node holds only
 what it reads, bounded by `max_capacity`.

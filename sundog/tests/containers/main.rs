@@ -31,6 +31,7 @@ mod anti_entropy;
 mod chaos;
 mod distributed;
 mod explain;
+mod invalidation_fold;
 mod loads;
 mod previous_release;
 mod replication;

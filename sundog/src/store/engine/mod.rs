@@ -103,6 +103,7 @@ mod slab_tests;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use self::apply::ApplyScope;
 #[cfg(doc)]
 use self::apply::apply_locked;
 #[cfg(feature = "spill")]

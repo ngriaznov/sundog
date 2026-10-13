@@ -7,6 +7,7 @@ mod ae_repair;
 mod background;
 mod builder;
 mod distributed;
+mod invalidation_fold;
 mod modes;
 mod request_handler;
 mod resolvers;
