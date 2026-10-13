@@ -4,6 +4,8 @@ use std::time::Duration;
 
 #[cfg(feature = "spill")]
 use super::apply::prefetch_spilled_conflict_bytes;
+#[cfg(feature = "spill")]
+use super::apply::read_stored_live;
 use super::apply::{ApplyCtx, EntryKey, apply_locked};
 use super::evict::{
     EVICTION_BATCH, EVICTION_BATCH_SAMPLE, EVICTION_SAMPLE, EvictOutcome, defer_to_flusher,
@@ -131,6 +133,8 @@ where
         std::iter::once((hash, &key_bytes)),
         &resolver,
         engine.spill().map(Arc::as_ref),
+        engine.tti_ms,
+        now_ms,
     );
     let mut stripe = engine.stripes[bucket].write();
     let ctx = ApplyCtx {
@@ -193,6 +197,8 @@ where
         std::iter::once((hash, &key_bytes)),
         resolver,
         engine.spill().map(Arc::as_ref),
+        engine.tti_ms,
+        now_ms,
     );
     let ctx = ApplyCtx {
         digest_bucket: &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],

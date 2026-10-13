@@ -58,19 +58,25 @@ pub(super) fn read_spilled_for_conflict(tier: &SpillTier, loc: SpillLoc) -> Opti
 /// for why a fallback under the write lock still exists. A brief stripe
 /// read lock finds which keys are spilled, then every read happens off-lock,
 /// keyed by [`SpillLoc`] so a moved entry misses rather than serving stale
-/// content. Skips the read lock entirely when `resolver` never inspects
-/// stored bytes ([`ConflictResolver::needs_value_bytes`] is `false`) or no
-/// tier is attached.
+/// content. A merging `resolver` never folds a record that reads as absent
+/// at `now_ms` (expired, or idle for `tti_ms`), so that record is not read;
+/// any other resolver sees every spilled record's bytes. Skips the read lock
+/// entirely when `resolver` never inspects stored bytes
+/// ([`ConflictResolver::needs_value_bytes`] is `false`) or no tier is
+/// attached.
 #[cfg(feature = "spill")]
 pub(super) fn prefetch_spilled_conflict_bytes<'a, K, V>(
     stripe_lock: &RwLock<Stripe<K, V>>,
     keys: impl IntoIterator<Item = (u64, &'a Bytes)>,
     resolver: &dyn ConflictResolver,
     spill: Option<&SpillTier>,
+    tti_ms: Option<u64>,
+    now_ms: u64,
 ) -> HashMap<SpillLoc, Bytes> {
     let Some(tier) = spill.filter(|_| resolver.needs_value_bytes()) else {
         return HashMap::new();
     };
+    let merges = resolver.merges();
     let mut locs: std::collections::HashSet<SpillLoc> = std::collections::HashSet::new();
     {
         let stripe = stripe_lock.read();
@@ -82,6 +88,8 @@ pub(super) fn prefetch_spilled_conflict_bytes<'a, K, V>(
                 .live
                 .find(hash, |l| record_key(&l.record) == key_bytes.as_ref())
                 && let EntryState::Spilled(loc) = &live.state
+                && !(merges
+                    && absent_at(live, key_bytes.as_ref(), &stripe.long_ttl, tti_ms, now_ms))
             {
                 locs.insert(*loc);
             }
@@ -139,24 +147,26 @@ pub(crate) struct ApplyCtx<'a, K, V> {
 
 /// The live entry [`apply_locked`] finds for a key, as the collision
 /// decision reads it.
-struct StoredLive {
-    ver: Hlc,
+pub(super) struct StoredLive {
+    pub(super) ver: Hlc,
     /// The value bytes: `None` for a spilled entry that is not read, or
     /// whose read failed.
-    encoded: Option<Bytes>,
-    expires_at_ms: Option<u64>,
+    pub(super) encoded: Option<Bytes>,
+    pub(super) expires_at_ms: Option<u64>,
     /// What a read at `now_ms` would see: an expired or idle entry still
     /// takes part in version ordering and still gets displaced, and a write
     /// over it counts as a creation, the same as after a sweep, but it never
     /// folds into a merge.
-    visible: bool,
+    pub(super) visible: bool,
 }
 
 /// `key_bytes`' live entry in `stripe`, if any. A currently-spilled entry
 /// has no value bytes resident in RAM; see [`apply_locked`]'s doc for
-/// `prefetched_spilled` and the off-lock/under-lock read split. An entry
-/// that is not visible is not read at all.
-fn read_stored_live<K, V>(
+/// `prefetched_spilled` and the off-lock/under-lock read split. A spilled
+/// entry that is not visible is not read when the resolver merges, since a
+/// dead side never folds; any other resolver sees its bytes as it sees a
+/// resident entry's.
+pub(super) fn read_stored_live<K, V>(
     stripe: &Stripe<K, V>,
     ctx: &ApplyCtx<'_, K, V>,
     hash: u64,
@@ -169,7 +179,7 @@ fn read_stored_live<K, V>(
     #[cfg(feature = "spill")]
     let encoded = match &live.state {
         EntryState::Resident => Some(record_value_bytes(&live.record)),
-        EntryState::Spilled(_) if !visible => None,
+        EntryState::Spilled(_) if !visible && ctx.resolver.merges() => None,
         EntryState::Spilled(loc) => ctx.prefetched_spilled.get(loc).cloned().or_else(|| {
             ctx.spill
                 .filter(|_| ctx.resolver.needs_value_bytes())
@@ -192,9 +202,11 @@ fn read_stored_live<K, V>(
 /// may fold both sides via [`ConflictResolver::merge`], rebinding
 /// `ver`/`incoming` to the merged version ([`merge_version`]) and bytes
 /// before anything downstream runs, so a merge stores and fingerprints like
-/// any other `Put`. A stored entry that reads as absent at `now_ms` is not
-/// read from disk and never folds ([`resolve_conflict`] treats it as
-/// absent), nor does a side that lapsed before the other side's write.
+/// any other `Put`. A stored entry that reads as absent at `now_ms` never
+/// folds ([`resolve_conflict`] treats it as absent), nor does a side that
+/// lapsed before the other side's write; under a merging resolver a spilled
+/// entry that reads as absent is not read from disk, by this call or by
+/// [`prefetch_spilled_conflict_bytes`].
 /// With [`ApplyCtx::held_only`] set, a write that does not fold into a
 /// visible live entry is [`ApplyOutcome::Rejected`] and stores nothing; see
 /// [`reject_unheld`]. Synchronous under the caller's write lock on `stripe`;
@@ -596,6 +608,8 @@ where
                 .map(|(hash, _, key_bytes, ..)| (*hash, key_bytes)),
             resolver,
             self.spill().map(Arc::as_ref),
+            self.tti_ms,
+            now_ms,
         );
         let entries: Vec<Option<BatchEntry<K, V>>> = if prefold {
             let runs = group_prefold_runs(&entries);
@@ -695,6 +709,8 @@ where
             [(hash, &key_bytes)],
             resolver,
             self.spill().map(Arc::as_ref),
+            self.tti_ms,
+            now_ms,
         );
         let outcome = {
             let mut stripe = self.stripes[bucket].write();

@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use super::*;
 
+mod held_only;
 mod refusal;
 mod reservation;
 
@@ -741,6 +742,337 @@ fn merge_against_an_expired_spilled_counter_starts_a_new_value() {
         !is_spilled(&engine, &kb),
         "the new value is resident; the spilled record is displaced"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A resolver that never merges and reads value bytes, recording the stored
+/// side's bytes every [`ConflictResolver::winner`] call is shown. The
+/// incoming side always wins.
+#[derive(Default)]
+struct RecordingResolver {
+    stored_seen: std::sync::Mutex<Vec<Option<Vec<u8>>>>,
+}
+
+impl ConflictResolver for RecordingResolver {
+    fn winner(&self, _key: &[u8], a: RecordView<'_>, _b: RecordView<'_>) -> Winner {
+        self.stored_seen
+            .lock()
+            .expect("lock")
+            .push(a.value.map(<[u8]>::to_vec));
+        Winner::B
+    }
+}
+
+/// A resolver that does not merge sees the value bytes of a spilled stored
+/// record that has expired, as it does for a resident one: the skipped read
+/// is the merging resolvers' alone.
+#[test]
+fn a_non_merging_resolver_reads_an_expired_spilled_record() {
+    let dir = temp_dir("recording-spilled-expired");
+    let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+    let tier = Arc::new(SpillTier::open(&cfg, "recording-spilled-expired").expect("tier opens"));
+    let engine = Engine::<u32, String>::new(u64::MAX, None, None, None);
+    engine.set_spill(Arc::clone(&tier));
+    let engine = Arc::new(engine);
+    tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
+
+    let key = 1u32;
+    let kb = key_bytes(key);
+    let bucket = stripe_index_from_hash(hash_key_bytes(kb.as_ref()));
+    let _ = put(
+        &engine,
+        key,
+        kb.clone(),
+        "aaaa".to_owned(),
+        hlc(1, 1),
+        Some(100),
+        0,
+    );
+    let _ = engine.evict_one_sampled(bucket, 0);
+    assert!(
+        poll_until(POLL_TIMEOUT, || is_spilled(&engine, &kb)),
+        "the flusher installs the spilled entry"
+    );
+
+    let resolver = RecordingResolver::default();
+    let outcome = put_with_resolver(
+        &engine,
+        key,
+        kb.clone(),
+        "b".to_owned(),
+        hlc(5, 2),
+        None,
+        500,
+        &resolver,
+    );
+    assert!(matches!(outcome, ApplyOutcome::Put { created: true, .. }));
+    assert_eq!(
+        *resolver.stored_seen.lock().expect("lock"),
+        vec![Some(postcard::to_stdvec("aaaa").expect("encodes"))],
+        "the resolver is shown the expired spilled bytes"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `read_stored_live` returns no bytes for a spilled record that is not
+/// visible when the resolver merges, whether or not the prefetch holds them,
+/// and returns them for a visible record and for a resolver that does not
+/// merge.
+#[test]
+fn read_stored_live_skips_an_invisible_spilled_record_for_a_merging_resolver_only() {
+    use crate::store::crdt::{PnCounter, PnCounterResolver};
+
+    let dir = temp_dir("read-stored-live");
+    let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+    let tier = Arc::new(SpillTier::open(&cfg, "read-stored-live").expect("tier opens"));
+    let engine = Engine::<u32, PnCounter>::new(u64::MAX, None, None, None);
+    engine.set_spill(Arc::clone(&tier));
+    let engine = Arc::new(engine);
+    tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
+
+    let merging = PnCounterResolver;
+    let key = 1u32;
+    let kb = key_bytes(key);
+    let hash = hash_key_bytes(kb.as_ref());
+    let bucket = stripe_index_from_hash(hash);
+    let writer = crate::store::crdt::WriterId::new(NodeId::from(11), 1);
+    let _ = put_with_resolver(
+        &engine,
+        key,
+        kb.clone(),
+        PnCounter::local_delta(writer, 3),
+        hlc(1, 1),
+        Some(100),
+        0,
+        &merging,
+    );
+    let _ = engine.evict_one_sampled(bucket, 0);
+    assert!(
+        poll_until(POLL_TIMEOUT, || is_spilled(&engine, &kb)),
+        "the flusher installs the spilled entry"
+    );
+
+    // Prefetched while the record is visible, so the map holds its bytes
+    // for every read below.
+    let prefetch = |resolver: &dyn ConflictResolver, now_ms: u64| {
+        prefetch_spilled_conflict_bytes(
+            engine.stripe_lock(bucket),
+            std::iter::once((hash, &kb)),
+            resolver,
+            engine.spill().map(Arc::as_ref),
+            None,
+            now_ms,
+        )
+    };
+    let read = |resolver: &dyn ConflictResolver, now_ms: u64| {
+        let prefetched = prefetch(resolver, 50);
+        assert_eq!(prefetched.len(), 1, "the prefetch holds the spilled bytes");
+        let ctx = ApplyCtx {
+            prefetched_spilled: &prefetched,
+            spill: engine.spill().map(Arc::as_ref),
+            ..test_ctx(&engine, bucket, hash, resolver, 60_000, 600_000, now_ms)
+        };
+        let stripe = engine.stripe_lock(bucket).read();
+        let stored = read_stored_live(&stripe, &ctx, hash, kb.as_ref()).expect("a live entry");
+        (stored.visible, stored.encoded.is_some())
+    };
+    assert_eq!(read(&merging, 50), (true, true), "a visible record is read");
+    assert_eq!(
+        prefetch(&merging, 500).len(),
+        0,
+        "the prefetch skips an expired record for a merging resolver"
+    );
+    assert_eq!(
+        prefetch(&RecordingResolver::default(), 500).len(),
+        1,
+        "and reads it for a resolver that does not merge"
+    );
+    assert_eq!(
+        read(&merging, 500),
+        (false, false),
+        "an expired record is not read for a merging resolver, prefetched or not"
+    );
+    assert_eq!(
+        read(&RecordingResolver::default(), 500),
+        (false, true),
+        "a resolver that does not merge still reads it"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A batch over an expired spilled record starts a new value.
+#[test]
+fn an_apply_many_over_an_expired_spilled_counter_starts_a_new_value() {
+    use crate::store::crdt::{PnCounter, PnCounterResolver};
+
+    let dir = temp_dir("apply-many-expired-spilled");
+    let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+    let tier = Arc::new(SpillTier::open(&cfg, "apply-many-expired-spilled").expect("tier opens"));
+    let engine = Engine::<u32, PnCounter>::new(u64::MAX, None, None, None);
+    engine.set_spill(Arc::clone(&tier));
+    let engine = Arc::new(engine);
+    tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
+
+    let resolver = PnCounterResolver;
+    let key = 1u32;
+    let kb = key_bytes(key);
+    let hash = hash_key_bytes(kb.as_ref());
+    let bucket = stripe_index_from_hash(hash);
+    let node_a = crate::store::crdt::WriterId::new(NodeId::from(11), 1);
+    let node_b = crate::store::crdt::WriterId::new(NodeId::from(22), 1);
+    let _ = put_with_resolver(
+        &engine,
+        key,
+        kb.clone(),
+        PnCounter::local_delta(node_a, 3),
+        hlc(1, 1),
+        Some(100),
+        0,
+        &resolver,
+    );
+    let _ = engine.evict_one_sampled(bucket, 0);
+    assert!(
+        poll_until(POLL_TIMEOUT, || is_spilled(&engine, &kb)),
+        "the flusher installs the spilled entry"
+    );
+
+    let delta = PnCounter::local_delta(node_b, 4);
+    let encoded = Bytes::from(postcard::to_stdvec(&delta).expect("encodes"));
+    let outcomes = engine.apply_many(
+        bucket,
+        vec![(
+            hash,
+            key,
+            kb.clone(),
+            hlc(50, 2),
+            Incoming::Put {
+                value: delta,
+                expires_at_ms: None,
+                encoded,
+            },
+        )],
+        &resolver,
+        60_000,
+        600_000,
+        500,
+    );
+    assert!(matches!(
+        outcomes[0],
+        ApplyOutcome::Put { created: true, .. }
+    ));
+    assert_eq!(
+        engine.get(&key, 500).map(|c| c.value()),
+        Some(4),
+        "the expired spilled contribution does not fold in"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A batch over an expired spilled seed leaves the record sequential
+/// application does, including a run entry stamped below the seed's version.
+#[test]
+fn prefold_over_an_expired_spilled_seed_matches_sequential_application() {
+    use crate::store::crdt::{PnCounter, PnCounterResolver};
+
+    let resolver = PnCounterResolver;
+    let key = 1u32;
+    let kb = key_bytes(key);
+    let hash = hash_key_bytes(kb.as_ref());
+    let bucket = stripe_index_from_hash(hash);
+    let node_p_id = NodeId::from(1);
+    let node_p = crate::store::crdt::WriterId::new(node_p_id, 1);
+    let node_b = crate::store::crdt::WriterId::new(NodeId::from(22), 1);
+    let node_c = crate::store::crdt::WriterId::new(NodeId::from(33), 1);
+    let p_ver = Hlc {
+        wall_ms: 60,
+        logical: 5,
+        node: node_p_id,
+    };
+    let e0 = (hlc(5, 2), PnCounter::local_delta(node_b, 4));
+    let e1 = (hlc(70, 3), PnCounter::local_delta(node_c, 9));
+
+    let sequential = Engine::<u32, PnCounter>::new(u64::MAX, None, None, None);
+    let _ = put_with_resolver(
+        &sequential,
+        key,
+        kb.clone(),
+        PnCounter::local_delta(node_p, 3),
+        p_ver,
+        Some(100),
+        0,
+        &resolver,
+    );
+    for (ver, value) in [e0.clone(), e1.clone()] {
+        let _ = put_with_resolver(
+            &sequential,
+            key,
+            kb.clone(),
+            value,
+            ver,
+            None,
+            500,
+            &resolver,
+        );
+    }
+    let (sequential_ver, sequential_value) = stored_ver_and_value(&sequential, key, &kb, bucket);
+
+    let dir = temp_dir("prefold-expired-spilled-seed");
+    let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+    let tier = Arc::new(SpillTier::open(&cfg, "prefold-expired-spilled-seed").expect("tier opens"));
+    let batched = Engine::<u32, PnCounter>::new(u64::MAX, None, None, None);
+    batched.set_spill(Arc::clone(&tier));
+    let batched = Arc::new(batched);
+    tier.attach(Arc::downgrade(
+        &(Arc::clone(&batched) as Arc<dyn SpillSink>),
+    ));
+    let _ = put_with_resolver(
+        &batched,
+        key,
+        kb.clone(),
+        PnCounter::local_delta(node_p, 3),
+        p_ver,
+        Some(100),
+        0,
+        &resolver,
+    );
+    let _ = batched.evict_one_sampled(bucket, 0);
+    assert!(
+        poll_until(POLL_TIMEOUT, || is_spilled(&batched, &kb)),
+        "the flusher installs the spilled entry"
+    );
+    assert!(batched.prefold_enabled());
+
+    let entry = |(ver, value): (Hlc, PnCounter)| {
+        let encoded = Bytes::from(postcard::to_stdvec(&value).expect("encodes"));
+        (
+            hash,
+            key,
+            kb.clone(),
+            ver,
+            Incoming::Put {
+                value,
+                expires_at_ms: None,
+                encoded,
+            },
+        )
+    };
+    let _ = batched.apply_many(
+        bucket,
+        vec![entry(e0), entry(e1)],
+        &resolver,
+        60_000,
+        600_000,
+        500,
+    );
+    let (batched_ver, batched_value) = stored_ver_and_value(&batched, key, &kb, bucket);
+
+    assert_eq!(batched_value, 13, "the expired seed's 3 does not fold in");
+    assert_eq!(batched_value, sequential_value);
+    assert_eq!(batched_ver, sequential_ver);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
