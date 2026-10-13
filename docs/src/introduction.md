@@ -11,14 +11,16 @@ A cache runs in one of four modes:
 - **Local**: an in-process cache with TTL and a size bound, and no cluster
   traffic.
 - **Invalidation**: each node caches its own working set, and a write on one
-  node drops the key everywhere else.
+  node drops the key everywhere else, or under a merging resolver folds into
+  every copy.
 - **Replicated**: every node holds every entry, and a read never touches the
   network.
 - **Distributed**: each key lives on a fixed number of owners, for a dataset
   too large to hold on every node.
 
 Writes are last-write-wins on a hybrid logical clock. Counters, sets and
-other values that combine merge through a conflict resolver instead.
+other values that combine merge through a [conflict resolver](resolvers.md)
+chosen per cache instead.
 Anti-entropy repairs whatever the network drops. Deleted and expired
 entries never come back.
 

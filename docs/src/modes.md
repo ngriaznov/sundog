@@ -3,7 +3,7 @@
 | Mode | Each node stores | A write | A read | Pick it when |
 |---|---|---|---|---|
 | `Local` | its own entries | stays on this node | local | you want an in-process cache with TTL and a size bound, and no cluster traffic |
-| `Invalidation` (default) | its own working set | drops the key on every other node | local | the dataset is too large to hold everywhere and each node serves mostly its own hot keys |
+| `Invalidation` (default) | its own working set | drops the key on every other node, or under a merging resolver folds into each copy | local | the dataset is too large to hold everywhere and each node serves mostly its own hot keys |
 | `Replicated` | every entry | sends the value to every node | local, never waits on the network | the dataset fits on one node and reads must never touch the network |
 | `Distributed` | the parts it owns | goes to the key's owners | `get` is local; `fetch` asks an owner | the dataset is too large for one node and must survive a node loss |
 
@@ -30,7 +30,8 @@ into its copy, so no node loses the contribution only it held. A peer that
 does not hold the key ignores the record and stores nothing, which keeps
 each node's cache to its own working set. A removal still drops the copy on
 every peer, and a peer on a release before protocol 8 gets the bare
-invalidation for every write.
+invalidation for every write. [Choosing a resolver](resolvers.md) has the
+detail.
 
 This is the mode for a large or expensive dataset: each node holds only
 what it reads, bounded by `max_capacity`.

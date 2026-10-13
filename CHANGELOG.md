@@ -53,6 +53,17 @@ All notable changes to this project are documented in this file. Format follows
   again until they do and fails the run when the deadline passes first, so
   `demo --headless` and `demo/record.sh`'s smoke run exercise `explain`
   before anything is filmed.
+- **`Cache::merge_with_ttl` merges a value with its own lifetime.** It is
+  `Cache::merge` with a per-write TTL, as `insert_with_ttl` is for `insert`,
+  and `Shard::merge_with_ttl` is the shard-level form. Calls inside a
+  `merge_coalesce_window` fold their deadlines with their values.
+- **`later_deadline` is the expiry rule the `crdt` resolvers merge with.**
+  It returns the later of two deadlines, a side with no deadline taking the
+  other's, so a custom `ConflictResolver` sets `Merged::expires_at_ms` the
+  same way. It is re-exported at the crate root.
+- **The book's "Choosing a resolver" page** says when a merging resolver
+  fits, how to write and read `PnCounter` and `OrSet` values, how merged
+  values expire, what a CRDT costs, and what a custom resolver upholds.
 
 ### Changed
 
@@ -70,9 +81,23 @@ All notable changes to this project are documented in this file. Format follows
 - **The README is a short introduction, and the book holds the detail.**
   It keeps what sundog is, the lens recording, the features, the four
   modes, a benchmark summary and the quick start, and links into the book
-  for the rest. The crate
-  packages it, and crates.io resolves a relative link against `sundog/`,
-  so every link in it names its GitHub URL; CI fails on a relative one.
+  for the rest. The crate packages it, and crates.io resolves a relative
+  link against `sundog/`, so every link in it names its GitHub URL; CI
+  fails on a relative one.
+- **A merged value keeps the later deadline.** `PnCounterResolver` and
+  `OrSetResolver` give a merge the later of its two sides' deadlines, and a
+  side with no deadline takes the other's, so a merged key expires once no
+  write extends it. `expire` extends a merged value and never shortens it,
+  `touch` moves its deadline to the cache's TTL from now when that is
+  later, and `persist` leaves it. A merged record's version hashes its
+  deadline along with its bytes, and two records that differ only in their
+  deadline are different records.
+- **An `Invalidation` cache under a merging resolver ships merged values.**
+  A write sends the writer's merged record instead of an invalidation; a
+  peer holding the key folds it into its copy through the resolver, and a
+  peer without the key ignores it and stores nothing. A remove still sends
+  an invalidation. Wire protocol 8 (`wire::PROTOCOL_INVALIDATION_FOLD`); a
+  peer on protocol 7 or older receives an invalidation for every write.
 
 ### Fixed
 
@@ -102,6 +127,13 @@ All notable changes to this project are documented in this file. Format follows
   `max_capacity` took about 450 stripe locks per applied entry, enough to
   run its state transfer past `state_transfer_budget` and open with part of
   the cache; it now takes a third of that.
+- **An expired or idle value never folds into a later merge.** Under a
+  merging resolver, a write over an expired entry that no sweep had removed
+  yet folded the expired value back in, so a counter read its old total
+  plus the new write. A write made after a value's deadline starts a new
+  value, judged by the deadline against the write's own version, so every
+  node decides alike; on the node applying a write, a value that reads as
+  absent there, expired or idle past `tti`, never folds either.
 
 ## [0.6.6] – 2026-10-09
 

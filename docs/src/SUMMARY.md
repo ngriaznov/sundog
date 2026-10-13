@@ -4,6 +4,7 @@
 
 - [Getting started](getting-started.md)
 - [Choosing a mode](modes.md)
+- [Choosing a resolver](resolvers.md)
 - [Guarantees](guarantees.md)
 
 # Running it

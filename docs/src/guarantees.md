@@ -30,7 +30,9 @@ A value that combines, a counter or a set, does not have to lose writes. A
 `ConflictResolver` that implements `merge` folds the stored and incoming
 records into a third value, and every node reaches the same result in any
 order. `sundog::crdt` ships two: `PnCounter` with `PnCounterResolver` and
-`OrSet` with `OrSetResolver`.
+`OrSet` with `OrSetResolver`. Every mode merges. [Choosing a
+resolver](resolvers.md) says when a merging resolver fits, how to write its
+values, and how they expire.
 
 ```rust
 {{#include ../cookbook/src/counters.rs:counter}}
@@ -43,11 +45,13 @@ fold still pending inside its window.
 
 Each writer owns a slot in a merged value. A background sweep retires the
 slot of a writer gone longer than `ClusterConfig::crdt_retire_after`, 24
-hours by default, and folds it away once the retirement itself has aged
-past a second bound with every peer quiet. A replica isolated for longer
-than that, still holding a slot every other replica has folded, counts
-that writer's contribution twice when it reconnects. The limit matches the
-one `tombstone_max_ttl` sets for deletes, below.
+hours by default, and folds it away once the retirement has aged past twice
+that bound with every peer quiet. Each fold leaves a receipt that every
+merge honors for three times `crdt_retire_after` past the retirement. A
+replica cut off from before the fold until after the receipt expires,
+still holding the slot every other replica has folded, counts that
+writer's contribution twice when it reconnects. The limit matches the one
+`tombstone_max_ttl` sets for deletes, below.
 
 ## Deletes
 
@@ -90,14 +94,17 @@ lifetime left on this node's copy.
 
 Shortening a lifetime is not a delete. A node cut off for the whole
 lifetime keeps its copy's old deadline and can bring the entry back until
-that deadline passes; `remove` is the delete. Under a merging resolver the
-resolver sets a merged record's expiry, and the `crdt` resolvers keep the
-later of the two deadlines, an unset side deferring to the other. A merged
-value therefore expires with its longest-lived contribution: `persist`
-leaves its deadline, `expire` extends it and never shortens it, and `touch`
-extends it by the default TTL. A record whose deadline passed before the
-other side's write was made never folds into the result, so a merge after
-expiry starts a new value.
+that deadline passes; `remove` is the delete.
+
+Under a merging resolver the resolver sets a merged record's expiry, and the
+`crdt` resolvers keep the later of the two deadlines, an unset side
+deferring to the other. A merged value therefore expires with its
+longest-lived contribution: `persist` leaves its deadline, `expire` extends
+it and never shortens it, and `touch` moves it to the default TTL from now
+when that is later. A record whose deadline passed before the other side's
+write was made never folds into the result, so a merge after expiry starts
+a new value. On the node applying a write, a value that reads as absent
+there, expired or idle, never folds either.
 
 `CacheBuilder::tti`, an idle timeout, is local to one node and applies only
 to `Local` and `Invalidation` caches.
@@ -107,7 +114,7 @@ to `Local` and `Invalidation` caches.
 | Mode | A reader sees | After a node's partition heals |
 |---|---|---|
 | `Local` | its own writes | nothing to converge |
-| `Invalidation` | its own copy, dropped when any node writes the key | copies it missed invalidations for stay until their TTL |
+| `Invalidation` | its own copy, dropped when any node writes the key, or under a merging resolver folded with that write | copies it missed invalidations for stay until their TTL |
 | `Replicated` | its own copy of every entry, a moment behind a write elsewhere | anti-entropy reconciles every entry by version |
 | `Distributed` | via `fetch`, the owners' copy | owners reconcile by version; each side of the partition accepted writes for its own view |
 

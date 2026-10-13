@@ -74,7 +74,9 @@ sundog-distributed-demo -- --nodes 5` (a `Distributed` cache).
   bring back a deleted or expired key, for deletes up to a 24-hour absence by
   default ([guarantees][guarantees]).
 - **Merges, not lost writes.** Counters and sets merge through `sundog::crdt`
-  or your own `ConflictResolver` instead of overwriting each other.
+  or your own `ConflictResolver` instead of overwriting each other, in every
+  mode and with TTLs. Merging is a [per-cache choice][resolvers]; the
+  default is last-write-wins.
 - **Change events and explain.** `Cache::events` streams every created,
   updated and removed key with its origin. `Cache::explain` says why a read of
   a key answers what it does.
@@ -92,7 +94,7 @@ mode][modes] has the detail.
 | Mode | Each node stores | A read | Pick it when |
 |---|---|---|---|
 | `Local` | its own entries; nothing is sent | local | you want an in-process cache with TTL and a size bound, and no cluster traffic |
-| `Invalidation` (default) | its own working set; a write drops the key on every other node | local | the dataset is too large to hold everywhere and each node mostly reads its own hot keys |
+| `Invalidation` (default) | its own working set; a write drops the key on every other node, or under a merging resolver folds into its copy | local | the dataset is too large to hold everywhere and each node mostly reads its own hot keys |
 | `Replicated` | every entry | local, never waits on the network | the dataset fits on one node and reads must never touch the network |
 | `Distributed` | the parts it owns, 2 owners per key by default | `get` is local, `fetch` asks an owner | the dataset is too large for one node and must survive a node loss |
 
@@ -167,7 +169,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 The [sundog book](https://ngriaznov.github.io/sundog/) holds the detail:
 
 - [Getting started](https://ngriaznov.github.io/sundog/getting-started.html),
-  [choosing a mode][modes] and the [guarantees][guarantees] of each.
+  [choosing a mode][modes] and a [resolver][resolvers], and the
+  [guarantees][guarantees].
 - Running it: [deployment](https://ngriaznov.github.io/sundog/deployment.html)
   (a LAN, Docker, a VPC, Kubernetes, TLS, rolling upgrades),
   [sizing](https://ngriaznov.github.io/sundog/sizing.html),
@@ -190,5 +193,6 @@ for inclusion in this project by you, as defined in the Apache-2.0 license,
 shall be dual licensed as above, without any additional terms or conditions.
 
 [modes]: https://ngriaznov.github.io/sundog/modes.html
+[resolvers]: https://ngriaznov.github.io/sundog/resolvers.html
 [guarantees]: https://ngriaznov.github.io/sundog/guarantees.html
 [loading]: https://ngriaznov.github.io/sundog/recipes/read-through.html

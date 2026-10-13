@@ -169,6 +169,16 @@ where
     /// Overrides the [`ConflictResolver`] that decides which of two
     /// differently-versioned records for the same key wins. Default:
     /// [`LwwResolver`], last-write-wins by [`crate::Hlc`].
+    ///
+    /// A merging resolver, such as [`crate::crdt::PnCounterResolver`] or
+    /// [`crate::crdt::OrSetResolver`], folds both records into one value
+    /// instead, in every mode. It fits a count or a set of members that
+    /// several nodes update at once and that the cache itself owns; a copy
+    /// of data that lives elsewhere keeps the default. Nodes compare a
+    /// cache's mode when it opens, not its resolver, so open the cache with
+    /// the same resolver on every node. The book's
+    /// [Choosing a resolver](https://ngriaznov.github.io/sundog/resolvers.html)
+    /// page says when a merging resolver fits and how its values expire.
     pub fn resolver(mut self, resolver: Arc<dyn ConflictResolver>) -> Self {
         self.resolver = resolver;
         self
