@@ -67,6 +67,12 @@ All notable changes to this project are documented in this file. Format follows
   behaviour change.** Tracing events from moved code carry deeper module
   targets, such as `sundog::cache::open`; prefix filters such as
   `RUST_LOG=sundog::cache=debug` still match them.
+- **The README is a short introduction, and the book holds the detail.**
+  It keeps what sundog is, the lens recording, the features, the four
+  modes, a benchmark summary and the quick start, and links into the book
+  for the rest. The crate
+  packages it, and crates.io resolves a relative link against `sundog/`,
+  so every link in it names its GitHub URL; CI fails on a relative one.
 
 ### Fixed
 
