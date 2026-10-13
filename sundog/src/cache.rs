@@ -927,11 +927,27 @@ where
     /// not yet flushed is invisible to a read for as long as it stays
     /// pending, up to one whole window from the call that opened it.
     ///
+    /// The folded record carries the cache's default TTL, if any; a
+    /// merging resolver keeps the later deadline of the two sides.
+    ///
     /// # Errors
     ///
     /// As [`Cache::insert`].
     pub async fn merge(&self, key: K, value: V) -> Result<(), CacheError> {
         self.shard.merge(key, value).await
+    }
+
+    /// [`Cache::merge`] with a lifespan for this contribution alone; `ttl`
+    /// overrides the cache's default and travels with the record. The
+    /// folded record's deadline is the resolver's merge of the two sides'
+    /// deadlines: the shipped resolvers keep the later one, so a stored
+    /// value that outlives `ttl` keeps its own deadline.
+    ///
+    /// # Errors
+    ///
+    /// As [`Cache::insert`].
+    pub async fn merge_with_ttl(&self, key: K, value: V, ttl: Duration) -> Result<(), CacheError> {
+        self.shard.merge_with_ttl(key, value, ttl).await
     }
 
     /// [`Cache::insert_many`] with one lifespan applied to every entry,

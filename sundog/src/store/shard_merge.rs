@@ -12,6 +12,7 @@ use bytes::Bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use super::engine::{Fold, fold_sides};
 use super::{
     Incoming, Merged, PendingMerge, PendingMergeStripe, RecordView, Shard, Winner, duration_ms,
     encode_key, engine,
@@ -76,7 +77,9 @@ where
 {
     /// Folds `value` into `key` through the configured [`ConflictResolver`]
     /// without a read, applying through the same versioned-apply path as
-    /// [`Shard::insert`]. With [`Shard::with_merge_coalesce_window`] left
+    /// [`Shard::insert`]. The folded record carries the shard's default TTL,
+    /// if any; a merging resolver keeps the later deadline of the two sides.
+    /// With [`Shard::with_merge_coalesce_window`] left
     /// at its default zero, every call applies at once. With a non-zero
     /// window, consecutive calls to the same key fold into an in-memory
     /// pending value instead, applying once when the window that opened at
@@ -96,6 +99,31 @@ where
     /// folded into a pending value within the window is checked when it is
     /// made, not when the fold flushes.
     pub async fn merge(&self, key: K, value: V) -> Result<(), CacheError> {
+        self.merge_expiring(key, value, None).await
+    }
+
+    /// [`Shard::merge`] with a lifespan for this contribution alone,
+    /// overriding the shard's default TTL. The folded record's deadline is
+    /// the resolver's merge of the two sides' deadlines: the shipped
+    /// resolvers keep the later one, so a stored value that outlives `ttl`
+    /// keeps its own deadline. Coalesces and replicates exactly as
+    /// [`Shard::merge`] does.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shard::merge`].
+    pub async fn merge_with_ttl(&self, key: K, value: V, ttl: Duration) -> Result<(), CacheError> {
+        self.merge_expiring(key, value, Some(ttl)).await
+    }
+
+    /// The path [`Shard::merge`] and [`Shard::merge_with_ttl`] share; `ttl`
+    /// overrides the shard's default when given.
+    async fn merge_expiring(
+        &self,
+        key: K,
+        value: V,
+        ttl: Option<Duration>,
+    ) -> Result<(), CacheError> {
         self.check_ceiling()?;
         let key_bytes = encode_key(&key)?;
         let encoded = Bytes::from(postcard::to_stdvec(&value).map_err(CodecError::from)?);
@@ -110,7 +138,7 @@ where
         let ver = self.stamp_local();
         if self.merge_window.is_zero() {
             self.wait_for_fan_out_room().await;
-            let expires_at_ms = self.expiry_for(None);
+            let expires_at_ms = self.expiry_for(ttl);
             return self.apply_or_forward(
                 key,
                 key_bytes,
@@ -122,6 +150,7 @@ where
                 },
             );
         }
+        let expires_at_ms = self.expiry_for(ttl);
         let hash = engine::hash_key_bytes(key_bytes.as_ref());
         let mut stripe = self.pending_merges[engine::stripe_index_from_hash(hash)]
             .lock()
@@ -133,7 +162,14 @@ where
         } = &mut *stripe;
         match entries.entry(key) {
             Entry::Occupied(slot) => {
-                self.fold_into_occupied_merge(slot, &key_bytes, encoded, value, ver)?;
+                self.fold_into_occupied_merge(
+                    slot,
+                    &key_bytes,
+                    encoded,
+                    value,
+                    ver,
+                    expires_at_ms,
+                )?;
             }
             Entry::Vacant(slot) => {
                 let deadline_ms = merge_deadline_ms(self.now_ms(), self.merge_window);
@@ -144,7 +180,7 @@ where
                     key_bytes,
                     value,
                     encoded,
-                    expires_at_ms: self.expiry_for(None),
+                    expires_at_ms,
                     ver,
                 });
                 drop(stripe);
@@ -154,8 +190,14 @@ where
         Ok(())
     }
 
-    /// [`Shard::merge`]'s occupied-slot branch: folds `value` into whatever
-    /// this stripe already holds pending, via the resolver's `merge` or `winner` call.
+    /// [`Shard::merge`]'s occupied-slot branch: folds `value`, stamped `ver`
+    /// and expiring at `expires_at_ms`, into whatever this stripe already
+    /// holds pending. For a merging resolver, [`fold_sides`] decides which
+    /// content survives, as it does against a stored record: both sides
+    /// fold through the resolver's `merge`, a lapsed pending entry is
+    /// replaced by the new call, a lapsed new call is dropped, and two
+    /// lapsed sides fall to the resolver's `winner`, which a non-merging
+    /// resolver always uses.
     fn fold_into_occupied_merge(
         &self,
         slot: OccupiedEntry<'_, K, PendingMerge<V>>,
@@ -163,7 +205,20 @@ where
         encoded: Bytes,
         value: V,
         ver: Hlc,
+        expires_at_ms: Option<u64>,
     ) -> Result<(), CacheError> {
+        let fold = if self.resolver.merges() {
+            let existing = slot.get();
+            fold_sides(
+                false,
+                existing.ver,
+                existing.expires_at_ms,
+                ver,
+                expires_at_ms,
+            )
+        } else {
+            Fold::Winner
+        };
         let (a, b) = {
             let existing = slot.get();
             (
@@ -175,41 +230,54 @@ where
                 RecordView {
                     value: Some(encoded.as_ref()),
                     ver,
-                    expires_at_ms: self.expiry_for(None),
+                    expires_at_ms,
                 },
             )
         };
-        let merged = self
-            .resolver
-            .merges()
+        let merged = matches!(fold, Fold::Both)
             .then(|| self.resolver.merge(key_bytes.as_ref(), a, b))
             .flatten();
-        match merged {
-            Some(Merged {
-                value: merged_bytes,
-                expires_at_ms,
-            }) => {
+        match (fold, merged) {
+            (
+                _,
+                Some(Merged {
+                    value: merged_bytes,
+                    expires_at_ms: merged_expires_at_ms,
+                }),
+            ) => {
                 let merged_value: V =
                     postcard::from_bytes(&merged_bytes).map_err(CodecError::from)?;
                 let entry = slot.into_mut();
                 entry.value = merged_value;
                 entry.encoded = merged_bytes;
+                entry.expires_at_ms = merged_expires_at_ms;
+                entry.ver = ver;
+            }
+            // The pending entry is all that is alive: the new call adds
+            // nothing.
+            (Fold::Stored, None) => {}
+            (Fold::Incoming, None) => {
+                let entry = slot.into_mut();
+                entry.value = value;
+                entry.encoded = encoded;
                 entry.expires_at_ms = expires_at_ms;
                 entry.ver = ver;
             }
-            None => match self.resolver.winner(key_bytes.as_ref(), a, b) {
-                Winner::B => {
-                    let entry = slot.into_mut();
-                    entry.value = value;
-                    entry.encoded = encoded;
-                    entry.expires_at_ms = self.expiry_for(None);
-                    entry.ver = ver;
+            (Fold::Both | Fold::Winner, None) => {
+                match self.resolver.winner(key_bytes.as_ref(), a, b) {
+                    Winner::B => {
+                        let entry = slot.into_mut();
+                        entry.value = value;
+                        entry.encoded = encoded;
+                        entry.expires_at_ms = expires_at_ms;
+                        entry.ver = ver;
+                    }
+                    Winner::A => {
+                        // The incoming call lost outright: nothing about the pending entry
+                        // changes, mirroring `resolve_and_rebind`'s `IncomingLoses => None`.
+                    }
                 }
-                Winner::A => {
-                    // The incoming call lost outright: nothing about the pending entry
-                    // changes, mirroring `resolve_and_rebind`'s `IncomingLoses => None`.
-                }
-            },
+            }
         }
         Ok(())
     }

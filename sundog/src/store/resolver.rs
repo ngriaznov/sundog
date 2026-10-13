@@ -31,14 +31,31 @@ pub enum Winner {
 }
 
 /// The outcome of a [`ConflictResolver::merge`] call: the folded value and
-/// its own TTL, decided explicitly by the resolver; the engine never infers
+/// its own expiry, decided explicitly by the resolver; the engine never infers
 /// one from `a`/`b`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Merged {
     /// The merged record's postcard-encoded value bytes.
     pub value: Bytes,
-    /// The merged record's own TTL; never derived from `a`/`b`.
+    /// The merged record's absolute expiry in epoch milliseconds, or `None`
+    /// for no expiry. The shipped resolvers set it to [`later_deadline`] of
+    /// the two sides' deadlines.
     pub expires_at_ms: Option<u64>,
+}
+
+/// The merged expiry of two records: the later deadline, with an unset side
+/// deferring to the other. `(Some(x), Some(y))` is the larger of the two,
+/// `(Some(x), None)` and `(None, Some(x))` are `Some(x)`, and `(None, None)`
+/// is `None`. Commutative, associative and idempotent, so it is a valid join
+/// for [`Merged::expires_at_ms`]; the shipped merging resolvers use it.
+///
+/// A merged value therefore keeps the longest lifetime any contribution
+/// asked for: [`crate::cache::Cache::persist`] leaves its deadline unchanged,
+/// [`crate::cache::Cache::expire`] extends it but never shortens it, and
+/// [`crate::cache::Cache::touch`] extends it by the default TTL.
+#[must_use]
+pub fn later_deadline(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    a.max(b)
 }
 
 /// Picks a winner between two differently-versioned records for the same
@@ -53,10 +70,15 @@ pub struct Merged {
 /// total order over one key's distinct-version records. A resolver whose
 /// [`ConflictResolver::merges`] is `true` additionally commits
 /// [`ConflictResolver::merge`] to the join-semilattice laws (commutative,
-/// associative across repeated pairwise folds, idempotent); it runs only
-/// when both sides carry a value, so
+/// associative across repeated pairwise folds, idempotent) over the merged
+/// value and over the merged expiry: [`Merged::expires_at_ms`] must itself be
+/// a join of the two deadlines, which [`later_deadline`] is and the shipped
+/// resolvers use. `merge` runs only when both sides carry a value, so
 /// [`ConflictResolver::needs_value_bytes`] must stay `true` whenever
-/// `merges` does. The engine, never the resolver, mints the merge
+/// `merges` does. The engine never folds a lapsed side (a record whose
+/// deadline is at or before the other side's write, or a stored entry that
+/// reads as absent on the applying node), so a resolver need not check
+/// deadlines itself. The engine, never the resolver, mints the merge
 /// outcome's version. Configuration is local per `Shard`, never
 /// wire-negotiated: every node must run an identical resolver for a given
 /// cache.
@@ -176,5 +198,46 @@ impl ConflictResolver for LwwResolver {
 
     fn needs_value_bytes(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::later_deadline;
+
+    #[test]
+    fn later_deadline_takes_the_larger_of_two_set_deadlines() {
+        assert_eq!(later_deadline(Some(5), Some(9)), Some(9));
+        assert_eq!(later_deadline(Some(9), Some(5)), Some(9));
+        assert_eq!(later_deadline(Some(7), Some(7)), Some(7));
+    }
+
+    #[test]
+    fn later_deadline_defers_to_the_set_side() {
+        assert_eq!(later_deadline(Some(5), None), Some(5));
+        assert_eq!(later_deadline(None, Some(5)), Some(5));
+    }
+
+    #[test]
+    fn later_deadline_of_two_unset_sides_is_unset() {
+        assert_eq!(later_deadline(None, None), None);
+    }
+
+    #[test]
+    fn later_deadline_is_a_join() {
+        let cases = [None, Some(0), Some(3), Some(u64::MAX)];
+        for a in cases {
+            assert_eq!(later_deadline(a, a), a, "idempotent");
+            for b in cases {
+                assert_eq!(later_deadline(a, b), later_deadline(b, a), "commutative");
+                for c in cases {
+                    assert_eq!(
+                        later_deadline(later_deadline(a, b), c),
+                        later_deadline(a, later_deadline(b, c)),
+                        "associative"
+                    );
+                }
+            }
+        }
     }
 }

@@ -35,7 +35,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::WriterId;
-use crate::store::{CompactionBounds, ConflictResolver, Merged, Quiescence, RecordView, Winner};
+use crate::store::{
+    CompactionBounds, ConflictResolver, Merged, Quiescence, RecordView, Winner, later_deadline,
+};
 
 /// A tag uniquely identifying one [`OrSet::add`]: the writer's identity
 /// paired with a sequence number local to that writer's own incarnation. No
@@ -425,11 +427,7 @@ where
         let bytes = sa.merge(&sb).encode().ok()?;
         Some(Merged {
             value: Bytes::from(bytes),
-            // A merged set's tags only ever accumulate (adds and
-            // seen/retired bookkeeping alike), so the set as a whole never
-            // expires on its own: a TTL policy for it, if any, belongs to
-            // whichever explicit write set one.
-            expires_at_ms: None,
+            expires_at_ms: later_deadline(a.expires_at_ms, b.expires_at_ms),
         })
     }
 
@@ -1742,6 +1740,37 @@ mod tests {
         let merged = OrSet::<String>::decode(&merged_ab).expect("decodes");
         assert!(merged.contains(&"x".to_string()));
         assert!(merged.contains(&"y".to_string()));
+    }
+
+    /// A view of `bytes` stamped at a fixed version, expiring at `expires_at_ms`.
+    fn view(bytes: &[u8], expires_at_ms: Option<u64>) -> RecordView<'_> {
+        RecordView {
+            value: Some(bytes),
+            ver: hlc(1, 0),
+            expires_at_ms,
+        }
+    }
+
+    #[test]
+    fn resolver_merge_keeps_the_later_deadline_and_an_unset_side_defers() {
+        let ba = OrSet::add(wid(1, 0), 0, "x".to_string())
+            .encode()
+            .expect("encodes");
+        let bb = OrSet::add(wid(2, 0), 0, "y".to_string())
+            .encode()
+            .expect("encodes");
+        let resolver = OrSetResolver::<String>::new();
+        let expiry = |a, b| {
+            resolver
+                .merge(b"k", view(&ba, a), view(&bb, b))
+                .expect("both sides decode")
+                .expires_at_ms
+        };
+        assert_eq!(expiry(Some(100), Some(200)), Some(200));
+        assert_eq!(expiry(Some(200), Some(100)), Some(200));
+        assert_eq!(expiry(Some(100), None), Some(100));
+        assert_eq!(expiry(None, Some(100)), Some(100));
+        assert_eq!(expiry(None, None), None);
     }
 
     #[test]

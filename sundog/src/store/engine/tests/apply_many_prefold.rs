@@ -62,12 +62,15 @@ fn arb_elem() -> impl Strategy<Value = &'static str> {
     prop_oneof![Just("a"), Just("b"), Just("c"), Just("d")]
 }
 
+/// An [`arb_entry_spec`] value: key, `wall_ms`, node and element.
+type EntrySpec = (u32, u64, u64, &'static str);
+
 /// One batch entry spec: a small key, so several entries collide on
 /// one key within a batch; a real per-writer [`Hlc`] over a narrow
 /// `wall_ms` range and a handful of `node`s, so ties and near-ties,
 /// the cases `merge_version` treats specially, are common; and a
 /// one-element `Put`.
-fn arb_entry_spec() -> impl Strategy<Value = (u32, u64, u64, &'static str)> {
+fn arb_entry_spec() -> impl Strategy<Value = EntrySpec> {
     (0u32..4, 0u64..12, 1u64..4, arb_elem())
 }
 
@@ -150,6 +153,175 @@ proptest! {
             "pre-fold on and off publish a real outcome for the same set of keys"
         );
     }
+}
+
+/// [`put_entry`] with a deadline.
+fn put_entry_expiring(key: u32, ver: Hlc, elem: &str, expires_at_ms: Option<u64>) -> SetEntry {
+    let (hash, key, kb, ver, incoming) = put_entry(key, ver, elem);
+    let Incoming::Put { value, encoded, .. } = incoming else {
+        unreachable!("put_entry builds a put");
+    };
+    (
+        hash,
+        key,
+        kb,
+        ver,
+        Incoming::Put {
+            value,
+            expires_at_ms,
+            encoded,
+        },
+    )
+}
+
+/// [`apply_batch`] at `now_ms`.
+fn apply_batch_at(engine: &SetEngine, entries: Vec<SetEntry>, now_ms: u64) {
+    let mut by_bucket: HashMap<usize, Vec<SetEntry>> = HashMap::new();
+    for entry in entries {
+        by_bucket
+            .entry(stripe_index_from_hash(entry.0))
+            .or_default()
+            .push(entry);
+    }
+    for (bucket, group) in by_bucket {
+        engine.apply_many(bucket, group, &UnionSetResolver, 60_000, 600_000, now_ms);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// As the property above, with deadlines: every stored entry and batch
+    /// entry carries a random deadline, and the batch applies at a random
+    /// later clock, so stored entries are live, expired or lapsed relative
+    /// to a write. Pre-fold seeds its fold with the stored entry's absence,
+    /// so an absent entry never folds into the run and the stored
+    /// `(version, bytes, deadline)` matches sequential application.
+    #[test]
+    fn prefold_with_deadlines_matches_sequential_application(
+        setup in proptest::collection::vec(
+            (arb_entry_spec(), proptest::option::of(1u64..24)),
+            0..12,
+        ),
+        main in proptest::collection::vec(
+            (arb_entry_spec(), proptest::option::of(1u64..24)),
+            1..40,
+        ),
+        now_ms in 0u64..30,
+    ) {
+        let build = |specs: &[(EntrySpec, Option<u64>)]| -> Vec<SetEntry> {
+            specs
+                .iter()
+                .map(|&((key, wall_ms, node, elem), expires_at_ms)| {
+                    put_entry_expiring(key, hlc(wall_ms, node), elem, expires_at_ms)
+                })
+                .collect()
+        };
+        let on: SetEngine = Engine::new(u64::MAX, None, None, None);
+        let off: SetEngine = Engine::new(u64::MAX, None, None, None);
+        off.set_prefold_enabled(false);
+        apply_batch_at(&on, build(&setup), 0);
+        apply_batch_at(&off, build(&setup), 0);
+        apply_batch_at(&on, build(&main), now_ms);
+        apply_batch_at(&off, build(&main), now_ms);
+
+        let touched_keys: std::collections::BTreeSet<u32> = setup
+            .iter()
+            .chain(main.iter())
+            .map(|&((key, ..), _)| key)
+            .collect();
+        for key in touched_keys {
+            let kb = key_bytes(key);
+            prop_assert_eq!(
+                on.record_for(kb.as_ref(), 0),
+                off.record_for(kb.as_ref(), 0),
+                "pre-fold never changes the stored (version, bytes, deadline), \
+                 including over an entry that is absent when the batch applies"
+            );
+        }
+    }
+}
+
+#[test]
+fn reaches_deadline_is_true_for_a_put_whose_deadline_has_passed() {
+    use super::super::prefold::reaches_deadline;
+
+    let put = |expires_at_ms| Incoming::Put {
+        value: 0u32,
+        expires_at_ms,
+        encoded: Bytes::new(),
+    };
+    assert!(reaches_deadline(&put(Some(10)), 10));
+    assert!(reaches_deadline(&put(Some(10)), 11));
+    assert!(!reaches_deadline(&put(Some(10)), 9));
+    assert!(!reaches_deadline(&put(None), u64::MAX));
+    assert!(!reaches_deadline::<u32>(&Incoming::Tombstone, u64::MAX));
+}
+
+#[test]
+fn prefold_stops_before_a_step_that_would_drop_the_stored_record() {
+    let key = 1u32;
+    let kb = key_bytes(key);
+    // The first entry's deadline has passed by the time the batch applies,
+    // so sequential application drops it, and "old" with it, when the
+    // second entry arrives. A fold that went on would drop "old" from the
+    // run while the survivor re-folds it from the stored record.
+    let build = || {
+        vec![
+            put_entry_expiring(key, hlc(1_500, 2), "x", Some(1_800)),
+            put_entry_expiring(key, hlc(1_600, 3), "y", None),
+        ]
+    };
+    let run = |prefold: bool| -> SetEngine {
+        let engine: SetEngine = Engine::new(u64::MAX, None, None, None);
+        engine.set_prefold_enabled(prefold);
+        apply_batch_at(
+            &engine,
+            vec![put_entry_expiring(key, hlc(1_000, 1), "old", None)],
+            1_000,
+        );
+        apply_batch_at(&engine, build(), 2_000);
+        engine
+    };
+    let folded = run(true);
+    let sequential = run(false);
+    assert_eq!(
+        folded.record_for(kb.as_ref(), 2_000),
+        sequential.record_for(kb.as_ref(), 2_000),
+        "the pre-folded batch leaves the record sequential application does"
+    );
+    assert_eq!(folded.get(&key, 2_000), Some(string_set(&["y"])));
+}
+
+#[test]
+fn prefold_over_an_absent_seed_never_folds_the_dead_entry_into_the_run() {
+    let key = 1u32;
+    let kb = key_bytes(key);
+    let build = || {
+        vec![
+            put_entry_expiring(key, hlc(2_000, 2), "x", None),
+            put_entry_expiring(key, hlc(2_100, 3), "y", None),
+        ]
+    };
+    let run = |prefold: bool| -> SetEngine {
+        let engine: SetEngine = Engine::new(u64::MAX, None, None, None);
+        engine.set_prefold_enabled(prefold);
+        apply_batch_at(
+            &engine,
+            vec![put_entry_expiring(key, hlc(1_000, 1), "old", Some(5_000))],
+            1_000,
+        );
+        apply_batch_at(&engine, build(), 6_000);
+        engine
+    };
+    let folded = run(true);
+    let sequential = run(false);
+    assert_eq!(folded.get(&key, 6_000), Some(string_set(&["x", "y"])));
+    assert_eq!(
+        folded.record_for(kb.as_ref(), 6_000),
+        sequential.record_for(kb.as_ref(), 6_000),
+        "the pre-folded batch leaves the record sequential application does"
+    );
 }
 
 #[test]

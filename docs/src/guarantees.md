@@ -91,7 +91,13 @@ lifetime left on this node's copy.
 Shortening a lifetime is not a delete. A node cut off for the whole
 lifetime keeps its copy's old deadline and can bring the entry back until
 that deadline passes; `remove` is the delete. Under a merging resolver the
-resolver sets a merged record's expiry, and the `crdt` resolvers set none.
+resolver sets a merged record's expiry, and the `crdt` resolvers keep the
+later of the two deadlines, an unset side deferring to the other. A merged
+value therefore expires with its longest-lived contribution: `persist`
+leaves its deadline, `expire` extends it and never shortens it, and `touch`
+extends it by the default TTL. A record whose deadline passed before the
+other side's write was made never folds into the result, so a merge after
+expiry starts a new value.
 
 `CacheBuilder::tti`, an idle timeout, is local to one node and applies only
 to `Local` and `Invalidation` caches.

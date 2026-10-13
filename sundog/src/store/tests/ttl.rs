@@ -254,12 +254,15 @@ async fn expire_with_a_zero_ttl_expires_the_entry_here_and_on_a_replica() {
 }
 
 /// Under a merging resolver the re-arm applies through the resolver
-/// like any write, and the `crdt` resolvers give a merged record no
-/// expiry: the value stays and the entry does not expire.
+/// like any write, and the `crdt` resolvers keep the later of the two
+/// deadlines: the value stays and `expire` sets the deadline of an entry
+/// that had none.
 #[tokio::test]
-async fn expire_under_a_crdt_resolver_keeps_the_value_and_the_resolvers_expiry() {
+async fn expire_under_a_crdt_resolver_keeps_the_value_and_sets_the_later_deadline() {
     use crate::store::crdt::{PnCounter, PnCounterResolver};
 
+    let clock = Arc::new(std::sync::atomic::AtomicU64::new(1_000_000));
+    let reader = Arc::clone(&clock);
     let s = Shard::<u32, PnCounter>::new(
         SmolStr::new("test-crdt-expire"),
         Mode::Replicated,
@@ -268,15 +271,19 @@ async fn expire_under_a_crdt_resolver_keeps_the_value_and_the_resolvers_expiry()
         None,
         None,
     )
-    .with_resolver(Arc::new(PnCounterResolver));
+    .with_resolver(Arc::new(PnCounterResolver))
+    .with_clock(Arc::new(move || {
+        reader.load(std::sync::atomic::Ordering::SeqCst)
+    }));
     let writer = crdt::WriterId::new(NodeId::from(11), 1);
     s.merge(1, PnCounter::local_delta(writer, 3))
         .await
         .expect("merge");
+    assert_eq!(s.ttl_of(&1), Some(Ttl::Never));
 
     assert!(s.expire(&1, Duration::from_secs(60)).await.expect("expire"));
     assert_eq!(s.get(&1).await.map(|c| c.value()), Some(3));
-    assert_eq!(s.ttl_of(&1), Some(Ttl::Never));
+    assert_eq!(s.ttl_of(&1), Some(Ttl::Remaining(Duration::from_secs(60))));
 }
 
 /// The re-arm's successor stamp outranks the value it read and nothing

@@ -679,6 +679,72 @@ fn merge_against_a_spilled_counter_folds_the_stored_side_instead_of_dropping_it(
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A spilled stored record that has expired by `apply_locked`'s clock
+/// never folds into a merge, and its bytes are not read: the write over it
+/// starts a new value.
+#[test]
+fn merge_against_an_expired_spilled_counter_starts_a_new_value() {
+    use crate::store::crdt::{PnCounter, PnCounterResolver};
+
+    let dir = temp_dir("merge-spilled-expired");
+    let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+    let tier = Arc::new(SpillTier::open(&cfg, "merge-spilled-expired").expect("tier opens"));
+    let engine = Engine::<u32, PnCounter>::new(u64::MAX, None, None, None);
+    engine.set_spill(Arc::clone(&tier));
+    let engine = Arc::new(engine);
+    tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
+
+    let resolver = PnCounterResolver;
+    let key = 1u32;
+    let kb = key_bytes(key);
+    let bucket = stripe_index_from_hash(hash_key_bytes(kb.as_ref()));
+    let node_a = crate::store::crdt::WriterId::new(NodeId::from(11), 1);
+    let node_b = crate::store::crdt::WriterId::new(NodeId::from(22), 1);
+
+    let _ = put_with_resolver(
+        &engine,
+        key,
+        kb.clone(),
+        PnCounter::local_delta(node_a, 3),
+        hlc(1, 1),
+        Some(100),
+        0,
+        &resolver,
+    );
+    let _ = engine.evict_one_sampled(bucket, 0);
+    assert!(
+        poll_until(POLL_TIMEOUT, || is_spilled(&engine, &kb)),
+        "the flusher installs the spilled entry"
+    );
+
+    // Stamped before the spilled record's deadline, applied after it.
+    let outcome = put_with_resolver(
+        &engine,
+        key,
+        kb.clone(),
+        PnCounter::local_delta(node_b, 4),
+        hlc(50, 2),
+        None,
+        500,
+        &resolver,
+    );
+    assert!(
+        matches!(outcome, ApplyOutcome::Put { created: true, .. }),
+        "a write over an expired spilled record creates"
+    );
+    assert_eq!(
+        engine.get(&key, 500).map(|c| c.value()),
+        Some(4),
+        "the expired spilled contribution does not fold in"
+    );
+    assert!(
+        !is_spilled(&engine, &kb),
+        "the new value is resident; the spilled record is displaced"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `peek_stored_seed`'s prefold seeding is spill-aware exactly
 /// like `apply_locked`'s own stored-side lookup: a same-key,
 /// multi-entry batch landing on an already-spilled stored record

@@ -30,6 +30,7 @@ mod compact_pass_tests;
 mod conflict_resolvers;
 mod distributed;
 mod gc_digests;
+mod merge_expiry;
 mod merging;
 mod ownership;
 mod read_through;

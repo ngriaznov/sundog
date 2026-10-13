@@ -29,7 +29,7 @@ impl ConflictResolver for MaxStringResolver {
         let merged = da.max(db);
         Some(Merged {
             value: Bytes::from(postcard::to_stdvec(&merged).expect("merged value encodes")),
-            expires_at_ms: None,
+            expires_at_ms: later_deadline(a.expires_at_ms, b.expires_at_ms),
         })
     }
 }

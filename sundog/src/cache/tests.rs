@@ -7,6 +7,7 @@ mod explain_reads;
 mod forwarding;
 mod lifecycle;
 mod loading;
+mod merge_expiry;
 mod observability;
 mod rules;
 #[cfg(feature = "spill")]

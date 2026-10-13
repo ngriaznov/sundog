@@ -120,6 +120,7 @@ pub(crate) use self::inflight::{FillOutcome, FreshLoad, JoinOutcome};
 pub(crate) use self::keys::part_index_from_hash;
 use self::keys::{digest_slot, hasher_for};
 pub(crate) use self::keys::{hash_key_bytes, stripe_index_from_hash};
+pub(crate) use self::merge::{Fold, fold_sides};
 #[cfg(doc)]
 use self::merge::{merge_version, resolve_conflict};
 #[cfg(doc)]

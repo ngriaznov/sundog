@@ -86,7 +86,7 @@ pub use load::{DEFAULT_MAX_BATCH_KEYS, LoadError, Loader};
 pub use part::PartId;
 pub(crate) use part::PartMask;
 pub(crate) use refresh::{RefreshRequest, refresh_permille};
-pub use resolver::{ConflictResolver, LwwResolver, Merged, RecordView, Winner};
+pub use resolver::{ConflictResolver, LwwResolver, Merged, RecordView, Winner, later_deadline};
 #[cfg(doc)]
 use shard_build::SettlingResolver;
 #[cfg(doc)]

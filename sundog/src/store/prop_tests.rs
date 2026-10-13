@@ -1313,3 +1313,142 @@ proptest! {
         }
     }
 }
+
+/// One side of [`two_replicas_exchanging_deadline_records_converge_in_one_round`]:
+/// a counter increment by writer `node`, stamped `ver_offset` ms past
+/// [`DEADLINE_BASE_MS`], expiring `deadline_offset` ms past it (never for
+/// `None`).
+#[derive(Debug, Clone, Copy)]
+struct DeadlineSide {
+    node: u64,
+    increment: u64,
+    ver_offset: u64,
+    deadline_offset: Option<u64>,
+}
+
+/// The clock both replicas of
+/// [`two_replicas_exchanging_deadline_records_converge_in_one_round`] read,
+/// below every deadline it generates, so no stored record reads as absent on
+/// a local clock and only the version-derived rule decides a fold.
+const DEADLINE_BASE_MS: u64 = 1_000_000;
+
+fn deadline_side(node: u64) -> impl Strategy<Value = DeadlineSide> {
+    (1u64..1_000, 0u64..100, proptest::option::of(1u64..200)).prop_map(
+        move |(increment, ver_offset, deadline_offset)| DeadlineSide {
+            node,
+            increment,
+            ver_offset,
+            deadline_offset,
+        },
+    )
+}
+
+impl DeadlineSide {
+    fn ver(self) -> Hlc {
+        Hlc {
+            wall_ms: DEADLINE_BASE_MS + self.ver_offset,
+            logical: 0,
+            node: NodeId::from(self.node),
+        }
+    }
+
+    fn expires_at_ms(self) -> Option<u64> {
+        self.deadline_offset.map(|offset| DEADLINE_BASE_MS + offset)
+    }
+
+    fn record(self, key_bytes: &Bytes) -> WireRecord {
+        let counter =
+            PnCounter::local_delta(WriterId::new(NodeId::from(self.node), 0), self.increment);
+        WireRecord {
+            key: key_bytes.clone(),
+            value: Some(Bytes::from(
+                counter.encode().expect("PnCounter always encodes"),
+            )),
+            ver: self.ver(),
+            expires_at_ms: self.expires_at_ms(),
+        }
+    }
+
+    /// Whether this side's record lapsed before `other`'s write was made.
+    fn lapsed_before(self, other: Self) -> bool {
+        self.expires_at_ms()
+            .is_some_and(|deadline| deadline <= other.ver().wall_ms)
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Two replicas, each holding one record with a random deadline, trade
+    /// records once: both end at the identical `(bytes, deadline, version)`.
+    /// A record that lapsed before the other side's write was made
+    /// contributes nothing to the result; two lapsed records leave the
+    /// winner's alone; two live records fold into the sum under the later
+    /// deadline.
+    #[test]
+    fn two_replicas_exchanging_deadline_records_converge_in_one_round(
+        a in deadline_side(1),
+        b in deadline_side(2),
+    ) {
+        let key_bytes = Bytes::from(postcard::to_stdvec(&0u8).expect("u8 key encodes"));
+        let rt = current_thread_runtime();
+
+        rt.block_on(async {
+            let replica = |node: u64| {
+                Arc::new(
+                    Shard::<u8, PnCounter>::new(
+                        SmolStr::new("pn-counter-deadline-exchange"),
+                        Mode::Replicated,
+                        NodeId::from(5000 + node),
+                        10_000,
+                        None,
+                        None,
+                    )
+                    .with_resolver(Arc::new(PnCounterResolver))
+                    .with_clock(Arc::new(|| DEADLINE_BASE_MS)),
+                )
+            };
+            let shards = [replica(1), replica(2)];
+            ShardOps::apply_remote(shards[0].as_ref(), a.record(&key_bytes)).await;
+            ShardOps::apply_remote(shards[1].as_ref(), b.record(&key_bytes)).await;
+
+            bidirectional_gossip_pass(&shards, &key_bytes).await;
+
+            let mut results = Vec::with_capacity(2);
+            for shard in &shards {
+                let rec = ShardOps::records_for(shard.as_ref(), vec![key_bytes.clone()])
+                    .await
+                    .into_iter()
+                    .next()
+                    .expect("both replicas hold the key after the exchange");
+                results.push(rec);
+            }
+            assert_eq!(
+                (&results[0].value, results[0].expires_at_ms, results[0].ver),
+                (&results[1].value, results[1].expires_at_ms, results[1].ver),
+                "one exchange leaves both replicas on the same (bytes, deadline, version)"
+            );
+
+            let total = PnCounter::decode(
+                results[0].value.as_deref().expect("a live record carries a value"),
+            )
+            .expect("PnCounter always decodes")
+            .value();
+            let expected = match (a.lapsed_before(b), b.lapsed_before(a)) {
+                (false, false) => i128::from(a.increment + b.increment),
+                (true, false) => i128::from(b.increment),
+                (false, true) => i128::from(a.increment),
+                (true, true) => i128::from(if a.ver() >= b.ver() { a.increment } else { b.increment }),
+            };
+            assert_eq!(total, expected, "a lapsed record never contributes");
+
+            if !a.lapsed_before(b) && !b.lapsed_before(a) {
+                assert_eq!(
+                    results[0].expires_at_ms,
+                    later_deadline(a.expires_at_ms(), b.expires_at_ms()),
+                    "two live records keep the later deadline"
+                );
+            }
+        });
+    }
+}

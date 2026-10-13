@@ -28,7 +28,7 @@ use crate::hlc::HlcClock;
 use crate::node::NodeId;
 use crate::store::{
     BucketPart, ConflictResolver, Incoming, KeyVersion, LwwResolver, Merged, PartId, Quiescence,
-    RecordView, Ttl, Winner,
+    RecordView, Ttl, Winner, later_deadline,
 };
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -305,7 +305,7 @@ impl ConflictResolver for UnionSetResolver {
         let merged: std::collections::BTreeSet<String> = da.union(&db).cloned().collect();
         Some(Merged {
             value: Bytes::from(postcard::to_stdvec(&merged).expect("merged value encodes")),
-            expires_at_ms: None,
+            expires_at_ms: later_deadline(a.expires_at_ms, b.expires_at_ms),
         })
     }
 }
@@ -380,6 +380,12 @@ mod compact_sweep;
 /// rule says, and that a mint is always recognizable as one (never a
 /// real node's id).
 mod merge_version;
+
+/// Coverage for the fold decision: the pure [`fold_sides`] and
+/// [`lapsed_before`], and [`apply_locked`] under a merging resolver when a
+/// side is expired, idle or lapsed before the other side's write, so a dead
+/// value never folds into a live one.
+mod merge_expiry;
 
 /// Coverage for [`Engine::apply_many`]'s pre-fold: that a non-merging
 /// resolver never triggers it, that a run never crosses a tombstone,

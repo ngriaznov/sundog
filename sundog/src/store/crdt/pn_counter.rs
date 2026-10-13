@@ -29,7 +29,9 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use super::WriterId;
-use crate::store::{CompactionBounds, ConflictResolver, Merged, Quiescence, RecordView, Winner};
+use crate::store::{
+    CompactionBounds, ConflictResolver, Merged, Quiescence, RecordView, Winner, later_deadline,
+};
 
 /// A writer's contribution at (and after) the moment it is retired: its
 /// `p`/`n` slots as they stand then, and when retirement happens. Stays
@@ -427,11 +429,7 @@ impl ConflictResolver for PnCounterResolver {
         let bytes = pa.merge(&pb).encode().ok()?;
         Some(Merged {
             value: Bytes::from(bytes),
-            // A merged counter's slots only ever accumulate, so the
-            // counter as a whole never expires on its own: a TTL
-            // policy for it, if any, belongs to whichever explicit
-            // write set one.
-            expires_at_ms: None,
+            expires_at_ms: later_deadline(a.expires_at_ms, b.expires_at_ms),
         })
     }
 
@@ -1329,6 +1327,37 @@ mod tests {
             "merge is commutative in argument order"
         );
         assert_eq!(PnCounter::decode(&merged_ab).expect("decodes").value(), 7);
+    }
+
+    /// A view of `bytes` stamped at a fixed version, expiring at `expires_at_ms`.
+    fn view(bytes: &[u8], expires_at_ms: Option<u64>) -> RecordView<'_> {
+        RecordView {
+            value: Some(bytes),
+            ver: hlc(1, 0),
+            expires_at_ms,
+        }
+    }
+
+    #[test]
+    fn resolver_merge_keeps_the_later_deadline_and_an_unset_side_defers() {
+        let ba = PnCounter::local_delta(wid(1, 0), 3)
+            .encode()
+            .expect("encodes");
+        let bb = PnCounter::local_delta(wid(2, 0), 4)
+            .encode()
+            .expect("encodes");
+        let resolver = PnCounterResolver;
+        let expiry = |a, b| {
+            resolver
+                .merge(b"k", view(&ba, a), view(&bb, b))
+                .expect("both sides decode")
+                .expires_at_ms
+        };
+        assert_eq!(expiry(Some(100), Some(200)), Some(200));
+        assert_eq!(expiry(Some(200), Some(100)), Some(200));
+        assert_eq!(expiry(Some(100), None), Some(100));
+        assert_eq!(expiry(None, Some(100)), Some(100));
+        assert_eq!(expiry(None, None), None);
     }
 
     #[test]

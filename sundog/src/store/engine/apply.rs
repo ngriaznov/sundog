@@ -124,13 +124,65 @@ pub(crate) struct ApplyCtx<'a, K, V> {
     pub(super) now_ms: u64,
 }
 
+/// The live entry [`apply_locked`] finds for a key, as the collision
+/// decision reads it.
+struct StoredLive {
+    ver: Hlc,
+    /// The value bytes: `None` for a spilled entry that is not read, or
+    /// whose read failed.
+    encoded: Option<Bytes>,
+    expires_at_ms: Option<u64>,
+    /// What a read at `now_ms` would see: an expired or idle entry still
+    /// takes part in version ordering and still gets displaced, and a write
+    /// over it counts as a creation, the same as after a sweep, but it never
+    /// folds into a merge.
+    visible: bool,
+}
+
+/// `key_bytes`' live entry in `stripe`, if any. A currently-spilled entry
+/// has no value bytes resident in RAM; see [`apply_locked`]'s doc for
+/// `prefetched_spilled` and the off-lock/under-lock read split. An entry
+/// that is not visible is not read at all.
+fn read_stored_live<K, V>(
+    stripe: &Stripe<K, V>,
+    ctx: &ApplyCtx<'_, K, V>,
+    hash: u64,
+    key_bytes: &[u8],
+) -> Option<StoredLive> {
+    let live = stripe
+        .live
+        .find(hash, |l| record_key(&l.record) == key_bytes)?;
+    let visible = !absent_at(live, key_bytes, &stripe.long_ttl, ctx.tti_ms, ctx.now_ms);
+    #[cfg(feature = "spill")]
+    let encoded = match &live.state {
+        EntryState::Resident => Some(record_value_bytes(&live.record)),
+        EntryState::Spilled(_) if !visible => None,
+        EntryState::Spilled(loc) => ctx.prefetched_spilled.get(loc).cloned().or_else(|| {
+            ctx.spill
+                .filter(|_| ctx.resolver.needs_value_bytes())
+                .and_then(|tier| read_spilled_for_conflict(tier, *loc))
+        }),
+    };
+    #[cfg(not(feature = "spill"))]
+    let encoded = Some(record_value_bytes(&live.record));
+    Some(StoredLive {
+        ver: live.ver(),
+        encoded,
+        expires_at_ms: decode_expiry(live.wall_ms, live.expiry, key_bytes, &stripe.long_ttl),
+        visible,
+    })
+}
+
 /// The versioned-apply core: applies `incoming` at `ver` for `key` iff
 /// `resolver` picks it over whatever `stripe` holds, updating
 /// `digest_bucket`, `total_weight`, and `live_count` to match. A collision
 /// may fold both sides via [`ConflictResolver::merge`], rebinding
 /// `ver`/`incoming` to the merged version ([`merge_version`]) and bytes
 /// before anything downstream runs, so a merge stores and fingerprints like
-/// any other `Put`. Synchronous under the caller's write lock on `stripe`;
+/// any other `Put`. A stored entry that reads as absent at `now_ms` is not
+/// read from disk and never folds ([`resolve_conflict`] treats it as
+/// absent), nor does a side that lapsed before the other side's write.
+/// Synchronous under the caller's write lock on `stripe`;
 /// no disk I/O of its own. `prefetched_spilled` (`spill` builds) is
 /// [`prefetch_spilled_conflict_bytes`]'s off-lock read of the stored side's
 /// bytes; a lookup miss falls back to [`read_spilled_for_conflict`] under
@@ -154,56 +206,26 @@ where
         key_bytes,
     } = entry;
     let prior_tombstone = stripe.tombstones.get(key_bytes.as_ref()).copied();
-    // `visible` is what a read at `now_ms` would see: an expired or idle
-    // entry still takes part in conflict resolution and still gets displaced,
-    // but a write over it counts as a creation, the same as after a sweep.
     let stored_live = if prior_tombstone.is_none() {
-        stripe
-            .live
-            .find(hash, |l| record_key(&l.record) == key_bytes.as_ref())
-            .map(|l| {
-                // A currently-spilled entry has no value bytes resident in
-                // RAM; see this function's doc for `prefetched_spilled` and
-                // the off-lock/under-lock read split.
-                #[cfg(feature = "spill")]
-                let encoded = match &l.state {
-                    EntryState::Resident => Some(record_value_bytes(&l.record)),
-                    EntryState::Spilled(loc) => {
-                        ctx.prefetched_spilled.get(loc).cloned().or_else(|| {
-                            ctx.spill
-                                .filter(|_| ctx.resolver.needs_value_bytes())
-                                .and_then(|tier| read_spilled_for_conflict(tier, *loc))
-                        })
-                    }
-                };
-                #[cfg(not(feature = "spill"))]
-                let encoded = Some(record_value_bytes(&l.record));
-                let kb = key_bytes.as_ref();
-                (
-                    l.ver(),
-                    encoded,
-                    decode_expiry(l.wall_ms, l.expiry, kb, &stripe.long_ttl),
-                    !absent_at(l, kb, &stripe.long_ttl, ctx.tti_ms, ctx.now_ms),
-                )
-            })
+        read_stored_live(stripe, ctx, hash, key_bytes.as_ref())
     } else {
         None
     };
     let stored_ver = prior_tombstone
         .map(|t| t.ver)
-        .or_else(|| stored_live.as_ref().map(|(v, _, _, _)| *v));
+        .or_else(|| stored_live.as_ref().map(|s| s.ver));
 
     if let Some(sv) = stored_ver {
-        let stored_encoded = stored_live
-            .as_ref()
-            .and_then(|(_, enc, _, _)| enc.as_deref());
-        let stored_expires_at_ms = stored_live.as_ref().and_then(|(_, _, e, _)| *e);
+        let stored_encoded = stored_live.as_ref().and_then(|s| s.encoded.as_deref());
+        let stored_expires_at_ms = stored_live.as_ref().and_then(|s| s.expires_at_ms);
+        let stored_absent = stored_live.as_ref().is_some_and(|s| !s.visible);
         match resolve_and_rebind(
             ctx.resolver,
             key_bytes.as_ref(),
             sv,
             stored_encoded,
             stored_expires_at_ms,
+            stored_absent,
             ver,
             incoming,
         ) {
@@ -216,9 +238,7 @@ where
     }
 
     let had_live = prior_tombstone.is_none() && stored_ver.is_some();
-    let was_visible = stored_live
-        .as_ref()
-        .is_some_and(|(_, _, _, visible)| *visible);
+    let was_visible = stored_live.as_ref().is_some_and(|s| s.visible);
     let new_fp = entry_fingerprint(key_bytes.as_ref(), ver);
 
     // Subtracts whatever this write displaces before adding the new fingerprint
@@ -486,11 +506,13 @@ where
                     &stripe,
                     &entries,
                     &runs,
+                    self.tti_ms,
+                    now_ms,
                     #[cfg(feature = "spill")]
                     &prefetched_spilled,
                 )
             };
-            prefold_batch(entries, runs, resolver, &stored_seeds)
+            prefold_batch(entries, runs, resolver, &stored_seeds, now_ms)
         } else {
             entries.into_iter().map(Some).collect()
         };

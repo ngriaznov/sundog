@@ -2,8 +2,25 @@
 
 use proptest::prelude::*;
 
-use super::super::merge::{MergedVersion, merge_version, mint_stamp};
+use super::super::merge::{MergedVersion, content_hash, merge_version, mint_stamp};
 use super::*;
+
+/// [`merge_version`] over three records that carry no deadline.
+fn merge_version_bytes(
+    sv: Hlc,
+    ver: Hlc,
+    stored: &[u8],
+    incoming: &[u8],
+    merged: &[u8],
+) -> MergedVersion {
+    merge_version(
+        sv,
+        ver,
+        Some((stored, None)),
+        (incoming, None),
+        (merged, None),
+    )
+}
 
 /// A real single-writer stamp: `wall_ms`/`logical` unconstrained,
 /// `node` drawn from the lower half of the `u64` range only,
@@ -45,7 +62,7 @@ proptest! {
         prop_assume!(merged != stored);
         prop_assume!(merged != incoming);
         let MergedVersion::Store(minted) =
-            merge_version(sv, ver, &stored, &incoming, &merged)
+            merge_version_bytes(sv, ver, &stored, &incoming, &merged)
         else {
             panic!("merged bytes matching neither side always mints a version");
         };
@@ -72,12 +89,12 @@ proptest! {
         prop_assume!(merged_b != stored && merged_b != incoming);
         prop_assume!(merged_a != merged_b);
         let MergedVersion::Store(a) =
-            merge_version(sv, ver, &stored, &incoming, &merged_a)
+            merge_version_bytes(sv, ver, &stored, &incoming, &merged_a)
         else {
             panic!("merged bytes matching neither side always mints a version");
         };
         let MergedVersion::Store(b) =
-            merge_version(sv, ver, &stored, &incoming, &merged_b)
+            merge_version_bytes(sv, ver, &stored, &incoming, &merged_b)
         else {
             panic!("merged bytes matching neither side always mints a version");
         };
@@ -94,7 +111,7 @@ proptest! {
         content in arb_bytes(),
     ) {
         prop_assume!(sv != ver);
-        let result = merge_version(sv, ver, &content, &content, &content);
+        let result = merge_version_bytes(sv, ver, &content, &content, &content);
         let greater = sv.max(ver);
         if greater == sv {
             prop_assert_eq!(result, MergedVersion::NoOp);
@@ -115,7 +132,7 @@ proptest! {
     ) {
         prop_assume!(ver > sv);
         prop_assume!(stored != incoming);
-        let result = merge_version(sv, ver, &stored, &incoming, &incoming);
+        let result = merge_version_bytes(sv, ver, &stored, &incoming, &incoming);
         prop_assert_eq!(result, MergedVersion::Store(ver));
     }
 
@@ -131,7 +148,7 @@ proptest! {
     ) {
         prop_assume!(sv > ver);
         prop_assume!(stored != incoming);
-        let result = merge_version(sv, ver, &stored, &incoming, &stored);
+        let result = merge_version_bytes(sv, ver, &stored, &incoming, &stored);
         prop_assert_eq!(result, MergedVersion::NoOp);
     }
 }
@@ -156,7 +173,8 @@ fn mint_arm_dominates_on_a_logical_overflow_at_a_wall_ms_tie() {
     let stored = b"stored".to_vec();
     let incoming = b"incoming".to_vec();
     let merged = b"merged".to_vec();
-    let MergedVersion::Store(minted) = merge_version(sv, ver, &stored, &incoming, &merged) else {
+    let MergedVersion::Store(minted) = merge_version_bytes(sv, ver, &stored, &incoming, &merged)
+    else {
         panic!("merged bytes matching neither side always mints a version");
     };
     assert!(minted > sv, "{minted:?} must dominate {sv:?}");
@@ -192,4 +210,102 @@ fn mint_stamp_holds_the_maximum_instead_of_wrapping_below_its_inputs() {
     let carried = mint_stamp(below, below, node);
     assert_eq!((carried.wall_ms, carried.logical), (u64::MAX, 0));
     assert!(carried > below);
+}
+
+/// Two records with the same bytes and different deadlines are different
+/// content: a merge to the later deadline is never a no-op against the
+/// stored record, even when the stored version is the newer one.
+#[test]
+fn a_deadline_only_difference_is_not_a_no_op() {
+    let sv = hlc(2_000, 1);
+    let ver = hlc(1_000, 2);
+    let bytes = b"same".as_slice();
+    let result = merge_version(
+        sv,
+        ver,
+        Some((bytes, Some(100))),
+        (bytes, None),
+        (bytes, Some(100)),
+    );
+    // The merged record is the stored one, and stored is newer: no-op.
+    assert_eq!(result, MergedVersion::NoOp);
+
+    let result = merge_version(
+        sv,
+        ver,
+        Some((bytes, Some(100))),
+        (bytes, Some(50)),
+        (bytes, Some(200)),
+    );
+    let MergedVersion::Store(minted) = result else {
+        panic!("a deadline neither side carries mints a version");
+    };
+    assert!(minted > sv && minted > ver);
+    assert!(minted.node.is_merge_derived());
+
+    let result = merge_version(
+        hlc(1_000, 1),
+        hlc(2_000, 2),
+        Some((bytes, Some(100))),
+        (bytes, Some(200)),
+        (bytes, Some(200)),
+    );
+    assert_eq!(
+        result,
+        MergedVersion::Store(hlc(2_000, 2)),
+        "a merge reducing to the newer incoming record stores it verbatim"
+    );
+}
+
+/// A stored side with no bytes (excluded or unreadable) is never the
+/// merge's result, even when the merged content equals the incoming one.
+#[test]
+fn a_stored_side_without_bytes_never_reduces_to_stored() {
+    let sv = hlc(2_000, 1);
+    let ver = hlc(1_000, 2);
+    let bytes = b"same".as_slice();
+    assert_eq!(
+        merge_version(sv, ver, Some((bytes, None)), (bytes, None), (bytes, None)),
+        MergedVersion::NoOp,
+        "with bytes, identical content at a newer stored version is a no-op"
+    );
+    let MergedVersion::Store(minted) = merge_version(sv, ver, None, (bytes, None), (bytes, None))
+    else {
+        panic!("an unreadable stored side mints for an older incoming write");
+    };
+    assert!(minted > sv && minted > ver);
+}
+
+/// The minted node hashes the bytes alone when the result has no
+/// deadline, which is what a release that predates deadline-bearing merges
+/// mints, and the bytes plus the deadline when it has one.
+#[test]
+fn the_mint_hash_without_a_deadline_is_the_bytes_hash() {
+    for bytes in [b"".as_slice(), b"a", b"counter-state"] {
+        assert_eq!(content_hash(bytes, None), xxh3_64(bytes));
+    }
+    let sv = hlc(1, 1);
+    let ver = hlc(2, 2);
+    let MergedVersion::Store(minted) = merge_version(
+        sv,
+        ver,
+        Some((b"s".as_slice(), None)),
+        (b"i".as_slice(), None),
+        (b"m".as_slice(), None),
+    ) else {
+        panic!("merged content matching neither side mints");
+    };
+    assert_eq!(minted.node, NodeId::merge_derived(xxh3_64(b"m")));
+}
+
+#[test]
+fn the_mint_hash_with_a_deadline_covers_the_bytes_and_the_deadline() {
+    let bytes = b"counter-state".as_slice();
+    let expected = xxh3_64(&[bytes, &700u64.to_le_bytes()].concat());
+    assert_eq!(content_hash(bytes, Some(700)), expected);
+    assert_ne!(content_hash(bytes, Some(700)), content_hash(bytes, None));
+    assert_ne!(
+        content_hash(bytes, Some(700)),
+        content_hash(bytes, Some(701))
+    );
 }
