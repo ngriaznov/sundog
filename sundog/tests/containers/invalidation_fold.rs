@@ -7,6 +7,9 @@ use rightsize::Network;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// The counter the scenario writes.
+const KEY: &str = "counter";
+
 /// How long a fold is given to show once a write that should fold is sent.
 const FOLD_WAIT: Duration = Duration::from_secs(10);
 
@@ -92,7 +95,6 @@ async fn an_invalidation_write_folds_into_the_nodes_that_hold_the_key() {
     wait_until_folds(&nodes, &a, &c, "a-to-c").await;
     wait_until_folds(&nodes, &b, &a, "b-to-a").await;
 
-    const KEY: &str = "counter";
     // B holds the counter. A holds nothing, so B's record is ignored there;
     // the barrier shows A has seen it before A writes.
     b.put(KEY, "3").await.expect("b puts");

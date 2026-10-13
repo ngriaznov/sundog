@@ -117,8 +117,9 @@ where
 
     /// Reads time from `clock` instead of the system clock, so a test moves
     /// every node's notion of time at once. A test cluster gives every node
-    /// the same clock.
-    #[cfg(test)]
+    /// the same clock. Absent from the `sim` build, which compiles no
+    /// loopback-cluster tests.
+    #[cfg(all(test, not(feature = "sim")))]
     pub(crate) fn clock(mut self, clock: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
         self.clock = Some(clock);
         self

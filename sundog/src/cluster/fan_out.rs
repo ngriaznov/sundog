@@ -641,7 +641,7 @@ mod tests {
     #[test]
     fn a_send_set_with_no_peer_is_left_out() {
         let records = vec![wire_record_for_u32(1)];
-        assert!(sends_for(true, &[], records.clone()).is_empty());
+        assert_eq!(sends_for(true, &[], records.clone()), Vec::new());
         let only_current = sends_for(true, &[(1, wire::PROTOCOL_VERSION)], records);
         assert_eq!(only_current.len(), 1);
         assert_eq!(only_current[0].peers, vec![NodeId::from(1)]);
