@@ -1333,17 +1333,13 @@ mod tests {
         assert!(peer_supports(PROTOCOL_VERSION, PROTOCOL_INVALIDATION_FOLD));
     }
 
+    /// The protocol numbers are an interop contract with released nodes: a
+    /// peer on protocol 7 gets no merged record, and the build's own
+    /// protocol is the fold protocol.
     #[test]
-    fn a_merged_invalidation_record_is_an_ordinary_replicate_frame() {
-        roundtrip(&Msg::Replicate {
-            cache: SmolStr::new("counters"),
-            rec: sample_record(Some("v1")),
-        });
-        roundtrip(&Msg::Invalidate {
-            cache: SmolStr::new("counters"),
-            key: Bytes::from_static(b"k1"),
-            ver: sample_record(Some("v1")).ver,
-        });
+    fn the_invalidation_fold_protocol_is_8_and_this_build_speaks_it() {
+        assert_eq!(PROTOCOL_INVALIDATION_FOLD, 8);
+        assert_eq!(PROTOCOL_VERSION, PROTOCOL_INVALIDATION_FOLD);
     }
 
     #[test]

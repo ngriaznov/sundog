@@ -335,6 +335,34 @@ async fn the_coalescing_window_replaces_a_pending_value_that_lapsed() {
     assert_eq!(s.ttl_of(&1), Some(Ttl::Remaining(secs(10))));
 }
 
+/// Two calls made in the same millisecond with a zero lifespan are each
+/// lapsed for the other, so neither folds and the resolver's winner, here
+/// the later version, is the pending value.
+#[tokio::test]
+async fn the_coalescing_window_lets_the_winner_decide_when_both_calls_are_lapsed() {
+    let clock = Arc::new(AtomicU64::new(T0));
+    let s = counter_shard(1, None, &clock).with_merge_coalesce_window(secs(3_600));
+    s.merge_with_ttl(1, delta(11, 3), Duration::ZERO)
+        .await
+        .expect("merge");
+    s.merge_with_ttl(1, delta(12, 4), Duration::ZERO)
+        .await
+        .expect("merge");
+
+    let key_bytes = key_bytes(&1u32);
+    let stripe = s.pending_merges
+        [engine::stripe_index_from_hash(engine::hash_key_bytes(key_bytes.as_ref()))]
+    .lock()
+    .expect("lock");
+    let pending = stripe.entries.get(&1).expect("a value is pending");
+    assert_eq!(
+        pending.value,
+        delta(12, 4),
+        "the winner replaces the pending value without folding it"
+    );
+    assert_eq!(pending.expires_at_ms, Some(T0));
+}
+
 #[tokio::test]
 async fn the_coalescing_window_drops_a_call_that_is_already_lapsed() {
     let clock = Arc::new(AtomicU64::new(T0));
