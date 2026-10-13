@@ -114,14 +114,63 @@ fn invalidations(cache_name: &SmolStr, records: Vec<WireRecord>) -> Vec<Msg> {
 }
 
 /// What a peer that folds receives for `records`: each live record as a
-/// replicate frame, batched, and each tombstone as an invalidation. Pure;
-/// unit tested directly.
+/// replicate frame, batched, and each tombstone as an invalidation. A live
+/// record whose frame would pass [`wire::MAX_FRAME`] cannot encode, and an
+/// `Invalidation` cache runs no anti-entropy to repair a record that never
+/// arrives, so it travels as an invalidation too and the peer drops its stale
+/// copy. Pure; unit tested directly.
 fn fold_msgs(cache_name: &SmolStr, records: Vec<WireRecord>) -> Vec<Msg> {
-    let (tombstones, live): (Vec<_>, Vec<_>) =
-        records.into_iter().partition(WireRecord::is_tombstone);
-    let mut msgs = batch_replicate(cache_name, live);
-    msgs.extend(invalidations(cache_name, tombstones));
+    let (shipped, invalidated): (Vec<_>, Vec<_>) = records.into_iter().partition(|rec| {
+        !rec.is_tombstone()
+            && wire::replicate_frame_len(
+                cache_name.len(),
+                rec.key.len(),
+                rec.value.as_ref().map_or(0, Bytes::len),
+            ) <= wire::MAX_FRAME
+    });
+    let mut msgs = batch_replicate(cache_name, shipped);
+    msgs.extend(invalidations(cache_name, invalidated));
     msgs
+}
+
+/// The peers that receive one set of messages from a `Mode::Invalidation`
+/// write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InvalidationSend {
+    peers: Vec<NodeId>,
+    msgs: Vec<Msg>,
+}
+
+/// What a `Mode::Invalidation` write of `records` sends each of `peers`, each
+/// a node with the protocol it speaks: the sends, one per distinct message
+/// set, in the order folding peers then older peers. A peer for which
+/// [`invalidation_ships_values`] holds receives [`fold_msgs`], every other
+/// peer [`invalidations`]; a set with no peer is left out. Pure; unit tested
+/// directly.
+fn invalidation_sends(
+    merges: bool,
+    peers: &[(NodeId, u16)],
+    cache_name: &SmolStr,
+    records: Vec<WireRecord>,
+) -> Vec<InvalidationSend> {
+    let (folding, dropping): (Vec<_>, Vec<_>) = peers
+        .iter()
+        .partition(|(_, protocol)| invalidation_ships_values(merges, *protocol));
+    let nodes = |group: Vec<&(NodeId, u16)>| group.into_iter().map(|&(node, _)| node).collect();
+    let mut sends = Vec::new();
+    if !folding.is_empty() {
+        sends.push(InvalidationSend {
+            peers: nodes(folding),
+            msgs: fold_msgs(cache_name, records.clone()),
+        });
+    }
+    if !dropping.is_empty() {
+        sends.push(InvalidationSend {
+            peers: nodes(dropping),
+            msgs: invalidations(cache_name, records),
+        });
+    }
+    sends
 }
 
 /// Encodes each of `msgs` into an [`OutFrame`], dropping (and logging) any
@@ -249,33 +298,23 @@ async fn fan_out_batch<K, V>(
         // Distributed is handled, and returned, above.
         Mode::Local | Mode::Distributed { .. } => (),
         Mode::Invalidation => {
-            let merges = shard.merges();
-            let (folding, dropping): (Vec<_>, Vec<_>) = cluster
-                .peers()
-                .into_iter()
-                .partition(|peer| invalidation_ships_values(merges, peer.protocol));
             // A peer that folds gets each live record as a replicate frame
             // and each tombstone as an invalidation; every other peer
             // gets an invalidation per record, which carries no value for a
             // low-protocol peer to misdecode.
-            if !folding.is_empty() {
-                let frames = encode_frames(fold_msgs(cache_name, records.clone()));
-                for peer in folding {
-                    cluster.mesh().send_frames(
-                        peer.node,
-                        MsgClass::Invalidate,
-                        frames.iter().cloned(),
-                    );
-                }
-            }
-            if !dropping.is_empty() {
-                let frames = encode_frames(invalidations(cache_name, records));
-                for peer in dropping {
-                    cluster.mesh().send_frames(
-                        peer.node,
-                        MsgClass::Invalidate,
-                        frames.iter().cloned(),
-                    );
+            let peers: Vec<(NodeId, u16)> = cluster
+                .peers()
+                .into_iter()
+                .map(|peer| (peer.node, peer.protocol))
+                .collect();
+            for InvalidationSend { peers, msgs } in
+                invalidation_sends(shard.merges(), &peers, cache_name, records)
+            {
+                let frames = encode_frames(msgs);
+                for peer in peers {
+                    cluster
+                        .mesh()
+                        .send_frames(peer, MsgClass::Invalidate, frames.iter().cloned());
                 }
             }
         }
@@ -483,6 +522,129 @@ mod tests {
             fold_msgs(&cache, vec![rec.clone()]),
             vec![Msg::Replicate { cache, rec }]
         );
+    }
+
+    /// A record whose frame would pass `MAX_FRAME` cannot encode, and no
+    /// anti-entropy repairs an `Invalidation` cache, so it travels as an
+    /// invalidation that drops the holder's stale copy.
+    #[test]
+    fn a_record_too_large_for_a_frame_travels_as_an_invalidation() {
+        let cache = SmolStr::new("c");
+        let sized = |key: u32, over: usize| {
+            let rec = wire_record_for_u32(key);
+            let base = wire::replicate_frame_len(cache.len(), rec.key.len(), 0);
+            WireRecord {
+                value: Some(Bytes::from(vec![0u8; wire::MAX_FRAME - base + over])),
+                ..rec
+            }
+        };
+        let fits = sized(1, 0);
+        let too_large = sized(2, 1);
+
+        let msgs = fold_msgs(&cache, vec![fits.clone(), too_large.clone()]);
+
+        assert_eq!(
+            msgs,
+            vec![
+                Msg::Replicate {
+                    cache: cache.clone(),
+                    rec: fits,
+                },
+                Msg::Invalidate {
+                    cache,
+                    key: too_large.key,
+                    ver: too_large.ver,
+                },
+            ]
+        );
+        assert_eq!(
+            encode_frames(msgs.clone()).len(),
+            msgs.len(),
+            "every message encodes, so none is dropped"
+        );
+    }
+
+    fn sends_for(
+        merges: bool,
+        peers: &[(u64, u16)],
+        records: Vec<WireRecord>,
+    ) -> Vec<InvalidationSend> {
+        let peers: Vec<(NodeId, u16)> = peers
+            .iter()
+            .map(|&(node, protocol)| (NodeId::from(node), protocol))
+            .collect();
+        invalidation_sends(merges, &peers, &SmolStr::new("c"), records)
+    }
+
+    #[test]
+    fn a_merging_cache_sends_an_older_peer_invalidations_and_a_current_peer_its_records() {
+        let live = wire_record_for_u32(1);
+        let removed = WireRecord {
+            value: None,
+            ..wire_record_for_u32(2)
+        };
+        let records = vec![live.clone(), removed.clone()];
+        let cache = SmolStr::new("c");
+        let old = wire::PROTOCOL_INVALIDATION_FOLD - 1;
+        let current = wire::PROTOCOL_INVALIDATION_FOLD;
+
+        let sends = sends_for(true, &[(1, old), (2, current), (3, old)], records.clone());
+
+        assert_eq!(
+            sends,
+            vec![
+                InvalidationSend {
+                    peers: vec![NodeId::from(2)],
+                    msgs: fold_msgs(&cache, records.clone()),
+                },
+                InvalidationSend {
+                    peers: vec![NodeId::from(1), NodeId::from(3)],
+                    msgs: invalidations(&cache, records),
+                },
+            ]
+        );
+        assert!(
+            matches!(&sends[0].msgs[0], Msg::Replicate { rec, .. } if *rec == live),
+            "the current peer receives the live record's value"
+        );
+        assert!(
+            sends[1]
+                .msgs
+                .iter()
+                .all(|msg| matches!(msg, Msg::Invalidate { .. })),
+            "the older peer receives no value, a live record included"
+        );
+        assert!(matches!(&sends[1].msgs[1], Msg::Invalidate { key, .. } if *key == removed.key));
+    }
+
+    #[test]
+    fn a_cache_whose_resolver_does_not_merge_sends_every_peer_invalidations() {
+        let records: Vec<WireRecord> = (0u32..2).map(wire_record_for_u32).collect();
+        let cache = SmolStr::new("c");
+        let sends = sends_for(
+            false,
+            &[
+                (1, wire::PROTOCOL_INVALIDATION_FOLD - 1),
+                (2, wire::PROTOCOL_VERSION),
+            ],
+            records.clone(),
+        );
+        assert_eq!(
+            sends,
+            vec![InvalidationSend {
+                peers: vec![NodeId::from(1), NodeId::from(2)],
+                msgs: invalidations(&cache, records),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_send_set_with_no_peer_is_left_out() {
+        let records = vec![wire_record_for_u32(1)];
+        assert!(sends_for(true, &[], records.clone()).is_empty());
+        let only_current = sends_for(true, &[(1, wire::PROTOCOL_VERSION)], records);
+        assert_eq!(only_current.len(), 1);
+        assert_eq!(only_current[0].peers, vec![NodeId::from(1)]);
     }
 
     #[test]
