@@ -78,7 +78,7 @@ where
             postcard::to_stdvec(&value)
                 .expect("invariant: a value returned by the loader postcard-encodes"),
         );
-        let expires_at_ms = self.expiry_for(None);
+        let expires_at_ms = self.expiry_for(ver.wall_ms, None);
         let outcome = self.engine.complete_fresh_load(
             engine::FreshLoad {
                 key,

@@ -89,6 +89,38 @@ async fn a_remote_record_over_a_locally_expired_counter_starts_a_new_value() {
     assert_eq!(s.ttl_of(&1), Some(Ttl::Remaining(secs(7))));
 }
 
+/// A node whose clock stamps run ahead of its physical clock by more than the
+/// TTL (it absorbed a fast peer's stamp, inside `max_clock_skew`) still folds
+/// its writes: a deadline is minted past the write's own stamp.
+#[tokio::test]
+async fn a_merge_folds_when_the_stamp_clock_leads_the_physical_clock_by_more_than_the_ttl() {
+    let clock = Arc::new(AtomicU64::new(T0));
+    let s = counter_shard(1, Some(secs(10)), &clock);
+    let fast_peer = WireRecord {
+        key: key_bytes(&1u32),
+        value: Some(Bytes::from(delta(11, 5).encode().expect("encodes"))),
+        ver: hlc(T0 + 30_000, 11),
+        expires_at_ms: None,
+    };
+    ShardOps::apply_remote(&s, fast_peer).await;
+    assert_eq!(counter_value(&s), Some(5));
+
+    s.merge(1, delta(12, 1)).await.expect("merge");
+    clock.store(T0 + 1_000, Ordering::SeqCst);
+    s.merge(1, delta(13, 2)).await.expect("merge");
+
+    assert_eq!(
+        counter_value(&s),
+        Some(8),
+        "every write folds although its stamp leads the physical clock by 30 s"
+    );
+    let record = ShardOps::records_for(&s, vec![key_bytes(&1u32)]).await;
+    assert!(
+        record[0].expires_at_ms.expect("a deadline") > record[0].ver.wall_ms,
+        "the deadline lies past the stamp of the write that set it"
+    );
+}
+
 #[tokio::test]
 async fn a_merge_after_the_old_value_was_swept_starts_a_new_value() {
     let clock = Arc::new(AtomicU64::new(T0));

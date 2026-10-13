@@ -573,12 +573,25 @@ where
             .observe(self.now_ms(), derived);
     }
 
-    /// The absolute expiry a write stamped now carries: the per-write `ttl` if
-    /// given, else the shard's configured default, else none. Only this
-    /// stamp is per-cache; everything downstream reads each record's own
-    /// `expires_at_ms`.
-    pub(super) fn expiry_for(&self, ttl: Option<Duration>) -> Option<u64> {
+    /// The absolute expiry a write stamped `stamp_wall_ms` carries: the
+    /// per-write `ttl` if given, else the shard's configured default, else
+    /// none. Only this stamp is per-cache; everything downstream reads each
+    /// record's own `expires_at_ms`.
+    ///
+    /// A merging resolver decides whether a side lapsed by comparing its
+    /// deadline with the other write's stamp, and a stamp runs ahead of the
+    /// physical clock by as much as the clock has absorbed from a fast peer.
+    /// The deadline of a merging shard therefore counts from the later of the
+    /// physical clock and the stamp, so it lies past the stamp of the write
+    /// that set it. Every other resolver counts from the physical clock.
+    pub(super) fn expiry_for(&self, stamp_wall_ms: u64, ttl: Option<Duration>) -> Option<u64> {
+        let now = self.now_ms();
+        let base = if self.resolver.merges() {
+            now.max(stamp_wall_ms)
+        } else {
+            now
+        };
         ttl.or(self.ttl)
-            .map(|d| self.now_ms().saturating_add(duration_ms(d)))
+            .map(|d| base.saturating_add(duration_ms(d)))
     }
 }

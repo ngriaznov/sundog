@@ -77,11 +77,12 @@ where
         self.engine.ttl_of(key_bytes.as_ref(), hash, self.now_ms())
     }
 
-    /// The absolute expiry `lifetime` stamps now.
-    fn deadline_for(&self, lifetime: Lifetime) -> Option<u64> {
+    /// The absolute expiry `lifetime` stamps now on a re-arm of a record
+    /// stamped `base_wall_ms`.
+    fn deadline_for(&self, base_wall_ms: u64, lifetime: Lifetime) -> Option<u64> {
         match lifetime {
-            Lifetime::For(ttl) => self.expiry_for(Some(ttl)),
-            Lifetime::Default => self.expiry_for(None),
+            Lifetime::For(ttl) => self.expiry_for(base_wall_ms, Some(ttl)),
+            Lifetime::Default => self.expiry_for(base_wall_ms, None),
             Lifetime::Unbounded => None,
         }
     }
@@ -128,7 +129,7 @@ where
                 _ => LocalRearm::NotHeld,
             });
         };
-        let expires_at_ms = self.deadline_for(lifetime);
+        let expires_at_ms = self.deadline_for(base_ver.wall_ms, lifetime);
         let ver = rearmed_version(base_ver, expires_at_ms);
         let applied = self.engine.apply_if_current(
             (
@@ -205,7 +206,7 @@ where
         }
         let key_bytes = encode_key(&key)?;
         let value: V = postcard::from_bytes(&encoded).map_err(CodecError::from)?;
-        let expires_at_ms = self.deadline_for(lifetime);
+        let expires_at_ms = self.deadline_for(base.ver.wall_ms, lifetime);
         let ver = rearmed_version(base.ver, expires_at_ms);
         self.wait_for_fan_out_room().await;
         self.apply_or_forward(

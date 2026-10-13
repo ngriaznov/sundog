@@ -137,7 +137,7 @@ where
         let ver = self.stamp_local();
         if self.merge_window.is_zero() {
             self.wait_for_fan_out_room().await;
-            let expires_at_ms = self.expiry_for(ttl);
+            let expires_at_ms = self.expiry_for(ver.wall_ms, ttl);
             return self.apply_or_forward(
                 key,
                 key_bytes,
@@ -149,7 +149,7 @@ where
                 },
             );
         }
-        let expires_at_ms = self.expiry_for(ttl);
+        let expires_at_ms = self.expiry_for(ver.wall_ms, ttl);
         let hash = engine::hash_key_bytes(key_bytes.as_ref());
         let mut stripe = self.pending_merges[engine::stripe_index_from_hash(hash)]
             .lock()

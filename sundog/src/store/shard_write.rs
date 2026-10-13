@@ -339,7 +339,7 @@ where
         let key_bytes = encode_key(&key)?;
         let encoded = Bytes::from(postcard::to_stdvec(&value).map_err(CodecError::from)?);
         let ver = self.stamp_local();
-        let expires_at_ms = self.expiry_for(ttl);
+        let expires_at_ms = self.expiry_for(ver.wall_ms, ttl);
         let wire_size = wire::replicate_frame_len(self.name.len(), key_bytes.len(), encoded.len());
         if wire_size > self.max_frame {
             return Err(CacheError::ValueTooLarge {
@@ -453,7 +453,7 @@ where
                 }
             };
             let ver = self.stamp_local();
-            let expires_at_ms = self.expiry_for(ttl);
+            let expires_at_ms = self.expiry_for(ver.wall_ms, ttl);
             let wire_size =
                 wire::replicate_frame_len(self.name.len(), key_bytes.len(), encoded.len());
             if wire_size > self.max_frame {
