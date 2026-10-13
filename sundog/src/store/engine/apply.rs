@@ -313,7 +313,7 @@ where
 
 /// The held-only gate of [`apply_locked`]: whether the write at `ver` is
 /// refused because it cannot fold into a visible live entry (`holds`). It
-/// folds only a [`Incoming::Put`] into such an entry; a tombstone reaches
+/// folds only an [`Incoming::Put`] into such an entry; a tombstone reaches
 /// the engine through [`Engine::invalidate`] instead. A refused write
 /// newer than whatever is stored for the key (a tombstone, a live entry
 /// that reads as absent, or nothing) marks a load in flight for the key

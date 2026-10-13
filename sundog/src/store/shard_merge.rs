@@ -79,9 +79,8 @@ where
     /// without a read, applying through the same versioned-apply path as
     /// [`Shard::insert`]. The folded record carries the shard's default TTL,
     /// if any; a merging resolver keeps the later deadline of the two sides.
-    /// With [`Shard::with_merge_coalesce_window`] left
-    /// at its default zero, every call applies at once. With a non-zero
-    /// window, consecutive calls to the same key fold into an in-memory
+    /// With [`Shard::with_merge_coalesce_window`] left at its default zero,
+    /// every call applies at once. With a non-zero window, consecutive calls to the same key fold into an in-memory
     /// pending value instead, applying once when the window that opened at
     /// the first call elapses (`crate::cache::tasks::merge_coalesce_task`,
     /// `Cache::close`, and this shard's `Drop` all guarantee a flush);

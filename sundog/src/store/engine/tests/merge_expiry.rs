@@ -1,8 +1,8 @@
-//! Tests for the merge fold decision: `lapsed_before`, `fold_sides` and `apply_locked` with an expired, idle or lapsed side.
+//! Tests for the merge fold decision: `lapsed_before`, `fold_sides`, `resolve_conflict` and `apply_locked` with an expired, idle or lapsed side.
 
 use std::collections::BTreeSet;
 
-use super::super::merge::{Fold, fold_sides, lapsed_before};
+use super::super::merge::{Fold, Resolution, fold_sides, lapsed_before, resolve_conflict};
 use super::*;
 
 type SetEngine = Engine<u32, BTreeSet<String>>;
@@ -327,4 +327,217 @@ fn replicas_exchanging_records_with_different_deadlines_converge() {
         converge(&record_b, &record_a),
         "both replicas end at the same bytes, deadline and version"
     );
+}
+
+/// The postcard bytes of the set `elems`.
+fn set_bytes(elems: &[&str]) -> Bytes {
+    Bytes::from(postcard::to_stdvec(&string_set(elems)).expect("test value encodes"))
+}
+
+/// An incoming put of the set `elems`, expiring at `expires_at_ms`.
+fn incoming_put(elems: &[&str], expires_at_ms: Option<u64>) -> Incoming<BTreeSet<String>> {
+    Incoming::Put {
+        value: string_set(elems),
+        expires_at_ms,
+        encoded: set_bytes(elems),
+    }
+}
+
+/// `resolve_conflict` under [`UnionSetResolver`], whose `winner` keeps the
+/// higher version.
+fn resolve_union(
+    stored: Option<&Bytes>,
+    stored_expires_at_ms: Option<u64>,
+    stored_absent: bool,
+    sv: Hlc,
+    ver: Hlc,
+    incoming: &Incoming<BTreeSet<String>>,
+) -> Resolution {
+    resolve_conflict(
+        &UnionSetResolver,
+        b"k",
+        sv,
+        stored.map(AsRef::as_ref),
+        stored_expires_at_ms,
+        stored_absent,
+        ver,
+        incoming,
+    )
+}
+
+#[test]
+fn resolve_conflict_folds_two_live_sides_through_the_resolver() {
+    let stored = set_bytes(&["a"]);
+    let resolution = resolve_union(
+        Some(&stored),
+        Some(5_000),
+        false,
+        hlc(1_000, 1),
+        hlc(2_000, 2),
+        &incoming_put(&["b"], Some(9_000)),
+    );
+    let Resolution::Merged {
+        value,
+        expires_at_ms,
+    } = resolution
+    else {
+        panic!("two live sides merge");
+    };
+    assert_eq!(value, set_bytes(&["a", "b"]));
+    assert_eq!(expires_at_ms, Some(9_000));
+}
+
+#[test]
+fn resolve_conflict_keeps_the_incoming_record_over_a_dead_stored_side_without_its_bytes() {
+    let incoming = incoming_put(&["b"], Some(9_000));
+    for (stored_expires_at_ms, stored_absent) in [(None, true), (Some(2_000), false)] {
+        let resolution = resolve_union(
+            None,
+            stored_expires_at_ms,
+            stored_absent,
+            hlc(1_000, 1),
+            hlc(2_000, 2),
+            &incoming,
+        );
+        let Resolution::Merged {
+            value,
+            expires_at_ms,
+        } = resolution
+        else {
+            panic!("the incoming record is the result");
+        };
+        assert_eq!(value, set_bytes(&["b"]));
+        assert_eq!(expires_at_ms, Some(9_000));
+    }
+}
+
+#[test]
+fn resolve_conflict_keeps_the_stored_record_over_a_dead_incoming_side() {
+    let stored = set_bytes(&["a"]);
+    let resolution = resolve_union(
+        Some(&stored),
+        Some(9_000),
+        false,
+        hlc(2_000, 1),
+        hlc(1_000, 2),
+        &incoming_put(&["b"], Some(1_000)),
+    );
+    let Resolution::Merged {
+        value,
+        expires_at_ms,
+    } = resolution
+    else {
+        panic!("the stored record is the result");
+    };
+    assert_eq!(value, stored);
+    assert_eq!(expires_at_ms, Some(9_000));
+}
+
+#[test]
+fn resolve_conflict_falls_to_the_winner_when_the_kept_stored_side_has_no_bytes() {
+    let resolution = resolve_union(
+        None,
+        None,
+        false,
+        hlc(1_000, 1),
+        hlc(2_000, 2),
+        &incoming_put(&["b"], None),
+    );
+    assert!(
+        matches!(resolution, Resolution::IncomingWins),
+        "an unreadable stored side never merges; the higher version wins"
+    );
+}
+
+#[test]
+fn resolve_conflict_falls_to_the_winner_when_both_sides_are_dead() {
+    // The stored record lapsed before the incoming write and the incoming
+    // record lapsed before the stored write.
+    let stored = set_bytes(&["a"]);
+    let newer_incoming = resolve_union(
+        Some(&stored),
+        Some(1_500),
+        false,
+        hlc(1_000, 1),
+        hlc(2_000, 2),
+        &incoming_put(&["b"], Some(1_000)),
+    );
+    assert!(matches!(newer_incoming, Resolution::IncomingWins));
+    let older_incoming = resolve_union(
+        Some(&stored),
+        Some(900),
+        false,
+        hlc(2_000, 1),
+        hlc(1_000, 2),
+        &incoming_put(&["b"], Some(2_000)),
+    );
+    assert!(matches!(older_incoming, Resolution::IncomingLoses));
+}
+
+#[test]
+fn resolve_conflict_leaves_a_tombstone_to_the_winner() {
+    let stored = set_bytes(&["a"]);
+    let tombstone_incoming = resolve_union(
+        Some(&stored),
+        None,
+        false,
+        hlc(1_000, 1),
+        hlc(2_000, 2),
+        &Incoming::Tombstone,
+    );
+    assert!(matches!(tombstone_incoming, Resolution::IncomingWins));
+    let tombstone_stored = resolve_union(
+        None,
+        None,
+        false,
+        hlc(1_000, 1),
+        hlc(2_000, 2),
+        &incoming_put(&["b"], None),
+    );
+    assert!(matches!(tombstone_stored, Resolution::IncomingWins));
+}
+
+#[test]
+fn resolve_conflict_never_reads_stored_absence_for_a_resolver_that_does_not_merge() {
+    for stored_absent in [false, true] {
+        let stored = set_bytes(&["a"]);
+        let incoming = incoming_put(&["b"], None);
+        let newer = resolve_conflict(
+            &LwwResolver,
+            b"k",
+            hlc(1_000, 1),
+            Some(stored.as_ref()),
+            None,
+            stored_absent,
+            hlc(2_000, 2),
+            &incoming,
+        );
+        assert!(matches!(newer, Resolution::IncomingWins));
+        let older = resolve_conflict(
+            &LwwResolver,
+            b"k",
+            hlc(2_000, 1),
+            Some(stored.as_ref()),
+            None,
+            stored_absent,
+            hlc(1_000, 2),
+            &incoming,
+        );
+        assert!(matches!(older, Resolution::IncomingLoses));
+    }
+}
+
+#[test]
+fn resolve_conflict_rejects_a_redelivered_record_whatever_the_stored_absence() {
+    let stored = set_bytes(&["a"]);
+    let ver = hlc(2_000, 2);
+    let resolution = resolve_union(
+        Some(&stored),
+        None,
+        true,
+        ver,
+        ver,
+        &incoming_put(&["a"], None),
+    );
+    assert!(matches!(resolution, Resolution::IncomingLoses));
 }

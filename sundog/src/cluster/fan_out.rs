@@ -256,8 +256,8 @@ async fn fan_out_batch<K, V>(
                 .partition(|peer| invalidation_ships_values(merges, peer.protocol));
             // A peer that folds gets each live record as a replicate frame
             // and each tombstone as an invalidation; every other peer
-            // gets an invalidation per record, which a low-protocol peer
-            // can never misdecode, exactly as before.
+            // gets an invalidation per record, which carries no value for a
+            // low-protocol peer to misdecode.
             if !folding.is_empty() {
                 let frames = encode_frames(fold_msgs(cache_name, records.clone()));
                 for peer in folding {

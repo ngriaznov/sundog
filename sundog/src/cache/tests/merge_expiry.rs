@@ -305,3 +305,86 @@ async fn merge_with_ttl_reaches_a_replica_with_its_deadline() {
     .await;
     shut_down(nodes).await;
 }
+
+#[tokio::test]
+async fn merge_with_ttl_reaches_the_owners_of_a_distributed_cache_with_its_deadline() {
+    let nodes = counter_nodes(
+        "cache-it-merge-with-ttl-distributed",
+        Mode::distributed(),
+        3,
+    )
+    .await;
+    wait_for_warm_owners(&nodes).await;
+    let cache = &nodes[0].1;
+    cache
+        .merge_with_ttl(
+            KEY,
+            PnCounter::local_delta(cache.writer_id(), 3),
+            Duration::from_secs(600),
+        )
+        .await
+        .expect("merge_with_ttl");
+    let owners = cache.owners_of(&KEY);
+    wait_until(
+        Duration::from_secs(30),
+        "every owner holds the record with the call's deadline",
+        async || {
+            nodes
+                .iter()
+                .filter(|(cluster, _)| owners.contains(&cluster.node_id()))
+                .all(|(_, cache)| {
+                    matches!(
+                        cache.ttl_of(&KEY),
+                        Some(Ttl::Remaining(left)) if left > Duration::from_secs(500)
+                    )
+                })
+        },
+    )
+    .await;
+    shut_down(nodes).await;
+}
+
+#[tokio::test]
+async fn merge_with_ttl_folds_into_an_invalidation_holder_with_the_later_deadline() {
+    let nodes = counter_nodes(
+        "cache-it-merge-with-ttl-invalidation",
+        Mode::Invalidation,
+        2,
+    )
+    .await;
+    let (holder, writer) = (&nodes[0].1, &nodes[1].1);
+    holder
+        .merge_with_ttl(
+            KEY,
+            PnCounter::local_delta(holder.writer_id(), 3),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("holder merges");
+    writer
+        .merge_with_ttl(
+            KEY,
+            PnCounter::local_delta(writer.writer_id(), 4),
+            Duration::from_secs(600),
+        )
+        .await
+        .expect("writer merges");
+
+    wait_until(
+        Duration::from_secs(30),
+        "the holder folds the record and takes its later deadline",
+        async || {
+            holder
+                .fetch(&KEY)
+                .await
+                .expect("local read")
+                .is_some_and(|c| c.value() == 7)
+                && matches!(
+                    holder.ttl_of(&KEY),
+                    Some(Ttl::Remaining(left)) if left > Duration::from_secs(500)
+                )
+        },
+    )
+    .await;
+    shut_down(nodes).await;
+}
