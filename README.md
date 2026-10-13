@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/social-card.png" alt="sundog: an embedded, replicated cache for Rust" width="720">
+  <img src="https://raw.githubusercontent.com/ngriaznov/sundog/main/assets/social-card.png" alt="sundog: an embedded, replicated cache for Rust" width="720">
 </p>
 
 [![CI](https://github.com/ngriaznov/sundog/actions/workflows/ci.yml/badge.svg)](https://github.com/ngriaznov/sundog/actions/workflows/ci.yml)
@@ -32,7 +32,7 @@ effect that puts extra copies of the sun beside the real one.
 ## See it run
 
 <p align="center">
-  <img src="assets/sundog-lens.gif" width="720" alt="The sundog-lens terminal UI during its scripted tour: three nodes join, a fourth and fifth scale the cluster out, an explain overlay shows where one key lives and what each of the five nodes says of reading it, then one node crashes, one leaves gracefully and one restarts while the part-ownership mosaic, member table, throughput chart and event log update">
+  <img src="https://raw.githubusercontent.com/ngriaznov/sundog/main/assets/sundog-lens.gif" width="720" alt="The sundog-lens terminal UI during its scripted tour: three nodes join, a fourth and fifth scale the cluster out, an explain overlay shows where one key lives and what each of the five nodes says of reading it, then one node crashes, one leaves gracefully and one restarts while the part-ownership mosaic, member table, throughput chart and event log update">
 </p>
 
 `sundog-lens` is a terminal UI that watches a running cluster from outside. It
@@ -53,7 +53,7 @@ cargo run --release -p sundog-lens -- watch <cluster> --seed host:7946 \
     --metrics 'http://{ip}:9090/metrics'
 ```
 
-`asciinema play assets/sundog-lens.cast` replays the recording. [`demos/`](demos/)
+`asciinema play assets/sundog-lens.cast` replays the recording. [`demos/`](https://github.com/ngriaznov/sundog/tree/main/demos)
 holds two more terminal demos that kill and restart in-process nodes under write
 load: `cargo run -p sundog-demo -- --nodes 5` and `cargo run --release -p
 sundog-distributed-demo -- --nodes 5` (a `Distributed` cache).
@@ -79,7 +79,7 @@ sundog-distributed-demo -- --nodes 5` (a `Distributed` cache).
   updated and removed key with its origin. `Cache::explain` says why a read of
   a key answers what it does.
 - **Production hooks.** Mutual TLS, Prometheus metrics with health probes, a
-  [Grafana dashboard](ops/grafana-dashboard.json) and rolling upgrades.
+  [Grafana dashboard](https://github.com/ngriaznov/sundog/blob/main/ops/grafana-dashboard.json) and rolling upgrades.
 - **Tested against divergence.** Property tests, deterministic network
   simulation, container tests, fuzzing, model checking and a weekly chaos run,
   described in [Verification](https://ngriaznov.github.io/sundog/verification.html).
@@ -182,8 +182,8 @@ The [sundog book](https://ngriaznov.github.io/sundog/) holds the detail:
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT
-license](LICENSE-MIT) at your option.
+Licensed under either of [Apache License, Version 2.0](https://github.com/ngriaznov/sundog/blob/main/LICENSE-APACHE) or [MIT
+license](https://github.com/ngriaznov/sundog/blob/main/LICENSE-MIT) at your option.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in this project by you, as defined in the Apache-2.0 license,

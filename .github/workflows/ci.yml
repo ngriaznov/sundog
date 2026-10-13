@@ -32,6 +32,16 @@ jobs:
       - name: No Rust file over 2,000 lines
         run: git ls-files -z '*.rs' | xargs -0 wc -l | awk '$2 != "total" && $1 > 2000 {print; bad=1} END {exit bad}'
 
+      # The `sundog` crate packages the root README, and crates.io resolves
+      # a relative link in it against `sundog/`, where `assets/`, `ops/` and
+      # `demos/` do not live. Every link in it is absolute or an anchor.
+      - name: No relative link in the README
+        run: |
+          relative=$(grep -oE '\]\([^)]+\)|^\[[^]]+\]: *[^ ]+|(src|href)="[^"]*"' README.md \
+            | sed -E 's/^\]\(//; s/\)$//; s/^\[[^]]+\]: *//; s/^(src|href)="//; s/"$//' \
+            | grep -vE '^(https?://|#|mailto:)' || true)
+          if [ -n "$relative" ]; then echo "$relative"; exit 1; fi
+
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings -W clippy::pedantic
 
