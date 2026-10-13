@@ -103,6 +103,50 @@ async fn apply_remote_batch_suspends_identically_under_a_saturated_queue() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An `Invalidation` shard stores a peer's record only as a fold into a key
+/// it holds, so `apply_remote_batch` reserves no flush-queue budget for the
+/// batch: a record for a key it does not hold completes at once while another
+/// caller holds the whole budget, and stores nothing.
+#[tokio::test]
+async fn an_invalidation_batch_waits_for_no_flush_queue_budget() {
+    let dir = temp_dir("invalidation-batch-no-reservation");
+    let cfg = SpillConfig::new(&dir, 1 << 20)
+        .region_bytes(4096)
+        .flush_queue_bytes(64)
+        .spill_wait_timeout(Duration::from_secs(30));
+    let shard = Shard::<u32, String>::new(
+        SmolStr::new("invalidation-batch-no-reservation"),
+        Mode::Invalidation,
+        NodeId::from(1u64),
+        u64::MAX,
+        None,
+        None,
+    )
+    .with_spill(&cfg)
+    .expect("tier opens");
+    let tier = Arc::clone(shard.engine.spill().expect("with_spill attaches a tier"));
+    let _held = tier
+        .reserve(64, Duration::from_secs(5))
+        .await
+        .expect("the whole (tiny) queue is free before this call");
+
+    let rec = WireRecord {
+        key: key_bytes(&1u32),
+        value: Some(Bytes::from(postcard::to_stdvec("a").expect("encode"))),
+        ver: hlc(1, 1),
+        expires_at_ms: None,
+    };
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        ShardOps::apply_remote_batch(&shard, vec![rec]),
+    )
+    .await
+    .expect("a batch of records this shard ignores reserves nothing and does not wait");
+    assert_eq!(shard.get_sync(&1), None);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Pins that `apply_remote_batch` groups by stripe before its one
 /// `reserve_for_batch` suspension point, so the suspension cannot
 /// reorder a batch: two same-key, same-`Hlc` puts must apply first-wins.

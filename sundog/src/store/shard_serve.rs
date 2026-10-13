@@ -421,13 +421,20 @@ where
             // One reservation for the whole decoded batch (see
             // `Shard::reserve_for_batch`) throttles replication, anti-entropy
             // repair, and state-transfer apply alike through this one method.
-            let (reservation, deadline) = self
-                .reserve_for_batch(
-                    decoded
-                        .iter()
-                        .map(|(_, _, key_bytes, _, incoming, _)| (key_bytes, incoming)),
-                )
-                .await;
+            // A held-only batch stores a record only as a fold into a key
+            // already held, and most of its records store nothing, so it
+            // reserves nothing and takes the apply's non-blocking path.
+            let (reservation, deadline) = match scope {
+                engine::ApplyScope::HeldOnly => (None, None),
+                engine::ApplyScope::Any => {
+                    self.reserve_for_batch(
+                        decoded
+                            .iter()
+                            .map(|(_, _, key_bytes, _, incoming, _)| (key_bytes, incoming)),
+                    )
+                    .await
+                }
+            };
 
             // Groups by raw key-byte stripe, no decode needed; order within
             // a stripe is preserved.
