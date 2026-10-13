@@ -177,22 +177,32 @@ pub(super) fn group_prefold_runs<K, V>(entries: &[BatchEntry<K, V>]) -> Vec<Vec<
     runs
 }
 
-/// [`peek_stored_seed`]'s and [`peek_prefold_seeds`]'s result for one key:
-/// the real stored `(version, encoded bytes, TTL, absent)` to seed
-/// [`prefold_batch`]'s fold with, `absent` being whether the entry reads as
-/// absent at the batch's `now_ms`, or `None` when there is none to seed
-/// with. Named only to keep the two functions' signatures under clippy's
-/// type-complexity threshold.
-pub(super) type PrefoldSeed = Option<(Hlc, Bytes, Option<u64>, bool)>;
+/// What [`peek_stored_seed`] and [`peek_prefold_seeds`] find stored for one
+/// key, as [`prefold_batch`] seeds a run's fold with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PrefoldSeed {
+    /// The key has no stored entry: the run folds from its own first entry.
+    Vacant,
+    /// The key's real stored record: its version, encoded bytes, TTL, and
+    /// whether it reads as absent at the batch's `now_ms` (expired, or idle
+    /// for `tti_ms`).
+    Stored(Hlc, Bytes, Option<u64>, bool),
+    /// The stored side is a tombstone, or a spilled entry whose bytes were
+    /// not prefetched: sequential application decides each of the run's
+    /// entries against it on its own, which a fold of the run cannot
+    /// reproduce, so the run is left to [`apply_locked`] entry by entry.
+    Sequential,
+}
 
 /// The key's real currently-stored record, in the same value-aware,
 /// tombstone/spill-degraded shape [`apply_locked`] itself reads before
-/// calling [`resolve_and_rebind`]: `None` against a tombstone, an absent
-/// key, or a currently-spilled entry whose bytes weren't already prefetched
-/// into `prefetched_spilled` (no value bytes to fold), `Some` with the
-/// stored `Hlc`, encoded bytes, TTL, and whether the entry reads as absent
-/// at `now_ms` (expired, or idle for `tti_ms`) otherwise. Read under a brief
-/// stripe read lock, before any decode or fold work runs; see
+/// calling [`resolve_and_rebind`]: [`PrefoldSeed::Sequential`] against a
+/// tombstone or a currently-spilled entry whose bytes weren't already
+/// prefetched into `prefetched_spilled` (no value bytes to fold),
+/// [`PrefoldSeed::Vacant`] for an absent key, and [`PrefoldSeed::Stored`]
+/// with the stored `Hlc`, encoded bytes, TTL, and whether the entry reads as
+/// absent at `now_ms` (expired, or idle for `tti_ms`) otherwise. Read under
+/// a brief stripe read lock, before any decode or fold work runs; see
 /// [`Engine::apply_many`]'s call site.
 pub(super) fn peek_stored_seed<K, V>(
     stripe: &Stripe<K, V>,
@@ -203,26 +213,31 @@ pub(super) fn peek_stored_seed<K, V>(
     #[cfg(feature = "spill")] prefetched_spilled: &HashMap<SpillLoc, Bytes>,
 ) -> PrefoldSeed {
     if stripe.tombstones.contains_key(key_bytes) {
-        return None;
+        return PrefoldSeed::Sequential;
     }
-    let live = stripe
+    let Some(live) = stripe
         .live
-        .find(hash, |l| record_key(&l.record) == key_bytes)?;
+        .find(hash, |l| record_key(&l.record) == key_bytes)
+    else {
+        return PrefoldSeed::Vacant;
+    };
     // `prefetched_spilled` is read off-lock, before this stripe's lock, in
-    // `prefetch_spilled_conflict_bytes`; a miss degrades to no seed.
+    // `prefetch_spilled_conflict_bytes`; a miss leaves the run sequential.
     #[cfg(feature = "spill")]
-    let encoded = match &live.state {
-        EntryState::Resident => record_value_bytes(&live.record),
-        EntryState::Spilled(loc) => prefetched_spilled.get(loc).cloned()?,
+    let Some(encoded) = (match &live.state {
+        EntryState::Resident => Some(record_value_bytes(&live.record)),
+        EntryState::Spilled(loc) => prefetched_spilled.get(loc).cloned(),
+    }) else {
+        return PrefoldSeed::Sequential;
     };
     #[cfg(not(feature = "spill"))]
     let encoded = record_value_bytes(&live.record);
-    Some((
+    PrefoldSeed::Stored(
         live.ver(),
         encoded,
         decode_expiry(live.wall_ms, live.expiry, key_bytes, &stripe.long_ttl),
         absent_at(live, key_bytes, &stripe.long_ttl, tti_ms, now_ms),
-    ))
+    )
 }
 
 /// [`Engine::apply_many`]'s seed lookup: for every `runs` entry long enough
@@ -270,7 +285,9 @@ pub(super) fn peek_prefold_seeds<K, V>(
 /// sequential application's order: `merge_version`'s content-join is
 /// fold-order independent but its mint arm's running max is not, so seeding
 /// first keeps the minted version identical too, not only the bytes. A run
-/// with no stored record folds from its own first entry. A run that
+/// with no stored entry folds from its own first entry. A run whose stored
+/// side is a tombstone, or cannot be read, is not folded
+/// ([`PrefoldSeed::Sequential`]): its entries stay in their own slots. A run that
 /// [`fold_run`] stops early folds only its consumed prefix; the rest of its
 /// entries stay in their own slots.
 ///
@@ -290,6 +307,25 @@ pub(super) fn prefold_batch<K, V: DeserializeOwned>(
             // Alone for this run: nothing to fold, left exactly as given.
             continue;
         }
+        let key_seed = {
+            let (_, _, key_bytes, ..) = slots[run[0]]
+                .as_ref()
+                .expect("each batch index belongs to at most one run");
+            stored_seeds.get(key_bytes.as_ref())
+        };
+        // Decoding the peeked stored bytes never happens under the read
+        // lock `peek_prefold_seeds` took: that lock is gone by here. Bytes
+        // that do not decode leave the run to sequential application.
+        let stored_decoded = match key_seed {
+            Some(PrefoldSeed::Sequential) => continue,
+            Some(PrefoldSeed::Stored(sv, encoded, expires_at_ms, absent)) => {
+                let Ok(value) = postcard::from_bytes::<V>(encoded) else {
+                    continue;
+                };
+                Some((*sv, value, encoded.clone(), *expires_at_ms, *absent))
+            }
+            Some(PrefoldSeed::Vacant) | None => None,
+        };
         let mut parts: Vec<(u64, K, Bytes)> = Vec::with_capacity(run.len());
         let mut versioned: Vec<(Hlc, Incoming<V>)> = Vec::with_capacity(run.len());
         for &idx in &run {
@@ -300,17 +336,6 @@ pub(super) fn prefold_batch<K, V: DeserializeOwned>(
             versioned.push((ver, incoming));
         }
         let key_bytes = parts[0].2.clone();
-
-        // Decoding the peeked stored bytes never happens under the read
-        // lock `peek_prefold_seeds` took: that lock is gone by here.
-        let stored_decoded = stored_seeds
-            .get(key_bytes.as_ref())
-            .and_then(Option::as_ref)
-            .and_then(|(sv, encoded, expires_at_ms, absent)| {
-                postcard::from_bytes::<V>(encoded)
-                    .ok()
-                    .map(|value| (*sv, value, encoded.clone(), *expires_at_ms, *absent))
-            });
 
         let folded = if let Some((sv, value, encoded, expires_at_ms, absent)) = stored_decoded {
             let stored_incoming = Incoming::Put {

@@ -191,10 +191,10 @@ fn apply_batch_at(engine: &SetEngine, entries: Vec<SetEntry>, now_ms: u64) {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
-    /// As the property above, with deadlines: every stored entry and batch
-    /// entry carries a random deadline, and the batch applies at a random
-    /// later clock, so stored entries are live, expired or lapsed relative
-    /// to a write. Pre-fold seeds its fold with the stored entry's absence,
+    /// As the property above, with deadlines and an optional idle timeout:
+    /// every stored entry and batch entry carries a random deadline, and the
+    /// batch applies at a random later clock, so stored entries are live,
+    /// expired, idle or lapsed relative to a write. Pre-fold seeds its fold with the stored entry's absence,
     /// so an absent entry never folds into the run and the stored
     /// `(version, bytes, deadline)` matches sequential application.
     #[test]
@@ -208,6 +208,7 @@ proptest! {
             1..40,
         ),
         now_ms in 0u64..30,
+        tti_ms in proptest::option::of(1u64..8),
     ) {
         let build = |specs: &[(EntrySpec, Option<u64>)]| -> Vec<SetEntry> {
             specs
@@ -217,8 +218,9 @@ proptest! {
                 })
                 .collect()
         };
-        let on: SetEngine = Engine::new(u64::MAX, None, None, None);
-        let off: SetEngine = Engine::new(u64::MAX, None, None, None);
+        let tti = tti_ms.map(Duration::from_millis);
+        let on: SetEngine = Engine::new(u64::MAX, tti, None, None);
+        let off: SetEngine = Engine::new(u64::MAX, tti, None, None);
         off.set_prefold_enabled(false);
         apply_batch_at(&on, build(&setup), 0);
         apply_batch_at(&off, build(&setup), 0);
@@ -294,6 +296,37 @@ fn prefold_stops_before_a_step_that_would_drop_the_stored_record() {
 }
 
 #[test]
+fn prefold_over_an_idle_seed_never_folds_the_idle_entry_into_the_run() {
+    let key = 1u32;
+    let kb = key_bytes(key);
+    let build = || {
+        vec![
+            put_entry(key, hlc(2_000, 2), "x"),
+            put_entry(key, hlc(2_100, 3), "y"),
+        ]
+    };
+    let run = |prefold: bool| -> SetEngine {
+        let engine: SetEngine = Engine::new(u64::MAX, Some(Duration::from_secs(1)), None, None);
+        engine.set_prefold_enabled(prefold);
+        apply_batch_at(&engine, vec![put_entry(key, hlc(1_000, 1), "old")], 1_000);
+        apply_batch_at(&engine, build(), 5_000);
+        engine
+    };
+    let folded = run(true);
+    let sequential = run(false);
+    assert_eq!(
+        sequential.get(&key, 5_000),
+        Some(string_set(&["x", "y"])),
+        "the entry idle past tti does not fold into the batch"
+    );
+    assert_eq!(
+        folded.record_for(kb.as_ref(), 5_000),
+        sequential.record_for(kb.as_ref(), 5_000),
+        "the pre-folded batch leaves the record sequential application does"
+    );
+}
+
+#[test]
 fn prefold_over_an_absent_seed_never_folds_the_dead_entry_into_the_run() {
     let key = 1u32;
     let kb = key_bytes(key);
@@ -320,6 +353,40 @@ fn prefold_over_an_absent_seed_never_folds_the_dead_entry_into_the_run() {
     assert_eq!(
         folded.record_for(kb.as_ref(), 6_000),
         sequential.record_for(kb.as_ref(), 6_000),
+        "the pre-folded batch leaves the record sequential application does"
+    );
+}
+
+/// A run over a stored tombstone applies entry by entry: an entry older than
+/// the tombstone loses to it alone and never rides a newer entry past it.
+#[test]
+fn prefold_over_a_stored_tombstone_matches_sequential_application() {
+    let key = 1u32;
+    let kb = key_bytes(key);
+    let build = || {
+        vec![
+            put_entry(key, hlc(90, 2), "x"),
+            put_entry(key, hlc(110, 3), "y"),
+        ]
+    };
+    let run = |prefold: bool| -> SetEngine {
+        let engine: SetEngine = Engine::new(u64::MAX, None, None, None);
+        engine.set_prefold_enabled(prefold);
+        tombstone(&engine, key, kb.clone(), hlc(100, 1), 0);
+        apply_batch_at(&engine, build(), 0);
+        engine
+    };
+    let folded = run(true);
+    let sequential = run(false);
+    assert_eq!(
+        sequential.get(&key, 0),
+        Some(string_set(&["y"])),
+        "the entry older than the tombstone loses to it"
+    );
+    assert_eq!(folded.get(&key, 0), sequential.get(&key, 0));
+    assert_eq!(
+        folded.record_for(kb.as_ref(), 0),
+        sequential.record_for(kb.as_ref(), 0),
         "the pre-folded batch leaves the record sequential application does"
     );
 }
