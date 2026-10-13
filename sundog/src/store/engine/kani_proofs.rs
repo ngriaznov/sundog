@@ -58,8 +58,10 @@ fn a_merge_never_moves_the_stored_version_back() {
 
 /// Both nodes of a collision, each holding the other's write as
 /// incoming, end at the same version: the one node keeps or stores what
-/// the other does. `stored_eq` says the two sides' bytes match, which
-/// the merged bytes can only equal both of when it holds.
+/// the other does. `stored_eq` says the two sides' content (bytes and
+/// deadline) match, which the merged content can only equal both of when it
+/// holds. Both stored sides are readable here; a stored side that reads as
+/// absent is `an_absent_stored_collision_converges_in_two_exchanges`.
 #[kani::proof]
 fn a_collision_converges_in_either_order() {
     let (sv, ver) = (any_hlc(), any_hlc());
@@ -82,6 +84,31 @@ fn a_collision_converges_in_either_order() {
         settle(sv, ver, is_stored, is_incoming),
         settle(ver, sv, is_incoming, is_stored)
     );
+}
+
+/// A collision whose stored side reads as absent on one node, so its
+/// `is_stored` is false while both nodes hold equal content, ends at one
+/// version within a second exchange: the first exchange leaves the absent
+/// side at the other's version or above it, and the second adopts the
+/// greater of the two on both nodes.
+#[kani::proof]
+fn an_absent_stored_collision_converges_in_two_exchanges() {
+    let (vx, vy) = (any_hlc(), any_hlc());
+    let node = NodeId::from(kani::any::<u64>());
+    let settle = |own: Hlc, other: Hlc, is_own: bool, is_other: bool| match merge_decision(
+        own,
+        other,
+        is_own,
+        is_other,
+        || node,
+    ) {
+        MergedVersion::NoOp => own,
+        MergedVersion::Store(v) => v,
+    };
+    // Node X holds `vx` as absent; node Y holds `vy` as live.
+    let x1 = settle(vx, vy, false, true);
+    let y1 = settle(vy, vx, true, true);
+    assert_eq!(settle(x1, y1, true, true), settle(y1, x1, true, true));
 }
 
 /// Every deadline encodes without panicking and reads back as itself:

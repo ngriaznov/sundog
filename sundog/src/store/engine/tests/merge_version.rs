@@ -276,6 +276,38 @@ fn a_stored_side_without_bytes_never_reduces_to_stored() {
     assert!(minted > sv && minted > ver);
 }
 
+/// A stored side that reads as absent on one node (`None`) while both nodes
+/// hold equal content ends both nodes at one version within a second
+/// exchange: the absent side takes the other's version or mints above both,
+/// and the second exchange adopts the greater.
+#[test]
+fn an_absent_stored_side_converges_in_two_exchanges() {
+    let bytes = b"same".as_slice();
+    let content = (bytes, Some(500));
+    let settle = |own: Hlc, other: Hlc, own_readable: bool| match merge_version(
+        own,
+        other,
+        own_readable.then_some(content),
+        content,
+        content,
+    ) {
+        MergedVersion::NoOp => own,
+        MergedVersion::Store(v) => v,
+    };
+    for (wx, wy) in [(1, 2), (2, 1), (3, 3)] {
+        let (vx, vy) = (hlc(wx, 1), hlc(wy, 2));
+        // X holds `vx` as absent, Y holds `vy` as live.
+        let x1 = settle(vx, vy, false);
+        let y1 = settle(vy, vx, true);
+        assert!(x1 >= y1, "the absent side ends at or above the live side");
+        assert_eq!(
+            settle(x1, y1, true),
+            settle(y1, x1, true),
+            "walls {wx} and {wy}: both nodes settle on one version"
+        );
+    }
+}
+
 /// The minted node hashes the bytes alone when the result has no
 /// deadline, which is what a release that predates deadline-bearing merges
 /// mints, and the bytes plus the deadline when it has one.
