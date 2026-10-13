@@ -79,6 +79,9 @@ pub struct CacheBuilder<K, V> {
     loader: Option<Loader<K, V>>,
     batch_window: Option<(Duration, usize)>,
     refresh_ahead: Option<f64>,
+    /// The clock this cache's shard reads, in place of the system clock.
+    #[cfg(test)]
+    clock: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
     marker: PhantomData<fn() -> (K, V)>,
 }
 
@@ -106,8 +109,19 @@ where
             loader: None,
             batch_window: None,
             refresh_ahead: None,
+            #[cfg(test)]
+            clock: None,
             marker: PhantomData,
         }
+    }
+
+    /// Reads time from `clock` instead of the system clock, so a test moves
+    /// every node's notion of time at once. A test cluster gives every node
+    /// the same clock.
+    #[cfg(test)]
+    pub(crate) fn clock(mut self, clock: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
+        self.clock = Some(clock);
+        self
     }
 
     /// Sets the cache's clustering mode. Default: [`Mode::Invalidation`].
@@ -346,6 +360,8 @@ where
             loader,
             batch_window,
             refresh_ahead,
+            #[cfg(test)]
+            clock,
             marker: _,
         } = self;
 
@@ -416,6 +432,10 @@ where
         .with_merge_coalesce_window(merge_coalesce_window)
         .with_prefold_enabled(prefold_enabled)
         .with_max_resident_bytes(max_resident_bytes);
+        #[cfg(test)]
+        if let Some(clock) = clock {
+            shard = shard.with_clock(clock);
+        }
         // `with_capacity_hint`/`with_weigher` each carry the other's setting
         // forward, so order is free. Skips the clamp when a weigher is set.
         if let Some(hint) = capacity_hint {

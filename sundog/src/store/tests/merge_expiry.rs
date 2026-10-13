@@ -274,6 +274,44 @@ async fn merge_with_ttl_replicates_the_deadline_with_the_record() {
     assert_eq!(counter_value(&b), Some(3));
 }
 
+/// A `Mode::Distributed` non-owner forwards a `merge_with_ttl` contribution
+/// to the owners with its deadline and applies nothing locally.
+#[tokio::test]
+async fn merge_with_ttl_on_a_non_owner_forwards_the_record_with_its_deadline() {
+    let clock = Arc::new(AtomicU64::new(T0));
+    let reader = Arc::clone(&clock);
+    let self_node = NodeId::from(1);
+    let eligible = (1..=5u64).map(NodeId::from).collect::<Vec<_>>();
+    let (s, view, _tx) =
+        distributed_shard::<u32, PnCounter>(self_node, eligible, 2, Arc::new(ResidencySet::new()));
+    let s = s
+        .with_resolver(Arc::new(PnCounterResolver))
+        .with_clock(Arc::new(move || reader.load(Ordering::SeqCst)));
+    let unowned_key = find_key_by_ownership(&view, false);
+
+    s.merge_with_ttl(unowned_key, delta(11, 3), secs(30))
+        .await
+        .expect("merge_with_ttl");
+
+    assert!(
+        s.get_sync(&unowned_key).is_none(),
+        "a non-owner applies nothing locally"
+    );
+    let forwarded = s.fan_out_queue().drain();
+    let [FanOutItem::Forward(rec)] = forwarded.as_slice() else {
+        panic!("one record is forwarded: {forwarded:?}");
+    };
+    assert_eq!(rec.key.as_ref(), key_bytes(&unowned_key).as_ref());
+    assert_eq!(
+        rec.expires_at_ms,
+        Some(T0 + 30_000),
+        "the forwarded record carries the call's deadline"
+    );
+    let forwarded_value = PnCounter::decode(rec.value.as_ref().expect("a live record"))
+        .expect("the forwarded value decodes");
+    assert_eq!(forwarded_value.value(), 3);
+}
+
 #[tokio::test]
 async fn merge_with_ttl_reports_the_errors_merge_does() {
     let clock = Arc::new(AtomicU64::new(T0));
