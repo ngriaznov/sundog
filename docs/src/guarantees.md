@@ -29,10 +29,10 @@ anti-entropy once their clocks catch up with its stamp.
 A value that combines, a counter or a set, does not have to lose writes. A
 `ConflictResolver` that implements `merge` folds the stored and incoming
 records into a third value, and every node reaches the same result in any
-order, as long as no deadline lapses between the writes. `sundog::crdt` ships two: `PnCounter` with `PnCounterResolver` and
-`OrSet` with `OrSetResolver`. Every mode merges. [Choosing a
-resolver](resolvers.md) says when a merging resolver fits, how to write its
-values, and how they expire.
+order, as long as no deadline lapses between the writes. `sundog::crdt`
+ships two: `PnCounter` with `PnCounterResolver` and `OrSet` with
+`OrSetResolver`. Every mode merges. [Choosing a resolver](resolvers.md) says
+when a merging resolver fits, how to write its values, and how they expire.
 
 ```rust
 {{#include ../cookbook/src/counters.rs:counter}}
@@ -40,8 +40,8 @@ values, and how they expire.
 
 `Cache::merge` writes through the resolver without a read.
 `CacheBuilder::merge_coalesce_window` folds a writer's consecutive merges
-(`merge` and `merge_with_ttl`) to one key into one applied record per window, and a read does not see a
-fold still pending inside its window.
+(`merge` and `merge_with_ttl`) to one key into one applied record per
+window, and a read does not see a fold still pending inside its window.
 
 Each writer owns a slot in a merged value. A background sweep retires the
 slot of a writer whose node has been absent longer than

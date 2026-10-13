@@ -139,18 +139,19 @@ give merged values a lifetime as they give any other value one:
   both records of a mismatched key instead of one.
 - **Every write that meets a stored value decodes both, merges them and
   encodes the result.** `CacheBuilder::merge_coalesce_window` folds a key's
-  consecutive `Cache::merge` and `Cache::merge_with_ttl` calls in memory and applies them once per
-  window. A read does not see a fold still waiting in its window, and a
-  crash loses it. `insert` never waits in a window, and `open` refuses a
-  nonzero window for a resolver that does not merge.
+  consecutive `Cache::merge` and `Cache::merge_with_ttl` calls in memory and
+  applies them once per window. A read does not see a fold still waiting in
+  its window, and a crash loses it. `insert` never waits in a window, and
+  `open` refuses a nonzero window for a resolver that does not merge.
 - **The value grows with its writers.** Each writer, one run of one node,
   owns a slot, so every restart adds one. The slots of writers whose node is
   gone longer than `ClusterConfig::crdt_retire_after`, 24 hours by default,
-  or has restarted, retire and later fold into one total. A replica cut off while that happens can count
-  a folded writer twice; [Guarantees](guarantees.md#values-that-merge) has
-  the bound. Folding an `OrSet` drops only its bookkeeping, never an add.
-  An `OrSet` writer, once retired, adds nothing new; its node adds again
-  after a restart, under a new writer id.
+  or has restarted, retire and later fold into one total. A replica cut off
+  while that happens can count a folded writer twice;
+  [Guarantees](guarantees.md#values-that-merge) has the bound. Folding an
+  `OrSet` drops only its bookkeeping, never an add. An `OrSet` writer, once
+  retired, adds nothing new; its node adds again after a restart, under a
+  new writer id.
 
 ## Every node needs the same resolver
 

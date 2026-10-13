@@ -185,11 +185,11 @@ whose RAM is bound by them.
 
 `CacheBuilder::refresh_ahead` reloads a read key on the one node its loads
 gather on, and the new value travels to every node that holds it. An
-`Invalidation` cache sends no values unless its resolver merges, and a merged
-record folds only into a key the receiver holds, so each node holding a key
-would need its own reload, gathered on the loader node without that node answering from
-its own cached copy. That takes a load request that bypasses the responder's
-cache: a new message kind with the usual bump.
+`Invalidation` cache sends no values unless its resolver merges, and a
+merged record folds only into a key the receiver holds, so each node holding
+a key would need its own reload, gathered on the loader node without that
+node answering from its own cached copy. That takes a load request that
+bypasses the responder's cache: a new message kind with the usual bump.
 
 **Trigger:** an `Invalidation` deployment whose hot keys expire under load
 and that cannot move to `Replicated` or `Distributed`.

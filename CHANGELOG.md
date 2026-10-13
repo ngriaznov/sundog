@@ -143,7 +143,7 @@ All notable changes to this project are documented in this file. Format follows
   entry.** A run of consecutive writes to a key whose stored side is a
   tombstone, or a spilled entry whose bytes are not prefetched, folded into
   one record that carried an entry older than the tombstone past it. Each
-  entry is now decided against the stored side on its own, as one-by-one
+  entry is decided against the stored side on its own, as one-by-one
   application decides it.
 
 ## [0.6.6] – 2026-10-09
