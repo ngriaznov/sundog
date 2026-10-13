@@ -15,10 +15,11 @@ const LIFETIME: Duration = Duration::from_secs(6);
 /// The clock every node of a test cluster reads, in epoch milliseconds.
 type Clock = Arc<AtomicU64>;
 
-/// A clock set to the system time, so peers' stamps sit inside the
-/// clock-skew bound, and moved only by [`advance`].
+/// A clock set an hour past the system time and moved only by [`advance`].
+/// A fetch re-checks a record's deadline against the system clock, so a
+/// deadline stays ahead of it however long the cluster takes to form.
 fn manual_clock() -> Clock {
-    Arc::new(AtomicU64::new(now_ms()))
+    Arc::new(AtomicU64::new(now_ms() + 3_600_000))
 }
 
 /// Moves `clock` forward by `by`.

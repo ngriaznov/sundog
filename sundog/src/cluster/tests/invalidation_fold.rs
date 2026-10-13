@@ -27,9 +27,9 @@ const LIFETIME: Duration = Duration::from_secs(5);
 /// The clock every node of the expiry test reads, in epoch milliseconds.
 type Clock = Arc<AtomicU64>;
 
-/// A clock set to the system time and moved only by the test.
+/// A clock set an hour past the system time and moved only by the test.
 fn manual_clock() -> Clock {
-    Arc::new(AtomicU64::new(now_ms()))
+    Arc::new(AtomicU64::new(now_ms() + 3_600_000))
 }
 
 /// [`open_counters`] with every value living for [`LIFETIME`] on `clock`.

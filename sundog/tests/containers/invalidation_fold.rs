@@ -13,17 +13,29 @@ const KEY: &str = "counter";
 /// How long a fold is given to show once a write that should fold is sent.
 const FOLD_WAIT: Duration = Duration::from_secs(10);
 
+/// Whether `receiver`, which put `1` under a key, now reads more than `1`:
+/// a record from another node folded into its copy. The summing resolver
+/// is not idempotent, so a record that reaches the sender between its put and
+/// its send makes the sender ship a total above `3`; the test asks only
+/// whether anything folded.
+async fn folded_into(receiver: &Node, key: &str) -> bool {
+    matches!(
+        receiver.get(key).await,
+        Ok(Some(value)) if value.parse::<i64>().is_ok_and(|total| total > 1)
+    )
+}
+
 /// Whether a write from `sender` folds into a copy `receiver` holds: the
-/// receiver puts `1` under `key`, the sender puts `2`, and the receiver
-/// reads the sum `3` within a few seconds. False when the sender's gossip
-/// view of the receiver has not yet reached the protocol that ships merged
-/// records, so the write went out as a plain invalidation and the receiver
-/// dropped its copy.
+/// receiver puts `1` under `key`, the sender puts `2`, and the receiver's
+/// copy grows within a few seconds. False when the sender's gossip view of
+/// the receiver has not yet reached the protocol that ships merged records,
+/// so the write went out as a plain invalidation and the receiver dropped
+/// its copy.
 async fn folds(sender: &Node, receiver: &Node, key: &str) -> bool {
     receiver.put(key, "1").await.expect("receiver puts");
     sender.put(key, "2").await.expect("sender puts");
     for _ in 0..30 {
-        if receiver.get(key).await == Ok(Some("3".to_string())) {
+        if folded_into(receiver, key).await {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -47,9 +59,9 @@ async fn wait_until_folds(nodes: &[&Node], sender: &Node, receiver: &Node, label
 
 /// Writes `key` from `sender` after a write the receiver should have
 /// applied, and waits until `receiver`, which holds `key` at `1`, shows the
-/// sum `3`. Frames from one node arrive in the order they were sent, so the
-/// receiver has applied, or ignored, everything `sender` wrote before this
-/// call by the time it shows the sum.
+/// sender's record folded in. Frames from one node arrive in the order they
+/// were sent, so the receiver has applied, or ignored, everything `sender`
+/// wrote before this call by the time it shows the fold.
 async fn barrier(sender: &Node, receiver: &Node, key: &str) {
     receiver
         .put(key, "1")
@@ -60,7 +72,7 @@ async fn barrier(sender: &Node, receiver: &Node, key: &str) {
         .await
         .expect("sender writes the barrier key");
     eventually_with_logs(FOLD_WAIT, &[sender, receiver], || async {
-        receiver.get(key).await == Ok(Some("3".to_string()))
+        folded_into(receiver, key).await
     })
     .await;
 }
