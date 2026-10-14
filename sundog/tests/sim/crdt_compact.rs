@@ -5,6 +5,7 @@ use crate::handler::{ShardHandler, dispatch_inbound};
 use crate::support::{
     SimResult, TICK, block_on, cache_name, peer_list_of, run_steps, run_until, sim_seed, steps_for,
 };
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -88,6 +89,34 @@ fn elapsed_ms(sim: &Sim<'_>) -> u64 {
     u64::try_from(sim.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Where the sweep first met each writer whose node the membership timeline
+/// does not list, mirroring `cluster::crdt_compact::UnseenWriters`
+/// (`pub(crate)`, unreachable from here). A node that is not in the
+/// timeline is one this process never observed; it counts as absent from the
+/// later of the process start (`0`, the start of virtual time) and the first
+/// tick that met its writer, which is always the tick.
+#[derive(Default)]
+struct FirstSight {
+    first_seen: RefCell<HashMap<WriterId, u64>>,
+    touched: RefCell<Vec<WriterId>>,
+}
+
+impl FirstSight {
+    fn first_sight(&self, writer: WriterId, now_ms: u64) -> u64 {
+        self.touched.borrow_mut().push(writer);
+        *self.first_seen.borrow_mut().entry(writer).or_insert(now_ms)
+    }
+
+    /// Ends a tick that walked the whole keyspace: forgets every writer it
+    /// did not meet.
+    fn end_cycle(&self) {
+        let touched = self.touched.take();
+        self.first_seen
+            .borrow_mut()
+            .retain(|writer, _| touched.contains(writer));
+    }
+}
+
 /// One compaction sweep tick, reimplementing `cluster.rs::crdt_compact_task`'s
 /// own per-tick logic against this harness's hand-scripted `members`:
 /// builds the `retire` closure from [`crdt_writer_is_dead`] (excluding
@@ -95,10 +124,14 @@ fn elapsed_ms(sim: &Sim<'_>) -> u64 {
 /// [`crdt_cache_is_quiet`], then drives [`ShardOps::compact_pass`] directly
 /// from the test thread -- the same "drive the production task's own logic
 /// by hand" idiom [`republish_view`] already uses for rebalance in `dist`.
+/// A writer whose node is not in `members` was never observed: it is dead
+/// once `bound_ms` has passed since `sight`'s first sight of it (the process
+/// started at virtual time zero, so that is also the later of the two).
 fn run_compact_tick<S: ShardOps>(
     shard: &S,
     local: NodeId,
     members: &CrdtMembership,
+    sight: &FirstSight,
     now_ms: u64,
     bound_ms: u64,
     batch: usize,
@@ -106,10 +139,16 @@ fn run_compact_tick<S: ShardOps>(
     let quiet = crdt_cache_is_quiet(members, local, now_ms, bound_ms);
     let members_for_retire = members.clone();
     let retire = move |w: WriterId| {
-        w.node() != local
-            && members_for_retire
-                .get(&w.node())
-                .is_some_and(|&presence| crdt_writer_is_dead(w, presence, now_ms, bound_ms))
+        if w.node() == local {
+            return false;
+        }
+        if let Some(&presence) = members_for_retire.get(&w.node()) {
+            crdt_writer_is_dead(w, presence, now_ms, bound_ms)
+        } else {
+            // The process started at virtual time zero, so a first sight is
+            // never before the start and is the whole of the absence.
+            now_ms.saturating_sub(sight.first_sight(w, now_ms)) >= bound_ms
+        }
     };
     let outcome = block_on(ShardOps::compact_pass(
         shard,
@@ -119,6 +158,7 @@ fn run_compact_tick<S: ShardOps>(
         CompactionBounds::three_bounds(bound_ms),
         batch,
     ));
+    sight.end_cycle();
     (outcome.retired, outcome.compacted)
 }
 
@@ -309,6 +349,7 @@ fn crdt_compaction_pncounter_churn_and_restart_retires_and_folds_exactly() {
     })
     .expect("the three writers' initial deltas converge to the exact total on every node");
 
+    let sight = FirstSight::default();
     let mut members: CrdtMembership = HashMap::new();
     for &(node, inc) in &[(node_a, 1u64), (node_b, 1u64), (node_c, 1u64)] {
         members.insert(
@@ -331,8 +372,24 @@ fn crdt_compaction_pncounter_churn_and_restart_retires_and_folds_exactly() {
     );
     run_steps(&mut sim, steps_for(Duration::from_millis(BOUND_MS / 2)));
     let now = elapsed_ms(&sim);
-    let (retired_a, _) = run_compact_tick(shard_a.as_ref(), node_a, &members, now, BOUND_MS, BATCH);
-    let (retired_b, _) = run_compact_tick(shard_b.as_ref(), node_b, &members, now, BOUND_MS, BATCH);
+    let (retired_a, _) = run_compact_tick(
+        shard_a.as_ref(),
+        node_a,
+        &members,
+        &sight,
+        now,
+        BOUND_MS,
+        BATCH,
+    );
+    let (retired_b, _) = run_compact_tick(
+        shard_b.as_ref(),
+        node_b,
+        &members,
+        &sight,
+        now,
+        BOUND_MS,
+        BATCH,
+    );
     assert!(
         retired_a.is_empty() && retired_b.is_empty(),
         "C absent for only half the bound: retirement must defer on every node, got a={retired_a:?} b={retired_b:?}"
@@ -380,6 +437,7 @@ fn crdt_compaction_pncounter_churn_and_restart_retires_and_folds_exactly() {
         shard_a.as_ref(),
         node_a,
         &members,
+        &sight,
         stage_one_now,
         BOUND_MS,
         BATCH,
@@ -405,6 +463,7 @@ fn crdt_compaction_pncounter_churn_and_restart_retires_and_folds_exactly() {
         shard_b.as_ref(),
         node_b,
         &members,
+        &sight,
         stage_one_now,
         BOUND_MS,
         BATCH,
@@ -437,7 +496,15 @@ fn crdt_compaction_pncounter_churn_and_restart_retires_and_folds_exactly() {
     );
     run_steps(&mut sim, steps_for(Duration::from_millis(BOUND_MS - 200)));
     let now = elapsed_ms(&sim);
-    let (retired_a, _) = run_compact_tick(shard_a.as_ref(), node_a, &members, now, BOUND_MS, BATCH);
+    let (retired_a, _) = run_compact_tick(
+        shard_a.as_ref(),
+        node_a,
+        &members,
+        &sight,
+        now,
+        BOUND_MS,
+        BATCH,
+    );
     assert!(
         retired_a.is_empty(),
         "C has been absent for less than the bound: still deferred, got {retired_a:?}"
@@ -449,6 +516,7 @@ fn crdt_compaction_pncounter_churn_and_restart_retires_and_folds_exactly() {
         shard_a.as_ref(),
         node_a,
         &members,
+        &sight,
         stage_one_now_2,
         BOUND_MS,
         BATCH,
@@ -477,6 +545,7 @@ fn crdt_compaction_pncounter_churn_and_restart_retires_and_folds_exactly() {
         shard_a.as_ref(),
         node_a,
         &members,
+        &sight,
         stage_two_now,
         BOUND_MS,
         BATCH,
@@ -507,4 +576,178 @@ fn crdt_compaction_pncounter_churn_and_restart_retires_and_folds_exactly() {
         value_on(&shard_a) == Some(65) && value_on(&shard_b) == Some(65)
     })
     .expect("the stage-two-folded record still carries the exact total once replicated");
+}
+
+/// A fresh single-shard [`PnCounter`] cache for the scenarios that need no
+/// network: one node, a merging resolver, every write and sweep driven from
+/// the test thread.
+fn counter_shard(node: NodeId) -> Arc<Shard<String, PnCounter>> {
+    Arc::new(
+        Shard::new(cache_name(), Mode::Replicated, node, 10_000, None, None)
+            .with_resolver(Arc::new(PnCounterResolver) as Arc<dyn ConflictResolver>),
+    )
+}
+
+/// Rolling replacement under random node ids: every deploy brings a node
+/// the surviving node has never observed, and leaves its writer slot behind.
+/// The membership timeline never lists any of them, so only the rule for an
+/// unobserved node can retire them. The merged value stays exact at every
+/// step and its record ends no larger than the local slot beside one folded
+/// total, where a live slot per deploy would be several times that.
+#[test]
+fn crdt_compaction_rolling_replacement_keeps_the_record_bounded_and_exact() {
+    const BOUND_MS: u64 = 2_000;
+    const DEPLOYS: u64 = 16;
+    const GAP_MS: u64 = 500;
+    const BATCH: usize = 64;
+    let key = "ctr".to_string();
+    let local = NodeId::from(9301);
+    let shard = counter_shard(local);
+    let members: CrdtMembership = HashMap::from([(
+        local,
+        CrdtPresence::Present {
+            since_ms: 0,
+            incarnation: 1,
+        },
+    )]);
+    let sight = FirstSight::default();
+
+    let mut every_slot = PnCounter::local_delta(WriterId::new(local, 1), 1);
+    block_on(shard.insert(key.clone(), every_slot.clone())).unwrap();
+    for deploy in 0..DEPLOYS {
+        let writer = WriterId::new(NodeId::from(9400 + deploy), 1);
+        let delta = PnCounter::local_delta(writer, 1);
+        every_slot = every_slot.merge(&delta);
+        block_on(shard.insert(key.clone(), delta)).unwrap();
+        let now = (deploy + 1) * GAP_MS;
+        run_compact_tick(
+            shard.as_ref(),
+            local,
+            &members,
+            &sight,
+            now,
+            BOUND_MS,
+            BATCH,
+        );
+        assert_eq!(
+            block_on(shard.get(&key)).map(|c| c.value()),
+            Some(i128::from(deploy) + 2),
+            "deploy {deploy}: every contribution is counted once"
+        );
+    }
+
+    // Long after the last deploy every dead writer folds, then its receipt
+    // prunes: the record is back to the local slot plus one folded total,
+    // far under a slot per deploy.
+    for step in 1..=12 {
+        let now = DEPLOYS * GAP_MS + step * BOUND_MS;
+        run_compact_tick(
+            shard.as_ref(),
+            local,
+            &members,
+            &sight,
+            now,
+            BOUND_MS,
+            BATCH,
+        );
+    }
+    let unretired_len = every_slot.encode().unwrap().len();
+    let settled_len = block_on(shard.get(&key)).unwrap().encode().unwrap().len();
+    let local_only_len = PnCounter::local_delta(WriterId::new(local, 1), 1)
+        .encode()
+        .unwrap()
+        .len();
+    assert!(
+        settled_len < unretired_len,
+        "sixteen dead writers fold away: settled={settled_len} unretired={unretired_len}"
+    );
+    assert!(
+        settled_len <= local_only_len,
+        "and leave no more than the local slot and the folded total: \
+         settled={settled_len} local_only={local_only_len}"
+    );
+    assert_eq!(
+        block_on(shard.get(&key)).map(|c| c.value()),
+        Some(i128::from(DEPLOYS) + 1)
+    );
+}
+
+/// A node that is live but not yet in this process's membership view is
+/// never retired: it becomes a peer within a bound of the first tick that
+/// met its writer. The control run, where the node never appears, retires
+/// the same writer a bound after that first tick.
+#[test]
+fn crdt_compaction_never_retires_a_writer_whose_node_turns_up_in_the_view() {
+    const BOUND_MS: u64 = 2_000;
+    const BATCH: usize = 64;
+    let key = "ctr".to_string();
+    let local = NodeId::from(9501);
+    let late = NodeId::from(9502);
+    let writer = WriterId::new(late, 1);
+    let alone: CrdtMembership = HashMap::from([(
+        local,
+        CrdtPresence::Present {
+            since_ms: 0,
+            incarnation: 1,
+        },
+    )]);
+
+    let seen_late = counter_shard(local);
+    let never_seen = counter_shard(local);
+    let (sight_late, sight_never) = (FirstSight::default(), FirstSight::default());
+    for shard in [&seen_late, &never_seen] {
+        block_on(shard.insert(key.clone(), PnCounter::local_delta(writer, 5))).unwrap();
+    }
+    // Both processes have run for a long time before the first tick.
+    let t0 = 10 * BOUND_MS;
+    for (shard, sight) in [(&seen_late, &sight_late), (&never_seen, &sight_never)] {
+        let (retired, _) =
+            run_compact_tick(shard.as_ref(), local, &alone, sight, t0, BOUND_MS, BATCH);
+        assert!(
+            retired.is_empty(),
+            "an old process still waits a bound after its first sight: {retired:?}"
+        );
+    }
+
+    // Gossip shows `late` half a bound later, under the writer's own
+    // incarnation, on one of the two.
+    let mut with_late = alone.clone();
+    with_late.insert(
+        late,
+        CrdtPresence::Present {
+            since_ms: t0 + BOUND_MS / 2,
+            incarnation: 1,
+        },
+    );
+    let t1 = t0 + BOUND_MS + 1;
+    let (retired, _) = run_compact_tick(
+        seen_late.as_ref(),
+        local,
+        &with_late,
+        &sight_late,
+        t1,
+        BOUND_MS,
+        BATCH,
+    );
+    assert!(
+        retired.is_empty(),
+        "a writer whose node is a peer under its own incarnation is not retired: {retired:?}"
+    );
+    assert_eq!(block_on(seen_late.get(&key)).map(|c| c.value()), Some(5));
+
+    let (retired, _) = run_compact_tick(
+        never_seen.as_ref(),
+        local,
+        &alone,
+        &sight_never,
+        t1,
+        BOUND_MS,
+        BATCH,
+    );
+    assert_eq!(
+        retired,
+        vec![writer],
+        "the control, a node that never turns up, retires a bound after the first sight"
+    );
+    assert_eq!(block_on(never_seen.get(&key)).map(|c| c.value()), Some(5));
 }

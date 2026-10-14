@@ -71,7 +71,7 @@ would let a released bucket's stale copy bring a removed key back.
 
 | Field | Default | Change it when |
 |---|---|---|
-| `crdt_retire_after` | 24 h | writers churn fast and merged values carry too many retired slots |
+| `crdt_retire_after` | 24 h | writers churn fast, merged values carry too many retired slots, or every node is replaced faster than this bound |
 | `crdt_sweep_interval` | a quarter of `crdt_retire_after`, at least 30 s | tests need retirement within seconds |
 | `crdt_compact_batch` | 4,096 records | one sweep step stalls the runtime too long |
 

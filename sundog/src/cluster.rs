@@ -27,7 +27,7 @@ use std::future::Future;
 use std::hash::Hash;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -142,6 +142,9 @@ struct ClusterInner {
     local_modes: Arc<RwLock<HashMap<SmolStr, Mode>>>,
     config: ClusterConfig,
     absence: absence::AbsenceTracker,
+    /// When [`ClusterBuilder::build`] began, before membership started to
+    /// observe anyone; see [`Cluster::started_at`].
+    started_at: Instant,
     /// When each peer last streamed replicate traffic in; see
     /// [`Cluster::peer_is_streaming`].
     inbound_activity: Arc<InboundActivity>,
@@ -310,6 +313,13 @@ impl Cluster {
     /// resuming one a compaction sweep may already have retired.
     pub(crate) fn local_incarnation(&self) -> u64 {
         self.inner.membership.local_peer().incarnation
+    }
+
+    /// The instant this cluster's build began: the earliest moment this
+    /// process could have observed any member, so the earliest a writer of
+    /// a node it never saw counts as absent for CRDT retirement.
+    pub(crate) fn started_at(&self) -> Instant {
+        self.inner.started_at
     }
 
     /// Opens or joins a named cache. Call `.open().await` on the result to
@@ -712,6 +722,7 @@ impl ClusterBuilder {
     /// backend fails to start, or [`Self::node_id`] receives a
     /// merge-derived id.
     pub async fn build(self) -> Result<Cluster, JoinError> {
+        let started_at = Instant::now();
         let Self {
             name,
             discovery,
@@ -798,6 +809,7 @@ impl ClusterBuilder {
                 local_modes,
                 config,
                 absence,
+                started_at,
                 inbound_activity: Arc::new(InboundActivity::default()),
                 warmth,
                 tracker: TaskTracker::new(),

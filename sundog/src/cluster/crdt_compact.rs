@@ -2,8 +2,8 @@
 //! decides which writer slots are dead, whether the whole cache is quiet
 //! enough for stage two folding, and runs the sweep on a timer.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use smol_str::SmolStr;
@@ -20,7 +20,9 @@ use crate::store::{CompactionBounds, Quiescence, ShardOps, crdt, now_ms};
 /// defense in depth: a live node's own current incarnation is already
 /// unreachable through `incarnation_is_dead`, but keeping the check
 /// explicit keeps the invariant holding even if that stops being
-/// incidentally true.
+/// incidentally true. A member with no live incarnation and no absent time
+/// is not dead, so the caller supplies the absent time of a writer's node
+/// it never observed ([`crdt_writer_absent_since`]).
 fn crdt_writer_is_retirement_eligible(
     local: crdt::WriterId,
     w: crdt::WriterId,
@@ -29,6 +31,81 @@ fn crdt_writer_is_retirement_eligible(
     bound: Duration,
 ) -> bool {
     w != local && membership::incarnation_is_dead(member, w.incarnation(), now, bound)
+}
+
+/// The instant a writer's node counts as absent when no live peer and no
+/// tracked gone time describes it. A tracked gone time is exact. A node
+/// this process never observed counts as absent from the later of two
+/// instants: the cluster's start, because the process cannot have seen the
+/// node live before it started, and the sweep's first sight of the writer,
+/// so a live node that gossip has not yet shown to this process is not
+/// retired on the strength of one tick: it is a peer long before the
+/// retirement bound elapses, and then its live incarnation decides.
+fn crdt_writer_absent_since(
+    gone_since: Option<Instant>,
+    first_unseen: Instant,
+    node_started: Instant,
+) -> Instant {
+    gone_since.unwrap_or_else(|| first_unseen.max(node_started))
+}
+
+/// Whether one sweep has walked every stripe of the keyspace, so a writer
+/// it did not meet is held by no resident record.
+fn keyspace_walked(stripes_visited: usize) -> bool {
+    stripes_visited >= crate::store::BUCKET_COUNT
+}
+
+/// Where the sweep first met each writer whose node it knows nothing about:
+/// neither a live peer nor a tracked gone member. [`crdt_writer_absent_since`]
+/// reads the instant as the start of the writer's absence.
+///
+/// An entry lives while the sweep keeps meeting the writer. After a sweep
+/// that walks the whole keyspace, [`end_cycle`](Self::end_cycle) drops every
+/// entry the sweep did not touch: the writer became known, was retired and
+/// folded away, or no resident record holds it any more. A sweep that stops
+/// short drops nothing, so an entry never goes because one pass reached
+/// only part of the keyspace.
+#[derive(Default)]
+pub(crate) struct UnseenWriters {
+    state: Mutex<UnseenState>,
+}
+
+#[derive(Default)]
+struct UnseenState {
+    first_seen: HashMap<crdt::WriterId, Instant>,
+    touched: HashSet<crdt::WriterId>,
+}
+
+impl UnseenWriters {
+    /// When the sweep first met `writer` as unknown, recorded at `now` on
+    /// the first call; marks the writer as met in this cycle.
+    fn first_sight(&self, writer: crdt::WriterId, now: Instant) -> Instant {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.touched.insert(writer);
+        *state.first_seen.entry(writer).or_insert(now)
+    }
+
+    /// Ends a cycle over the whole keyspace: forgets every writer the cycle
+    /// did not meet.
+    fn end_cycle(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let UnseenState {
+            first_seen,
+            touched,
+        } = &mut *state;
+        first_seen.retain(|writer, _| touched.contains(writer));
+        touched.clear();
+    }
+
+    /// How many writers are tracked.
+    #[cfg(all(test, not(feature = "sim")))]
+    fn len(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .first_seen
+            .len()
+    }
 }
 
 /// Whether an entire cache is quiet this tick: every relevant member has
@@ -96,13 +173,16 @@ fn crdt_cache_members(
 /// otherwise builds this tick's retirement predicate and quiet flag from
 /// the membership/absence snapshot and hands both to
 /// [`ShardOps::compact_pass`], counting each retired writer and rewritten
-/// record. Returns that same result, so a test observes one pass directly;
+/// record. A writer of a node that is neither a live peer nor tracked gone is
+/// one this process never observed; `unseen` holds where the sweep first met
+/// it. Returns that same result, so a test observes one pass directly;
 /// split out from [`crdt_compact_task`]'s ticker loop for the same reason.
 async fn crdt_compact_tick(
     shard: &dyn ShardOps,
     name: &SmolStr,
     cluster: &Cluster,
     absence: &absence::AbsenceTracker,
+    unseen: &UnseenWriters,
     bounds: CompactionBounds,
 ) -> (Vec<crdt::WriterId>, usize) {
     if !shard.merges() {
@@ -120,13 +200,11 @@ async fn crdt_compact_tick(
     // peers': `Cluster::peers()` excludes self by construction, so without
     // this a node could never tell its *own* past incarnations (same
     // `NodeId`, a prior `local_incarnation()` from before a restart) apart
-    // from a writer it has genuinely never observed. The "never
-    // observed" branch below always answers "not dead", and a node is
-    // never absent from its own point of view to fall back to the absence
-    // check either. A node's own current incarnation is always known with
-    // certainty, no membership round-trip required, so every one of its
-    // own past incarnations is unconditionally eligible the moment it
-    // holds a newer one live, the same "any difference counts" rule
+    // from a writer of a node it has never observed. A node's own current
+    // incarnation is always known with certainty, no membership round-trip
+    // required, so every one of its own past incarnations is
+    // unconditionally eligible the moment it holds a newer one live, the
+    // same "any difference counts" rule
     // [`membership::incarnation_is_dead`] already applies to every peer.
     // Without this, a node's own dead incarnations never fold locally: the
     // node keeps taking part in ordinary anti-entropy, so its perpetually
@@ -140,21 +218,36 @@ async fn crdt_compact_tick(
 
     let members = crdt_cache_members(&peers, &modes, name, absence);
     let quiet = crdt_cache_is_quiet(&members, now, retire_after);
+    let started = cluster.started_at();
 
+    // A writer's node that is neither a live peer nor tracked gone is one
+    // this process never observed, as after a rolling replacement of
+    // random node ids: it counts as absent from the later of this
+    // process's start and the sweep's first sight of the writer
+    // ([`crdt_writer_absent_since`]), so it retires once this process has
+    // run for the bound, and a live node that gossip has not yet shown is
+    // never retired on one tick's say-so.
     let retire = |w: crdt::WriterId| {
-        let member = match live_incarnation.get(&w.node()) {
-            Some(&incarnation) => membership::MemberView {
+        let member = if let Some(&incarnation) = live_incarnation.get(&w.node()) {
+            membership::MemberView {
                 known_since: None,
                 present_since: None,
                 absent_since: None,
                 live_incarnation: Some(incarnation),
-            },
-            None => membership::MemberView {
+            }
+        } else {
+            let gone_since = absence.gone_since(w.node());
+            let first_unseen = if gone_since.is_some() {
+                now
+            } else {
+                unseen.first_sight(w, now)
+            };
+            membership::MemberView {
                 known_since: None,
                 present_since: None,
-                absent_since: absence.gone_since(w.node()),
+                absent_since: Some(crdt_writer_absent_since(gone_since, first_unseen, started)),
                 live_incarnation: None,
-            },
+            }
         };
         crdt_writer_is_retirement_eligible(local, w, &member, now, retire_after)
     };
@@ -181,6 +274,9 @@ async fn crdt_compact_tick(
         }
         tokio::task::yield_now().await;
     }
+    if keyspace_walked(stripes_visited) {
+        unseen.end_cycle();
+    }
     for _ in &retired {
         metrics::counter!("sundog_crdt_retired_writers_total", "cache" => name.to_string())
             .increment(1);
@@ -196,7 +292,7 @@ async fn crdt_compact_tick(
 /// its `compact_pass` calls walked add up to every stripe, or the last
 /// call walked none (an empty budget, or a shard that never compacts).
 fn sweep_is_complete(stripes_visited: usize, last_call_stripes: usize) -> bool {
-    last_call_stripes == 0 || stripes_visited >= crate::store::BUCKET_COUNT
+    last_call_stripes == 0 || keyspace_walked(stripes_visited)
 }
 
 /// Periodically runs [`crdt_compact_tick`] for one merging cache, at a
@@ -204,7 +300,8 @@ fn sweep_is_complete(stripes_visited: usize, last_call_stripes: usize) -> bool {
 /// immediately on the first tick. Ticks need no alignment across replicas:
 /// [`crate::store::ConflictResolver::settle`] drops a pruned fold receipt
 /// again on every merge apply, so replicas compacting the same bytes agree
-/// whenever they get to it.
+/// whenever they get to it. The task owns the [`UnseenWriters`] its ticks
+/// share.
 pub(crate) async fn crdt_compact_task(
     shard: Arc<dyn ShardOps>,
     name: SmolStr,
@@ -214,6 +311,7 @@ pub(crate) async fn crdt_compact_task(
 ) {
     let period = cluster.config().crdt_sweep_period();
     let bounds = cluster.config().crdt_compaction_bounds();
+    let unseen = UnseenWriters::default();
     let mut wait = Duration::ZERO;
     loop {
         if cancel
@@ -223,12 +321,13 @@ pub(crate) async fn crdt_compact_task(
         {
             return;
         }
-        crdt_compact_tick(shard.as_ref(), &name, &cluster, &absence, bounds).await;
+        crdt_compact_tick(shard.as_ref(), &name, &cluster, &absence, &unseen, bounds).await;
         wait = period;
     }
 }
 
 // Pure decision logic (`crdt_writer_is_retirement_eligible`,
+// `crdt_writer_absent_since`, `keyspace_walked`, `UnseenWriters`,
 // `crdt_cache_is_quiet`, `crdt_cache_members`, `sweep_is_complete`) needs no
 // cluster; end-to-end passes drive a real `Cluster`/`Shard`, which panics
 // under `sim` outside a driven `turmoil::Sim`.
@@ -244,6 +343,8 @@ mod tests {
     use crate::store::Mode;
     use crate::store::crdt::{PnCounter, PnCounterResolver};
     use crate::wire;
+
+    mod unobserved;
 
     // -----------------------------------------------------------------
     // crdt_compact_task: pure decision logic.
@@ -334,6 +435,9 @@ mod tests {
 
     #[test]
     fn crdt_writer_is_retirement_eligible_is_false_for_a_never_observed_writer() {
+        // With no live incarnation and no absent time the member is not
+        // dead; the sweep supplies an absent time for a writer's node it
+        // never observed (`crdt_writer_absent_since`).
         let now = Instant::now();
         let bound = Duration::from_secs(60);
         let local = writer(1, 1);
@@ -347,6 +451,133 @@ mod tests {
         assert!(!crdt_writer_is_retirement_eligible(
             local, w, &member, now, bound
         ));
+    }
+
+    #[test]
+    fn crdt_writer_absent_since_is_the_tracked_gone_time_even_when_later_than_the_start() {
+        let now = Instant::now();
+        let started = ago(now, 3600);
+        let gone = ago(now, 5);
+        assert_eq!(
+            crdt_writer_absent_since(Some(gone), ago(now, 1800), started),
+            gone,
+            "a tracked gone time is exact: neither the start nor the first sight lowers or raises it"
+        );
+        let long_gone = ago(now, 7200);
+        assert_eq!(
+            crdt_writer_absent_since(Some(long_gone), now, started),
+            long_gone,
+            "and a tracked gone time earlier than the start is kept too"
+        );
+    }
+
+    #[test]
+    fn crdt_writer_absent_since_is_the_later_of_first_sight_and_start_for_an_unobserved_node() {
+        let now = Instant::now();
+        let started = ago(now, 3600);
+        let first_seen = ago(now, 60);
+        assert_eq!(
+            crdt_writer_absent_since(None, first_seen, started),
+            first_seen,
+            "a writer first met after the start counts from the first sight"
+        );
+        assert_eq!(
+            crdt_writer_absent_since(None, ago(now, 7200), started),
+            started,
+            "a first sight cannot precede the start"
+        );
+    }
+
+    #[test]
+    fn an_unobserved_writer_is_eligible_only_once_the_start_and_first_sight_are_a_bound_old() {
+        let now = Instant::now();
+        let local = writer(1, 1);
+        let w = writer(2, 1);
+        let eligible = |first_seen: Instant, started: Instant, bound: Duration| {
+            let member = membership::MemberView {
+                known_since: None,
+                present_since: None,
+                absent_since: Some(crdt_writer_absent_since(None, first_seen, started)),
+                live_incarnation: None,
+            };
+            crdt_writer_is_retirement_eligible(local, w, &member, now, bound)
+        };
+        let minute = Duration::from_secs(60);
+        assert!(
+            eligible(ago(now, 3600), ago(now, 3600), minute),
+            "met at the start of a process that has run for an hour"
+        );
+        assert!(
+            !eligible(ago(now, 3600), ago(now, 5), Duration::from_secs(3600)),
+            "a process younger than the bound retires nothing it never observed"
+        );
+        assert!(
+            !eligible(ago(now, 5), ago(now, 3600), minute),
+            "a writer first met a moment ago waits a bound from that sight, however old the process"
+        );
+    }
+
+    #[test]
+    fn keyspace_walked_is_true_from_one_full_pass_of_stripes() {
+        assert!(!keyspace_walked(0));
+        assert!(!keyspace_walked(crate::store::BUCKET_COUNT - 1));
+        assert!(keyspace_walked(crate::store::BUCKET_COUNT));
+        assert!(keyspace_walked(crate::store::BUCKET_COUNT + 9));
+    }
+
+    #[test]
+    fn unseen_writers_keep_the_first_sight_across_later_sights() {
+        let unseen = UnseenWriters::default();
+        let now = Instant::now();
+        let w = writer(7, 1);
+        assert_eq!(unseen.first_sight(w, ago(now, 30)), ago(now, 30));
+        assert_eq!(
+            unseen.first_sight(w, now),
+            ago(now, 30),
+            "a later sight returns the first"
+        );
+        assert_eq!(unseen.len(), 1);
+    }
+
+    #[test]
+    fn unseen_writers_end_a_cycle_by_dropping_what_the_cycle_did_not_meet() {
+        let unseen = UnseenWriters::default();
+        let now = Instant::now();
+        let (met, passed) = (writer(7, 1), writer(8, 1));
+        unseen.first_sight(met, ago(now, 30));
+        unseen.first_sight(passed, ago(now, 30));
+        unseen.end_cycle();
+        assert_eq!(
+            unseen.len(),
+            2,
+            "both were met in the cycle that just ended"
+        );
+
+        assert_eq!(unseen.first_sight(met, now), ago(now, 30));
+        unseen.end_cycle();
+        assert_eq!(unseen.len(), 1, "the writer the cycle skipped is forgotten");
+
+        unseen.end_cycle();
+        assert_eq!(unseen.len(), 0, "and one met in no cycle at all");
+        assert_eq!(
+            unseen.first_sight(met, now),
+            now,
+            "a forgotten writer starts over at its next sight"
+        );
+    }
+
+    #[test]
+    fn unseen_writers_keep_a_writer_through_a_cycle_that_has_not_ended() {
+        let unseen = UnseenWriters::default();
+        let now = Instant::now();
+        let w = writer(7, 1);
+        unseen.first_sight(w, ago(now, 30));
+        unseen.end_cycle();
+        assert_eq!(unseen.len(), 1);
+        // No end_cycle: the sweep stopped short of the whole keyspace, so
+        // nothing is dropped however many passes ran.
+        assert_eq!(unseen.first_sight(writer(9, 1), now), now);
+        assert_eq!(unseen.len(), 2);
     }
 
     #[test]
@@ -544,6 +775,7 @@ mod tests {
             &name,
             &cluster,
             &absence,
+            &UnseenWriters::default(),
             three_bounds(retire_after),
         )
         .await;
@@ -621,7 +853,15 @@ mod tests {
             receipt_ttl_ms: 60_000,
             ..three_bounds(retire_after)
         };
-        crdt_compact_tick(shard.as_ref(), &name, &cluster, &absence, a_minute).await;
+        crdt_compact_tick(
+            shard.as_ref(),
+            &name,
+            &cluster,
+            &absence,
+            &UnseenWriters::default(),
+            a_minute,
+        )
+        .await;
         assert!(
             absence.gone_since(gone).is_some(),
             "gone within the receipt lifetime: still tracked"
@@ -632,6 +872,7 @@ mod tests {
             &name,
             &cluster,
             &absence,
+            &UnseenWriters::default(),
             three_bounds(retire_after),
         )
         .await;
@@ -694,6 +935,7 @@ mod tests {
             &name,
             &cluster,
             &absence,
+            &UnseenWriters::default(),
             three_bounds(retire_after),
         )
         .await;
@@ -732,6 +974,7 @@ mod tests {
             &name,
             &cluster,
             &absence,
+            &UnseenWriters::default(),
             three_bounds(retire_after),
         )
         .await;
@@ -754,6 +997,7 @@ mod tests {
             &name,
             &cluster,
             &absence,
+            &UnseenWriters::default(),
             three_bounds(retire_after),
         )
         .await;
@@ -837,6 +1081,7 @@ mod tests {
                     &name,
                     &cluster,
                     &absence,
+                    &UnseenWriters::default(),
                     three_bounds(retire_after),
                 )
                 .await;
@@ -946,6 +1191,83 @@ mod tests {
             cache.get(&1).await.map(|c| c.value()),
             Some(7),
             "retiring the dead writer never changes the counter's exact value"
+        );
+
+        cancel.cancel();
+        task.await.expect("crdt_compact_task doesn't panic");
+        cluster.shutdown().await;
+    }
+
+    /// A writer slot of a node this process never observed, in a record that
+    /// arrived from an earlier deploy, retires once this process has run for
+    /// `crdt_retire_after`: random node ids mean a rolling replacement leaves
+    /// a fresh process no gone-time for any earlier writer, so the absence
+    /// tracker alone never retires them and a merged value would grow by one
+    /// slot per deploy.
+    #[tokio::test]
+    async fn crdt_compact_task_retires_a_writer_of_a_node_this_process_never_observed() {
+        let retire_after = Duration::from_millis(20);
+        let cluster = Cluster::builder("cluster-it-crdt-retire-unobserved")
+            .seeds(std::iter::empty())
+            .config(crdt_task_loopback_config(retire_after))
+            .build()
+            .await
+            .expect("build succeeds");
+
+        let name = SmolStr::new("counters");
+        let cache = open_counters_cache(&cluster, name.as_str()).await;
+        let shard = registered_shard(&cluster, &name);
+
+        let local = crdt::WriterId::new(cluster.node_id(), cluster.local_incarnation());
+        let unknown_writer = writer(999, 1);
+        cache
+            .insert(1, PnCounter::local_delta(unknown_writer, 5))
+            .await
+            .expect("seed write from a writer this node never observed");
+        cache
+            .insert(1, PnCounter::local_delta(local, 2))
+            .await
+            .expect("seed write from this node's own current writer identity");
+
+        // Nothing observed: the tracker was never told the writer existed,
+        // as after a rolling replacement of random node ids.
+        let absence = absence::AbsenceTracker::default();
+        tokio::time::sleep(retire_after + Duration::from_millis(20)).await;
+
+        let seeded_len = cache
+            .get(&1)
+            .await
+            .expect("counter 1 is resident")
+            .encode()
+            .expect("PnCounter::encode never fails on a resident value")
+            .len();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(crdt_compact_task(
+            Arc::clone(&shard),
+            name.clone(),
+            cluster.clone(),
+            absence.clone(),
+            cancel.clone(),
+        ));
+        wait_until(
+            Duration::from_secs(5),
+            "the unobserved writer's slot moves into its retired entry, rewriting the record",
+            async || {
+                let len = cache
+                    .get(&1)
+                    .await
+                    .expect("counter 1 is resident")
+                    .encode()
+                    .expect("PnCounter::encode never fails on a resident value")
+                    .len();
+                len != seeded_len
+            },
+        )
+        .await;
+        assert_eq!(
+            cache.get(&1).await.map(|c| c.value()),
+            Some(7),
+            "retiring the unobserved writer never changes the counter's exact value"
         );
 
         cancel.cancel();

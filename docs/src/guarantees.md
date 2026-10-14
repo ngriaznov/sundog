@@ -87,7 +87,16 @@ Each writer owns a slot in a merged value. A background sweep retires the
 slot of a writer whose node has been absent longer than
 `ClusterConfig::crdt_retire_after`, 24 hours by default, or has restarted
 under a new incarnation, and folds it away once the retirement has aged
-past twice that bound with every peer quiet. Each fold leaves a receipt that
+past twice that bound with every peer quiet. A node this node never saw as a
+member counts as absent from the later of this node's start and the sweep's
+first sight of its writer, so the slots that earlier deploys left retire once
+this node has run for the bound; a fleet that replaces every node faster than
+that bound lowers `crdt_retire_after`, or merged values keep a slot for every
+deploy ([Tuning](tuning.md)). A writer the sweep meets for the first time waits
+a full bound before it retires, so a live node that gossip has not shown yet
+is a peer by then and never retires. The sweep reads
+resident records only, so a spilled record keeps its slots until it is read
+back. Each fold leaves a receipt that
 every merge honors for three times `crdt_retire_after` past the retirement,
 longer when the sweep period is more than half that bound. A replica cut
 off from before the fold until after the receipt expires, still holding the

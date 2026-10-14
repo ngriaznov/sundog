@@ -23,6 +23,22 @@ async fn local_incarnation_matches_the_membership_local_peer() {
 }
 
 #[tokio::test]
+async fn started_at_lies_within_the_build_and_is_the_same_on_every_clone() {
+    let before = std::time::Instant::now();
+    let cluster = solo_cluster("cluster-it-started-at").await;
+    let after = std::time::Instant::now();
+
+    let started = cluster.started_at();
+    assert!(
+        before <= started && started <= after,
+        "the build began between the two instants taken around it"
+    );
+    assert_eq!(cluster.clone().started_at(), started);
+
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
 async fn build_rejects_a_max_frame_above_the_wire_codec_cap() {
     let mut config = loopback_config();
     config.max_frame = crate::wire::MAX_FRAME + 1;

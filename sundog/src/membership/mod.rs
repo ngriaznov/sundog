@@ -711,9 +711,11 @@ pub(crate) fn member_is_quiet(member: &MemberView, now: Instant, bound: Duration
 /// `member` has been absent longer than `bound`, or `member` is live with
 /// a *different* current incarnation than `w_incarnation` (any difference
 /// counts, not only a greater one, so a clock stepping backward across a
-/// restart can't pin an old incarnation live forever). A member never
-/// observed at all, neither live nor tracked absent, is not yet known
-/// dead.
+/// restart can't pin an old incarnation live forever). A member with no
+/// live incarnation and no absent time, one never observed at all, is not
+/// dead: no information means not dead. The CRDT sweep avoids that state for
+/// the writer of a node it never observed by passing the later of the
+/// process start and its first sight of the writer as `absent_since`.
 pub(crate) fn incarnation_is_dead(
     member: &MemberView,
     w_incarnation: u64,

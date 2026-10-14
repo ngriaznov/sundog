@@ -27,6 +27,19 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **Merged values stay bounded under rolling replacement.** The CRDT sweep
+  retires a `PnCounter` or `OrSet` writer slot of a node this node never saw as
+  a member: such a node counts as gone from the later of this node's start and
+  the sweep's first sight of its writer, so the sweep retires the slot once this
+  node has run for `crdt_retire_after` and folds it by the usual rules. Only a
+  node that watched the writer leave for the whole bound retired it before, so a
+  fleet that replaced every node faster than that kept one slot per deploy and
+  shipped the whole value on every write. The sweep waits a full bound after it
+  first meets a writer, so a live node that gossip has not shown yet is a peer
+  by then and never retires. A fleet that replaces every node faster than
+  `crdt_retire_after` lowers it. The sweep reads resident records, so a spilled
+  record keeps its slots until it is read back.
+
 - **A `Mode::Distributed` write forwarded by a non-owner survives an owner's
   clock-skew refusal.** The writer keeps no copy of a forwarded insert,
   remove or merge, so an owner that refused its stamp for being further ahead

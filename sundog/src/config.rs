@@ -114,6 +114,13 @@ pub struct ClusterConfig {
     /// crate already documents as "a member gone longer than this may
     /// resurrect data" if it returns, and the trust boundary CRDT
     /// compaction's writer-retirement rule relies on for the same reason.
+    ///
+    /// A writer whose node this node never saw as a member counts as gone
+    /// from the later of this node's start and the sweep's first sight of
+    /// the writer, so the slots earlier deploys left retire once this node
+    /// has run for this long, and values stay bounded once any node runs
+    /// that long. A fleet that replaces every node faster than this lowers
+    /// it, or merged values keep a slot for every deploy.
     pub crdt_retire_after: Duration,
     /// How many resident CRDT records one `compact_pass` call examines
     /// before yielding to the executor. A tick keeps calling until the
