@@ -405,12 +405,14 @@ impl Mesh {
     }
 
     /// Whether `peer` is still in the peer table:
-    /// [`Mesh::send_frames_awaiting`]'s liveness check between wait slices.
+    /// [`Mesh::send_frames_awaiting`]'s liveness check between wait slices,
+    /// and what decides whether the inbound loop's re-forward lane toward
+    /// `peer` is opened or retired.
     ///
     /// # Panics
     ///
     /// Panics if the peer-table lock is poisoned.
-    fn peer_is_live(&self, peer: NodeId) -> bool {
+    pub(crate) fn peer_is_live(&self, peer: NodeId) -> bool {
         self.inner
             .peers
             .read()

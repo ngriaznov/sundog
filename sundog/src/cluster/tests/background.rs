@@ -87,7 +87,7 @@ fn mode_conflicts_are_reported_once_per_peer_and_cache() {
 }
 
 /// A `WireRecord` for `key`, its own postcard-encoded bytes as `key`.
-fn wire_record_for_u32(key: u32) -> WireRecord {
+pub(super) fn wire_record_for_u32(key: u32) -> WireRecord {
     WireRecord {
         key: postcard::to_stdvec(&key)
             .expect("a u32 key always postcard-encodes")

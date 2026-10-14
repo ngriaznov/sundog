@@ -21,6 +21,19 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **A peer that stops reading no longer stalls inbound traffic.** The inbound
+  loop used to wait for the target owner's outbox while it re-forwarded a
+  stale-view `ForwardBatch`, so one wedged live peer stopped the node from
+  applying anything for any cache, filled the inbound channel and its
+  connections, delayed `Cluster::shutdown` until the failure detector removed
+  the peer, and let two nodes forwarding at each other wait on each other for
+  good. The loop now hands each re-forward to a lane per peer and applies the
+  next message at once, and shutdown gives the lanes half a second to reach
+  the mesh. A lane holds 64 MiB per peer. Past that, batches for that peer are
+  dropped, logged and counted in `sundog_backlog_dropped_total{peer}`, and the
+  peer is marked for anti-entropy. That repairs records this node owns; a
+  record it only passed on, because it does not own it, is lost, since
+  nothing else holds it.
 - **A broken peer connection no longer loses the frames the writer had
   taken.** The per-peer writer keeps a burst whose send failed and sends it
   again first on the next connection, along with the last second of what it

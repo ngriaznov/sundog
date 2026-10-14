@@ -82,7 +82,12 @@ replica until an owner applies it, so anti-entropy cannot repair it. The
 sender's writer holds a batch whose send failed and sends it again on its next
 connection, along with everything it wrote in the last second, and it notices
 a peer that closed the connection before it writes. A partition that never
-delivers a close can still lose the batches in flight.
+delivers a close can still lose the batches in flight. A node passes a
+re-forwarded batch to a lane for each owner, so one owner that stops reading
+holds back only its own lane. A lane holds 64 MiB per peer; past that, batches
+for that peer are dropped and counted in `sundog_backlog_dropped_total`. When
+the node is not an owner of those records, its pass-through copy was the only
+one, and anti-entropy cannot repair it.
 `get` reads this node's copy and returns `None` off a non-owner, and a
 read-through fill does not change that: `get_or_load` and `load` on a
 non-owner answer with the loaded value and keep no copy. `fetch` is

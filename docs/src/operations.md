@@ -51,7 +51,7 @@ addresses once it forms, under `cluster formed`.
 | `sundog_frames_sent_total` | data-plane frames sent |
 | `sundog_bytes_sent_total` | data-plane bytes sent |
 | `sundog_fan_out_wait_seconds_total{peer}` | whole seconds writers spent waiting for a live peer's full outbox |
-| `sundog_backlog_dropped_total{peer}` | frames dropped before reaching the peer's connection: an outbox that stayed full, the oldest invalidation displaced by a newer one, a message that failed to encode, or the peer leaving the mesh. Each drop marks the peer for the next anti-entropy round. A broken connection drops nothing: the writer sends its frames again |
+| `sundog_backlog_dropped_total{peer}` | frames dropped before reaching the peer's connection: an outbox that stayed full, the oldest invalidation displaced by a newer one, a message that failed to encode, a re-forward lane that already held 64 MiB for a live peer, or the peer leaving the mesh. Each drop marks the peer for the next anti-entropy round, which repairs a record the dropping node owns but not one it only passed on A broken connection drops nothing: the writer sends its frames again |
 
 ### Distributed caches
 
@@ -141,7 +141,10 @@ grows for one peer: that peer reads its outbox slower than this node
 writes. sundog applies backpressure instead of dropping frames for a live
 peer, so writers wait. Find the slow peer by its label and check its CPU
 and network. `sundog_fan_out_wait_timeouts_total` counts writes that
-waited the whole `fan_out_wait_timeout` and went ahead anyway.
+waited the whole `fan_out_wait_timeout` and went ahead anyway. A peer that
+stops reading delays only the writes and re-forwards aimed at it: a node
+keeps applying what every other peer sends, and a re-forward waits in a lane
+for that peer alone.
 
 ### Repairs climb steadily
 
