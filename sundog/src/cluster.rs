@@ -1122,13 +1122,16 @@ fn until_next_grid_tick(now_ms: u64, period: Duration) -> Duration {
 /// `Mode::Replicated` tombstone survives up to `tombstone_max_ttl` while any
 /// recently known member is absent, and for another `tombstone_ttl` once it
 /// is back; `Mode::Distributed` narrows that to a member that co-owns a
-/// part with this node when it is eligible again.
+/// part with this node when it is eligible again. `now_ms` reads the wall
+/// clock in epoch milliseconds that places the grid; the cache's tasks pass
+/// [`crate::store::now_ms`].
 pub(crate) async fn tombstone_gc_task(
     shard: Arc<dyn ShardOps>,
     mode: Mode,
     tombstone_ttl: Duration,
     tombstone_max_ttl: Duration,
     absence: absence::AbsenceTracker,
+    now_ms: impl Fn() -> u64,
     cancel: CancellationToken,
 ) {
     let period = (tombstone_ttl / 4).max(Duration::from_secs(1));
@@ -1146,7 +1149,7 @@ pub(crate) async fn tombstone_gc_task(
             view.as_deref(),
         );
         shard.gc_tombstones(defer).await;
-        let wait = until_next_grid_tick(crate::store::now_ms(), period);
+        let wait = until_next_grid_tick(now_ms(), period);
         if cancel
             .run_until_cancelled(tokio::time::sleep(wait))
             .await

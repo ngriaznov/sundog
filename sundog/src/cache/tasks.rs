@@ -89,6 +89,7 @@ pub(super) async fn spawn_cache_tasks<K, V>(
             cluster.config().tombstone_ttl,
             cluster.config().tombstone_max_ttl,
             cluster.absence_tracker(),
+            crate::store::now_ms,
             cancel.clone(),
         ),
     );
