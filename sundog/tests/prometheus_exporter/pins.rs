@@ -2,12 +2,13 @@
 
 use smol_str::SmolStr;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::num::NonZeroU8;
 use std::sync::Arc;
 use std::time::Duration;
 use sundog::store::{Shard, ShardOps};
 use sundog::{Cluster, Mode, NodeId};
 
-use crate::support::node_config;
+use crate::support::{node_config, reserve_tcp_addr};
 
 /// A known hit/miss sequence on a `Mode::Local` cache of its own, exact
 /// rather than shared with `users`' traffic: 2 inserts, 3 hit gets, 2 miss
@@ -412,4 +413,134 @@ pub(crate) async fn clock_skew_pin_metrics() {
         .await;
     assert_eq!(shard.get(&1).await, None);
     assert_eq!(shard.get(&2).await.as_deref(), Some("v"));
+}
+
+/// The records the skew hold keeps per cache: the cap
+/// `ShardOps::apply_forwarded_batch` holds forwards up to, documented with
+/// `sundog_clock_skew_held` in operations.md.
+pub(crate) const SKEW_HOLD_PIN_CAPACITY: u32 = 16_384;
+
+/// Bytes the hold charges a record beyond its key and value.
+const SKEW_HOLD_RECORD_OVERHEAD: usize = 64;
+
+/// What `sundog_clock_skew_held_bytes{cache="skew-hold-pin"}` reads after
+/// [`skew_hold_pin_metrics`]: every held record's key and value bytes plus
+/// the fixed overhead.
+pub(crate) fn skew_hold_pin_bytes() -> f64 {
+    let held: usize = (0..SKEW_HOLD_PIN_CAPACITY)
+        .map(|key| {
+            postcard::to_stdvec(&key).expect("key encodes").len()
+                + postcard::to_stdvec(&"v".to_string())
+                    .expect("value encodes")
+                    .len()
+                + SKEW_HOLD_RECORD_OVERHEAD
+        })
+        .sum();
+    f64::from(u32::try_from(held).expect("the pinned hold fits in u32"))
+}
+
+/// Drives the skew hold's metrics on a `Mode::Distributed` cache that owns
+/// every part, with a raw data-plane peer that is no owner forwarding it
+/// records stamped an hour ahead of the default one-minute skew bound: the
+/// first [`SKEW_HOLD_PIN_CAPACITY`] distinct keys are held, one more finds
+/// the hold full, and one stamped three days ahead is past its horizon.
+/// Pins `sundog_clock_skew_held`, `sundog_clock_skew_held_bytes`,
+/// `sundog_clock_skew_hold_dropped_total{reason}` and, one refusal per
+/// record, `sundog_clock_skew_rejected_total`. Returns the node and the
+/// peer's socket, which stay up until the metrics are scraped.
+pub(crate) async fn skew_hold_pin_metrics() -> (Cluster, tokio::net::TcpStream) {
+    use sundog::wire::{self, Msg, WireRecord};
+    use tokio::io::AsyncWriteExt;
+
+    let data_addr = reserve_tcp_addr().await;
+    let node = Cluster::builder("it-prometheus-skew-hold")
+        .seeds(std::iter::empty())
+        .config(
+            node_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).with(|c| {
+                c.data_bind_addr = data_addr;
+                c.max_clock_skew = Some(Duration::from_mins(1));
+            }),
+        )
+        .build()
+        .await
+        .expect("node builds");
+    let _cache = node
+        .cache::<u32, String>("skew-hold-pin")
+        .mode(Mode::Distributed {
+            owners: NonZeroU8::new(2).expect("nonzero"),
+        })
+        .open()
+        .await
+        .expect("cache opens");
+    // The cache stays open until the node shuts down: dropping a handle
+    // does not close it.
+
+    let writer = NodeId::from(0x5eed_0001);
+    let mut stream = tokio::net::TcpStream::connect(data_addr)
+        .await
+        .expect("the node's data port accepts");
+    let send = async |stream: &mut tokio::net::TcpStream, msg: &Msg| {
+        let frame = wire::encode(msg).expect("encodes");
+        let len = u32::try_from(frame.len()).expect("a frame fits u32");
+        stream
+            .write_all(&len.to_be_bytes())
+            .await
+            .expect("length sent");
+        stream.write_all(&frame).await.expect("frame sent");
+    };
+    send(
+        &mut stream,
+        &Msg::Hello {
+            node: writer,
+            incarnation: 1,
+            protocol: wire::PROTOCOL_VERSION,
+            cluster: wire::UNNAMED_CLUSTER,
+        },
+    )
+    .await;
+
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is past the epoch")
+            .as_millis(),
+    )
+    .expect("epoch milliseconds fit in u64");
+    let record = |key: u32, ahead_ms: u64| WireRecord {
+        key: bytes::Bytes::from(postcard::to_stdvec(&key).expect("key encodes")),
+        value: Some(bytes::Bytes::from(
+            postcard::to_stdvec(&"v".to_string()).expect("value encodes"),
+        )),
+        ver: sundog::Hlc {
+            wall_ms: now_ms + ahead_ms,
+            logical: 0,
+            node: writer,
+        },
+        expires_at_ms: None,
+    };
+    let hour = 3_600_000;
+    let keys: Vec<u32> = (0..=SKEW_HOLD_PIN_CAPACITY).collect();
+    for chunk in keys.chunks(2_000) {
+        send(
+            &mut stream,
+            &Msg::ForwardBatch {
+                cache: SmolStr::new("skew-hold-pin"),
+                view_hash: 0,
+                hops: 0,
+                recs: chunk.iter().map(|&key| record(key, hour)).collect(),
+            },
+        )
+        .await;
+    }
+    send(
+        &mut stream,
+        &Msg::ForwardBatch {
+            cache: SmolStr::new("skew-hold-pin"),
+            view_hash: 0,
+            hops: 0,
+            recs: vec![record(u32::MAX, 72 * hour)],
+        },
+    )
+    .await;
+    (node, stream)
 }

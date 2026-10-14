@@ -1,5 +1,5 @@
-//! The background loops a cache spawns when it opens: fan-out, merge coalescing, refresh-ahead,
-//! warm-up and rebalancing.
+//! The background loops a cache spawns when it opens: fan-out, merge coalescing, the clock-skew
+//! hold's release, refresh-ahead, warm-up and rebalancing.
 
 use std::hash::Hash;
 use std::sync::Arc;
@@ -119,6 +119,9 @@ pub(super) async fn spawn_cache_tasks<K, V>(
             merge_coalesce_task(Arc::clone(shard), cancel.clone()),
         );
     }
+    if matches!(mode, Mode::Distributed { .. }) && shard.holds_skewed_forwards() {
+        cluster.spawn_tracked_in(tasks, skew_hold_task(Arc::clone(shard), cancel.clone()));
+    }
     if let Some(requests) = shard.take_refresh_requests() {
         cluster.spawn_tracked_in(
             tasks,
@@ -154,6 +157,36 @@ where
             () = tokio::time::sleep(sleep_for) => {
                 shard.flush_due_pending_merges(now_ms());
             }
+        }
+    }
+}
+
+/// Drives [`Shard::release_due_skewed`] for a `Mode::Distributed` cache with a
+/// `max_clock_skew`: parks on [`Shard::skew_wake_notified`] while the shard
+/// holds no forward it refused for skew, so an idle cache costs no wake-ups.
+/// With records held it sleeps until the earliest comes due, in slices of at
+/// most [`Shard::next_skew_wait`]'s poll so a wall-clock step cannot strand a
+/// release, and releases whatever is due. [`Cache::close`] hands the hold to
+/// the fan-out before this task is cancelled, so its timing is never
+/// load-bearing for a graceful close.
+pub(super) async fn skew_hold_task<K, V>(shard: Arc<Shard<K, V>>, cancel: CancellationToken)
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    loop {
+        // A record held after the wait is computed leaves a permit with
+        // `skew_wake`, so the select below wakes at once instead of missing it.
+        match shard.next_skew_wait() {
+            None => tokio::select! {
+                () = cancel.cancelled() => return,
+                () = shard.skew_wake_notified() => {}
+            },
+            Some(wait) => tokio::select! {
+                () = cancel.cancelled() => return,
+                () = shard.skew_wake_notified() => {}
+                () = tokio::time::sleep(wait) => shard.release_due_skewed().await,
+            },
         }
     }
 }

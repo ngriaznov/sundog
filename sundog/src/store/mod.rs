@@ -43,8 +43,10 @@ mod shard_ops;
 mod shard_read;
 mod shard_rearm;
 mod shard_serve;
+mod shard_skew;
 mod shard_spill;
 mod shard_write;
+mod skew_hold;
 mod types;
 use engine::Engine;
 
@@ -497,6 +499,17 @@ where
     /// Set once this node's clock has been logged as further behind its
     /// own last stamp than `max_clock_skew_ms`.
     clock_jump_warned: AtomicBool,
+    /// Forwarded records [`Shard::observe_remote`] refused as stamped past
+    /// `max_clock_skew_ms`, parked until this node's clock is within the
+    /// bound of their stamps; see `shard_skew.rs`. Never held across an
+    /// `.await`.
+    skew_hold: StdMutex<skew_hold::SkewHold>,
+    /// Notified whenever a record is held, so the release task recomputes
+    /// its sleep (mirrors `merge_wake`).
+    skew_wake: Notify,
+    /// Set once the first forwarded record dropped instead of held has been
+    /// logged at `warn`; later drops log at `debug` and only count.
+    skew_drop_warned: AtomicBool,
     /// Runs the spill tier's checkpointed close once: later and concurrent
     /// closers wait for the first and find it done, and a first close
     /// dropped mid-way leaves the cell empty for the next to run.

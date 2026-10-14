@@ -1184,8 +1184,10 @@ where
         self.shard.flush_all_pending_merges();
         // Sealed before the tasks are cancelled: a write accepted until
         // now is in the backlog the fan-out task drains on its way out,
-        // and a write from now on fails with `CacheError::Closed`.
-        self.shard.fan_out_queue().seal();
+        // and a write from now on fails with `CacheError::Closed`. The
+        // forwards held for clock skew join that backlog first, so the
+        // other owners take them over.
+        self.shard.seal_for_close();
         self.cancel.cancel();
         self.tasks.close();
         self.tasks.wait().await;

@@ -16,9 +16,10 @@ pub(crate) async fn dispatch_inbound<S: ShardOps>(shard: &S, msg: Msg) {
     match msg {
         Msg::Invalidate { key, ver, .. } => ShardOps::invalidate(shard, key, ver).await,
         Msg::Replicate { rec, .. } => ShardOps::apply_remote(shard, rec).await,
-        Msg::ReplicateBatch { recs, .. } | Msg::ForwardBatch { recs, .. } => {
-            ShardOps::apply_remote_batch(shard, recs).await;
-        }
+        Msg::ReplicateBatch { recs, .. } => ShardOps::apply_remote_batch(shard, recs).await,
+        // As `cluster::inbound_loop` applies them: a shard holds a forward it
+        // refuses for clock skew.
+        Msg::ForwardBatch { recs, .. } => ShardOps::apply_forwarded_batch(shard, recs).await,
         // `Hello`, request/response messages, and `ReqDone` are a no-op here.
         _ => {}
     }

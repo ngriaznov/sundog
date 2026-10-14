@@ -41,6 +41,9 @@ addresses once it forms, under `cluster formed`.
 | `sundog_ae_parts_total{cache, outcome}` | part-level reconciliations, `listing`, `sketch` or `fallback` |
 | `sundog_state_transfer_records_total{cache}` | records a joining node pulled from its donor |
 | `sundog_clock_skew_rejected_total{cache}` | records refused for a stamp further ahead of this node's clock than `max_clock_skew` |
+| `sundog_clock_skew_held{cache}` | `Distributed` forwards this node refused for clock skew and holds until its clock is within the bound |
+| `sundog_clock_skew_held_bytes{cache}` | the memory those held records take: key, value and 64 bytes each |
+| `sundog_clock_skew_hold_dropped_total{cache, reason}` | forwarded records dropped instead of held: `full` (the hold is at 16,384 records or 32 MiB) or `horizon` (the stamp is further ahead than a day or `tombstone_max_ttl`) |
 
 ### The cluster
 
@@ -245,8 +248,16 @@ answered.
 naming the writer and how far ahead its stamp was. One node's clock runs
 fast, or this node's runs slow: compare each host's time against NTP. A
 refused write stays on the node that made it until the other clocks reach
-its stamp. A node that logs that its clock is behind its own last write
-stamp had its system clock stepped back; its writes keep their order.
+its stamp. A `Distributed` write forwarded by a non-owner has no copy on the
+writer, so the owner that refuses it holds it: `sundog_clock_skew_held` and
+`sundog_clock_skew_held_bytes` show what waits, and the write lands once this
+node's clock is within `max_clock_skew` of its stamp. The wait is the stamp's
+lead minus the bound, and fixing the writer's clock does not shorten it. A
+non-zero `sundog_clock_skew_hold_dropped_total` means writes were lost: the
+`full` reason is a hold at its 16,384 records or 32 MiB, and `horizon` a
+stamp further ahead than a day (or `tombstone_max_ttl`, if shorter), which no
+clock skew explains. A node that logs that its clock is behind its own last
+write stamp had its system clock stepped back; its writes keep their order.
 
 ### A spill tier drops evictions
 

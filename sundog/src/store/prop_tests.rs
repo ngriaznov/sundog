@@ -1453,3 +1453,73 @@ proptest! {
         });
     }
 }
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// Forwards from a writer that owns nothing, each a key with a value or a
+    /// remove and stamped past the owner's skew bound by some milliseconds, in
+    /// any order and chunking, are all held; once the
+    /// clock reaches the latest due time one release leaves every key at its
+    /// newest write (a remove reads as absent) and the hold empty.
+    #[test]
+    fn held_forwards_converge_on_the_newest_write_per_key(
+        writes in proptest::collection::vec(
+            (0..KEYSPACE, proptest::option::of(any::<u8>()), 1u64..1_500),
+            1..40,
+        ),
+        seed in any::<u64>(),
+    ) {
+        let (shard, mut model) = model::new_shard_and_model_with_ownership(
+            "skew-hold-prop",
+            1,
+            vec![NodeId::from(1)],
+            std::num::NonZeroU8::MIN,
+        );
+        let now = model.now_ms();
+        let writer = NodeId::from(99);
+        let mut records: Vec<WireRecord> = writes
+            .iter()
+            .enumerate()
+            .map(|(n, &(key, value, past_the_bound))| WireRecord {
+                key: Bytes::from(postcard::to_stdvec(&key).expect("u8 key encodes")),
+                value: value.map(|value| {
+                    Bytes::from(postcard::to_stdvec(&value).expect("u8 value encodes"))
+                }),
+                ver: Hlc {
+                    wall_ms: now + model::MAX_CLOCK_SKEW_MS + past_the_bound,
+                    logical: u32::try_from(n).expect("a small index"),
+                    node: writer,
+                },
+                expires_at_ms: None,
+            })
+            .collect();
+
+        let mut expected: std::collections::HashMap<u8, (Hlc, Option<u8>)> =
+            std::collections::HashMap::new();
+        for (record, &(key, value, _)) in records.iter().zip(&writes) {
+            let entry = expected.entry(key).or_insert((record.ver, value));
+            if record.ver >= entry.0 {
+                *entry = (record.ver, value);
+            }
+        }
+
+        records.shuffle(&mut StdRng::seed_from_u64(seed));
+        let rt = current_thread_runtime();
+        rt.block_on(async {
+            for chunk in records.chunks(7) {
+                ShardOps::apply_forwarded_batch(&shard, chunk.to_vec()).await;
+            }
+            for key in 0..KEYSPACE {
+                assert_eq!(shard.get(&key).await, None, "nothing applies before it is due");
+            }
+            model.advance_clock(1_500);
+            shard.release_due_skewed().await;
+            assert_eq!(shard.skew_held(), (0, 0), "one release takes everything due");
+            for key in 0..KEYSPACE {
+                let want = expected.get(&key).and_then(|&(_, value)| value);
+                assert_eq!(shard.get(&key).await, want, "key {key}");
+            }
+        });
+    }
+}

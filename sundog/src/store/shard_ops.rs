@@ -90,6 +90,19 @@ pub trait ShardOps: Send + Sync {
     /// any other key, and treats a tombstone record as [`ShardOps::invalidate`].
     fn apply_remote_batch(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, ()>;
 
+    /// [`ShardOps::apply_remote_batch`] for the records of a
+    /// [`crate::wire::Msg::ForwardBatch`]. A `Mode::Distributed` writer that is
+    /// not an owner of a record's part keeps no copy of the write it forwards,
+    /// so a record this shard refuses for a stamp further ahead of its clock
+    /// than `max_clock_skew` is held in memory and applied once the clock is
+    /// within the bound, where `apply_remote_batch` drops it (its sender still
+    /// holds the record and offers it again). The hold is bounded and lost on
+    /// a crash; a graceful close hands it to the other owners. Default:
+    /// `apply_remote_batch`, for a shard that holds nothing.
+    fn apply_forwarded_batch(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, ()> {
+        self.apply_remote_batch(recs)
+    }
+
     /// Drops the local copy of `key` iff `ver` is newer than the locally stored
     /// version. Not routed through [`ConflictResolver`]: an invalidation
     /// carries no value, so `Hlc` order is the only signal.

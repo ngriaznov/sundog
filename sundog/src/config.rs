@@ -87,6 +87,19 @@ pub struct ClusterConfig {
     /// an hour fast wins every conflicting write and pulls every other
     /// node's clock an hour forward.
     ///
+    /// A `Mode::Distributed` write that a node forwards without owning its
+    /// part leaves no copy behind for anti-entropy to offer, so an owner that
+    /// refuses its stamp holds the record in memory and applies it once its
+    /// clock is within the bound, after about the stamp's lead minus this
+    /// bound. The hold takes 16,384 records and 32 MiB per cache, and nothing
+    /// further ahead than the shorter of
+    /// [`tombstone_max_ttl`](Self::tombstone_max_ttl) and a day; a record past
+    /// those limits is dropped and counted in
+    /// `sundog_clock_skew_hold_dropped_total{cache, reason}`. A crash loses
+    /// the hold; a closing cache hands it to the other owners. While a record
+    /// is held the owner's clock has not absorbed its stamp, so a write made
+    /// meanwhile stamps below it and loses to it once it applies.
+    ///
     /// The same bound flags this node's own clock: a node whose system
     /// clock falls further than this behind its own last stamp logs one
     /// warning per cache. Its writes stay ordered, held at that last stamp

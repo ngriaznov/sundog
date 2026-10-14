@@ -25,44 +25,85 @@ fn lookup_shard(shards: &ShardRegistry, cache: &SmolStr) -> Option<Arc<dyn Shard
 /// Cap on how many queued inbound messages [`inbound_loop`] drains per wake.
 const INBOUND_DRAIN_CAP: usize = 1024;
 
-/// Applies one accumulated same-cache run of `Replicate`/`ReplicateBatch`
-/// records under one `apply_remote_batch` call. `shard_cache` memoizes the
-/// lookup per drained batch, so a cache name costs at most one lock
-/// acquisition.
-async fn apply_pending_replicate(
+/// One accumulated run of records bound for one shard in one call: the
+/// records of consecutive `Replicate`/`ReplicateBatch` messages for a cache,
+/// or of consecutive `ForwardBatch` messages for it.
+struct PendingRun {
+    cache: SmolStr,
+    /// Whether the records came in a `ForwardBatch`, which the shard applies
+    /// through [`ShardOps::apply_forwarded_batch`].
+    forwarded: bool,
+    recs: Vec<WireRecord>,
+}
+
+/// Whether a message for `cache` (`forwarded` says it is a `ForwardBatch`)
+/// joins the `pending` run `(cache, forwarded)`. A forward and a replicate
+/// never share a call: the shard holds a forward it refuses for clock skew
+/// and drops a replicate it refuses. Pure; unit tested directly.
+pub(super) fn same_run(
+    pending: Option<(&SmolStr, bool)>,
+    cache: &SmolStr,
+    forwarded: bool,
+) -> bool {
+    pending.is_some_and(|(pending_cache, pending_forwarded)| {
+        pending_cache == cache && pending_forwarded == forwarded
+    })
+}
+
+/// Applies one accumulated run under one `apply_remote_batch` call, or one
+/// `apply_forwarded_batch` call for a run of forwards. `shard_cache`
+/// memoizes the lookup per drained batch, so a cache name costs at most one
+/// lock acquisition.
+async fn apply_pending_run(
     shards: &ShardRegistry,
     shard_cache: &mut HashMap<SmolStr, Option<Arc<dyn ShardOps>>>,
-    cache: SmolStr,
-    recs: Vec<WireRecord>,
+    run: PendingRun,
 ) {
+    let PendingRun {
+        cache,
+        forwarded,
+        recs,
+    } = run;
     let shard = shard_cache
         .entry(cache.clone())
         .or_insert_with(|| lookup_shard(shards, &cache));
     if let Some(shard) = shard {
-        shard.apply_remote_batch(recs).await;
+        if forwarded {
+            shard.apply_forwarded_batch(recs).await;
+        } else {
+            shard.apply_remote_batch(recs).await;
+        }
     } else {
         tracing::trace!(%cache, "replicate batch for unknown cache; dropped");
     }
 }
 
-/// Appends `recs` to the pending same-cache run, or applies the run in
-/// progress first when `cache` differs and starts a new one.
-async fn queue_replicate(
+/// Appends `recs` to the pending run for `cache`, or applies the run in
+/// progress first when `cache` or `forwarded` differs and starts a new one.
+async fn queue_run(
     shards: &ShardRegistry,
     shard_cache: &mut HashMap<SmolStr, Option<Arc<dyn ShardOps>>>,
-    pending: &mut Option<(SmolStr, Vec<WireRecord>)>,
+    pending: &mut Option<PendingRun>,
     cache: SmolStr,
+    forwarded: bool,
     mut recs: Vec<WireRecord>,
 ) {
+    let joins = same_run(
+        pending.as_ref().map(|run| (&run.cache, run.forwarded)),
+        &cache,
+        forwarded,
+    );
     match pending {
-        Some((pending_cache, pending_recs)) if *pending_cache == cache => {
-            pending_recs.append(&mut recs);
-        }
+        Some(run) if joins => run.recs.append(&mut recs),
         _ => {
-            if let Some((old_cache, old_recs)) = pending.take() {
-                apply_pending_replicate(shards, shard_cache, old_cache, old_recs).await;
+            if let Some(old) = pending.take() {
+                apply_pending_run(shards, shard_cache, old).await;
             }
-            *pending = Some((cache, recs));
+            *pending = Some(PendingRun {
+                cache,
+                forwarded,
+                recs,
+            });
         }
     }
 }
@@ -101,7 +142,9 @@ fn burst_shard<'a>(
 /// `Invalidate`/`Replicate`/`ReplicateBatch`/`ForwardBatch` to the named
 /// shard, dropping a message for an unregistered cache with a trace event.
 /// Drains a bounded batch per wake with `recv_many`, so a run of same-cache
-/// messages coalesces into one `apply_remote_batch` call. A `ForwardBatch`
+/// messages coalesces into one `apply_remote_batch` call, and a run of
+/// `ForwardBatch` messages into one `apply_forwarded_batch` call, which holds a
+/// record the shard refuses for clock skew instead of dropping it. A `ForwardBatch`
 /// under a stale view hash is handed to the [`Reforwarder`], which sends it
 /// on to its records' current owners from a lane per peer, then applied like
 /// any other: the loop waits on no socket, so a peer that stops reading
@@ -138,15 +181,22 @@ pub(super) async fn inbound_loop(
         reforwarder.retire_departed();
 
         let mut shard_cache: HashMap<SmolStr, Option<Arc<dyn ShardOps>>> = HashMap::new();
-        let mut pending: Option<(SmolStr, Vec<WireRecord>)> = None;
+        let mut pending: Option<PendingRun> = None;
         for InboundMsg { from, msg } in drained.drain(..) {
             match msg {
                 Msg::Replicate { cache, rec } => {
-                    queue_replicate(&shards, &mut shard_cache, &mut pending, cache, vec![rec])
-                        .await;
+                    queue_run(
+                        &shards,
+                        &mut shard_cache,
+                        &mut pending,
+                        cache,
+                        false,
+                        vec![rec],
+                    )
+                    .await;
                 }
                 Msg::ReplicateBatch { cache, recs } => {
-                    queue_replicate(&shards, &mut shard_cache, &mut pending, cache, recs).await;
+                    queue_run(&shards, &mut shard_cache, &mut pending, cache, false, recs).await;
                 }
                 Msg::ForwardBatch {
                     cache,
@@ -168,12 +218,11 @@ pub(super) async fn inbound_loop(
                             },
                         );
                     }
-                    queue_replicate(&shards, &mut shard_cache, &mut pending, cache, recs).await;
+                    queue_run(&shards, &mut shard_cache, &mut pending, cache, true, recs).await;
                 }
                 Msg::Invalidate { cache, key, ver } => {
-                    if let Some((old_cache, old_recs)) = pending.take() {
-                        apply_pending_replicate(&shards, &mut shard_cache, old_cache, old_recs)
-                            .await;
+                    if let Some(run) = pending.take() {
+                        apply_pending_run(&shards, &mut shard_cache, run).await;
                     }
                     let Some(shard) = burst_shard(&mut shard_cache, &shards, &cache) else {
                         tracing::trace!(%cache, %from, "invalidate for unknown cache; dropped");
@@ -218,8 +267,8 @@ pub(super) async fn inbound_loop(
                 | Msg::ReqDone => {}
             }
         }
-        if let Some((cache, recs)) = pending.take() {
-            apply_pending_replicate(&shards, &mut shard_cache, cache, recs).await;
+        if let Some(run) = pending.take() {
+            apply_pending_run(&shards, &mut shard_cache, run).await;
         }
     }
     reforwarder.shutdown().await;

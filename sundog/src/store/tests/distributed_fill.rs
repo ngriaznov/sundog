@@ -49,7 +49,7 @@ fn loading_shard() -> (
 
 /// A view over forty nodes, in which node 1 owns far fewer parts than in
 /// [`loading_shard`]'s five-node view.
-fn crowded_view() -> Arc<OwnershipView> {
+pub(super) fn crowded_view() -> Arc<OwnershipView> {
     Arc::new(OwnershipView::compute(
         NodeId::from(1),
         (1..=40u64).map(NodeId::from).collect(),
@@ -58,7 +58,7 @@ fn crowded_view() -> Arc<OwnershipView> {
 }
 
 /// A key `before` owns and `after` does not.
-fn key_moved_away(before: &OwnershipView, after: &OwnershipView) -> u32 {
+pub(super) fn key_moved_away(before: &OwnershipView, after: &OwnershipView) -> u32 {
     (0..1_000_000u32)
         .find(|key| {
             let part = PartId::of_key(&key_bytes(key));

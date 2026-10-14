@@ -34,6 +34,29 @@ refused write stays on the node that made it and reaches the others through
 anti-entropy once their clocks catch up with its stamp.
 `sundog_clock_skew_rejected_total{cache}` counts refusals.
 
+A `Distributed` write that a non-owner forwards is the exception: the writer
+keeps no copy, so the frame is the only one. An owner that refuses its stamp
+holds the record in memory and applies it once its own clock is within the
+bound, about the stamp's lead minus `max_clock_skew` after the write.
+Correcting the writer's clock afterwards does not shorten the wait, because
+the stamp is fixed when the write is made. While a record is held, the
+owner's clock has not absorbed its stamp, so a write or remove made in the
+meantime, here or on a node with a correct clock, stamps below the held
+record and loses to it when it applies: an acknowledged insert from a fast
+clock can bring back a key removed during the wait, and a held remove can
+delete a newer insert. Several held versions of one key reduce to the newest,
+except for a merging resolver, which keeps every contribution. The hold
+covers 16,384 records and 32 MiB per cache, and a stamp further ahead than
+the shorter of `tombstone_max_ttl` and a day is a broken clock rather than
+skew; a record past either limit is dropped and counted in
+`sundog_clock_skew_hold_dropped_total{cache, reason}`. The hold is in memory:
+a crash loses it, and a cache that closes hands its held records to the other
+owners of their parts, which hold them in turn. A forward whose writer is an
+owner of the part is not held, because that owner kept its record and
+anti-entropy offers it again. Rebalance and state transfer do
+not hold what they are refused: a record a receiver refuses for skew is not
+applied there, and a donor that finishes its round can release the part.
+
 A restart that replays a spill snapshot resumes the node's clock at or past
 the replayed stamps, so a clock that steps back across a restart does not
 make the node's new writes and deletes lose to its own old entries. Until

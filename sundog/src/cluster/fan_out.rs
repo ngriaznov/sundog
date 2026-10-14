@@ -339,7 +339,7 @@ async fn send_departed(cluster: &Cluster, cache_name: &SmolStr, plan: Vec<Depart
     clippy::too_many_lines,
     reason = "one branch per Mode, each with its own send path"
 )]
-async fn fan_out_batch<K, V>(
+pub(crate) async fn fan_out_batch<K, V>(
     shard: &Shard<K, V>,
     cluster: &Cluster,
     cache_name: &SmolStr,
@@ -396,7 +396,8 @@ async fn fan_out_batch<K, V>(
         // A write forwarded before this node owned its part, but owned by
         // the time the queue drains, lands here too: sending it only to
         // the other owners (or nobody, if this node is the sole owner)
-        // would lose the one copy that exists.
+        // would lose the one copy that exists. It applies as a forward, so a
+        // stamp this node's clock refuses is held rather than dropped.
         let mine: Vec<WireRecord> = records
             .iter()
             .filter(|rec| {
@@ -406,7 +407,7 @@ async fn fan_out_batch<K, V>(
             .cloned()
             .collect();
         if !mine.is_empty() {
-            shard.apply_remote_batch(mine).await;
+            shard.apply_forwarded_batch(mine).await;
         }
         fan_out_by_owner_set(
             cluster.mesh(),

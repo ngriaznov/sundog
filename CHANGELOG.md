@@ -11,6 +11,12 @@ All notable changes to this project are documented in this file. Format follows
   cache, its deletes and, in a `Replicated` or `Distributed` cache, its swept
   expired entries, refreshed every five seconds with `sundog_cache_entries`.
 
+- **`sundog_clock_skew_held{cache}`, `sundog_clock_skew_held_bytes{cache}`
+  and `sundog_clock_skew_hold_dropped_total{cache, reason}`**: the forwarded
+  writes an owner holds for clock skew, the memory they take, and the ones it
+  drops instead, because the hold is `full` or the stamp is past its
+  `horizon`.
+
 ### Changed
 
 - **The wire protocol is 9** (`wire::PROTOCOL_AE_LISTING_CHUNKS`). A reply to
@@ -21,6 +27,24 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **A `Mode::Distributed` write forwarded by a non-owner survives an owner's
+  clock-skew refusal.** The writer keeps no copy of a forwarded insert,
+  remove or merge, so an owner that refused its stamp for being further ahead
+  than `max_clock_skew` dropped the only one: an insert never appeared and a
+  remove left the key live, though both returned `Ok`. The owner now holds the
+  record in memory, 16,384 records and 32 MiB per cache, and applies it once
+  its clock is within the bound, after about the stamp's lead minus
+  `max_clock_skew`; correcting the writer's clock does not shorten the wait.
+  A held key keeps its newest version, except under a merging resolver, which
+  keeps every contribution. A forward whose writer owns the part is not held,
+  since that owner kept its copy and anti-entropy offers it again, and a stamp
+  further ahead than the shorter of `tombstone_max_ttl` and a day is dropped.
+  A hold does not survive a crash, and a closing cache hands its held records
+  to the other owners. While a record is held the owner's clock has not
+  absorbed its stamp, so a write or remove made meanwhile stamps below it and
+  loses to it when it applies. Rebalance and state transfer still drop a
+  record the receiver refuses for skew. New `ShardOps::apply_forwarded_batch`
+  (a provided method) is the entry point for `ForwardBatch` records.
 - **A peer that stops reading no longer stalls inbound traffic.** The inbound
   loop used to wait for the target owner's outbox while it re-forwarded a
   stale-view `ForwardBatch`, so one wedged live peer stopped the node from

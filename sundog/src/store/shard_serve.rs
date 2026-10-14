@@ -57,6 +57,139 @@ where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
+    /// The body of [`ShardOps::apply_remote_batch`] and
+    /// [`ShardOps::apply_forwarded_batch`]. `hold_skewed` says the records
+    /// came in a `ForwardBatch`: one the stamp refuses, from a writer that is
+    /// not an owner of its part, goes to the skew hold instead of being
+    /// dropped (see [`Shard::hold_skewed`]). Every other refusal drops the
+    /// record, because the sender still holds it.
+    pub(super) async fn apply_inbound(&self, recs: Vec<WireRecord>, hold_skewed: bool) {
+        // The inbound-apply guard: a `Mode::Distributed` shard never
+        // applies a record for a bucket its own *current* view does not
+        // own: strict current-view ownership, before decoding, is the
+        // single choke point every inbound record path (live
+        // replication, an anti-entropy pull reply, a rebalance transfer
+        // chunk) funnels through. A record for a bucket this node is
+        // mid disown-grace on came from a sender whose view still lists
+        // this node as an owner; this node's view is the newer one, so
+        // the record is forwarded on to the bucket's current owners,
+        // never applied here and never dropped. A record for a bucket
+        // this node never held is dropped and counted.
+        let recs = self.guard_inbound(recs);
+        // An `Invalidation` cache takes a tombstone record as the
+        // invalidation it stands for: the copy goes, and a load in
+        // flight for the key stores nothing.
+        let scope = inbound_scope(self.mode);
+        let (recs, removals) = match scope {
+            engine::ApplyScope::HeldOnly => recs.into_iter().partition(|rec| !rec.is_tombstone()),
+            engine::ApplyScope::Any => (recs, Vec::new()),
+        };
+        for rec in removals {
+            self.invalidate_key(rec.key.as_ref(), rec.ver, true);
+        }
+        let mut decoded: Vec<RemoteEntry<K, V>> = Vec::with_capacity(recs.len());
+        for rec in recs {
+            if !self.observe_remote(rec.ver) {
+                if hold_skewed {
+                    self.hold_skewed(rec);
+                }
+                continue;
+            }
+            let hash = engine::hash_key_bytes(rec.key.as_ref());
+            let Ok(key) = postcard::from_bytes::<K>(&rec.key) else {
+                tracing::warn!(cache = %self.name, "apply_remote_batch: undecodable key bytes");
+                continue;
+            };
+            let origin = Origin::Remote(rec.ver.node);
+            let incoming = match rec.value {
+                Some(value_bytes) => {
+                    let Ok(value) = postcard::from_bytes::<V>(&value_bytes) else {
+                        tracing::warn!(
+                            cache = %self.name,
+                            "apply_remote_batch: undecodable value bytes"
+                        );
+                        continue;
+                    };
+                    Incoming::Put {
+                        value,
+                        expires_at_ms: rec.expires_at_ms,
+                        // The verbatim wire bytes, decoded above only for the resolver.
+                        encoded: value_bytes,
+                    }
+                }
+                None => Incoming::Tombstone {
+                    expired_at_ms: rec.expires_at_ms,
+                },
+            };
+            decoded.push((hash, key, rec.key, rec.ver, incoming, origin));
+        }
+
+        // One reservation for the whole decoded batch (see
+        // `Shard::reserve_for_batch`) throttles replication, anti-entropy
+        // repair, and state-transfer apply alike through this one method.
+        // A held-only batch stores a record only as a fold into a key
+        // already held, and most of its records store nothing, so it
+        // reserves nothing and takes the apply's non-blocking path.
+        let (reservation, deadline) = match scope {
+            engine::ApplyScope::HeldOnly => (None, None),
+            engine::ApplyScope::Any => {
+                self.reserve_for_batch(
+                    decoded
+                        .iter()
+                        .map(|(_, _, key_bytes, _, incoming, _)| (key_bytes, incoming)),
+                )
+                .await
+            }
+        };
+
+        // Groups by raw key-byte stripe, no decode needed; order within
+        // a stripe is preserved.
+        let mut by_stripe: Vec<Vec<RemoteEntry<K, V>>> =
+            (0..BUCKET_COUNT).map(|_| Vec::new()).collect();
+        for entry in decoded {
+            by_stripe[engine::stripe_index_from_hash(entry.0)].push(entry);
+        }
+        let now = self.now_ms();
+        let mut written = engine::Written::default();
+        // Scoped as in `Shard::apply_grouped`: the reservation is back
+        // with the tier before the retry asks for a fresh one.
+        let deficit = {
+            let mut reservation = reservation;
+            let mut deficit = 0u64;
+            for (bucket, group) in by_stripe.into_iter().enumerate() {
+                if group.is_empty() {
+                    continue;
+                }
+                let mut origins = Vec::with_capacity(group.len());
+                let entries: Vec<_> = group
+                    .into_iter()
+                    .map(|(hash, key, key_bytes, ver, incoming, origin)| {
+                        origins.push(origin);
+                        (hash, key, key_bytes, ver, incoming)
+                    })
+                    .collect();
+                let (outcomes, bucket_deficit) = self.engine.apply_many_in(
+                    scope,
+                    bucket,
+                    entries,
+                    self.resolver.as_ref(),
+                    self.tombstone_ttl_ms,
+                    self.tombstone_max_ttl_ms,
+                    now,
+                    reservation.as_mut(),
+                    &mut written,
+                );
+                deficit += bucket_deficit;
+                for (outcome, origin) in outcomes.into_iter().zip(origins) {
+                    self.handle_apply_outcome(outcome, origin, true);
+                }
+            }
+            deficit
+        };
+        self.retry_reservation_deficit(0, deficit, deadline, &mut written)
+            .await;
+    }
+
     /// [`ShardOps::invalidate`]'s body. `tombstone` says the caller knows the
     /// record is a tombstone, as a held-only batch does for its removals: a
     /// pending [`Shard::merge`] fold older than it is then discarded. A bare
@@ -84,6 +217,31 @@ where
         }
     }
 
+    /// Hands `redirected`, records for a part this node's view does not own,
+    /// to the fan-out as forwards, which send them on to the part's current
+    /// owners; `why` names the reason in the log. Counted in
+    /// `sundog_forwarded_writes_total`. A refusal means the cache is closing:
+    /// nothing forwards from a node on its way out.
+    pub(super) fn redirect_to_owners(&self, redirected: Vec<WireRecord>, why: &str) {
+        if redirected.is_empty() {
+            return;
+        }
+        metrics::counter!(
+            "sundog_forwarded_writes_total",
+            "cache" => self.name.to_string()
+        )
+        .increment(u64::try_from(redirected.len()).unwrap_or(u64::MAX));
+        tracing::debug!(
+            cache = %self.name,
+            redirected = redirected.len(),
+            why,
+            "forwarded records this node does not own on to the part's current owners"
+        );
+        let _ = self
+            .fan_out
+            .extend(redirected.into_iter().map(FanOutItem::Forward));
+    }
+
     /// The inbound-apply guard, applied to a batch before decoding: keeps
     /// the records this node's current view owns, forwards the ones for a
     /// bucket mid disown-grace on to its current owners, and drops the rest.
@@ -99,24 +257,7 @@ where
                             .as_ref()
                             .is_some_and(|r| r.is_releasing(PartId::of_key(rec.key.as_ref())))
                     });
-                if !redirected.is_empty() {
-                    metrics::counter!(
-                        "sundog_forwarded_writes_total",
-                        "cache" => self.name.to_string()
-                    )
-                    .increment(u64::try_from(redirected.len()).unwrap_or(u64::MAX));
-                    tracing::debug!(
-                        cache = %self.name,
-                        redirected = redirected.len(),
-                        "apply_remote_batch: forwarded records for a releasing bucket on \
-                         to its current owners"
-                    );
-                    // A refusal means the cache is closing: nothing
-                    // forwards from a node on its way out.
-                    let _ = self
-                        .fan_out
-                        .extend(redirected.into_iter().map(FanOutItem::Forward));
-                }
+                self.redirect_to_owners(redirected, "a releasing bucket");
                 if !dropped.is_empty() {
                     metrics::counter!(
                         "sundog_unowned_inbound_dropped_total",
@@ -467,131 +608,11 @@ where
     }
 
     fn apply_remote_batch(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, ()> {
-        Box::pin(async move {
-            // The inbound-apply guard: a `Mode::Distributed` shard never
-            // applies a record for a bucket its own *current* view does not
-            // own: strict current-view ownership, before decoding, is the
-            // single choke point every inbound record path (live
-            // replication, an anti-entropy pull reply, a rebalance transfer
-            // chunk) funnels through. A record for a bucket this node is
-            // mid disown-grace on came from a sender whose view still lists
-            // this node as an owner; this node's view is the newer one, so
-            // the record is forwarded on to the bucket's current owners,
-            // never applied here and never dropped. A record for a bucket
-            // this node never held is dropped and counted.
-            let recs = self.guard_inbound(recs);
-            // An `Invalidation` cache takes a tombstone record as the
-            // invalidation it stands for: the copy goes, and a load in
-            // flight for the key stores nothing.
-            let scope = inbound_scope(self.mode);
-            let (recs, removals) = match scope {
-                engine::ApplyScope::HeldOnly => {
-                    recs.into_iter().partition(|rec| !rec.is_tombstone())
-                }
-                engine::ApplyScope::Any => (recs, Vec::new()),
-            };
-            for rec in removals {
-                self.invalidate_key(rec.key.as_ref(), rec.ver, true);
-            }
-            let mut decoded: Vec<RemoteEntry<K, V>> = Vec::with_capacity(recs.len());
-            for rec in recs {
-                if !self.observe_remote(rec.ver) {
-                    continue;
-                }
-                let hash = engine::hash_key_bytes(rec.key.as_ref());
-                let Ok(key) = postcard::from_bytes::<K>(&rec.key) else {
-                    tracing::warn!(cache = %self.name, "apply_remote_batch: undecodable key bytes");
-                    continue;
-                };
-                let origin = Origin::Remote(rec.ver.node);
-                let incoming = match rec.value {
-                    Some(value_bytes) => {
-                        let Ok(value) = postcard::from_bytes::<V>(&value_bytes) else {
-                            tracing::warn!(
-                                cache = %self.name,
-                                "apply_remote_batch: undecodable value bytes"
-                            );
-                            continue;
-                        };
-                        Incoming::Put {
-                            value,
-                            expires_at_ms: rec.expires_at_ms,
-                            // The verbatim wire bytes, decoded above only for the resolver.
-                            encoded: value_bytes,
-                        }
-                    }
-                    None => Incoming::Tombstone {
-                        expired_at_ms: rec.expires_at_ms,
-                    },
-                };
-                decoded.push((hash, key, rec.key, rec.ver, incoming, origin));
-            }
+        Box::pin(self.apply_inbound(recs, false))
+    }
 
-            // One reservation for the whole decoded batch (see
-            // `Shard::reserve_for_batch`) throttles replication, anti-entropy
-            // repair, and state-transfer apply alike through this one method.
-            // A held-only batch stores a record only as a fold into a key
-            // already held, and most of its records store nothing, so it
-            // reserves nothing and takes the apply's non-blocking path.
-            let (reservation, deadline) = match scope {
-                engine::ApplyScope::HeldOnly => (None, None),
-                engine::ApplyScope::Any => {
-                    self.reserve_for_batch(
-                        decoded
-                            .iter()
-                            .map(|(_, _, key_bytes, _, incoming, _)| (key_bytes, incoming)),
-                    )
-                    .await
-                }
-            };
-
-            // Groups by raw key-byte stripe, no decode needed; order within
-            // a stripe is preserved.
-            let mut by_stripe: Vec<Vec<RemoteEntry<K, V>>> =
-                (0..BUCKET_COUNT).map(|_| Vec::new()).collect();
-            for entry in decoded {
-                by_stripe[engine::stripe_index_from_hash(entry.0)].push(entry);
-            }
-            let now = self.now_ms();
-            let mut written = engine::Written::default();
-            // Scoped as in `Shard::apply_grouped`: the reservation is back
-            // with the tier before the retry asks for a fresh one.
-            let deficit = {
-                let mut reservation = reservation;
-                let mut deficit = 0u64;
-                for (bucket, group) in by_stripe.into_iter().enumerate() {
-                    if group.is_empty() {
-                        continue;
-                    }
-                    let mut origins = Vec::with_capacity(group.len());
-                    let entries: Vec<_> = group
-                        .into_iter()
-                        .map(|(hash, key, key_bytes, ver, incoming, origin)| {
-                            origins.push(origin);
-                            (hash, key, key_bytes, ver, incoming)
-                        })
-                        .collect();
-                    let (outcomes, bucket_deficit) = self.engine.apply_many_in(
-                        scope,
-                        bucket,
-                        entries,
-                        self.resolver.as_ref(),
-                        self.tombstone_ttl_ms,
-                        self.tombstone_max_ttl_ms,
-                        now,
-                        reservation.as_mut(),
-                        &mut written,
-                    );
-                    deficit += bucket_deficit;
-                    for (outcome, origin) in outcomes.into_iter().zip(origins) {
-                        self.handle_apply_outcome(outcome, origin, true);
-                    }
-                }
-                deficit
-            };
-            self.retry_reservation_deficit(0, deficit, deadline, &mut written)
-                .await;
-        })
+    fn apply_forwarded_batch(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, ()> {
+        Box::pin(self.apply_inbound(recs, true))
     }
 
     fn invalidate(&self, key: Bytes, ver: Hlc) -> BoxFuture<'_, ()> {
@@ -971,7 +992,7 @@ where
     }
 
     fn seal_fan_out(&self) {
-        self.fan_out.seal();
+        self.seal_for_close();
     }
 
     #[allow(

@@ -93,12 +93,11 @@ impl<S> CountingShard<S> {
     }
 }
 
-impl<S: ShardOps + 'static> ShardOps for CountingShard<S> {
-    fn apply_remote(&self, rec: WireRecord) -> BoxFuture<'_, ()> {
-        self.apply_remote_batch(vec![rec])
-    }
-
-    fn apply_remote_batch(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, ()> {
+impl<S: ShardOps + 'static> CountingShard<S> {
+    /// Applies `recs` through the inner shard (`forwarded` picks its
+    /// forwarded entry point) and counts each record and each one that left
+    /// its key's stored record unchanged.
+    fn counted(&self, recs: Vec<WireRecord>, forwarded: bool) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             if recs.is_empty() {
                 return;
@@ -112,7 +111,11 @@ impl<S: ShardOps + 'static> ShardOps for CountingShard<S> {
                 .into_iter()
                 .map(|rec| (rec.key.clone(), rec))
                 .collect();
-            self.inner.apply_remote_batch(recs).await;
+            if forwarded {
+                self.inner.apply_forwarded_batch(recs).await;
+            } else {
+                self.inner.apply_remote_batch(recs).await;
+            }
             let after = self.inner.records_for(keys).await;
             let redundant = after
                 .into_iter()
@@ -123,6 +126,22 @@ impl<S: ShardOps + 'static> ShardOps for CountingShard<S> {
                     .fetch_add(redundant as u64, Ordering::Relaxed);
             }
         })
+    }
+}
+
+impl<S: ShardOps + 'static> ShardOps for CountingShard<S> {
+    fn apply_remote(&self, rec: WireRecord) -> BoxFuture<'_, ()> {
+        self.apply_remote_batch(vec![rec])
+    }
+
+    fn apply_remote_batch(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, ()> {
+        self.counted(recs, false)
+    }
+
+    /// Counts like `apply_remote_batch` and delegates to the inner shard's
+    /// forwarded apply, so its skew hold still works under the wrapper.
+    fn apply_forwarded_batch(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, ()> {
+        self.counted(recs, true)
     }
 
     fn invalidate(&self, key: Bytes, ver: Hlc) -> BoxFuture<'_, ()> {

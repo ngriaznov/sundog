@@ -19,10 +19,10 @@ mod spill;
 mod support;
 
 use crate::pins::{
-    TOMBSTONE_PIN_COUNT, clock_skew_pin_metrics, count_hits_and_misses,
+    SKEW_HOLD_PIN_CAPACITY, TOMBSTONE_PIN_COUNT, clock_skew_pin_metrics, count_hits_and_misses,
     fan_out_wait_timeout_pin_metrics, loader_calls_pin_metric, memory_ceiling_pin_metrics,
     read_durations_pin_metrics, refresh_hints_pin_metric, refresh_outcomes_pin_metrics,
-    tombstone_pin_metrics,
+    skew_hold_pin_bytes, skew_hold_pin_metrics, tombstone_pin_metrics,
 };
 use crate::seeds::{
     seed_crdt_compaction_metrics, seed_distributed_metrics, seed_part_mismatch,
@@ -83,6 +83,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     assert!(ceiling_pin_bytes > 0.0);
     loader_calls_pin_metric(&cluster).await;
     let tombstone_node = tombstone_pin_metrics().await;
+    let (skew_hold_node, skew_hold_peer) = skew_hold_pin_metrics().await;
     refresh_outcomes_pin_metrics(&cluster).await;
     refresh_hints_pin_metric(&cluster, &peer).await;
     #[cfg(feature = "spill")]
@@ -127,6 +128,13 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
                 .is_some()
             && scraped_metric_value(&body, "sundog_tombstones", &[("cache", "tombstone-pin")])
                 == Some(TOMBSTONE_PIN_COUNT)
+            // The raw peer's forwards are applied in order, so the horizon
+            // drop at the end of its stream is the last to count.
+            && scraped_metric_value(
+                &body,
+                "sundog_clock_skew_hold_dropped_total",
+                &[("cache", "skew-hold-pin"), ("reason", "horizon")],
+            ) == Some(1.0)
             && (cfg!(not(feature = "spill"))
                 || scraped_metric_value(
                     &body,
@@ -296,6 +304,43 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         ),
         Some(1.0),
         "expected exactly one refused record on the 'clock-skew-pin' cache; got body:\n{body}"
+    );
+    // The skew hold: pinned by skew_hold_pin_metrics. A raw peer that is no
+    // owner forwards 16,385 distinct keys stamped an hour ahead and one
+    // stamped three days ahead to a cache that owns every part.
+    let skew_hold_cache = [("cache", "skew-hold-pin")];
+    assert_eq!(
+        scraped_metric_value(&body, "sundog_clock_skew_held", &skew_hold_cache),
+        Some(f64::from(SKEW_HOLD_PIN_CAPACITY)),
+        "the hold keeps its capacity of records; got body:\n{body}"
+    );
+    assert_eq!(
+        scraped_metric_value(&body, "sundog_clock_skew_held_bytes", &skew_hold_cache),
+        Some(skew_hold_pin_bytes()),
+        "each held record costs its key, its value and 64 bytes; got body:\n{body}"
+    );
+    assert_eq!(
+        scraped_metric_value(
+            &body,
+            "sundog_clock_skew_hold_dropped_total",
+            &[("cache", "skew-hold-pin"), ("reason", "full")]
+        ),
+        Some(1.0),
+        "the record past the cap is dropped as full; got body:\n{body}"
+    );
+    assert_eq!(
+        scraped_metric_value(
+            &body,
+            "sundog_clock_skew_hold_dropped_total",
+            &[("cache", "skew-hold-pin"), ("reason", "horizon")]
+        ),
+        Some(1.0),
+        "the record three days ahead is dropped as past the horizon; got body:\n{body}"
+    );
+    assert_eq!(
+        scraped_metric_value(&body, "sundog_clock_skew_rejected_total", &skew_hold_cache),
+        Some(f64::from(SKEW_HOLD_PIN_CAPACITY) + 2.0),
+        "every forwarded record is refused once, held or not; got body:\n{body}"
     );
     // sundog_fan_out_wait_timeouts_total / sundog_fan_out_backlog: pinned
     // by the bare-Shard scenario above; nothing drains it, so both keys
@@ -747,6 +792,8 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
 
     peer.shutdown().await;
     tombstone_node.shutdown().await;
+    drop(skew_hold_peer);
+    skew_hold_node.shutdown().await;
     cluster.shutdown().await;
     #[cfg(feature = "spill")]
     for dir in &spill_dirs {

@@ -78,7 +78,10 @@ A write for a part this node does not own goes to that part's owners. The
 forwarded batch carries the writer's ownership view, and an owner whose view
 differs passes it on once more, so a write routed under a view that has since
 changed still reaches every current owner. A forwarded write is held by no
-replica until an owner applies it, so anti-entropy cannot repair it. The
+replica until an owner applies it, so anti-entropy cannot repair it. An owner
+whose clock refuses the write's stamp for clock skew holds it in memory
+until its clock is within `max_clock_skew` of the stamp (see
+[guarantees](guarantees.md#conflicting-writes)). The
 sender's writer holds a batch whose send failed and sends it again on its next
 connection, along with everything it wrote in the last second, and it notices
 a peer that closed the connection before it writes. A partition that never

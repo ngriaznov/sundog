@@ -207,7 +207,9 @@ where
     /// other write path here. The caller pushes the returned record onto
     /// [`Shard::fan_out`] as [`FanOutItem::Forward`] and counts
     /// `sundog_forwarded_writes_total{cache}`; this method only builds the
-    /// record and emits the event.
+    /// record and emits the event. The writer keeps no copy, so an owner that
+    /// refuses the record's stamp for clock skew holds it and applies it
+    /// once its clock allows; see `ShardOps::apply_forwarded_batch`.
     fn forward_write(
         &self,
         key: K,
@@ -374,7 +376,9 @@ where
     /// bucket, or builds and forwards it to the bucket's current owners
     /// otherwise: the tail every local-write entry point shares,
     /// [`Shard::insert_expiring`] and a coalesced [`Shard::merge`] fold's
-    /// flush alike.
+    /// flush alike. A forwarded record is the only copy of the write, so an
+    /// owner that refuses its stamp for clock skew holds it; see
+    /// [`Shard::forward_write`].
     pub(super) fn apply_or_forward(
         &self,
         key: K,
@@ -701,7 +705,10 @@ where
 
     /// Stamps and applies a local tombstone, then fans it out per [`Mode`], as
     /// [`Shard::insert`] does. A [`Shard::merge`] fold still pending for the
-    /// key is discarded first.
+    /// key is discarded first. On a `Mode::Distributed` non-owner the
+    /// tombstone is only forwarded, and an owner that refuses its stamp for
+    /// clock skew holds it: the key stays readable there until the owner's
+    /// clock is within `max_clock_skew` of the stamp.
     ///
     /// # Errors
     ///

@@ -13,6 +13,7 @@ use smol_str::SmolStr;
 use tokio::sync::{Notify, broadcast};
 
 use super::engine::Engine;
+use super::skew_hold::{SKEW_HOLD_MAX_BYTES, SKEW_HOLD_MAX_RECORDS, SkewHold};
 use super::{
     BUCKET_COUNT, CeilingRefusals, CompactionBounds, ConflictResolver, FanOutQueue, LwwResolver,
     Merged, Mode, PendingMergeStripe, Quiescence, RecordView, Shard, SharedWeigher, Weigher,
@@ -160,6 +161,9 @@ where
             skew_rejected,
             skew_warned: AtomicBool::new(false),
             clock_jump_warned: AtomicBool::new(false),
+            skew_hold: StdMutex::new(SkewHold::new(SKEW_HOLD_MAX_RECORDS, SKEW_HOLD_MAX_BYTES)),
+            skew_wake: Notify::new(),
+            skew_drop_warned: AtomicBool::new(false),
             spill_close: tokio::sync::OnceCell::new(),
             resolver: Arc::new(LwwResolver),
             raw_resolver: Arc::new(LwwResolver),
@@ -548,6 +552,10 @@ where
     /// refuses it and returns `false` when it is stamped more than
     /// `max_clock_skew_ms` ahead of this node's clock: a refused record is
     /// not applied, and counts in `sundog_clock_skew_rejected_total{cache}`.
+    /// This method only refuses: whether the record is lost is the caller's
+    /// to decide. A record from a replication, anti-entropy or transfer is
+    /// offered again by its sender, while a forward is the only copy and the
+    /// caller holds it (see `Shard::hold_skewed`).
     pub(super) fn observe_remote(&self, remote: Hlc) -> bool {
         let now = self.now_ms();
         let accepted = {

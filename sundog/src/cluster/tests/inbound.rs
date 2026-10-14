@@ -15,18 +15,39 @@ use crate::net::test_support::{BucketPullHandler, peer_at};
 use crate::wire::{Msg, WireRecord};
 use bytes::Bytes;
 
+/// One apply call a [`ViewShard`] received, with its record count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Applied {
+    /// `apply_remote_batch`: replication, anti-entropy, state transfer.
+    Replicated(usize),
+    /// `apply_forwarded_batch`: the records of `ForwardBatch` messages.
+    Forwarded(usize),
+}
+
 /// A [`ShardOps`] double with an ownership view that records every
-/// invalidation it applies. Everything else panics if called.
+/// invalidation and apply call it receives. Everything else panics if called.
 struct ViewShard {
     view: Arc<OwnershipView>,
     invalidated: Arc<Mutex<Vec<Bytes>>>,
+    applied: Arc<Mutex<Vec<Applied>>>,
 }
 
 impl ShardOps for ViewShard {
     fn apply_remote(&self, _rec: WireRecord) -> futures::future::BoxFuture<'_, ()> {
         Box::pin(async {})
     }
-    fn apply_remote_batch(&self, _recs: Vec<WireRecord>) -> futures::future::BoxFuture<'_, ()> {
+    fn apply_remote_batch(&self, recs: Vec<WireRecord>) -> futures::future::BoxFuture<'_, ()> {
+        self.applied
+            .lock()
+            .expect("fixture mutex is never poisoned")
+            .push(Applied::Replicated(recs.len()));
+        Box::pin(async {})
+    }
+    fn apply_forwarded_batch(&self, recs: Vec<WireRecord>) -> futures::future::BoxFuture<'_, ()> {
+        self.applied
+            .lock()
+            .expect("fixture mutex is never poisoned")
+            .push(Applied::Forwarded(recs.len()));
         Box::pin(async {})
     }
     fn invalidate(&self, key: Bytes, _ver: Hlc) -> futures::future::BoxFuture<'_, ()> {
@@ -100,17 +121,33 @@ fn wedged_addr() -> SocketAddr {
 }
 
 fn shard_registry(view: &Arc<OwnershipView>) -> (ShardRegistry, Arc<Mutex<Vec<Bytes>>>) {
+    let (shards, invalidated, _applied) = recording_registry(view);
+    (shards, invalidated)
+}
+
+/// A registry holding a [`ViewShard`], with the keys it was invalidated
+/// for and the apply calls it received.
+type RecordingRegistry = (
+    ShardRegistry,
+    Arc<Mutex<Vec<Bytes>>>,
+    Arc<Mutex<Vec<Applied>>>,
+);
+
+/// [`shard_registry`] plus the log of apply calls the shard receives.
+fn recording_registry(view: &Arc<OwnershipView>) -> RecordingRegistry {
     let invalidated = Arc::new(Mutex::new(Vec::new()));
+    let applied = Arc::new(Mutex::new(Vec::new()));
     let shard: Arc<dyn ShardOps> = Arc::new(ViewShard {
         view: Arc::clone(view),
         invalidated: Arc::clone(&invalidated),
+        applied: Arc::clone(&applied),
     });
     let shards: ShardRegistry = Arc::new(RwLock::new(HashMap::new()));
     shards
         .write()
         .expect("lock")
         .insert(SmolStr::new("users"), shard);
-    (shards, invalidated)
+    (shards, invalidated, applied)
 }
 
 fn small_outbox() -> ClusterConfig {
@@ -680,4 +717,127 @@ mod reforwarder {
             "the healthy lane's batches were handed to the mesh before shutdown returned"
         );
     }
+}
+
+/// An inbound loop on node 1 that is handed `messages` in one burst, then
+/// drained and cancelled: the apply calls its shard received, in order.
+async fn applied_from_one_burst(messages: Vec<InboundMsg>) -> Vec<Applied> {
+    let view = Arc::new(OwnershipView::compute(
+        NodeId::from(1),
+        vec![NodeId::from(1), NodeId::from(2)],
+        std::num::NonZeroU8::new(2).expect("nonzero"),
+    ));
+    let (shards, _invalidated, applied) = recording_registry(&view);
+    let (mesh, _unused_inbound) = Mesh::spawn(
+        "127.0.0.1:0".parse().expect("valid loopback addr"),
+        NodeId::from(1),
+        1,
+        &ClusterConfig::default(),
+        Arc::new(BucketPullHandler::default()),
+    )
+    .await
+    .expect("bind loopback");
+    let (tx, rx) = mpsc::channel(64);
+    for message in messages {
+        tx.send(message).await.expect("inbound open");
+    }
+    drop(tx);
+    // The channel closes once the burst is drained, which ends the loop.
+    inbound_loop(
+        shards,
+        Arc::new(InboundActivity::default()),
+        mesh,
+        NodeId::from(1),
+        rx,
+        CancellationToken::new(),
+    )
+    .await;
+    applied.lock().expect("lock").clone()
+}
+
+/// A message of `count` records for the `users` cache: a `ForwardBatch`
+/// under the receiver's own view hash (so nothing re-forwards) at `hops`, or
+/// a `ReplicateBatch`.
+fn burst_message(forwarded_at_hops: Option<u8>, count: usize) -> InboundMsg {
+    let recs: Vec<WireRecord> = (0..count)
+        .map(|n| wire_record_for_u32(u32::try_from(n).expect("small")))
+        .collect();
+    let cache = SmolStr::new("users");
+    let msg = match forwarded_at_hops {
+        Some(hops) => Msg::ForwardBatch {
+            cache,
+            view_hash: OwnershipView::compute(
+                NodeId::from(1),
+                vec![NodeId::from(1), NodeId::from(2)],
+                std::num::NonZeroU8::new(2).expect("nonzero"),
+            )
+            .view_hash(),
+            hops,
+            recs,
+        },
+        None => Msg::ReplicateBatch { cache, recs },
+    };
+    InboundMsg {
+        from: NodeId::from(2),
+        msg,
+    }
+}
+
+/// Consecutive `ForwardBatch`es share one `apply_forwarded_batch` call, a
+/// `Replicate` between two of them splits the run, and the replicate takes
+/// `apply_remote_batch`: a shard holds a forward it refuses for clock skew
+/// and drops a replicate it refuses.
+#[tokio::test]
+async fn forward_batches_apply_as_forwards_and_never_share_a_call_with_replicates() {
+    let applied = applied_from_one_burst(vec![
+        burst_message(Some(0), 1),
+        burst_message(Some(0), 2),
+        burst_message(None, 1),
+        burst_message(None, 3),
+        burst_message(Some(0), 1),
+    ])
+    .await;
+    assert_eq!(
+        applied,
+        [
+            Applied::Forwarded(3),
+            Applied::Replicated(4),
+            Applied::Forwarded(1)
+        ]
+    );
+}
+
+/// A forward already re-forwarded once (`hops` at the cap) is the last copy
+/// the final owner receives, and applies as a forward too.
+#[tokio::test]
+async fn a_re_forwarded_batch_at_the_hop_cap_applies_as_a_forward() {
+    let applied = applied_from_one_burst(vec![burst_message(
+        Some(crate::cluster::inbound::MAX_FORWARD_HOPS),
+        2,
+    )])
+    .await;
+    assert_eq!(applied, [Applied::Forwarded(2)]);
+}
+
+#[test]
+fn same_run_joins_only_the_same_cache_and_the_same_kind() {
+    use crate::cluster::inbound::same_run;
+
+    let users = SmolStr::new("users");
+    let orders = SmolStr::new("orders");
+    assert!(same_run(Some((&users, true)), &users, true));
+    assert!(same_run(Some((&users, false)), &users, false));
+    assert!(
+        !same_run(Some((&users, true)), &users, false),
+        "a replicate does not join a forward run"
+    );
+    assert!(
+        !same_run(Some((&users, false)), &users, true),
+        "a forward does not join a replicate run"
+    );
+    assert!(!same_run(Some((&users, true)), &orders, true));
+    assert!(
+        !same_run(None, &users, true),
+        "nothing pending, nothing to join"
+    );
 }
