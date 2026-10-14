@@ -19,10 +19,14 @@ use crate::wire::{Cell, Msg, WireRecord};
 pub enum MsgClass {
     /// Overflow drops the oldest queued invalidation, or merged record of an
     /// `Invalidation` cache: a storm on a dead peer must never stall writers,
-    /// and a newer write supersedes an older one.
+    /// and a newer write supersedes an older one. The drop marks the peer
+    /// dirty and counts in `sundog_backlog_dropped_total`.
     Invalidate,
     /// Overflow drops the new message and marks the peer dirty so the next
-    /// anti-entropy round targets it first.
+    /// anti-entropy round targets it first. A frame whose send fails stays
+    /// with the peer's writer and goes out on its next connection; a
+    /// connection that carried frames and broke marks the peer dirty once
+    /// the writer has redialed.
     Replicate,
 }
 

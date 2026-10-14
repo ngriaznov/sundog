@@ -77,7 +77,12 @@ at any cluster size.
 A write for a part this node does not own goes to that part's owners. The
 forwarded batch carries the writer's ownership view, and an owner whose view
 differs passes it on once more, so a write routed under a view that has since
-changed still reaches every current owner.
+changed still reaches every current owner. A forwarded write is held by no
+replica until an owner applies it, so anti-entropy cannot repair it. The
+sender's writer holds a batch whose send failed and sends it again on its next
+connection, along with everything it wrote in the last second, and it notices
+a peer that closed the connection before it writes. A partition that never
+delivers a close can still lose the batches in flight.
 `get` reads this node's copy and returns `None` off a non-owner, and a
 read-through fill does not change that: `get_or_load` and `load` on a
 non-owner answer with the loaded value and keep no copy. `fetch` is

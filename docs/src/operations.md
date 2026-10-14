@@ -51,7 +51,7 @@ addresses once it forms, under `cluster formed`.
 | `sundog_frames_sent_total` | data-plane frames sent |
 | `sundog_bytes_sent_total` | data-plane bytes sent |
 | `sundog_fan_out_wait_seconds_total{peer}` | whole seconds writers spent waiting for a live peer's full outbox |
-| `sundog_backlog_dropped_total{peer}` | frames dropped because the peer left the mesh |
+| `sundog_backlog_dropped_total{peer}` | frames dropped before reaching the peer's connection: an outbox that stayed full, the oldest invalidation displaced by a newer one, a message that failed to encode, or the peer leaving the mesh. Each drop marks the peer for the next anti-entropy round. A broken connection drops nothing: the writer sends its frames again |
 
 ### Distributed caches
 
@@ -149,7 +149,10 @@ A steady rise in `sundog_ae_repaired_total` means replication messages are
 not arriving and anti-entropy is doing replication's job. Look for
 `sundog_backlog_dropped_total` on the sending side and for peers flapping
 in `sundog_live_peers`. Flapping under jitter calls for a higher
-`phi_threshold`.
+`phi_threshold`. A peer whose connection broke after carrying frames is
+steered to first by the next anti-entropy round, once the writer has
+redialed it, and a connection that closes within half a second of opening
+does not steer rounds.
 
 ### A `Distributed` cache reports fetch errors
 

@@ -3,13 +3,18 @@
 #[cfg(doc)]
 use crate::wire::MAX_FRAME;
 
+use std::collections::VecDeque;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures::{Sink, Stream, StreamExt as _};
 use smol_str::SmolStr;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::framing::{
@@ -19,6 +24,7 @@ use crate::error::CodecError;
 use crate::net::outbox::DropOldestQueue;
 use crate::net::tcp::TcpStream;
 use crate::net::{Greeting, OutFrame, TlsCtx};
+use crate::node::NodeId;
 use crate::wire::{self, Msg};
 
 /// Byte budget for one coalesced [`Msg::ReplicateBatch`] frame, well under
@@ -42,10 +48,15 @@ struct PendingRun {
 }
 
 /// Flushes `pending`, if any, into `out`. The close-off step
-/// [`coalesce_replicate`] calls both mid-run and at the end of `drained`. A
-/// batch that fails to encode is dropped with a warning rather than
-/// panicking; anti-entropy repairs the gap like any other lost write.
-fn flush_pending_replicate(pending: &mut Option<PendingRun>, out: &mut Vec<Bytes>) {
+/// [`coalesce_replicate_counted`] calls both mid-run and at the end of
+/// `drained`. A batch that fails to encode is dropped with a warning rather
+/// than panicking, and its records are added to `unencoded` so the writer
+/// marks the peer for anti-entropy.
+fn flush_pending_replicate(
+    pending: &mut Option<PendingRun>,
+    out: &mut Vec<Bytes>,
+    unencoded: &mut usize,
+) {
     let Some(run) = pending.take() else {
         return;
     };
@@ -59,7 +70,8 @@ fn flush_pending_replicate(pending: &mut Option<PendingRun>, out: &mut Vec<Bytes
         );
         return;
     }
-    let mut recs = Vec::with_capacity(run.records);
+    let records = run.records;
+    let mut recs = Vec::with_capacity(records);
     for item in run.items {
         match item.msg {
             Msg::Replicate { rec, .. } => recs.push(rec),
@@ -76,6 +88,7 @@ fn flush_pending_replicate(pending: &mut Option<PendingRun>, out: &mut Vec<Bytes
         Ok(frame) => out.push(frame),
         Err(error) => {
             tracing::warn!(%error, "failed to encode coalesced ReplicateBatch; dropped");
+            *unencoded += records;
         }
     }
 }
@@ -85,8 +98,10 @@ fn flush_pending_replicate(pending: &mut Option<PendingRun>, out: &mut Vec<Bytes
 /// [`REPLICATE_BATCH_BUDGET`] and [`REPLICATE_BATCH_COUNT`], counting
 /// records rather than queue items. A run of exactly one item reuses its
 /// already-encoded [`OutFrame::frame`] as-is; only a real merge re-encodes.
-pub(super) fn coalesce_replicate(drained: Vec<OutFrame>) -> Vec<Bytes> {
+/// Also answers how many records a failed re-encode dropped.
+fn coalesce_replicate_counted(drained: Vec<OutFrame>) -> (Vec<Bytes>, usize) {
     let mut out = Vec::with_capacity(drained.len());
+    let mut unencoded = 0usize;
     let mut pending: Option<PendingRun> = None;
 
     for item in drained {
@@ -94,7 +109,7 @@ pub(super) fn coalesce_replicate(drained: Vec<OutFrame>) -> Vec<Bytes> {
             Msg::Replicate { cache, .. } => (cache, 1),
             Msg::ReplicateBatch { cache, recs } => (cache, recs.len()),
             _ => {
-                flush_pending_replicate(&mut pending, &mut out);
+                flush_pending_replicate(&mut pending, &mut out, &mut unencoded);
                 out.push(item.frame);
                 continue;
             }
@@ -113,7 +128,7 @@ pub(super) fn coalesce_replicate(drained: Vec<OutFrame>) -> Vec<Bytes> {
             run.size += rec_size;
             run.records += item_records;
         } else {
-            flush_pending_replicate(&mut pending, &mut out);
+            flush_pending_replicate(&mut pending, &mut out, &mut unencoded);
             let cache = cache.clone();
             pending = Some(PendingRun {
                 cache,
@@ -123,8 +138,14 @@ pub(super) fn coalesce_replicate(drained: Vec<OutFrame>) -> Vec<Bytes> {
             });
         }
     }
-    flush_pending_replicate(&mut pending, &mut out);
-    out
+    flush_pending_replicate(&mut pending, &mut out, &mut unencoded);
+    (out, unencoded)
+}
+
+/// [`coalesce_replicate_counted`] without the count of dropped records.
+#[cfg(test)]
+pub(super) fn coalesce_replicate(drained: Vec<OutFrame>) -> Vec<Bytes> {
+    coalesce_replicate_counted(drained).0
 }
 
 /// Dials `addr` on a fresh connection, layers TLS on per `tls`, and
@@ -160,58 +181,370 @@ pub(in crate::net) async fn dial_with_hello_and(
     Ok(framed)
 }
 
-/// The long-lived per-peer writer: connects with a fixed backoff, sends
-/// `Hello`, then drains both broadcast-class outboxes until told to stop
-/// or the connection breaks, in which case it reconnects. Never reads from
-/// the connection; two connections per pair of peers is normal.
-pub(in crate::net) async fn run_peer_writer(
-    greeting: Greeting,
-    addr: SocketAddr,
-    invalidate: Arc<DropOldestQueue<OutFrame>>,
-    mut replicate_rx: mpsc::Receiver<OutFrame>,
-    cancel: CancellationToken,
-    tls: TlsCtx,
-) {
-    'reconnect: loop {
-        let mut framed = tokio::select! {
-            biased;
-            () = cancel.cancelled() => return,
-            connected = connect_with_hello(addr, greeting, &tls, &cancel) => match connected {
-                Some(framed) => framed,
-                None => return, // cancelled while retrying
-            },
-        };
+/// The wait between two dials of a peer, and between two attempts of one
+/// dial.
+pub(super) const RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
 
-        loop {
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => return,
-                item = invalidate.pop() => {
-                    let mut drained = vec![item];
-                    while let Some(item) = invalidate.try_pop() {
-                        drained.push(item);
-                    }
-                    let encoded = drained.into_iter().map(|item| item.frame);
-                    if send_frames(&mut framed, encoded).await.is_err() {
-                        continue 'reconnect;
-                    }
+/// The least time between two dirty marks one writer sets, so a peer that
+/// flaps cannot make every anti-entropy round target it.
+const DIRTY_MARK_SPACING: Duration = Duration::from_secs(5);
+
+/// How long a written burst stays in [`RecentTail`], long enough to cover a
+/// write in flight when the peer's FIN or RST arrives.
+const RECENT_WINDOW: Duration = Duration::from_secs(1);
+
+/// The bytes [`RecentTail`] keeps per peer at most.
+const RECENT_BYTES: usize = 1024 * 1024;
+
+/// How long a write already under way may finish after the writer is
+/// cancelled: [`crate::net::Mesh::shutdown`] cancels a moment after the last
+/// frame leaves its outbox, and that frame is still being written.
+const CANCEL_SEND_GRACE: Duration = Duration::from_millis(250);
+
+/// The wait before dialing again after a connection that lived `lived`: the
+/// rest of [`RECONNECT_BACKOFF`], so a peer that accepts and closes at once
+/// is dialed at most once per backoff.
+pub(super) fn reconnect_delay(lived: Duration) -> Duration {
+    RECONNECT_BACKOFF.saturating_sub(lived)
+}
+
+/// Whether a connection that ended in error or EOF leaves the peer owed an
+/// anti-entropy round: frames wait in `held_nonempty`, or the connection
+/// carried a frame (`sent_any`) and outlived [`RECONNECT_BACKOFF`]. A
+/// connection shorter than that is a peer that accepts and closes (a
+/// rejected `Hello`, a node that crashes in a loop), and a mark for it would
+/// steer every round to that one peer.
+pub(super) fn owes_repair(sent_any: bool, held_nonempty: bool, lived: Duration) -> bool {
+    held_nonempty || (sent_any && lived >= RECONNECT_BACKOFF)
+}
+
+/// Whether a writer whose last dirty mark was at `last_mark` sets another
+/// at `now`: at least [`DIRTY_MARK_SPACING`] apart.
+pub(super) fn dirty_mark_due(last_mark: Option<Instant>, now: Instant) -> bool {
+    last_mark.is_none_or(|at| now.saturating_duration_since(at) >= DIRTY_MARK_SPACING)
+}
+
+/// The frames written within [`RECENT_WINDOW`], at most [`RECENT_BYTES`] of
+/// them. A write racing the peer's FIN or RST succeeds locally and is lost,
+/// so the writer sends this tail again on the next connection.
+#[derive(Default)]
+pub(super) struct RecentTail {
+    frames: VecDeque<(Instant, Bytes)>,
+    bytes: usize,
+}
+
+impl RecentTail {
+    /// Remembers `frames`, written at `now`.
+    pub(super) fn record(&mut self, now: Instant, frames: &[Bytes]) {
+        for frame in frames {
+            self.bytes += frame.len();
+            self.frames.push_back((now, frame.clone()));
+        }
+        self.trim(now);
+    }
+
+    /// Forgets the frames older than [`RECENT_WINDOW`], then the oldest
+    /// until [`RECENT_BYTES`] hold.
+    fn trim(&mut self, now: Instant) {
+        while let Some((at, len)) = self.frames.front().map(|(at, frame)| (*at, frame.len())) {
+            if now.saturating_duration_since(at) <= RECENT_WINDOW && self.bytes <= RECENT_BYTES {
+                break;
+            }
+            self.bytes -= len;
+            self.frames.pop_front();
+        }
+    }
+
+    /// Removes and returns the frames still within the window at `now`, the
+    /// oldest first.
+    pub(super) fn take(&mut self, now: Instant) -> Vec<Bytes> {
+        self.trim(now);
+        self.bytes = 0;
+        self.frames.drain(..).map(|(_, frame)| frame).collect()
+    }
+
+    /// How many frames are kept.
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.frames.len()
+    }
+}
+
+/// How one connection of a writer ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LinkEnd {
+    /// The writer was cancelled.
+    Cancelled,
+    /// The replicate sender dropped: the peer was removed.
+    PeerGone,
+    /// The link failed, hit EOF or carried a frame it must not: dial again.
+    Closed,
+}
+
+/// How a write ended.
+enum SendEnd {
+    Sent,
+    Failed,
+    Cancelled,
+}
+
+/// What a writer keeps across its connections: the burst whose send failed,
+/// the tail of what it wrote, and whether this connection carried a frame.
+pub(super) struct WriterState {
+    peer: NodeId,
+    dirty: Arc<AtomicBool>,
+    /// Frames to send before anything else on the next write: a burst whose
+    /// send failed, or the recent tail a closed link may not have delivered.
+    pub(super) held: Vec<Bytes>,
+    pub(super) recent: RecentTail,
+    /// Whether the current connection carried a frame.
+    pub(super) sent_any: bool,
+}
+
+impl WriterState {
+    pub(super) fn new(peer: NodeId, dirty: Arc<AtomicBool>) -> Self {
+        Self {
+            peer,
+            dirty,
+            held: Vec::new(),
+            recent: RecentTail::default(),
+            sent_any: false,
+        }
+    }
+
+    /// Marks the peer dirty and counts `frames` this writer dropped before
+    /// they reached a link.
+    fn note_dropped(&self, frames: usize) {
+        if frames == 0 {
+            return;
+        }
+        self.dirty.store(true, Ordering::Relaxed);
+        metrics::counter!("sundog_backlog_dropped_total", "peer" => self.peer.to_string())
+            .increment(u64::try_from(frames).unwrap_or(u64::MAX));
+    }
+
+    /// Puts the recent tail ahead of the held frames, for a connection that
+    /// closed: the tail is older, and the peer may not have received it.
+    pub(super) fn requeue_recent(&mut self, now: Instant) {
+        let mut tail = self.recent.take(now);
+        tail.append(&mut self.held);
+        self.held = tail;
+    }
+
+    /// Sends `held`, clearing it and remembering it as recent on success.
+    async fn flush_held<L>(
+        &mut self,
+        link: &mut L,
+        cancel: &CancellationToken,
+    ) -> Result<(), LinkEnd>
+    where
+        L: Sink<Bytes, Error = io::Error> + Unpin,
+    {
+        match send_unless_cancelled(link, self.held.iter().cloned(), cancel).await {
+            SendEnd::Sent => {
+                self.recent.record(Instant::now(), &self.held);
+                self.held.clear();
+                self.sent_any = true;
+                Ok(())
+            }
+            SendEnd::Failed => Err(LinkEnd::Closed),
+            SendEnd::Cancelled => Err(LinkEnd::Cancelled),
+        }
+    }
+
+    /// Takes `burst` into `held` and sends it; a failed send leaves it there.
+    async fn send_burst<L>(
+        &mut self,
+        link: &mut L,
+        burst: Vec<Bytes>,
+        cancel: &CancellationToken,
+    ) -> Result<(), LinkEnd>
+    where
+        L: Sink<Bytes, Error = io::Error> + Unpin,
+    {
+        debug_assert!(
+            self.held.is_empty(),
+            "held frames are flushed before a burst"
+        );
+        self.held = burst;
+        self.flush_held(link, cancel).await
+    }
+}
+
+/// Writes `frames` to `link`, racing the write against `cancel`. A write
+/// under way when `cancel` fires gets [`CANCEL_SEND_GRACE`] to finish.
+async fn send_unless_cancelled<L>(
+    link: &mut L,
+    frames: impl IntoIterator<Item = Bytes>,
+    cancel: &CancellationToken,
+) -> SendEnd
+where
+    L: Sink<Bytes, Error = io::Error> + Unpin,
+{
+    let writing = send_frames(link, frames);
+    tokio::pin!(writing);
+    tokio::select! {
+        biased;
+        result = &mut writing => if result.is_ok() { SendEnd::Sent } else { SendEnd::Failed },
+        () = cancel.cancelled() => {
+            let _ = tokio::time::timeout(CANCEL_SEND_GRACE, writing).await;
+            SendEnd::Cancelled
+        }
+    }
+}
+
+/// Drives one connection: sends the held frames first, then drains the two
+/// outboxes in bursts until the link ends.
+///
+/// The link is read only to notice the peer closing: an acceptor never
+/// writes on a broadcast link, so EOF, an error or any frame ends the
+/// connection, and it is seen before a burst is drained into it. A burst
+/// whose send fails stays in `state.held` for the next connection; the
+/// receiver applies a resent frame idempotently.
+pub(super) async fn drive_connection<L>(
+    link: &mut L,
+    state: &mut WriterState,
+    invalidate: &DropOldestQueue<OutFrame>,
+    replicate_rx: &mut mpsc::Receiver<OutFrame>,
+    cancel: &CancellationToken,
+) -> LinkEnd
+where
+    L: Stream<Item = io::Result<BytesMut>> + Sink<Bytes, Error = io::Error> + Unpin,
+{
+    if !state.held.is_empty()
+        && let Err(end) = state.flush_held(link, cancel).await
+    {
+        return end;
+    }
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return LinkEnd::Cancelled,
+            inbound = link.next() => {
+                match inbound {
+                    Some(Ok(_)) => tracing::warn!(
+                        peer = %state.peer,
+                        "peer sent a frame on a broadcast link; closing it"
+                    ),
+                    Some(Err(error)) => tracing::debug!(
+                        peer = %state.peer, %error, "broadcast link failed"
+                    ),
+                    None => tracing::debug!(peer = %state.peer, "peer closed the broadcast link"),
                 }
-                received = replicate_rx.recv() => {
-                    let Some(first) = received else { return }; // sender dropped: peer removed
-                    let mut drained = vec![first];
-                    while let Ok(item) = replicate_rx.try_recv() {
-                        drained.push(item);
-                    }
-                    if send_frames(&mut framed, coalesce_replicate(drained)).await.is_err() {
-                        continue 'reconnect;
-                    }
+                return LinkEnd::Closed;
+            }
+            item = invalidate.pop() => {
+                let mut burst = vec![item.frame];
+                while let Some(item) = invalidate.try_pop() {
+                    burst.push(item.frame);
+                }
+                if let Err(end) = state.send_burst(link, burst, cancel).await {
+                    return end;
+                }
+            }
+            received = replicate_rx.recv() => {
+                let Some(first) = received else { return LinkEnd::PeerGone };
+                let mut drained = vec![first];
+                while let Ok(item) = replicate_rx.try_recv() {
+                    drained.push(item);
+                }
+                let (burst, unencoded) = coalesce_replicate_counted(drained);
+                state.note_dropped(unencoded);
+                if burst.is_empty() {
+                    continue;
+                }
+                if let Err(end) = state.send_burst(link, burst, cancel).await {
+                    return end;
                 }
             }
         }
     }
 }
 
-/// Retries `connect` + `Hello` on [`RECONNECT_BACKOFF`][] until it succeeds
+/// The peer a writer serves and where it reports.
+pub(in crate::net) struct PeerTarget {
+    pub(in crate::net) peer: NodeId,
+    pub(in crate::net) greeting: Greeting,
+    pub(in crate::net) addr: SocketAddr,
+    /// The peer's dirty flag, shared with its `PeerHandle`.
+    pub(in crate::net) dirty: Arc<AtomicBool>,
+    pub(in crate::net) tls: TlsCtx,
+}
+
+/// The long-lived per-peer writer: connects with a fixed backoff, sends
+/// `Hello`, then drains both broadcast-class outboxes until told to stop
+/// or the connection breaks, in which case it reconnects.
+///
+/// A burst whose send fails stays with the writer and goes out first on the
+/// next connection, and so does the tail of what the last second wrote,
+/// which a peer that closed the link may not have received (see
+/// [`drive_connection`]). The peer is marked dirty once the redial succeeds,
+/// when a connection that carried frames ended or frames were held, so the
+/// next anti-entropy round targets it: that repairs `Replicated` and
+/// owner-to-owner loss. A `Distributed` non-owner's forwarded write has no
+/// other copy, and a partition that never delivers a FIN can still lose it.
+/// Dials are at least [`RECONNECT_BACKOFF`] apart, and the dirty marks at
+/// least `DIRTY_MARK_SPACING`. Two connections per pair of peers is normal.
+pub(in crate::net) async fn run_peer_writer(
+    target: PeerTarget,
+    invalidate: Arc<DropOldestQueue<OutFrame>>,
+    mut replicate_rx: mpsc::Receiver<OutFrame>,
+    cancel: CancellationToken,
+) {
+    let PeerTarget {
+        peer,
+        greeting,
+        addr,
+        dirty,
+        tls,
+    } = target;
+    let mut state = WriterState::new(peer, Arc::clone(&dirty));
+    let mut owes_repair_mark = false;
+    let mut last_mark: Option<Instant> = None;
+    loop {
+        let mut link = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            connected = connect_with_hello(addr, greeting, &tls, &cancel) => match connected {
+                Some(link) => link,
+                None => return, // cancelled while retrying
+            },
+        };
+        let connected_at = Instant::now();
+        if owes_repair_mark && dirty_mark_due(last_mark, connected_at) {
+            dirty.store(true, Ordering::Relaxed);
+            last_mark = Some(connected_at);
+            owes_repair_mark = false;
+        }
+        state.sent_any = false;
+        let end = drive_connection(
+            &mut link,
+            &mut state,
+            &invalidate,
+            &mut replicate_rx,
+            &cancel,
+        )
+        .await;
+        if end != LinkEnd::Closed {
+            return;
+        }
+        let lived = connected_at.elapsed();
+        owes_repair_mark |= owes_repair(state.sent_any, !state.held.is_empty(), lived);
+        state.requeue_recent(Instant::now());
+        tracing::debug!(
+            %peer,
+            held = state.held.len(),
+            "broadcast link closed; redialing after the backoff"
+        );
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            () = tokio::time::sleep(reconnect_delay(lived)) => {}
+        }
+    }
+}
+
+/// Retries `connect` + `Hello` on [`RECONNECT_BACKOFF`] until it succeeds
 /// or `cancel` fires. Returns `None` only when cancelled mid-retry.
 async fn connect_with_hello(
     addr: SocketAddr,
@@ -219,7 +552,6 @@ async fn connect_with_hello(
     tls: &TlsCtx,
     cancel: &CancellationToken,
 ) -> Option<PeerFramed> {
-    const RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
     loop {
         if let Ok(framed) = dial_with_hello(addr, greeting, tls).await {
             return Some(framed);

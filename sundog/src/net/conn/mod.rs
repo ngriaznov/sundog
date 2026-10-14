@@ -17,6 +17,8 @@ mod serve;
 #[cfg(test)]
 mod tests;
 mod writer;
+#[cfg(test)]
+mod writer_tests;
 
 pub(super) use accept::accept_loop;
 pub(super) use framing::{recv_msg, send_msg};
@@ -26,5 +28,5 @@ pub(super) use reply::{
     collect_ae_round_scoped, collect_fetch_reply, collect_load_reply, collect_pulled_records,
     state_stream,
 };
+pub(super) use writer::{PeerTarget, dial_with_hello_and, run_peer_writer};
 pub(crate) use writer::{REPLICATE_BATCH_BUDGET, REPLICATE_BATCH_COUNT};
-pub(super) use writer::{dial_with_hello_and, run_peer_writer};

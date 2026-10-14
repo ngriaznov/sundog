@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{InboundActivity, ShardRegistry, ShardRegistryExt, fan_out};
-use crate::net::{InboundMsg, Mesh, OutFrame, batch_forward};
+use crate::net::{InboundMsg, Mesh, batch_forward};
 use crate::node::NodeId;
 use crate::ownership::OwnershipView;
 use crate::store::ShardOps;
@@ -311,16 +311,11 @@ async fn reforward_stale_view(mesh: &Mesh, batch: ReforwardBatch<'_>) {
         "forward batch routed under another view; re-forwarded to its owners under ours"
     );
     for fan_out::OwnerGroup { owners, records } in groups {
-        let frames: Vec<OutFrame> = batch_forward(cache_name, view.view_hash(), hops + 1, records)
-            .into_iter()
-            .filter_map(|msg| match OutFrame::new(msg) {
-                Ok(frame) => Some(frame),
-                Err(error) => {
-                    tracing::warn!(%error, "failed to encode outbound message; dropped");
-                    None
-                }
-            })
-            .collect();
+        let frames = fan_out::encode_frames_for(
+            mesh,
+            &owners,
+            batch_forward(cache_name, view.view_hash(), hops + 1, records),
+        );
         for peer in owners {
             mesh.send_frames_awaiting(peer, frames.clone()).await;
         }

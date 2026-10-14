@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{Cluster, group_in_order};
 use crate::hlc::Hlc;
-use crate::net::{MsgClass, OutFrame, batch_forward, batch_replicate};
+use crate::net::{Mesh, MsgClass, OutFrame, batch_forward, batch_replicate};
 use crate::node::NodeId;
 use crate::ownership::OwnershipView;
 use crate::store::{
@@ -183,18 +183,33 @@ fn invalidation_sends(
 }
 
 /// Encodes each of `msgs` into an [`OutFrame`], dropping (and logging) any
-/// that fails to encode: the one fan-out encoding policy every send site
-/// in this module shares.
-fn encode_frames(msgs: Vec<Msg>) -> Vec<OutFrame> {
-    msgs.into_iter()
+/// that fails to encode, and answers how many did: the one fan-out encoding
+/// policy every send site in this module shares.
+fn encode_frames(msgs: Vec<Msg>) -> (Vec<OutFrame>, usize) {
+    let mut unencoded = 0;
+    let frames = msgs
+        .into_iter()
         .filter_map(|msg| match OutFrame::new(msg) {
             Ok(frame) => Some(frame),
             Err(error) => {
                 tracing::warn!(%error, "failed to encode outbound message; dropped");
+                unencoded += 1;
                 None
             }
         })
-        .collect()
+        .collect();
+    (frames, unencoded)
+}
+
+/// [`encode_frames`] for a send to `peers`: a message that does not encode
+/// reaches none of them, so each is marked dirty and the drop counted
+/// ([`Mesh::note_unsent`]), and anti-entropy covers the write where it can.
+pub(super) fn encode_frames_for(mesh: &Mesh, peers: &[NodeId], msgs: Vec<Msg>) -> Vec<OutFrame> {
+    let (frames, unencoded) = encode_frames(msgs);
+    for &peer in peers {
+        mesh.note_unsent(peer, unencoded);
+    }
+    frames
 }
 
 /// Groups `records` by the exact target-peer set each replicates to: its
@@ -209,7 +224,7 @@ fn encode_frames(msgs: Vec<Msg>) -> Vec<OutFrame> {
 /// forwarded writes route through: "group by owner set instead of
 /// broadcast" has one implementation, not two.
 async fn fan_out_by_owner_set(
-    mesh: &crate::net::Mesh,
+    mesh: &Mesh,
     cache_name: &SmolStr,
     view: &OwnershipView,
     self_node: NodeId,
@@ -219,7 +234,11 @@ async fn fan_out_by_owner_set(
         if owners.is_empty() {
             continue;
         }
-        let frames = encode_frames(batch_forward(cache_name, view.view_hash(), 0, records));
+        let frames = encode_frames_for(
+            mesh,
+            &owners,
+            batch_forward(cache_name, view.view_hash(), 0, records),
+        );
         for peer in owners {
             mesh.send_frames_awaiting(peer, frames.clone()).await;
         }
@@ -296,7 +315,8 @@ async fn send_departed(cluster: &Cluster, cache_name: &SmolStr, plan: Vec<Depart
         records,
     } in plan
     {
-        let frames = encode_frames(invalidations(cache_name, records));
+        let frames =
+            encode_frames_for(cluster.mesh(), &targets, invalidations(cache_name, records));
         for peer in targets {
             match class {
                 DepartedClass::Drop => {
@@ -417,7 +437,7 @@ async fn fan_out_batch<K, V>(
             for InvalidationSend { peers, msgs } in
                 invalidation_sends(shard.merges(), &peers, cache_name, records)
             {
-                let frames = encode_frames(msgs);
+                let frames = encode_frames_for(cluster.mesh(), &peers, msgs);
                 for peer in peers {
                     cluster
                         .mesh()
@@ -430,8 +450,10 @@ async fn fan_out_batch<K, V>(
         // into drop-newest. The writer-side coalescer still catches trickle
         // writes arriving one drained event at a time.
         Mode::Replicated => {
-            let frames = encode_frames(batch_replicate(cache_name, records));
-            for peer in cluster.live_peer_ids() {
+            let live = cluster.live_peer_ids();
+            let frames =
+                encode_frames_for(cluster.mesh(), &live, batch_replicate(cache_name, records));
+            for peer in live {
                 cluster
                     .mesh()
                     .send_frames(peer, MsgClass::Replicate, frames.iter().cloned());
@@ -668,7 +690,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            encode_frames(msgs.clone()).len(),
+            encode_frames(msgs.clone()).0.len(),
             msgs.len(),
             "every message encodes, so none is dropped"
         );
@@ -791,7 +813,7 @@ mod tests {
     fn departed_frames_encode_one_invalidate_per_departed_record() {
         let departed = departed_for(0..3);
         let msgs = invalidations(&SmolStr::new("c"), departed.clone());
-        let frames = encode_frames(msgs.clone());
+        let frames = encode_frames(msgs.clone()).0;
         assert_eq!(frames.len(), departed.len(), "every departed write encodes");
         for (msg, rec) in msgs.iter().zip(&departed) {
             assert!(matches!(

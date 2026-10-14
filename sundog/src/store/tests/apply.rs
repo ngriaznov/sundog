@@ -276,3 +276,84 @@ async fn with_clock_drives_every_shard_timestamp() {
         "the sweep ran against the injected clock, not real time"
     );
 }
+
+/// What `shard` holds for `key` as wire records, tombstones and expiries
+/// included.
+async fn held_records<V>(shard: &Shard<u32, V>, key: u32) -> Vec<WireRecord>
+where
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    ShardOps::records_for(shard, vec![key_bytes(&key)]).await
+}
+
+/// Applies `rec` twice and answers the records held after each.
+async fn held_after_each_apply<V>(
+    shard: &Shard<u32, V>,
+    key: u32,
+    rec: WireRecord,
+) -> (Vec<WireRecord>, Vec<WireRecord>)
+where
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    ShardOps::apply_remote_batch(shard, vec![rec.clone()]).await;
+    let once = held_records(shard, key).await;
+    ShardOps::apply_remote_batch(shard, vec![rec]).await;
+    (once, held_records(shard, key).await)
+}
+
+#[tokio::test]
+async fn a_resent_put_changes_nothing() {
+    let s = shard::<u32, String>(1);
+    let (once, twice) = held_after_each_apply(&s, 1, put(1, "a", hlc(1_000, 2))).await;
+    assert_eq!(once.len(), 1, "the first delivery stores the record");
+    assert_eq!(
+        twice, once,
+        "the second delivery leaves the value and version alone"
+    );
+    assert_eq!(s.get(&1).await.as_deref(), Some("a"));
+}
+
+#[tokio::test]
+async fn a_resent_put_with_an_expiry_keeps_its_expiry() {
+    let s = shard::<u32, String>(1);
+    let rec = WireRecord {
+        expires_at_ms: Some(s.now_ms() + 60_000),
+        ..put(1, "a", hlc(s.now_ms(), 2))
+    };
+    let (once, twice) = held_after_each_apply(&s, 1, rec.clone()).await;
+    assert_eq!(once[0].expires_at_ms, rec.expires_at_ms);
+    assert_eq!(twice, once);
+}
+
+#[tokio::test]
+async fn a_resent_tombstone_changes_nothing_and_does_not_resurrect_the_key() {
+    let s = shard::<u32, String>(1);
+    ShardOps::apply_remote(&s, put(1, "a", hlc(1_000, 2))).await;
+    let tombstone = WireRecord {
+        value: None,
+        ..put(1, "a", hlc(2_000, 2))
+    };
+    let (once, twice) = held_after_each_apply(&s, 1, tombstone).await;
+    assert_eq!(twice, once);
+    assert_eq!(s.get(&1).await, None);
+    // The put that preceded the tombstone, resent late, stays dead.
+    ShardOps::apply_remote(&s, put(1, "a", hlc(1_000, 2))).await;
+    assert_eq!(s.get(&1).await, None, "a deleted entry never resurrects");
+}
+
+#[tokio::test]
+async fn a_resent_merged_record_changes_nothing() {
+    use crate::store::crdt::{PnCounter, PnCounterResolver};
+    let source = shard::<u32, PnCounter>(1).with_resolver(Arc::new(PnCounterResolver));
+    let writer = crdt::WriterId::new(NodeId::from(1), 1);
+    source
+        .merge(1, PnCounter::local_delta(writer, 5))
+        .await
+        .expect("merge");
+    let rec = held_records(&source, 1).await.remove(0);
+
+    let target = shard::<u32, PnCounter>(2).with_resolver(Arc::new(PnCounterResolver));
+    let (once, twice) = held_after_each_apply(&target, 1, rec).await;
+    assert_eq!(twice, once);
+    assert_eq!(target.get(&1).await.map(|c| c.value()), Some(5));
+}

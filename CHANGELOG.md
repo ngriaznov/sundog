@@ -21,6 +21,21 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **A broken peer connection no longer loses the frames the writer had
+  taken.** The per-peer writer keeps a burst whose send failed and sends it
+  again first on the next connection, along with the last second of what it
+  wrote, which a peer that closed the link may not have received, so a
+  `Distributed` write forwarded to an owner survives a stale link. The writer
+  reads its link to notice a peer that closed it before a write fails, and
+  dials at most once per 500 ms. After a redial that follows a connection that
+  carried frames and lasted at least that long, or that left frames held, it
+  marks the peer for the next anti-entropy round, at most every five seconds.
+  A receiver can see a frame twice; applying one is idempotent. A drop of the
+  oldest queued invalidation or of a message that fails to encode now marks the
+  peer and counts in `sundog_backlog_dropped_total{peer}` too. Anti-entropy
+  repairs `Replicated` and owner-to-owner loss only: a non-owner's forwarded
+  write is held by no replica, and a partition that never delivers a close can
+  still lose the frames in flight.
 - **Closing a clone of a cache after its name was reopened leaves the
   reopened cache alone.** The close used to remove the new cache from the
   shard registry, `Cluster::health`, the gossiped mode and loader and the

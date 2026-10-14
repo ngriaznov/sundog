@@ -433,3 +433,266 @@ async fn update_peers_cancels_the_writer_of_a_dropped_peer() {
         "the dropped peer's handle must leave the table"
     );
 }
+
+/// The value of `sundog_backlog_dropped_total{peer}` a recorder has seen.
+fn backlog_dropped(snapshotter: &metrics_util::debugging::Snapshotter, peer: NodeId) -> u64 {
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(key, ..)| {
+            key.key().name() == "sundog_backlog_dropped_total"
+                && key
+                    .key()
+                    .labels()
+                    .any(|label| label.key() == "peer" && label.value() == peer.to_string())
+        })
+        .map(|(_, _, _, value)| match value {
+            metrics_util::debugging::DebugValue::Counter(n) => n,
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Accepts one connection on `listener` and reads its `Hello`.
+async fn accept_persistent(
+    listener: &TcpListener,
+) -> tokio_util::codec::Framed<TcpStream, LengthDelimitedCodec> {
+    let (stream, _) = listener.accept().await.expect("accept dial-in");
+    let mut framed = LengthDelimitedCodec::builder()
+        .max_frame_length(MAX_FRAME)
+        .new_framed(stream);
+    let hello = framed.next().await.expect("hello").expect("no io error");
+    assert!(matches!(
+        wire::decode(&hello.freeze()).expect("decodes"),
+        Msg::Hello { .. }
+    ));
+    framed
+}
+
+/// Polls `mesh.take_dirty_peers()` for up to `within`, answering what the
+/// first non-empty take held.
+async fn dirty_within(mesh: &Mesh, within: Duration) -> Vec<NodeId> {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let dirty = mesh.take_dirty_peers();
+        if !dirty.is_empty() || tokio::time::Instant::now() >= deadline {
+            return dirty;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_broken_connection_that_carried_frames_marks_the_peer_dirty() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let fake_peer_addr = listener.local_addr().expect("listener has a local addr");
+    let (mesh, _inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+    mesh.update_peers(vec![peer_at(NodeId::from(2), fake_peer_addr)]);
+
+    let mut conn = accept_persistent(&listener).await;
+    mesh.send(
+        NodeId::from(2),
+        MsgClass::Replicate,
+        Msg::Replicate {
+            cache: SmolStr::new("users"),
+            rec: sample_record(1),
+        },
+    );
+    conn.next().await.expect("the frame").expect("no io error");
+    // The link outlives the redial backoff, then breaks.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(
+        mesh.take_dirty_peers().is_empty(),
+        "a connection that is still up owes nothing"
+    );
+    drop(conn);
+
+    assert_eq!(
+        dirty_within(&mesh, Duration::from_secs(3)).await,
+        vec![NodeId::from(2)],
+        "the peer is marked once the writer has redialed"
+    );
+    assert!(mesh.take_dirty_peers().is_empty(), "one break, one mark");
+}
+
+#[tokio::test]
+async fn an_idle_connection_close_leaves_the_peer_clean() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let fake_peer_addr = listener.local_addr().expect("listener has a local addr");
+    let (mesh, _inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+    mesh.update_peers(vec![peer_at(NodeId::from(2), fake_peer_addr)]);
+
+    drop(accept_persistent(&listener).await);
+    let _redialed = accept_persistent(&listener).await;
+
+    assert!(
+        dirty_within(&mesh, Duration::from_millis(500))
+            .await
+            .is_empty(),
+        "a connection that carried nothing loses nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_replicate_sent_into_a_closed_connection_is_redelivered_on_the_redial() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let fake_peer_addr = listener.local_addr().expect("listener has a local addr");
+    let (mesh, _inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+    mesh.update_peers(vec![peer_at(NodeId::from(2), fake_peer_addr)]);
+
+    drop(accept_persistent(&listener).await);
+    let replicate = |n: u8| Msg::Replicate {
+        cache: SmolStr::new("users"),
+        rec: sample_record(n),
+    };
+    mesh.send(NodeId::from(2), MsgClass::Replicate, replicate(1));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    mesh.send(NodeId::from(2), MsgClass::Replicate, replicate(2));
+
+    let mut conn2 = accept_persistent(&listener).await;
+    let delivered = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let frame = conn2.next().await.expect("frame").expect("no io error");
+            if wire::decode(&frame.freeze()).expect("decodes") == replicate(2) {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        delivered.is_ok(),
+        "the frame sent through Mesh::send reaches the peer's next connection"
+    );
+}
+
+#[tokio::test]
+async fn invalidate_overflow_marks_the_peer_dirty_and_counts_the_dropped_frame() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let config = ClusterConfig {
+        outbox_capacity: 2,
+        ..ClusterConfig::default()
+    };
+    let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid loopback addr");
+    let (mesh, _inbound) = Mesh::spawn(addr, NodeId::from(1), 1, &config, empty_handler())
+        .await
+        .expect("bind loopback");
+    // A peer nobody listens on: its outbox never drains.
+    let dead_peer: SocketAddr = "127.0.0.1:1".parse().expect("valid unroutable addr");
+    mesh.update_peers(vec![peer_at(NodeId::from(2), dead_peer)]);
+    let invalidate = |n: u8| Msg::Invalidate {
+        cache: SmolStr::new("users"),
+        key: Bytes::from(vec![n]),
+        ver: sample_record(n).ver,
+    };
+
+    mesh.send_many(
+        NodeId::from(2),
+        MsgClass::Invalidate,
+        [invalidate(1), invalidate(2)],
+    );
+    assert!(
+        mesh.take_dirty_peers().is_empty(),
+        "room in the outbox: nothing dropped"
+    );
+    assert_eq!(backlog_dropped(&snapshotter, NodeId::from(2)), 0);
+
+    mesh.send(NodeId::from(2), MsgClass::Invalidate, invalidate(3));
+
+    assert_eq!(
+        mesh.take_dirty_peers(),
+        vec![NodeId::from(2)],
+        "an invalidation lost to overflow steers the next anti-entropy round"
+    );
+    assert_eq!(backlog_dropped(&snapshotter, NodeId::from(2)), 1);
+}
+
+#[tokio::test]
+async fn a_message_that_cannot_be_encoded_marks_the_peer_dirty_and_is_counted() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let (mesh, _inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+    let dead_peer: SocketAddr = "127.0.0.1:1".parse().expect("valid unroutable addr");
+    mesh.update_peers(vec![peer_at(NodeId::from(2), dead_peer)]);
+    let too_large = Msg::Replicate {
+        cache: SmolStr::new("users"),
+        rec: WireRecord {
+            value: Some(Bytes::from(vec![0u8; MAX_FRAME + 1])),
+            ..sample_record(1)
+        },
+    };
+
+    assert!(
+        !mesh.send_many_enqueued(NodeId::from(2), MsgClass::Replicate, [too_large]),
+        "a message that does not encode is not enqueued"
+    );
+
+    assert_eq!(mesh.take_dirty_peers(), vec![NodeId::from(2)]);
+    assert_eq!(backlog_dropped(&snapshotter, NodeId::from(2)), 1);
+}
+
+#[tokio::test]
+async fn note_unsent_marks_a_known_peer_and_ignores_zero_frames_and_unknown_peers() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let (mesh, _inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+    let dead_peer: SocketAddr = "127.0.0.1:1".parse().expect("valid unroutable addr");
+    mesh.update_peers(vec![peer_at(NodeId::from(2), dead_peer)]);
+
+    mesh.note_unsent(NodeId::from(2), 0);
+    mesh.note_unsent(NodeId::from(9), 4);
+    assert_eq!(mesh.take_dirty_peers(), Vec::<NodeId>::new());
+    assert_eq!(backlog_dropped(&snapshotter, NodeId::from(9)), 0);
+
+    mesh.note_unsent(NodeId::from(2), 3);
+    assert_eq!(mesh.take_dirty_peers(), vec![NodeId::from(2)]);
+    assert_eq!(backlog_dropped(&snapshotter, NodeId::from(2)), 3);
+}
+
+#[tokio::test]
+async fn a_forwarded_write_sent_awaiting_into_a_closed_connection_reaches_the_redial() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let owner_addr = listener.local_addr().expect("listener has a local addr");
+    let (mesh, _inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+    mesh.update_peers(vec![peer_at(NodeId::from(2), owner_addr)]);
+
+    // The owner's link goes stale: closed, with the writer not yet aware.
+    drop(accept_persistent(&listener).await);
+    let forward = |n: u8| {
+        batch_forward(&SmolStr::new("users"), 7, 0, vec![sample_record(n)])
+            .into_iter()
+            .map(|msg| OutFrame::new(msg).expect("encodes"))
+            .collect::<Vec<_>>()
+    };
+    mesh.send_frames_awaiting(NodeId::from(2), forward(1)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    mesh.send_frames_awaiting(NodeId::from(2), forward(2)).await;
+
+    let mut conn2 = accept_persistent(&listener).await;
+    let wanted = forward(2).remove(0).msg;
+    let delivered = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let frame = conn2.next().await.expect("frame").expect("no io error");
+            if wire::decode(&frame.freeze()).expect("decodes") == wanted {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        delivered.is_ok(),
+        "the only copy of a non-owner's write survives a stale owner link"
+    );
+}

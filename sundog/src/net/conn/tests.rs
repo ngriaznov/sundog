@@ -386,11 +386,11 @@ use crate::net::{AeMismatch, AePartReply, BucketStreamItem, InboundMsg};
 use crate::node::NodeId;
 use crate::wire::{self, MAX_FRAME, Msg, WireRecord};
 
-fn out_frame(msg: Msg) -> OutFrame {
+pub(super) fn out_frame(msg: Msg) -> OutFrame {
     OutFrame::new(msg).expect("test message encodes")
 }
 
-fn record(n: u8) -> WireRecord {
+pub(super) fn record(n: u8) -> WireRecord {
     WireRecord {
         key: Bytes::from(vec![n]),
         value: Some(Bytes::from(vec![n, n])),
@@ -694,11 +694,11 @@ async fn serve_state_transfer_stops_promptly_once_cancelled() {
 /// `TlsCtx` for a plain (non-TLS) accepted/dialed connection in a test,
 /// matching whichever concrete shape the active feature set gives it.
 #[cfg(all(feature = "tls", not(feature = "sim")))]
-fn no_tls() -> crate::net::TlsCtx {
+pub(super) fn no_tls() -> crate::net::TlsCtx {
     None
 }
 #[cfg(all(not(feature = "tls"), not(feature = "sim")))]
-fn no_tls() -> crate::net::TlsCtx {
+pub(super) fn no_tls() -> crate::net::TlsCtx {
     crate::net::TlsCtx
 }
 
@@ -1212,12 +1212,16 @@ async fn run_peer_writer_exits_promptly_when_cancelled_while_retrying() {
         cluster: wire::UNNAMED_CLUSTER,
     };
     let handle = tokio::spawn(super::writer::run_peer_writer(
-        greeting,
-        unreachable,
+        super::PeerTarget {
+            peer: NodeId::from(2),
+            greeting,
+            addr: unreachable,
+            dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tls: no_tls(),
+        },
         invalidate,
         replicate_rx,
         cancel.clone(),
-        no_tls(),
     ));
 
     // Let it fail to connect and settle into the retry backoff.

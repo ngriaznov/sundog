@@ -162,29 +162,34 @@ impl Mesh {
             true
         });
         for peer in incoming_peers {
-            table
-                .entry(peer.node)
-                .or_insert_with(|| self.spawn_peer_handle(peer.data_addr, peer.protocol));
+            table.entry(peer.node).or_insert_with(|| {
+                self.spawn_peer_handle(peer.node, peer.data_addr, peer.protocol)
+            });
         }
     }
 
-    fn spawn_peer_handle(&self, data_addr: SocketAddr, protocol: u16) -> PeerHandle {
+    fn spawn_peer_handle(&self, peer: NodeId, data_addr: SocketAddr, protocol: u16) -> PeerHandle {
         let invalidate = Arc::new(DropOldestQueue::new(self.inner.outbox_capacity));
         let (replicate_tx, replicate_rx) = mpsc::channel(self.inner.outbox_capacity);
         let cancel = CancellationToken::new();
+        let dirty = Arc::new(AtomicBool::new(false));
         tokio::spawn(conn::run_peer_writer(
-            self.inner.greeting(),
-            data_addr,
+            conn::PeerTarget {
+                peer,
+                greeting: self.inner.greeting(),
+                addr: data_addr,
+                dirty: Arc::clone(&dirty),
+                tls: self.inner.tls.clone(),
+            },
             Arc::clone(&invalidate),
             replicate_rx,
             cancel.clone(),
-            self.inner.tls.clone(),
         ));
         PeerHandle {
             data_addr,
             invalidate,
             replicate_tx,
-            dirty: Arc::new(AtomicBool::new(false)),
+            dirty,
             last_replicate_enqueued: Arc::new(AtomicU64::new(0)),
             ae_deferrals: AtomicU32::new(0),
             cancel,
@@ -231,17 +236,42 @@ impl Mesh {
         class: MsgClass,
         msgs: impl IntoIterator<Item = Msg>,
     ) -> bool {
-        let mut encoded = true;
+        let mut unencoded = 0usize;
         let frames = msgs.into_iter().filter_map(|msg| match OutFrame::new(msg) {
             Ok(frame) => Some(frame),
             Err(error) => {
                 tracing::warn!(%error, "failed to encode outbound message; dropped");
-                encoded = false;
+                unencoded += 1;
                 None
             }
         });
         let enqueued = self.send_frames(peer, class, frames);
-        encoded && enqueued
+        self.note_unsent(peer, unencoded);
+        unencoded == 0 && enqueued
+    }
+
+    /// Marks `peer` dirty and counts `frames` in
+    /// `sundog_backlog_dropped_total{peer}`: for messages a caller could not
+    /// encode, which never reach an outbox. A `peer` the mesh doesn't know
+    /// about, and zero `frames`, are no-ops.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the peer-table lock is poisoned.
+    pub(crate) fn note_unsent(&self, peer: NodeId, frames: usize) {
+        if frames == 0 {
+            return;
+        }
+        let table = self
+            .inner
+            .peers
+            .read()
+            .expect("invariant: peers lock is never poisoned");
+        if let Some(handle) = table.get(&peer) {
+            handle.dirty.store(true, Ordering::Relaxed);
+            metrics::counter!("sundog_backlog_dropped_total", "peer" => peer.to_string())
+                .increment(u64::try_from(frames).unwrap_or(u64::MAX));
+        }
     }
 
     /// [`Mesh::send_many`], but for already-encoded [`OutFrame`]s, so
@@ -270,7 +300,17 @@ impl Mesh {
         let mut enqueued_all = true;
         for frame in frames {
             match class {
-                MsgClass::Invalidate => handle.invalidate.push(frame),
+                MsgClass::Invalidate => {
+                    // The new frame is queued; the oldest one it displaced is lost.
+                    if handle.invalidate.push(frame) {
+                        handle.dirty.store(true, Ordering::Relaxed);
+                        metrics::counter!(
+                            "sundog_backlog_dropped_total",
+                            "peer" => peer.to_string()
+                        )
+                        .increment(1);
+                    }
+                }
                 MsgClass::Replicate => {
                     enqueued_replicate = true;
                     if let Err(mpsc::error::TrySendError::Full(_)) =
@@ -430,8 +470,14 @@ impl Mesh {
         }
     }
 
-    /// Returns every peer whose `Replicate` outbox has dropped a message
-    /// since the last call, clearing their dirty mark.
+    /// Returns every peer marked dirty since the last call, clearing their
+    /// mark: a peer whose outbox dropped a message, or whose frames a writer
+    /// could not encode, and, once its redial succeeds, a peer whose
+    /// connection broke after carrying frames or while frames waited to be
+    /// resent. The next anti-entropy round targets a dirty peer first.
+    /// That repairs a `Replicated` write and an owner-to-owner write; a
+    /// `Distributed` non-owner's forwarded write is held by no replica, so
+    /// only the writer's resend protects it.
     ///
     /// # Panics
     ///

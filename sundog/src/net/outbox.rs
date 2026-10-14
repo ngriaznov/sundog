@@ -31,18 +31,21 @@ impl<T> DropOldestQueue<T> {
         }
     }
 
-    /// Enqueues `item`, dropping the oldest entry first if already at capacity.
-    pub(super) fn push(&self, item: T) {
+    /// Enqueues `item`, dropping the oldest entry first if already at
+    /// capacity. Answers whether it dropped one.
+    pub(super) fn push(&self, item: T) -> bool {
         let mut queue = self
             .inner
             .lock()
             .expect("invariant: outbox mutex is never held across a panic");
-        if queue.len() >= self.capacity {
+        let evicted = queue.len() >= self.capacity;
+        if evicted {
             queue.pop_front();
         }
         queue.push_back(item);
         drop(queue);
         self.notify.notify_one();
+        evicted
     }
 
     /// Removes and returns the oldest queued entry, if any, without
@@ -79,9 +82,9 @@ mod tests {
     #[tokio::test]
     async fn overflow_drops_the_oldest_entry() {
         let queue = DropOldestQueue::new(2);
-        queue.push(1u64);
-        queue.push(2u64);
-        queue.push(3u64); // drops 1, not 3
+        assert!(!queue.push(1u64), "room left: nothing dropped");
+        assert!(!queue.push(2u64), "room left: nothing dropped");
+        assert!(queue.push(3u64), "the push at capacity drops the oldest"); // drops 1, not 3
 
         assert_eq!(queue.pop().await, 2);
         assert_eq!(queue.pop().await, 3);

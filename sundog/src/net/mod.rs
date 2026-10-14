@@ -4,7 +4,9 @@
 //!
 //! Each live peer gets one persistent writer connection, `Hello` then a
 //! stream of `Invalidate` and `Replicate` frames drained from bounded
-//! per-class outboxes, plus a small pool of reused connections for
+//! per-class outboxes. The writer sends a burst whose send failed again on
+//! its next connection and reads the link only to notice the peer closing.
+//! A small pool of reused connections serves
 //! request/response exchanges. The pool stays off the broadcast path, so a
 //! slow snapshot never delays live traffic. Both kinds share one listener:
 //! the message after `Hello` decides whether the connection serves requests
@@ -147,6 +149,9 @@ struct PeerHandle {
     data_addr: SocketAddr,
     invalidate: Arc<DropOldestQueue<OutFrame>>,
     replicate_tx: mpsc::Sender<OutFrame>,
+    /// Set when the peer's next anti-entropy round should come first: an
+    /// outbox dropped a message for it, or its writer redialed after a
+    /// connection that carried frames broke ([`Mesh::take_dirty_peers`]).
     dirty: Arc<AtomicBool>,
     /// [`mono_ms`] + 1 of the last `Replicate` frame enqueued, `0` if none.
     /// Read by [`Mesh::replicate_in_flight`].

@@ -4,7 +4,7 @@
 use crate::net::OutFrame;
 
 use bytes::Bytes;
-use futures::{SinkExt as _, StreamExt as _};
+use futures::{Sink, SinkExt as _, StreamExt as _};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tokio_util::sync::CancellationToken;
 
@@ -106,17 +106,21 @@ pub(super) async fn send_batch(framed: &mut PeerFramed, msgs: &[Msg]) -> Result<
 
 /// [`send_batch`], but for already-encoded frames: the per-peer writer's
 /// broadcast-class drain feeds these straight onto the wire. The frame is
-/// built once, upstream, and shared as a `Bytes` clone per peer.
-pub(super) async fn send_frames(
-    framed: &mut PeerFramed,
+/// built once, upstream, and shared as a `Bytes` clone per peer. Generic over
+/// the link so the writer's tests can script a link that fails a flush.
+pub(super) async fn send_frames<L>(
+    link: &mut L,
     encoded: impl IntoIterator<Item = Bytes>,
-) -> Result<(), CodecError> {
+) -> Result<(), CodecError>
+where
+    L: Sink<Bytes, Error = std::io::Error> + Unpin,
+{
     for frame in encoded {
         let len = frame.len();
-        framed.feed(frame).await.map_err(CodecError::Io)?;
+        link.feed(frame).await.map_err(CodecError::Io)?;
         crate::net::record_frame_sent(len);
     }
-    framed.flush().await.map_err(CodecError::Io)?;
+    link.flush().await.map_err(CodecError::Io)?;
     Ok(())
 }
 
