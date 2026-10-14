@@ -198,6 +198,57 @@ async fn an_eviction_burst_invalidates_every_peer_copy() {
     a.shutdown().await;
 }
 
+/// `b` holds a counter of 1,000 for every key; `a`, capped at ten entries,
+/// merges into a hundred of them, so most of `a`'s counters are evicted
+/// before the fan-out drains. A merging resolver sends nothing for an
+/// evicted write: `b`'s merged copy is the best one left, and it keeps
+/// every counter. (A `Replicated` cache cannot evict; its departed writes
+/// are swept ones, covered with a real shard in `cluster::fan_out`.)
+#[tokio::test]
+async fn an_eviction_burst_spares_every_peer_counter_in_invalidation() {
+    let mode = Mode::Invalidation;
+    let (a, b) = two_nodes("cache-it-fan-out-merging-evicted").await;
+    let open_counters = |cluster: &Cluster, capacity: u64| {
+        cluster
+            .cache::<u32, PnCounter>("counters")
+            .mode(mode)
+            .max_capacity(capacity)
+            .resolver(Arc::new(PnCounterResolver))
+            .open()
+    };
+    let cache_a = open_counters(&a, 10).await.expect("a opens");
+    let cache_b = open_counters(&b, u64::MAX).await.expect("b opens");
+    for key in 0..100u32 {
+        cache_b
+            .merge(key, PnCounter::local_delta(cache_b.writer_id(), 1_000))
+            .await
+            .expect("merge");
+    }
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    for key in 0..100u32 {
+        cache_a
+            .merge(key, PnCounter::local_delta(cache_a.writer_id(), 5))
+            .await
+            .expect("merge");
+    }
+
+    let deadline = tokio::time::Instant::now() + SETTLE;
+    while tokio::time::Instant::now() < deadline {
+        for key in 0..100u32 {
+            let kept = cache_b.get(&key).await.map(|counter| counter.value());
+            assert!(
+                kept.is_some_and(|value| value >= 1_000),
+                "b lost its counter for key {key}: {kept:?}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    b.shutdown().await;
+    a.shutdown().await;
+}
+
 #[cfg(feature = "spill")]
 mod spilled {
     use super::*;

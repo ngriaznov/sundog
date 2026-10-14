@@ -270,15 +270,19 @@ struct DepartedSend {
 /// `Invalidation` and `Replicated`, sent drop-oldest; the other owners of a
 /// write's part under `view` for `Distributed`, sent awaiting, with a part
 /// this node solely owns left out. `Local` sends nothing, and `Distributed`
-/// without a view has no owners to name. Pure; unit tested directly.
+/// without a view has no owners to name. A `merges` resolver sends nothing in
+/// any mode: a peer's merged copy is the best one left, and a bare
+/// invalidation cannot say which contributions the writer's gone copy
+/// lacked. Pure; unit tested directly.
 fn plan_departed_sends(
     mode: Mode,
     peers: &[NodeId],
     view: Option<&OwnershipView>,
     self_node: NodeId,
+    merges: bool,
     departed: Vec<WireRecord>,
 ) -> Vec<DepartedSend> {
-    if departed.is_empty() {
+    if departed.is_empty() || merges {
         return Vec::new();
     }
     match mode {
@@ -417,7 +421,14 @@ pub(crate) async fn fan_out_batch<K, V>(
             records,
         )
         .await;
-        let plan = plan_departed_sends(mode, &[], Some(&view), cluster.node_id(), departed);
+        let plan = plan_departed_sends(
+            mode,
+            &[],
+            Some(&view),
+            cluster.node_id(),
+            shard.merges(),
+            departed,
+        );
         send_departed(cluster, cache_name, plan).await;
         return;
     }
@@ -462,7 +473,14 @@ pub(crate) async fn fan_out_batch<K, V>(
         }
     }
     let peers = cluster.live_peer_ids();
-    let plan = plan_departed_sends(mode, &peers, None, cluster.node_id(), departed);
+    let plan = plan_departed_sends(
+        mode,
+        &peers,
+        None,
+        cluster.node_id(),
+        shard.merges(),
+        departed,
+    );
     send_departed(cluster, cache_name, plan).await;
 }
 
@@ -470,9 +488,14 @@ pub(crate) async fn fan_out_batch<K, V>(
 // own test.
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
     use super::*;
     use crate::hlc::Hlc;
     use crate::ownership::OwnershipView;
+    use crate::store::crdt::{PnCounter, PnCounterResolver, WriterId};
+    use crate::store::encode_key;
 
     /// Mirrors `store::bucket_of`'s formula so a test can compute which
     /// anti-entropy bucket a key lands in without that private function.
@@ -834,6 +857,7 @@ mod tests {
                     &nodes(&[2, 3]),
                     None,
                     NodeId::from(1),
+                    false,
                     departed.clone()
                 ),
                 vec![DepartedSend {
@@ -850,12 +874,12 @@ mod tests {
     fn nothing_departed_or_nobody_to_tell_plans_no_send() {
         for mode in [Mode::Invalidation, Mode::Replicated, Mode::Local] {
             assert!(
-                plan_departed_sends(mode, &nodes(&[2]), None, NodeId::from(1), Vec::new())
+                plan_departed_sends(mode, &nodes(&[2]), None, NodeId::from(1), false, Vec::new())
                     .is_empty(),
                 "{mode:?}: no departed write"
             );
             assert!(
-                plan_departed_sends(mode, &[], None, NodeId::from(1), departed_for(0..1))
+                plan_departed_sends(mode, &[], None, NodeId::from(1), false, departed_for(0..1))
                     .is_empty(),
                 "{mode:?}: no peer"
             );
@@ -866,6 +890,7 @@ mod tests {
                 &nodes(&[2]),
                 None,
                 NodeId::from(1),
+                false,
                 departed_for(0..1)
             )
             .is_empty(),
@@ -886,6 +911,7 @@ mod tests {
             &[],
             Some(&view),
             self_node,
+            false,
             departed.clone(),
         );
 
@@ -929,8 +955,228 @@ mod tests {
             &nodes(&[2]),
             None,
             NodeId::from(1),
+            false,
             departed_for(0..3),
         );
         assert_eq!(plan, Vec::new(), "no view names no owner");
+    }
+
+    #[test]
+    fn a_merging_cache_plans_no_departed_send_in_any_mode() {
+        let self_node = NodeId::from(1);
+        let eligible: Vec<NodeId> = (1..=5u64).map(NodeId::from).collect();
+        let owners = std::num::NonZeroU8::new(2).expect("nonzero");
+        let view = OwnershipView::compute(self_node, eligible, owners);
+        for mode in [
+            Mode::Local,
+            Mode::Invalidation,
+            Mode::Replicated,
+            Mode::Distributed { owners },
+        ] {
+            for merges in [false, true] {
+                let plan =
+                    plan_departed_sends(mode, &nodes(&[2, 3]), Some(&view), self_node, merges, {
+                        departed_for(0..40)
+                    });
+                assert_eq!(
+                    plan.is_empty(),
+                    merges || matches!(mode, Mode::Local),
+                    "{mode:?}, merges = {merges}: a merging resolver's peers keep their merged copy"
+                );
+            }
+        }
+    }
+
+    /// A counter shard in `mode` on the clock `clock` reads.
+    fn counter_shard(
+        mode: Mode,
+        node: u64,
+        max_capacity: u64,
+        clock: &Arc<AtomicU64>,
+    ) -> Shard<u32, PnCounter> {
+        let reader = Arc::clone(clock);
+        Shard::<u32, PnCounter>::new(
+            SmolStr::new("c"),
+            mode,
+            NodeId::from(node),
+            max_capacity,
+            None,
+            None,
+        )
+        .with_resolver(Arc::new(PnCounterResolver))
+        .with_clock(Arc::new(move || reader.load(Ordering::SeqCst)))
+    }
+
+    fn delta(node: u64, by: u64) -> PnCounter {
+        PnCounter::local_delta(WriterId::new(NodeId::from(node), 1), by)
+    }
+
+    /// The writes `shard` queued, newest per key, as `fan_out_batch` drains them.
+    fn queued_writes(shard: &Shard<u32, PnCounter>) -> Vec<(u32, Hlc)> {
+        newest_per_key(
+            shard
+                .fan_out_queue()
+                .drain()
+                .into_iter()
+                .map(|item| match item {
+                    FanOutItem::Applied(key, ver) => (key, ver),
+                    FanOutItem::Forward(_) => unreachable!("a local write queues as applied"),
+                })
+                .collect(),
+        )
+    }
+
+    /// Seeds `peer` with counters for keys 1 and 2, written by node 2, then
+    /// moves the clock on, so a later write at the writer is the newer version.
+    async fn peer_holds_counters(peer: &Shard<u32, PnCounter>, clock: &Arc<AtomicU64>) {
+        for key in [1, 2] {
+            peer.merge(key, delta(2, 1_000)).await.expect("merge");
+        }
+        let _ = peer.fan_out_queue().drain();
+        clock.fetch_add(10, Ordering::SeqCst);
+    }
+
+    /// Delivers `plan` to `peer` as the mesh would, on the receive path.
+    async fn deliver(plan: &[DepartedSend], peer: &Shard<u32, PnCounter>) {
+        for send in plan {
+            for rec in &send.records {
+                ShardOps::invalidate(peer, rec.key.clone(), rec.ver).await;
+            }
+        }
+    }
+
+    /// How many of keys 1 and 2 `peer` still reads as a counter at 1,000.
+    async fn counters_kept(peer: &Shard<u32, PnCounter>) -> usize {
+        let mut kept = 0;
+        for key in [1, 2] {
+            kept += usize::from(peer.get(&key).await.map(|c| c.value()) == Some(1_000));
+        }
+        kept
+    }
+
+    /// Departs a write of `writer` (the `departed` carriers), plans it in
+    /// `mode` for the merging resolver and delivers the plan to `peer`: the
+    /// peer keeps both counters. The same carriers planned for a resolver
+    /// that does not merge drop the peer's copy of the departed key.
+    async fn assert_departed_spares_peer(
+        mode: Mode,
+        writer: &Shard<u32, PnCounter>,
+        peer: &Shard<u32, PnCounter>,
+        departed: Vec<WireRecord>,
+    ) {
+        assert!(!departed.is_empty(), "the scenario departs a write");
+        assert!(writer.merges());
+        let plan = plan_departed_sends(
+            mode,
+            &nodes(&[2]),
+            None,
+            NodeId::from(1),
+            writer.merges(),
+            departed.clone(),
+        );
+        assert!(plan.is_empty(), "{mode:?}: nothing is sent");
+        deliver(&plan, peer).await;
+        assert_eq!(counters_kept(peer).await, 2, "{mode:?}");
+
+        let lww = plan_departed_sends(mode, &nodes(&[2]), None, NodeId::from(1), false, departed);
+        deliver(&lww, peer).await;
+        assert!(
+            counters_kept(peer).await < 2,
+            "{mode:?}: the same carrier drops a peer's copy where the resolver does not merge"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_evicted_merging_write_leaves_the_peers_counter_alone_in_invalidation() {
+        let clock = Arc::new(AtomicU64::new(1_000_000));
+        let writer = counter_shard(Mode::Invalidation, 1, 1, &clock);
+        let peer = counter_shard(Mode::Invalidation, 2, u64::MAX, &clock);
+        peer_holds_counters(&peer, &clock).await;
+        writer.merge(1, delta(1, 5)).await.expect("merge");
+        writer.merge(2, delta(1, 5)).await.expect("merge");
+        assert_eq!(writer.entry_count().await, 1, "one counter fits");
+
+        let fan = writer.fan_out_records(&queued_writes(&writer)).await;
+
+        assert_departed_spares_peer(Mode::Invalidation, &writer, &peer, fan.departed).await;
+    }
+
+    #[tokio::test]
+    async fn a_swept_merging_write_leaves_the_peers_counter_alone_in_replicated() {
+        let clock = Arc::new(AtomicU64::new(1_000_000));
+        let writer = counter_shard(Mode::Replicated, 1, u64::MAX, &clock);
+        let peer = counter_shard(Mode::Replicated, 2, u64::MAX, &clock);
+        peer_holds_counters(&peer, &clock).await;
+        for key in [1, 2] {
+            writer
+                .merge_with_ttl(key, delta(1, 5), Duration::from_millis(50))
+                .await
+                .expect("merge");
+        }
+        let queued = queued_writes(&writer);
+        clock.fetch_add(100, Ordering::SeqCst);
+        ShardOps::run_pending_tasks(&writer).await;
+
+        let fan = writer.fan_out_records(&queued).await;
+
+        assert!(
+            fan.records.is_empty(),
+            "a merging sweep keeps no tombstone, so both writes depart"
+        );
+        assert_departed_spares_peer(Mode::Replicated, &writer, &peer, fan.departed).await;
+    }
+
+    #[tokio::test]
+    async fn a_released_merging_write_leaves_the_owners_counter_alone_in_distributed() {
+        let self_node = NodeId::from(1);
+        let owners = std::num::NonZeroU8::new(2).expect("nonzero");
+        let view =
+            OwnershipView::compute(self_node, (1..=3u64).map(NodeId::from).collect(), owners);
+        let clock = Arc::new(AtomicU64::new(1_000_000));
+        let peer = counter_shard(Mode::Replicated, 2, u64::MAX, &clock);
+        peer_holds_counters(&peer, &clock).await;
+        let departed = |keys: [u32; 2]| -> Vec<WireRecord> {
+            keys.into_iter()
+                .map(|key| WireRecord {
+                    key: encode_key(&key).expect("key"),
+                    value: None,
+                    ver: Hlc {
+                        wall_ms: 1_000_100,
+                        logical: 0,
+                        node: self_node,
+                    },
+                    expires_at_ms: None,
+                })
+                .collect()
+        };
+        let carriers = departed([1, 2]);
+
+        let merging = plan_departed_sends(
+            Mode::Distributed { owners },
+            &[],
+            Some(&view),
+            self_node,
+            true,
+            carriers.clone(),
+        );
+        assert!(
+            merging.is_empty(),
+            "a part's other owners keep their counter"
+        );
+        deliver(&merging, &peer).await;
+        assert_eq!(counters_kept(&peer).await, 2);
+
+        let lww = plan_departed_sends(
+            Mode::Distributed { owners },
+            &[],
+            Some(&view),
+            self_node,
+            false,
+            carriers,
+        );
+        assert!(
+            !lww.is_empty(),
+            "the same carriers go out where the resolver does not merge"
+        );
     }
 }

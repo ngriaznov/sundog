@@ -26,7 +26,9 @@ loader or its own writes.
 A write drops the peers' older copy even when this node's entry is gone
 before the write is sent. An entry that `max_capacity` evicted or the spill
 tier moved to disk, or one that expired, still sends its invalidation, so a
-peer never serves a value this node already replaced.
+peer never serves a value this node already replaced. A merging resolver is
+the exception: its peers keep the merged copy they hold, since an
+invalidation cannot say which contributions this node's gone copy lacked.
 
 Values cross the network only when the cache's resolver merges, as
 `PnCounterResolver` does. The write then ships the writer's merged record

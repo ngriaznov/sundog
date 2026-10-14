@@ -182,7 +182,9 @@ it is sent, swept, disowned or idle, invalidates the older copy on every
 peer that receives the frame; a frame lost to an overflowing outbox is not
 resent. In `Replicated` and `Distributed` an evicted entry spills to disk
 rather than disappearing, so a departed write there comes from a sweep or
-from an ownership release.
+from an ownership release. With a merging resolver a departed write sends
+nothing, in every mode: a peer's merged copy is the best one left, and a bare
+invalidation cannot say which contributions the writer's copy lacked.
 
 In `Replicated` and `Distributed`, the sweep that removes an expired entry
 keeps a tombstone at the entry's version. A replica that missed the

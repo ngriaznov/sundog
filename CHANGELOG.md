@@ -230,8 +230,9 @@ All notable changes to this project are documented in this file. Format follows
   write whose entry is gone, evicted, swept, disowned, idle or unreadable
   on disk, invalidates the peers' older copy: every peer in `Invalidation`
   and `Replicated`, the part's other owners in `Distributed`, which waits for
-  outbox space. A record older than the write is never sent beside its
-  invalidation. A lost invalidation is not resent, and the invalidation does
+  outbox space. A merging resolver sends nothing for a departed write, in
+  every mode, so a peer keeps its merged counter or set. A record older than
+  the write is never sent beside its invalidation. A lost invalidation is not resent, and the invalidation does
   not leave a version floor, so a partitioned or late-joining peer can still
   bring an older value back through anti-entropy.
 
