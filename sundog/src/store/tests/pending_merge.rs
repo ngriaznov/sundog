@@ -428,17 +428,51 @@ async fn a_non_owner_remove_forwards_only_the_tombstone_and_the_later_fold() {
 }
 
 #[tokio::test]
-async fn a_non_owner_clear_tombstones_a_pending_key() {
+async fn a_non_owner_clear_forwards_a_pending_fold_and_writes_no_tombstone() {
     let (s, _owned, key) = distributed_coalescing_shard();
     s.merge(key, 2).await.expect("merge");
 
     s.clear().await.expect("clear");
     s.flush_all_pending_merges();
 
+    assert_eq!(s.pending_merge_count(), 0, "the clear settled the fold");
     let recs = forwarded(s.fan_out_queue().drain());
-    assert_eq!(recs.len(), 1, "only the tombstone leaves: {recs:?}");
-    assert!(recs[0].is_tombstone());
+    assert_eq!(recs.len(), 1, "only the fold leaves: {recs:?}");
+    assert!(
+        !recs[0].is_tombstone(),
+        "no tombstone reaches the owners: {recs:?}"
+    );
     assert_eq!(recs[0].key, key_bytes(&key));
+    assert_eq!(
+        recs[0].value.as_deref(),
+        Some(postcard::to_stdvec(&2u32).expect("encode").as_slice()),
+        "the fold goes to the owners as the merge call made it"
+    );
+}
+
+#[tokio::test]
+async fn an_owner_clear_discards_a_pending_fold_and_tombstones_the_key() {
+    let (s, key, unowned) = distributed_coalescing_shard();
+    s.merge(key, 2).await.expect("merge an owned key");
+    s.merge(unowned, 3).await.expect("merge an unowned key");
+
+    s.clear().await.expect("clear");
+    s.flush_all_pending_merges();
+
+    assert_eq!(s.get(&key).await, None, "the owned key is removed");
+    let queued = s.fan_out_queue().drain();
+    let forwarded_keys: Vec<_> = queued
+        .iter()
+        .filter_map(|item| match item {
+            FanOutItem::Forward(rec) => Some((rec.key.clone(), rec.is_tombstone())),
+            FanOutItem::Applied(..) => None,
+        })
+        .collect();
+    assert_eq!(
+        forwarded_keys,
+        [(key_bytes(&unowned), false)],
+        "only the unowned key's fold is forwarded, as a value: {queued:?}"
+    );
 }
 
 #[tokio::test]
@@ -473,4 +507,114 @@ async fn an_owner_holding_a_newer_tombstone_rejects_a_fold_stamped_before_it() {
     .await;
 
     assert_eq!(s.get(&key).await, None);
+}
+
+/// Runs `flush` on its own thread, parked between the take and the apply of
+/// its first stripe until the returned sender fires. Returns once the flush is
+/// parked there.
+fn park_a_flush(
+    s: &Arc<Shard<u32, u32>>,
+    flush: impl FnOnce(&Shard<u32, u32>) + Send + 'static,
+) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+    let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    s.set_after_take_hook(move || {
+        let _ = parked_tx.send(());
+        let _ = release_rx.lock().expect("hook lock").recv();
+    });
+    let flusher = {
+        let s = Arc::clone(s);
+        std::thread::spawn(move || flush(&s))
+    };
+    parked_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the flush parks between its take and its apply");
+    (release_tx, flusher)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_clear_waits_for_a_flush_between_its_take_and_its_apply() {
+    let s = Arc::new(coalescing_shard());
+    s.merge(1, 5).await.expect("merge");
+    let (release, flusher) = park_a_flush(&s, Shard::flush_all_pending_merges);
+    assert_eq!(
+        s.pending_merge_count(),
+        0,
+        "the parked flush has taken the fold: it is pending nowhere"
+    );
+    assert!(s.keys().is_empty(), "and stored nowhere");
+
+    let clearing = {
+        let s = Arc::clone(&s);
+        tokio::spawn(async move { s.clear().await })
+    };
+    // Long enough that a clear which does not wait for the flush has
+    // finished and listed nothing.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    release.send(()).expect("release the flush");
+    flusher.join().expect("the flush finishes");
+    clearing.await.expect("clear task").expect("clear succeeds");
+
+    assert_eq!(
+        s.get(&1).await,
+        None,
+        "the fold the flush had taken lands under the clear's tombstone"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_clear_waits_for_a_due_flush_and_for_an_invalidation_flush() {
+    let s = Arc::new(
+        shard::<u32, u32>(1)
+            .with_resolver(Arc::new(SumResolver))
+            .with_clock(Arc::new(|| 0u64))
+            .with_merge_coalesce_window(Duration::from_millis(100)),
+    );
+    s.merge(1, 5).await.expect("merge");
+    let (release, flusher) = park_a_flush(&s, |s| s.flush_due_pending_merges(100));
+
+    let clearing = {
+        let s = Arc::clone(&s);
+        tokio::spawn(async move { s.clear().await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    release.send(()).expect("release the flush");
+    flusher.join().expect("the flush finishes");
+    clearing.await.expect("clear task").expect("clear succeeds");
+    assert_eq!(s.get(&1).await, None, "the due flush's fold is cleared");
+
+    // A peer's bare invalidation applies the fold first, under the same gate.
+    let s = Arc::new(coalescing_shard());
+    s.merge(2, 5).await.expect("merge");
+    let key_hash = engine::hash_key_bytes(key_bytes(&2u32).as_ref());
+    let newer = hlc(ahead_ms(), 2);
+    let (release, flusher) = park_a_flush(&s, move |s| {
+        s.flush_pending_merge_before(&2, key_hash, newer);
+    });
+    let clearing = {
+        let s = Arc::clone(&s);
+        tokio::spawn(async move { s.clear().await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    release.send(()).expect("release the flush");
+    flusher.join().expect("the flush finishes");
+    clearing.await.expect("clear task").expect("clear succeeds");
+    assert_eq!(
+        s.get(&2).await,
+        None,
+        "the invalidation flush's fold is cleared"
+    );
+}
+
+#[test]
+fn a_clear_tombstones_only_the_pending_keys_it_owns() {
+    let (owned, foreign) =
+        crate::store::shard_merge::split_pending_for_clear([(1u32, true), (2, false), (3, true)]);
+    assert_eq!(owned, [1, 3], "owned folds are discarded and tombstoned");
+    assert_eq!(foreign, [2], "an unowned fold is applied, never tombstoned");
+
+    let (owned, foreign) =
+        crate::store::shard_merge::split_pending_for_clear(Vec::<(u32, bool)>::new());
+    assert!(owned.is_empty() && foreign.is_empty());
 }

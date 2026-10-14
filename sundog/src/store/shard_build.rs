@@ -179,6 +179,9 @@ where
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             pending_merge_count: AtomicUsize::new(0),
+            merge_flush_gate: std::sync::RwLock::new(()),
+            #[cfg(test)]
+            after_take_hook: std::sync::Mutex::new(None),
             merge_wake: Notify::new(),
             max_capacity,
             tti,

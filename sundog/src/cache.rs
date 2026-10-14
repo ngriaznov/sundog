@@ -1137,7 +1137,12 @@ where
     /// cluster-wide reset: an entry never reached from a peer, or a
     /// concurrent write outracing the tombstone's HLC, survives. A key whose
     /// [`Cache::merge`] fold is still pending in its coalesce window counts
-    /// as held: the fold is discarded and the key tombstoned.
+    /// as held: the fold is discarded and the key tombstoned, including a
+    /// fold a flush is applying as the clear begins. In a
+    /// [`Mode::Distributed`] cache a key this node does not own is not held:
+    /// its pending fold is applied, which forwards it to the owners, and no
+    /// tombstone is written, so a non-owner's `clear` never deletes a value
+    /// at the owners.
     ///
     /// # Errors
     ///

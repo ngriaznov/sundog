@@ -1,12 +1,14 @@
 //! The merge path of a [`Shard`]: stored merges, the coalesce window and the flush of pending
 //! merges, with the pure deadline helpers they decide by.
 
-use std::collections::BTreeMap;
 use std::collections::hash_map::{Entry, OccupiedEntry};
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::hash::Hash;
-use std::sync::PoisonError;
+#[cfg(test)]
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Mutex as StdMutex, PoisonError, RwLockReadGuard};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -47,6 +49,26 @@ pub(super) fn merge_window_elapsed(now_ms: u64, deadline_ms: u64) -> bool {
 /// no window, so it stays. Pure, so the ordering has a unit test of its own.
 pub(super) fn pending_merge_superseded(pending_ver: Hlc, tombstone_ver: Hlc) -> bool {
     pending_ver < tombstone_ver
+}
+
+/// Splits the pending keys of a [`Shard::clear`] by whether this node owns
+/// them: the first list is the keys the clear tombstones, the owned ones, the
+/// second the keys whose fold it applies instead (which forwards it to the
+/// owners), the ones this node does not own. Only a `Mode::Distributed` shard
+/// has a key it does not own. Pure, so the rule has a unit test of its own.
+pub(super) fn split_pending_for_clear<K>(
+    pending: impl IntoIterator<Item = (K, bool)>,
+) -> (Vec<K>, Vec<K>) {
+    let mut owned = Vec::new();
+    let mut foreign = Vec::new();
+    for (key, is_owned) in pending {
+        if is_owned {
+            owned.push(key);
+        } else {
+            foreign.push(key);
+        }
+    }
+    (owned, foreign)
 }
 
 /// The version a pending fold carries once a call stamped `call_ver` folds
@@ -341,6 +363,28 @@ where
         self.pending_merge_count.load(Ordering::Acquire) != 0
     }
 
+    /// Test-only: sets `hook` to run once, in the first flush that has taken
+    /// a fold, between its take and its apply.
+    #[cfg(test)]
+    pub(super) fn set_after_take_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self
+            .after_take_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_after_take_hook(&self) {
+        let hook = self
+            .after_take_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     /// The number of pending folds.
     #[cfg(test)]
     pub(super) fn pending_merge_count(&self) -> usize {
@@ -407,24 +451,88 @@ where
         if !self.has_pending_merges() {
             return;
         }
+        let _flushing = self.begin_flush();
         if let Some(pending) = self.take_pending_merge_if(key, hash, |pending_ver| {
             pending_merge_superseded(pending_ver, ver)
         }) {
+            #[cfg(test)]
+            self.run_after_take_hook();
             self.flush_one_pending_merge(key.clone(), pending);
         }
     }
 
-    /// The keys with a pending fold, for [`Shard::clear`]: a key that exists
-    /// only as a fold is not among the stored keys.
-    pub(super) fn pending_merge_keys(&self) -> Vec<K> {
-        if !self.has_pending_merges() {
-            return Vec::new();
+    /// Marks a flush in flight until the returned guard drops. Every path that
+    /// takes a fold out of its stripe holds it from the take through the last
+    /// apply of what it took, so a key is always either pending or stored,
+    /// never between the two, to [`Shard::clear`]'s snapshot, which waits for
+    /// the guards to drop. A guard is never held across an await.
+    fn begin_flush(&self) -> RwLockReadGuard<'_, ()> {
+        self.merge_flush_gate
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Takes `select`'s pick out of one stripe and applies it, holding
+    /// [`Shard::begin_flush`]'s guard across both.
+    fn flush_stripe(
+        &self,
+        stripe_lock: &StdMutex<PendingMergeStripe<K, V>>,
+        select: impl FnOnce(&mut PendingMergeStripe<K, V>) -> Vec<(K, PendingMerge<V>)>,
+    ) {
+        let _flushing = self.begin_flush();
+        let due = {
+            let mut stripe = stripe_lock.lock().unwrap_or_else(PoisonError::into_inner);
+            let due = select(&mut stripe);
+            self.pending_merge_count
+                .fetch_sub(due.len(), Ordering::AcqRel);
+            due
+        };
+        #[cfg(test)]
+        if !due.is_empty() {
+            self.run_after_take_hook();
         }
+        for (key, entry) in due {
+            self.flush_one_pending_merge(key, entry);
+        }
+    }
+
+    /// The keys [`Shard::clear`] tombstones, and the pending folds it settles
+    /// on the way. Waits for every flush in flight, so each pending key is
+    /// still pending and each flushed one is stored, and snapshots both under
+    /// that one wait. A fold for a key this node owns is discarded by the
+    /// tombstone and listed with the stored keys. A fold for a key this node
+    /// does not own, which only a `Mode::Distributed` shard has, is applied as
+    /// a zero window would have, which forwards it to the owners, and is not
+    /// listed: this node holds nothing of that key for a tombstone to remove,
+    /// and a tombstone forwarded for it would delete the owners' copy.
+    pub(super) fn keys_to_clear(&self) -> Vec<K> {
+        let _clearing = self
+            .merge_flush_gate
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         let mut keys = Vec::new();
-        for stripe_lock in &*self.pending_merges {
-            let stripe = stripe_lock.lock().unwrap_or_else(PoisonError::into_inner);
-            keys.extend(stripe.entries.keys().cloned());
+        let mut forwarded = Vec::new();
+        if self.has_pending_merges() {
+            for stripe_lock in &*self.pending_merges {
+                let mut stripe = stripe_lock.lock().unwrap_or_else(PoisonError::into_inner);
+                let (kept, flush) =
+                    split_pending_for_clear(stripe.entries.iter().map(|(key, entry)| {
+                        (key.clone(), self.owns_key(entry.key_bytes.as_ref()))
+                    }));
+                keys.extend(kept);
+                for key in flush {
+                    if let Some(entry) = stripe.remove(&key) {
+                        self.pending_merge_count.fetch_sub(1, Ordering::AcqRel);
+                        forwarded.push((key, entry));
+                    }
+                }
+            }
         }
+        for (key, entry) in forwarded {
+            self.flush_one_pending_merge(key, entry);
+        }
+        let pending: HashSet<K> = keys.iter().cloned().collect();
+        keys.extend(self.keys().into_iter().filter(|key| !pending.contains(key)));
         keys
     }
 
@@ -440,19 +548,12 @@ where
     /// the pending map itself.
     pub(crate) fn flush_due_pending_merges(&self, now_ms: u64) {
         for stripe_lock in &*self.pending_merges {
-            let due: Vec<(K, PendingMerge<V>)> = {
-                let mut stripe = stripe_lock.lock().unwrap_or_else(PoisonError::into_inner);
-                let due: Vec<_> = drain_due_deadlines(&mut stripe.by_deadline, now_ms)
+            self.flush_stripe(stripe_lock, |stripe| {
+                drain_due_deadlines(&mut stripe.by_deadline, now_ms)
                     .into_iter()
                     .filter_map(|key| stripe.entries.remove(&key).map(|entry| (key, entry)))
-                    .collect();
-                self.pending_merge_count
-                    .fetch_sub(due.len(), Ordering::AcqRel);
-                due
-            };
-            for (key, entry) in due {
-                self.flush_one_pending_merge(key, entry);
-            }
+                    .collect()
+            });
         }
     }
 
@@ -465,17 +566,10 @@ where
     /// [`Shard::flush_due_pending_merges`] uses.
     pub(crate) fn flush_all_pending_merges(&self) {
         for stripe_lock in &*self.pending_merges {
-            let due: Vec<(K, PendingMerge<V>)> = {
-                let mut stripe = stripe_lock.lock().unwrap_or_else(PoisonError::into_inner);
+            self.flush_stripe(stripe_lock, |stripe| {
                 stripe.by_deadline.clear();
-                let due: Vec<_> = std::mem::take(&mut stripe.entries).into_iter().collect();
-                self.pending_merge_count
-                    .fetch_sub(due.len(), Ordering::AcqRel);
-                due
-            };
-            for (key, entry) in due {
-                self.flush_one_pending_merge(key, entry);
-            }
+                std::mem::take(&mut stripe.entries).into_iter().collect()
+            });
         }
     }
 

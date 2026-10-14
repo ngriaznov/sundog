@@ -1,7 +1,6 @@
 //! The write path of a [`Shard`]: single and bulk inserts, removes, `clear`, the apply and
 //! forward helpers they share, and the fan-out backpressure and memory-ceiling checks.
 
-use std::collections::HashSet;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Duration;
@@ -809,23 +808,19 @@ where
     /// [`Shard::remove_many`] over a snapshot of [`Shard::keys`] and of the
     /// keys with a [`Shard::merge`] fold still pending in its coalesce
     /// window, cost O(entries). A pending fold is discarded and its key
-    /// tombstoned like any other. An entry a peer holds that never reached
-    /// this node survives untouched.
+    /// tombstoned like any other, whether or not a flush was taking it as the
+    /// clear began: the snapshot waits for a flush in flight. A `Mode::Distributed`
+    /// non-owner holds no entry of its own, so for a key it does not own that
+    /// exists only as a pending fold, `clear` applies the fold, which
+    /// forwards it to the owners, and writes no tombstone: a non-owner's
+    /// `clear` never deletes a value at the owners. An entry a peer holds
+    /// that never reached this node survives untouched.
     ///
     /// # Errors
     ///
     /// As [`Shard::remove_many`].
     pub async fn clear(&self) -> Result<(), CacheError> {
-        // Pending keys first: a flush between the two snapshots moves a key
-        // from pending to stored, so taking them in this order sees it in at
-        // least one of them.
-        let mut keys = self.pending_merge_keys();
-        if keys.is_empty() {
-            return self.remove_many(self.keys()).await;
-        }
-        let pending: HashSet<K> = keys.iter().cloned().collect();
-        keys.extend(self.keys().into_iter().filter(|key| !pending.contains(key)));
-        self.remove_many(keys).await
+        self.remove_many(self.keys_to_clear()).await
     }
 
     /// Drops the local copy of `key` without writing a tombstone or fanning
