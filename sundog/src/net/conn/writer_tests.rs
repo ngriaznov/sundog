@@ -10,7 +10,9 @@ use smol_str::SmolStr;
 use tokio::time::Instant;
 
 use super::tests::{out_frame, record};
-use super::writer::{RECONNECT_BACKOFF, RecentTail, dirty_mark_due, owes_repair, reconnect_delay};
+use super::writer::{
+    RECONNECT_BACKOFF, RecentTail, dirty_mark_due, mark_deadline, owes_repair, reconnect_delay,
+};
 use crate::node::NodeId;
 use crate::wire::Msg;
 
@@ -69,6 +71,34 @@ fn dirty_marks_are_spaced() {
 }
 
 #[test]
+fn an_owed_mark_is_due_at_the_end_of_the_spacing_and_never_dropped() {
+    let start = Instant::now();
+    assert_eq!(mark_deadline(false, None, start), None, "nothing is owed");
+    assert_eq!(
+        mark_deadline(false, Some(start), start),
+        None,
+        "nothing is owed after a mark either"
+    );
+    assert_eq!(
+        mark_deadline(true, None, start),
+        Some(start),
+        "the first mark is due at once"
+    );
+    let later = start + Duration::from_secs(2);
+    assert_eq!(
+        mark_deadline(true, Some(start), later),
+        Some(start + Duration::from_secs(5)),
+        "a mark the spacing defers is due when the spacing ends"
+    );
+    let much_later = start + Duration::from_secs(60);
+    let deadline = mark_deadline(true, Some(start), much_later).expect("owed");
+    assert!(
+        dirty_mark_due(Some(start), deadline),
+        "the deadline is an instant at which the mark is allowed"
+    );
+}
+
+#[test]
 fn the_recent_tail_keeps_frames_within_the_window_only() {
     let start = Instant::now();
     let mut tail = RecentTail::default();
@@ -111,6 +141,7 @@ mod scripted {
     use std::io;
     use std::pin::Pin;
     use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
     use std::task::{Context, Poll};
 
     use bytes::BytesMut;
@@ -185,6 +216,7 @@ mod scripted {
 
     struct Rig {
         state: WriterState,
+        dirty: Arc<AtomicBool>,
         invalidate: Arc<DropOldestQueue<OutFrame>>,
         replicate_tx: mpsc::Sender<OutFrame>,
         replicate_rx: mpsc::Receiver<OutFrame>,
@@ -194,8 +226,10 @@ mod scripted {
     impl Rig {
         fn new() -> Self {
             let (replicate_tx, replicate_rx) = mpsc::channel(16);
+            let dirty = Arc::new(AtomicBool::new(false));
             Self {
-                state: WriterState::new(NodeId::from(2), Arc::new(AtomicBool::new(false))),
+                state: WriterState::new(NodeId::from(2), Arc::clone(&dirty)),
+                dirty,
                 invalidate: Arc::new(DropOldestQueue::new(16)),
                 replicate_tx,
                 replicate_rx,
@@ -410,6 +444,63 @@ mod scripted {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_mark_the_spacing_deferred_is_set_on_the_live_connection_once_the_spacing_ends() {
+        let mut rig = Rig::new();
+        let start = Instant::now();
+        // A mark was set 1 s ago, and a connection that ended since owes one.
+        rig.state.last_mark = Some(start - Duration::from_secs(1));
+        rig.state.sent_any = true;
+        rig.state.note_connection_end(RECONNECT_BACKOFF);
+        assert!(rig.state.owes_mark);
+        rig.state.apply_mark_if_due(start);
+        assert!(
+            !rig.dirty.load(Ordering::Relaxed),
+            "the redial lands inside the spacing, so the mark waits"
+        );
+        assert!(rig.state.owes_mark, "the debt stays");
+
+        // The next connection stays up and idle.
+        let mut link = ScriptedLink::default();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), rig.drive(&mut link))
+                .await
+                .ok(),
+            None
+        );
+        assert!(
+            !rig.dirty.load(Ordering::Relaxed),
+            "4 s after the last mark is inside the spacing"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), rig.drive(&mut link))
+                .await
+                .ok(),
+            None
+        );
+        assert!(
+            rig.dirty.load(Ordering::Relaxed),
+            "the connection that lives on sets the owed mark once 5 s have passed"
+        );
+        assert!(!rig.state.owes_mark, "the debt is paid");
+        assert_eq!(
+            rig.state.last_mark.map(|at| at.duration_since(start)),
+            Some(Duration::from_secs(4)),
+            "the mark is stamped when the spacing ended"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_that_owes_nothing_sets_no_mark() {
+        let mut rig = Rig::new();
+        let mut link = ScriptedLink::default();
+        assert_eq!(rig.drive_for_a_second(&mut link).await, None);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(rig.drive_for_a_second(&mut link).await, None);
+        assert!(!rig.dirty.load(Ordering::Relaxed));
+        assert!(rig.state.last_mark.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn requeue_recent_puts_the_older_tail_ahead_of_the_held_burst() {
         let mut state = WriterState::new(NodeId::from(2), Arc::new(AtomicBool::new(false)));
         let now = Instant::now();
@@ -452,11 +543,34 @@ mod sockets {
         handle: JoinHandle<()>,
     }
 
+    /// A loopback listener on a port below every default ephemeral range
+    /// (Linux starts at 32768, macOS and Windows at 49152), so no socket
+    /// bound to port 0 is handed the port while the listener is closed. The
+    /// port is the first in 20000..30000, from an offset derived from the
+    /// process id, that binds.
+    async fn low_port_listener() -> TcpListener {
+        const FIRST: u16 = 20_000;
+        const SPAN: u16 = 10_000;
+        let offset = u16::try_from(std::process::id() % u32::from(SPAN)).expect("below SPAN");
+        for step in 0..SPAN {
+            let port = FIRST + (offset + step) % SPAN;
+            if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)).await {
+                return listener;
+            }
+        }
+        panic!("a free port in 20000..30000");
+    }
+
     impl Writer {
         async fn start() -> Self {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind loopback");
+            Self::start_on(listener)
+        }
+
+        /// Starts a writer that dials `listener`.
+        fn start_on(listener: TcpListener) -> Self {
             let addr = listener.local_addr().expect("listener has a local addr");
             let (replicate_tx, replicate_rx) = mpsc::channel(8);
             let dirty = Arc::new(AtomicBool::new(false));
@@ -655,12 +769,13 @@ mod sockets {
 
     #[tokio::test]
     async fn run_peer_writer_marks_dirty_only_after_the_redial_succeeds() {
-        let writer = Writer::start().await;
+        let listener = low_port_listener().await;
+        let addr = listener.local_addr().expect("addr");
+        let writer = Writer::start_on(listener);
         let mut conn1 = writer.accept().await;
         writer.queue(1).await;
         assert!(reads_replicate(&mut conn1, 1).await);
         tokio::time::sleep(RECONNECT_BACKOFF + Duration::from_millis(100)).await;
-        let addr = writer.listener.local_addr().expect("addr");
         let Writer {
             listener,
             replicate_tx,
@@ -677,9 +792,11 @@ mod sockets {
             "a mark set while the peer is unreachable would be spent on a failed round"
         );
 
+        // The port lies below every ephemeral range, so nothing else is
+        // handed it while it is free.
         let listener = TcpListener::bind(addr)
             .await
-            .expect("the port is free again");
+            .expect("a port below the ephemeral ranges is free again");
         let writer = Writer {
             listener,
             replicate_tx,

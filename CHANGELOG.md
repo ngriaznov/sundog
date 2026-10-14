@@ -99,8 +99,9 @@ All notable changes to this project are documented in this file. Format follows
   reads its link to notice a peer that closed it before a write fails, and
   dials at most once per 500 ms. After a redial that follows a connection that
   carried frames and lasted at least that long, or that left frames held, it
-  marks the peer for the next anti-entropy round, at most every five seconds.
-  A receiver can see a frame twice; applying one is idempotent. A drop of the
+  marks the peer for the next anti-entropy round, at most every five seconds;
+  a mark the spacing defers is set on the live connection once the spacing has
+  passed, so it is delayed and never skipped. A receiver can see a frame twice; applying one is idempotent. A drop of the
   oldest queued invalidation or of a message that fails to encode now marks the
   peer and counts in `sundog_backlog_dropped_total{peer}` too. Anti-entropy
   repairs `Replicated` and owner-to-owner loss only: a non-owner's forwarded

@@ -158,7 +158,9 @@ in `sundog_live_peers`. Flapping under jitter calls for a higher
 `phi_threshold`. A peer whose connection broke after carrying frames is
 steered to first by the next anti-entropy round, once the writer has
 redialed it, and a connection that closes within half a second of opening
-does not steer rounds.
+does not steer rounds. A writer marks its peer at most every five seconds; a
+mark held back by that spacing is set as soon as the spacing ends, on the
+connection then live.
 
 ### A `Distributed` cache reports fetch errors
 

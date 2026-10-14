@@ -224,6 +224,18 @@ pub(super) fn dirty_mark_due(last_mark: Option<Instant>, now: Instant) -> bool {
     last_mark.is_none_or(|at| now.saturating_duration_since(at) >= DIRTY_MARK_SPACING)
 }
 
+/// When a writer that `owes` a dirty mark sets it: now if no mark was set
+/// yet, otherwise [`DIRTY_MARK_SPACING`] after `last_mark`. `None` when no
+/// mark is owed. A connection that stays up applies the mark at this
+/// instant, so a rate-limited mark is delayed, never skipped.
+pub(super) fn mark_deadline(
+    owes: bool,
+    last_mark: Option<Instant>,
+    now: Instant,
+) -> Option<Instant> {
+    owes.then(|| last_mark.map_or(now, |at| at + DIRTY_MARK_SPACING))
+}
+
 /// The frames written within [`RECENT_WINDOW`], at most [`RECENT_BYTES`] of
 /// them. A write racing the peer's FIN or RST succeeds locally and is lost,
 /// so the writer sends this tail again on the next connection.
@@ -289,7 +301,8 @@ enum SendEnd {
 }
 
 /// What a writer keeps across its connections: the burst whose send failed,
-/// the tail of what it wrote, and whether this connection carried a frame.
+/// the tail of what it wrote, whether this connection carried a frame, and
+/// the dirty mark it owes.
 pub(super) struct WriterState {
     peer: NodeId,
     dirty: Arc<AtomicBool>,
@@ -299,6 +312,11 @@ pub(super) struct WriterState {
     pub(super) recent: RecentTail,
     /// Whether the current connection carried a frame.
     pub(super) sent_any: bool,
+    /// Whether a dirty mark is owed: a connection ended with loss to repair
+    /// and the mark is not set yet.
+    pub(super) owes_mark: bool,
+    /// When the writer last marked the peer dirty.
+    pub(super) last_mark: Option<Instant>,
 }
 
 impl WriterState {
@@ -309,7 +327,34 @@ impl WriterState {
             held: Vec::new(),
             recent: RecentTail::default(),
             sent_any: false,
+            owes_mark: false,
+            last_mark: None,
         }
+    }
+
+    /// Records that a connection that lived `lived` ended: a dirty mark is
+    /// owed when it left loss to repair (see [`owes_repair`]).
+    pub(super) fn note_connection_end(&mut self, lived: Duration) {
+        self.owes_mark |= owes_repair(self.sent_any, !self.held.is_empty(), lived);
+    }
+
+    /// When the owed dirty mark is due, if one is owed.
+    fn mark_deadline(&self, now: Instant) -> Option<Instant> {
+        mark_deadline(self.owes_mark, self.last_mark, now)
+    }
+
+    /// Sets the owed dirty mark if the spacing since the last one allows it.
+    pub(super) fn apply_mark_if_due(&mut self, now: Instant) {
+        if self.owes_mark && dirty_mark_due(self.last_mark, now) {
+            self.set_mark(now);
+        }
+    }
+
+    /// Marks the peer dirty at `now` and clears the debt.
+    fn set_mark(&mut self, now: Instant) {
+        self.dirty.store(true, Ordering::Relaxed);
+        self.last_mark = Some(now);
+        self.owes_mark = false;
     }
 
     /// Marks the peer dirty and counts `frames` this writer dropped before
@@ -400,7 +445,8 @@ where
 /// writes on a broadcast link, so EOF, an error or any frame ends the
 /// connection, and it is seen before a burst is drained into it. A burst
 /// whose send fails stays in `state.held` for the next connection; the
-/// receiver applies a resent frame idempotently.
+/// receiver applies a resent frame idempotently. A dirty mark that the
+/// spacing deferred is set on this connection once the spacing has passed.
 pub(super) async fn drive_connection<L>(
     link: &mut L,
     state: &mut WriterState,
@@ -417,9 +463,15 @@ where
         return end;
     }
     loop {
+        let mark_at = state.mark_deadline(Instant::now());
         tokio::select! {
             biased;
             () = cancel.cancelled() => return LinkEnd::Cancelled,
+            () = tokio::time::sleep_until(mark_at.unwrap_or_else(Instant::now)),
+                if mark_at.is_some() =>
+            {
+                state.set_mark(Instant::now());
+            }
             inbound = link.next() => {
                 match inbound {
                     Some(Ok(_)) => tracing::warn!(
@@ -480,7 +532,9 @@ pub(in crate::net) struct PeerTarget {
 /// which a peer that closed the link may not have received (see
 /// [`drive_connection`]). The peer is marked dirty once the redial succeeds,
 /// when a connection that carried frames ended or frames were held, so the
-/// next anti-entropy round targets it: that repairs `Replicated` and
+/// next anti-entropy round targets it; a mark the spacing defers is set on
+/// the connection itself once the spacing has passed, however long that
+/// connection lives. That repairs `Replicated` and
 /// owner-to-owner loss. A `Distributed` non-owner's forwarded write has no
 /// other copy, and a partition that never delivers a FIN can still lose it.
 /// Dials are at least [`RECONNECT_BACKOFF`] apart, and the dirty marks at
@@ -499,8 +553,6 @@ pub(in crate::net) async fn run_peer_writer(
         tls,
     } = target;
     let mut state = WriterState::new(peer, Arc::clone(&dirty));
-    let mut owes_repair_mark = false;
-    let mut last_mark: Option<Instant> = None;
     loop {
         let mut link = tokio::select! {
             biased;
@@ -511,11 +563,7 @@ pub(in crate::net) async fn run_peer_writer(
             },
         };
         let connected_at = Instant::now();
-        if owes_repair_mark && dirty_mark_due(last_mark, connected_at) {
-            dirty.store(true, Ordering::Relaxed);
-            last_mark = Some(connected_at);
-            owes_repair_mark = false;
-        }
+        state.apply_mark_if_due(connected_at);
         state.sent_any = false;
         let end = drive_connection(
             &mut link,
@@ -529,7 +577,7 @@ pub(in crate::net) async fn run_peer_writer(
             return;
         }
         let lived = connected_at.elapsed();
-        owes_repair_mark |= owes_repair(state.sent_any, !state.held.is_empty(), lived);
+        state.note_connection_end(lived);
         state.requeue_recent(Instant::now());
         tracing::debug!(
             %peer,
