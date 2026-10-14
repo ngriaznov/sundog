@@ -22,7 +22,7 @@ All notable changes to this project are documented in this file. Format follows
   an anti-entropy listing request may carry one bucket across several
   `AeBucket` messages. A responder chunks only for a peer on protocol 9 or
   later, and a requester joins the messages whatever the responder speaks, so
-  release 9 interoperates with release 8 in both directions.
+  protocol 9 interoperates with protocol 8 in both directions.
 
 ### Fixed
 
@@ -39,11 +39,12 @@ All notable changes to this project are documented in this file. Format follows
 - **A fold receipt lives from the fold, not from the retirement.** `PnCounter`
   and `OrSet` stamp the receipt that stage two leaves with the fold instant,
   never lowering a stamp the writer already has. A fold that membership churn
-  delays past three bounds used to write a receipt the next merge apply
-  dropped as expired, so a replica that had retired the writer but not yet
-  folded it counted its contribution twice (`PnCounter`) or brought removed
-  elements back (`OrSet`). The receipt now lives its full lifetime after the
-  fold, about two bounds plus a sweep period longer than before, and a receipt
+  delays past three bounds still leaves a receipt the next merge apply keeps;
+  a receipt stamped at the retirement would be dropped as expired, and a
+  replica that had retired the writer but not yet folded it would count its
+  contribution twice (`PnCounter`) or bring removed elements back (`OrSet`).
+  The receipt lives its full lifetime after the fold, about two bounds plus a
+  sweep period longer than one stamped at the retirement, and a receipt
   stamped more than that lifetime ahead of the clock expires, so one fast clock
   cannot keep a receipt alive on every replica. Replicas that fold the same
   writer at different sweeps carry different stamps and merge them by maximum
@@ -64,7 +65,7 @@ All notable changes to this project are documented in this file. Format follows
   clock-skew refusal.** The writer keeps no copy of a forwarded insert,
   remove or merge, so an owner that refused its stamp for being further ahead
   than `max_clock_skew` dropped the only one: an insert never appeared and a
-  remove left the key live, though both returned `Ok`. The owner now holds the
+  remove left the key live, though both returned `Ok`. The owner holds the
   record in memory, 16,384 records and 32 MiB per cache, and applies it once
   its clock is within the bound, after about the stamp's lead minus
   `max_clock_skew`; correcting the writer's clock does not shorten the wait.
@@ -82,12 +83,12 @@ All notable changes to this project are documented in this file. Format follows
   record the receiver refuses for skew. New `ShardOps::apply_forwarded_batch`
   (a provided method) is the entry point for `ForwardBatch` records.
 - **A peer that stops reading no longer stalls inbound traffic.** The inbound
-  loop used to wait for the target owner's outbox while it re-forwarded a
-  stale-view `ForwardBatch`, so one wedged live peer stopped the node from
-  applying anything for any cache, filled the inbound channel and its
-  connections, delayed `Cluster::shutdown` until the failure detector removed
+  loop waits on no peer's outbox while it re-forwards a stale-view
+  `ForwardBatch`: a wait there would let one wedged live peer stop the node
+  from applying anything for any cache, fill the inbound channel and its
+  connections, delay `Cluster::shutdown` until the failure detector removed
   the peer, and let two nodes forwarding at each other wait on each other for
-  good. The loop now hands each re-forward to a lane per peer and applies the
+  good. The loop hands each re-forward to a lane per peer and applies the
   next message at once, and shutdown gives the lanes half a second to reach
   the mesh. A lane holds 64 MiB per peer. Past that, batches for that peer are
   dropped, logged and counted in `sundog_backlog_dropped_total{peer}`, and the
@@ -97,28 +98,29 @@ All notable changes to this project are documented in this file. Format follows
 - **A broken peer connection no longer loses the frames the writer had
   taken.** The per-peer writer keeps a burst whose send failed and sends it
   again first on the next connection, along with the last second of what it
-  wrote, which a peer that closed the link may not have received, so a
-  `Distributed` write forwarded to an owner survives a stale link. The writer
+  wrote, at most 1 MiB of it, which a peer that closed the link may not have
+  received, so a `Distributed` write forwarded to an owner survives a stale
+  link. The writer
   reads its link to notice a peer that closed it before a write fails, and
   dials at most once per 500 ms. After a redial that follows a connection that
   carried frames and lasted at least that long, or that left frames held, it
   marks the peer for the next anti-entropy round, at most every five seconds;
   a mark the spacing defers is set on the live connection once the spacing has
   passed, so it is delayed and never skipped. A receiver can see a frame twice; applying one is idempotent. A drop of the
-  oldest queued invalidation or of a message that fails to encode now marks the
+  oldest queued invalidation or of a message that fails to encode marks the
   peer and counts in `sundog_backlog_dropped_total{peer}` too. Anti-entropy
   repairs `Replicated` and owner-to-owner loss only: a non-owner's forwarded
   write is held by no replica, and a partition that never delivers a close can
   still lose the frames in flight.
 - **Closing a clone of a cache after its name was reopened leaves the
-  reopened cache alone.** The close used to remove the new cache from the
-  shard registry, `Cluster::health`, the gossiped mode and loader and the
-  shutdown spill sweep, so peers stopped seeing it and inbound replication,
-  anti-entropy, fetch and load lookups by name failed. It also checkpointed
-  the closed spill tier a second time into the directory the reopened cache
-  now owned, which could drop that cache's later entries from the next warm
-  reopen. A close now acts on the cluster only for the shard the registry
-  holds, and a cache checkpoints its spill tier once: a second or concurrent
+  reopened cache alone.** A close acts on the cluster only for the shard the
+  registry holds. A close that acted on the name would remove the new cache
+  from the shard registry, `Cluster::health`, the gossiped mode and loader and
+  the shutdown spill sweep, so peers would stop seeing it and inbound
+  replication, anti-entropy, fetch and load lookups by name would fail, and
+  it would checkpoint the closed spill tier a second time into the directory
+  the reopened cache owns, which could drop that cache's later entries from
+  the next warm reopen. A cache checkpoints its spill tier once: a second or concurrent
   close waits for the first and does nothing more. The checkpoint runs on its
   own task, so a `close` cut short by a timeout leaves it running and the next
   `close` waits for it instead of starting a second checkpoint beside its
@@ -158,15 +160,15 @@ All notable changes to this project are documented in this file. Format follows
   tombstone that arrives already past that retention, holding nothing it
   displaces, is dropped instead of being handed back and forth between
   replicas that collected it and replicas that have not. The expiry travels as the tombstone record's `expires_at_ms`; a
-  peer on release 8 reads the record as an ordinary delete. A sweep no longer
-  changes a bucket's digest, and a `Distributed` owner of a cold part now
-  answers a peer's fetch for a swept key with a miss, as for a deleted one,
-  where it declined. Each expired entry of such a cache costs a tombstone for
+  peer on protocol 8 reads the record as an ordinary delete. A sweep leaves a
+  bucket's digest unchanged, and a `Distributed` owner of a cold part answers
+  a peer's fetch for a swept key with a miss, as for a deleted one, instead
+  of declining. Each expired entry of such a cache costs a tombstone for
   the retention, and while a member is absent for up to `tombstone_max_ttl`: a
   TTL-heavy cache holds that many tombstones, outside `max_capacity` and the
   memory ceiling, so size for the expiry rate times the retention.
   `LocalRecord` reports a swept key as `Tombstone` in these caches. `Local`,
-  `Invalidation` and merging caches keep nothing, as before, and report it as
+  `Invalidation` and merging caches keep nothing, and report it as
   `Absent`: a merging cache already reads an expired side as absent on every
   node.
 - **A merge waiting in its coalesce window no longer outlives a remove, a
@@ -174,8 +176,8 @@ All notable changes to this project are documented in this file. Format follows
   and `clear` discard a fold still pending for the key, `clear` covers keys
   that exist only as pending folds, including a fold a flush is applying as
   the clear begins, and a tombstone from a peer discards a
-  fold made before it. A merge made after the remove starts a fresh fold,
-  where the old one used to flush with it. A flushed fold carries the version
+  fold made before it. A merge made after the remove starts a fresh fold
+  that does not flush with the old one. A flushed fold carries the version
   of its last `merge` call instead of the flush time, so a delete or an
   insert made after the call outranks it as it does with no window. A peer's
   invalidation newer than a pending fold in an `Invalidation` cache applies
@@ -201,7 +203,7 @@ All notable changes to this project are documented in this file. Format follows
 - **A full spill flush queue no longer stalls the writer.** With the default
   `flush_queue_bytes`, small values could pass the byte budget and then find
   the flusher's channel full, and the eviction pass counted the abandoned
-  hand-off as progress and ran again without end. A queued value is now
+  hand-off as progress and ran again without end. A queued value is
   charged at least its share of the channel's slots, so the byte budget
   refuses first and the refusal follows the documented policy: `Local` and
   `Invalidation` delete the victim (`queue_full`), `Replicated`,
@@ -228,9 +230,9 @@ All notable changes to this project are documented in this file. Format follows
   already decided that pair by version.
 - **An anti-entropy sketch-fallback listing of a large bucket completes.** A
   responder streams a bucket's full listing in frames of about 2 MiB and the
-  requester joins them. The listing used to travel as one frame, which a
-  bucket of about 84,000 entries or more pushed past the 4 MiB frame cap, so
-  the round failed on every attempt and the replicas stayed divergent. A
+  requester joins them. A listing sent as one frame would pass the 4 MiB
+  frame cap for a bucket of about 84,000 entries or more, and the round would
+  fail on every attempt with the replicas staying divergent. A
   protocol 8 requester still fails on such a bucket until it upgrades. A
   digest-path listing, bounded by `ae_sketch_min_bucket`, is still one frame,
   and a single key within a few hundred bytes of the frame cap fits no frame.
@@ -239,7 +241,7 @@ All notable changes to this project are documented in this file. Format follows
   reads the entry back when it sends. A zero-TTL write, `expire(k, ZERO)` and
   any write that lapses before the send replicate as an already-expired
   record (an invalidation in a non-merging `Invalidation` cache), so a peer
-  no longer keeps the value it replaced. A spilled write is read back from
+  never keeps the value it replaced. A spilled write is read back from
   disk and sent, except where the peers get only an invalidation, a
   non-merging `Invalidation` cache or a lapsed entry, which reads no disk. A
   write whose entry is gone, evicted, swept, disowned, idle or unreadable

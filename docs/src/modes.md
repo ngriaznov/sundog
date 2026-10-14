@@ -87,9 +87,9 @@ whose clock refuses the write's stamp for clock skew holds it in memory
 until its clock is within `max_clock_skew` of the stamp (see
 [guarantees](guarantees.md#conflicting-writes)). The
 sender's writer holds a batch whose send failed and sends it again on its next
-connection, along with everything it wrote in the last second, and it notices
-a peer that closed the connection before it writes. A partition that never
-delivers a close can still lose the batches in flight. A node passes a
+connection, along with what it wrote in the last second, at most 1 MiB of it,
+and it notices a peer that closed the connection before it writes. A
+partition that never delivers a close can still lose the batches in flight. A node passes a
 re-forwarded batch to a lane for each owner, so one owner that stops reading
 holds back only its own lane. A lane holds 64 MiB per peer; past that, batches
 for that peer are dropped and counted in `sundog_backlog_dropped_total`. When

@@ -528,8 +528,8 @@ pub(in crate::net) struct PeerTarget {
 /// or the connection breaks, in which case it reconnects.
 ///
 /// A burst whose send fails stays with the writer and goes out first on the
-/// next connection, and so does the tail of what the last second wrote,
-/// which a peer that closed the link may not have received (see
+/// next connection, and so does the tail of what the last second wrote (at
+/// most 1 MiB), which a peer that closed the link may not have received (see
 /// [`drive_connection`]). The peer is marked dirty once the redial succeeds,
 /// when a connection that carried frames ended or frames were held, so the
 /// next anti-entropy round targets it; a mark the spacing defers is set on
