@@ -43,7 +43,7 @@ addresses once it forms, under `cluster formed`.
 | `sundog_clock_skew_rejected_total{cache}` | records refused for a stamp further ahead of this node's clock than `max_clock_skew` |
 | `sundog_clock_skew_held{cache}` | `Distributed` forwards this node refused for clock skew and holds until its clock is within the bound |
 | `sundog_clock_skew_held_bytes{cache}` | the memory those held records take: key, value and 64 bytes each |
-| `sundog_clock_skew_hold_dropped_total{cache, reason}` | forwarded records dropped instead of held: `full` (the hold is at 16,384 records or 32 MiB) or `horizon` (the stamp is further ahead than a day or `tombstone_max_ttl`) |
+| `sundog_clock_skew_hold_dropped_total{cache, reason}` | forwarded records dropped instead of held: `full` (the hold is at 16,384 records or 32 MiB) or `horizon` (the record would wait longer than a day or `tombstone_max_ttl`, if shorter: a stamp ahead by more than `max_clock_skew` plus that limit) |
 
 ### The cluster
 
@@ -258,8 +258,9 @@ node's clock is within `max_clock_skew` of its stamp. The wait is the stamp's
 lead minus the bound, and fixing the writer's clock does not shorten it. A
 non-zero `sundog_clock_skew_hold_dropped_total` means writes were lost: the
 `full` reason is a hold at its 16,384 records or 32 MiB, and `horizon` a
-stamp further ahead than a day (or `tombstone_max_ttl`, if shorter), which no
-clock skew explains. A node that logs that its clock is behind its own last
+record that would wait longer than a day (or `tombstone_max_ttl`, if
+shorter), a stamp ahead by more than `max_clock_skew` plus that limit, which
+no clock skew explains. A node that logs that its clock is behind its own last
 write stamp had its system clock stepped back; its writes keep their order.
 
 ### A spill tier drops evictions

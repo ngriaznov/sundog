@@ -91,11 +91,14 @@ pub struct ClusterConfig {
     /// part leaves no copy behind for anti-entropy to offer, so an owner that
     /// refuses its stamp holds the record in memory and applies it once its
     /// clock is within the bound, after about the stamp's lead minus this
-    /// bound. The hold takes 16,384 records and 32 MiB per cache, and nothing
-    /// further ahead than the shorter of
-    /// [`tombstone_max_ttl`](Self::tombstone_max_ttl) and a day; a record past
+    /// bound. The hold takes 16,384 records and 32 MiB per cache, and a
+    /// record whose wait would pass the shorter of
+    /// [`tombstone_max_ttl`](Self::tombstone_max_ttl) and a day, a stamp ahead
+    /// by more than this bound plus that limit, is not held. A record past
     /// those limits is dropped and counted in
-    /// `sundog_clock_skew_hold_dropped_total{cache, reason}`. A crash loses
+    /// `sundog_clock_skew_hold_dropped_total{cache, reason}`; a held record
+    /// is never evicted to make room, so a merging resolver loses the
+    /// contribution that arrives at a full hold. A crash loses
     /// the hold; a closing cache hands it to the other owners. While a record
     /// is held the owner's clock has not absorbed its stamp, so a write made
     /// meanwhile stamps below it and loses to it once it applies.

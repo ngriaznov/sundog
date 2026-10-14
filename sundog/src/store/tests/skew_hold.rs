@@ -441,6 +441,68 @@ async fn a_merging_resolver_holds_every_version_and_merges_them_on_release() {
     assert_eq!(s.get(&key).await, Some(7));
 }
 
+/// A full hold under a merging resolver refuses the contribution that does
+/// not fit and counts it as `full`; it never evicts a contribution it holds,
+/// so the release merges all of them.
+#[tokio::test]
+async fn a_full_merging_hold_drops_and_counts_the_new_contribution_and_keeps_the_held_ones() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let clock = TestClock::at(START_MS);
+    let (s, view, _tx, _residency) = skew_shard::<u32>(&clock);
+    let s = s.with_resolver(Arc::new(SumResolver));
+    let key = owned_key(&view);
+    let contribution = |amount: u32, wall_ms: u64, writer: u64| WireRecord {
+        key: key_bytes(&key),
+        value: Some(key_bytes(&amount)),
+        ver: hlc(wall_ms, writer),
+        expires_at_ms: None,
+    };
+    let held: Vec<WireRecord> = (0..SKEW_HOLD_MAX_RECORDS as u64)
+        .map(|n| contribution(1, START_MS + 5_000 + n, OUTSIDER))
+        .collect();
+    ShardOps::apply_forwarded_batch(&s, held).await;
+    assert_eq!(s.skew_held().0, SKEW_HOLD_MAX_RECORDS);
+
+    // Another writer's higher version finds the hold full.
+    let late = contribution(1_000_000, START_MS + 500_000, OUTSIDER - 1);
+    ShardOps::apply_forwarded_batch(&s, vec![late]).await;
+
+    assert_eq!(
+        s.skew_held().0,
+        SKEW_HOLD_MAX_RECORDS,
+        "nothing was evicted"
+    );
+    let dropped = |reason: &str| -> u64 {
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, ..)| {
+                key.key().name() == "sundog_clock_skew_hold_dropped_total"
+                    && key
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == "reason" && label.value() == reason)
+            })
+            .map(|(_, _, _, value)| match value {
+                metrics_util::debugging::DebugValue::Counter(n) => n,
+                _ => 0,
+            })
+            .sum()
+    };
+    assert_eq!(dropped("full"), 1, "the refused contribution is counted");
+
+    clock.set(START_MS + 2_000_000);
+    s.release_due_skewed().await;
+    assert_eq!(
+        s.get(&key).await,
+        Some(u32::try_from(SKEW_HOLD_MAX_RECORDS).expect("fits")),
+        "every held contribution merged, the refused one did not"
+    );
+}
+
 /// A stamp further out than the horizon is a broken clock, not skew worth
 /// waiting for: it is not held. One within it is.
 #[tokio::test]

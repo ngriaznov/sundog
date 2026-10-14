@@ -45,10 +45,14 @@ meantime, here or on a node with a correct clock, stamps below the held
 record and loses to it when it applies: an acknowledged insert from a fast
 clock can bring back a key removed during the wait, and a held remove can
 delete a newer insert. Several held versions of one key reduce to the newest,
-except for a merging resolver, which keeps every contribution. The hold
-covers 16,384 records and 32 MiB per cache, and a stamp further ahead than
-the shorter of `tombstone_max_ttl` and a day is a broken clock rather than
-skew; a record past either limit is dropped and counted in
+except for a merging resolver, which holds every contribution that fits. The
+hold covers 16,384 records and 32 MiB per cache. A record that does not fit
+is dropped and counted with reason `full`; a held record is never evicted to
+make room, so under a merging resolver the contribution that arrives at a
+full hold is the one lost. A record whose wait would pass the shorter of
+`tombstone_max_ttl` and a day, a stamp ahead by more than `max_clock_skew`
+plus that limit, is a broken clock rather than skew, and is dropped and
+counted with reason `horizon`. Both count in
 `sundog_clock_skew_hold_dropped_total{cache, reason}`. The hold is in memory:
 a crash loses it, and a cache that closes hands its held records to the other
 owners of their parts, which hold them in turn. A forward whose writer is an

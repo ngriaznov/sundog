@@ -28,8 +28,9 @@ pub(super) const SKEW_HOLD_MAX_RECORDS: usize = 16_384;
 /// holds for clock skew.
 pub(super) const SKEW_HOLD_MAX_BYTES: usize = 32 * 1024 * 1024;
 
-/// The longest a record is held, whatever `tombstone_max_ttl` allows: a stamp
-/// further ahead than this is a broken clock, not skew worth waiting out.
+/// The longest a record is held, whatever `tombstone_max_ttl` allows: a
+/// record that would wait longer (a stamp ahead by more than `max_clock_skew`
+/// plus this) is a broken clock, not skew worth waiting out.
 pub(super) const SKEW_HOLD_MAX_HORIZON_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// The longest the release task sleeps between looks at the hold. Due times
@@ -90,7 +91,8 @@ pub(super) enum HoldOutcome {
     /// A newer record for this key is held, and the resolver keeps one
     /// version per key.
     Superseded,
-    /// Holding the record would pass the record or byte cap.
+    /// Holding the record would pass the record or byte cap. A hold never
+    /// evicts another record to make room for a merging key's contribution.
     Full,
     /// The hold was closed by [`SkewHold::close`].
     Closed,
@@ -136,8 +138,10 @@ impl SkewHold {
 
     /// Holds `rec`, due when the clock is within `max_skew_ms` of its stamp.
     /// `keep_every_version` is the resolver's `merges()`. A refusal changes
-    /// nothing; a held record with a lower version for the same key makes
-    /// room for `rec` before the caps refuse it.
+    /// nothing. A key that keeps one version gives up its held record for a
+    /// newer `rec`. A key that keeps every version never gives one up: at a
+    /// cap `rec` is refused as [`HoldOutcome::Full`], because a version from
+    /// another writer does not subsume the one held.
     pub(super) fn hold(
         &mut self,
         rec: WireRecord,
@@ -160,19 +164,7 @@ impl SkewHold {
             evict.extend(held_for_key.iter().map(|&(slot, _)| slot));
         }
         if !self.fits(&evict, size) {
-            // A merging key keeps every version, so make room from its lowest
-            // one below `rec`, if that is enough.
-            let lowest = held_for_key
-                .iter()
-                .filter(|&&(_, ver)| ver < rec.ver)
-                .min_by_key(|&&(_, ver)| ver)
-                .map(|&(slot, _)| slot);
-            match lowest {
-                Some(slot) if keep_every_version && self.fits(&[slot], size) => {
-                    evict = vec![slot];
-                }
-                _ => return HoldOutcome::Full,
-            }
+            return HoldOutcome::Full;
         }
         for slot in evict {
             self.remove(slot);
@@ -301,6 +293,24 @@ mod tests {
         assert!(beyond_horizon(2_001, 1_000, 1_000));
         assert!(!beyond_horizon(500, 1_000, 0), "already due is within");
         assert!(beyond_horizon(u64::MAX, 1_000, SKEW_HOLD_MAX_HORIZON_MS));
+    }
+
+    #[test]
+    fn the_horizon_bounds_the_wait_so_a_stamp_may_lead_by_the_skew_bound_plus_it() {
+        let (now_ms, max_skew_ms, horizon_ms) = (1_000_000, 60_000, 600_000);
+        let due = |lead_ms: u64| skew_due_ms(now_ms + lead_ms, max_skew_ms);
+        assert!(
+            !beyond_horizon(due(max_skew_ms + horizon_ms), now_ms, horizon_ms),
+            "a lead of the bound plus the horizon waits exactly the horizon"
+        );
+        assert!(
+            beyond_horizon(due(max_skew_ms + horizon_ms + 1), now_ms, horizon_ms),
+            "one millisecond more waits past it"
+        );
+        assert!(
+            !beyond_horizon(due(horizon_ms), now_ms, horizon_ms),
+            "a lead of the horizon alone waits less than it"
+        );
     }
 
     #[test]
@@ -511,28 +521,39 @@ mod tests {
         );
     }
 
+    /// `rec` as written by `writer`.
+    fn by_writer(mut rec: WireRecord, writer: u64) -> WireRecord {
+        rec.ver.node = node(writer);
+        rec
+    }
+
     #[test]
-    fn a_full_merging_hold_evicts_the_lowest_version_of_the_same_key() {
+    fn a_full_merging_hold_refuses_a_newer_contribution_and_evicts_nothing() {
         let mut hold = SkewHold::new(2, SKEW_HOLD_MAX_BYTES);
         assert_eq!(
-            hold.hold(rec(1, 5_000, 0, 1), 1_000, true),
+            hold.hold(by_writer(rec(1, 5_000, 0, 1), 7), 1_000, true),
             HoldOutcome::Held
         );
         assert_eq!(
-            hold.hold(rec(1, 5_500, 0, 1), 1_000, true),
+            hold.hold(by_writer(rec(1, 5_500, 0, 1), 8), 1_000, true),
             HoldOutcome::Held
         );
         assert_eq!(
-            hold.hold(rec(1, 6_000, 0, 1), 1_000, true),
-            HoldOutcome::Held,
-            "the lowest version of the key makes room"
+            hold.hold(by_writer(rec(1, 6_000, 0, 1), 9), 1_000, true),
+            HoldOutcome::Full,
+            "a higher version from another writer does not subsume a held one"
         );
-        let walls: Vec<u64> = hold
+        assert_eq!(
+            hold.hold(by_writer(rec(1, 6_000, 0, 1), 7), 1_000, true),
+            HoldOutcome::Full,
+            "nor does a higher version from the same writer, which an OrSet add is not"
+        );
+        let kept: Vec<(u64, NodeId)> = hold
             .take_due(10_000)
             .iter()
-            .map(|r| r.ver.wall_ms)
+            .map(|r| (r.ver.wall_ms, r.ver.node))
             .collect();
-        assert_eq!(walls, [5_500, 6_000]);
+        assert_eq!(kept, [(5_000, node(7)), (5_500, node(8))]);
     }
 
     #[test]

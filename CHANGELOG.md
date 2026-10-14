@@ -69,9 +69,12 @@ All notable changes to this project are documented in this file. Format follows
   its clock is within the bound, after about the stamp's lead minus
   `max_clock_skew`; correcting the writer's clock does not shorten the wait.
   A held key keeps its newest version, except under a merging resolver, which
-  keeps every contribution. A forward whose writer owns the part is not held,
-  since that owner kept its copy and anti-entropy offers it again, and a stamp
-  further ahead than the shorter of `tombstone_max_ttl` and a day is dropped.
+  holds every contribution that fits: at a full hold the arriving
+  contribution is dropped and counted with reason `full`, and no held one is
+  evicted for it. A forward whose writer owns the part is not held, since that
+  owner kept its copy and anti-entropy offers it again, and a record whose
+  wait would pass the shorter of `tombstone_max_ttl` and a day, a stamp ahead
+  by more than `max_clock_skew` plus that limit, is dropped.
   A hold does not survive a crash, and a closing cache hands its held records
   to the other owners. While a record is held the owner's clock has not
   absorbed its stamp, so a write or remove made meanwhile stamps below it and
