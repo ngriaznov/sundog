@@ -902,3 +902,71 @@ fn evict_one_sampled_breaks_a_last_access_tie_by_arena_order() {
         "today's concrete tie-break: the second-inserted key survives"
     );
 }
+
+#[test]
+fn sampled_eviction_keeps_an_entry_touched_after_the_evictors_now() {
+    let (key_hot, key_cold, bucket) = same_bucket_pair(100_000);
+    let engine = Engine::<u32, String>::new(u64::MAX, None, None, None);
+    let now = 10_000u64;
+    let _ = put(
+        &engine,
+        key_cold,
+        key_bytes(key_cold),
+        "cold".to_string(),
+        hlc(1, 1),
+        None,
+        now - 50,
+    );
+    let _ = put(
+        &engine,
+        key_hot,
+        key_bytes(key_hot),
+        "hot".to_string(),
+        hlc(2, 1),
+        None,
+        now + 10,
+    );
+
+    let outcome = engine.evict_one_sampled(bucket, now);
+    assert_eq!(outcome.removed_weight, 1, "one entry evicted");
+    assert_eq!(
+        engine.get(&key_cold, now + 11),
+        None,
+        "the entry idle for 50 ms is the victim"
+    );
+    assert_eq!(
+        engine.get(&key_hot, now + 11),
+        Some("hot".to_string()),
+        "an entry touched after the evictor sampled its now ranks hottest, not coldest"
+    );
+}
+
+#[test]
+fn batch_eviction_keeps_an_entry_touched_after_the_evictors_now() {
+    let (key_hot, key_cold, bucket) = same_bucket_pair(100_000);
+    let engine = Engine::<u32, String>::new(u64::MAX, None, None, None);
+    let now = 10_000u64;
+    let _ = put(
+        &engine,
+        key_cold,
+        key_bytes(key_cold),
+        "cold".to_string(),
+        hlc(1, 1),
+        None,
+        now - 50,
+    );
+    let _ = put(
+        &engine,
+        key_hot,
+        key_bytes(key_hot),
+        "hot".to_string(),
+        hlc(2, 1),
+        None,
+        now + 10,
+    );
+
+    let outcome = engine.evict_batch_sampled(bucket, 1, now);
+    assert_eq!(outcome.removed_weight, 1, "one entry evicted");
+    assert_eq!(engine.get(&key_cold, now + 11), None);
+    assert_eq!(engine.get(&key_hot, now + 11), Some("hot".to_string()));
+}

@@ -541,3 +541,22 @@ fn resolve_conflict_rejects_a_redelivered_record_whatever_the_stored_absence() {
     );
     assert!(matches!(resolution, Resolution::IncomingLoses));
 }
+
+#[test]
+fn a_stored_entry_touched_after_the_writers_now_still_folds_into_a_merge() {
+    let engine: SetEngine = Engine::new(u64::MAX, Some(Duration::from_millis(100)), None, None);
+    put_set(&engine, &["old"], hlc(1_000, 1), None, 1_000);
+    assert_eq!(
+        engine.get(&KEY, 1_010),
+        Some(string_set(&["old"])),
+        "a read at 1_010 touches the entry"
+    );
+
+    // The writer sampled its clock at 1_005, before that touch landed.
+    let outcome = put_set(&engine, &["new"], hlc(2_000, 2), None, 1_005);
+    assert!(
+        matches!(outcome, ApplyOutcome::Put { created: false, .. }),
+        "the stored side was just used: it folds, it is not displaced"
+    );
+    assert_eq!(engine.get(&KEY, 1_010), Some(string_set(&["new", "old"])));
+}

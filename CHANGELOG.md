@@ -3,6 +3,17 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **A just-read entry is never idle because of a clock behind its last read.**
+  An entry read after the clock a concurrent reader, a sweep or a merge
+  sampled, or after a backward step of the wall clock of up to 24 hours, no
+  longer reads as idle past `tti`: the read hits, the sweep keeps it, a
+  merging resolver folds it and eviction ranks it hottest, in every mode with
+  a capacity. A `tti` longer than about 48.7 days is capped at that.
+
 ## [0.6.7] – 2026-10-13
 
 ### Added

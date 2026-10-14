@@ -170,7 +170,8 @@ struct Live<K, V> {
     /// `Weigher`, `0` while a spill hand-off for this entry is in flight.
     weight: u32,
     /// [`touch_stamp`] of this entry's last read, read only through
-    /// [`idle_elapsed_ms`] (a rollover confuses a raw comparison).
+    /// [`idle_elapsed_ms`] (a rollover confuses a raw comparison, and a
+    /// stamp ahead of an observer's clock reads as zero idle).
     last_access_ms: AtomicU32,
     /// Whether `record` holds a value or points at disk with none. Absent
     /// in a non-`spill` build: every entry is implicitly resident.
@@ -525,7 +526,8 @@ pub(crate) struct Engine<K, V> {
     /// record swap. `None`, the default, counts nothing.
     resident_bytes: Option<Arc<AtomicU64>>,
     max_capacity: u64,
-    /// The configured time-to-idle, clamped by [`clamp_tti_ms`].
+    /// The configured time-to-idle, clamped by [`clamp_tti_ms`] to
+    /// `MAX_TTI_MS` (~48.7 days).
     tti_ms: Option<u64>,
     weigher: Option<Weigher<K, V>>,
     evict_cursor: AtomicU64,

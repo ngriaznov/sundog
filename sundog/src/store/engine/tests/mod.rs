@@ -12,8 +12,8 @@ use super::evict::{
     deficit_once_still_over_capacity, eviction_batch_size,
 };
 use super::expiry::{
-    LONG_TTL, MAX_INLINE_TTL_MS, NEVER_EXPIRES, decode_expiry, encode_expiry, idle_elapsed_ms,
-    lapse_cause,
+    LONG_TTL, MAX_INLINE_TTL_MS, MAX_STAMP_LEAD_MS, MAX_TTI_MS, NEVER_EXPIRES, decode_expiry,
+    encode_expiry, idle_elapsed_ms, lapse_cause,
 };
 use super::housekeeping::should_shrink_stripe;
 use super::inflight::fill_supersedes;

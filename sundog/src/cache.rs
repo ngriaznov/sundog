@@ -174,8 +174,8 @@ where
         self
     }
 
-    /// Sets a local-only max-idle (TTI), not cluster-replicated. Default: no
-    /// idle expiry.
+    /// Sets a local-only max-idle (TTI), not cluster-replicated. Capped at
+    /// about 48.7 days. Default: no idle expiry.
     pub fn tti(mut self, tti: Duration) -> Self {
         self.tti = Some(tti);
         self

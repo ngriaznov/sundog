@@ -1,8 +1,8 @@
 //! Kani proofs over the `Hlc`, expiry, hash-slot, merge and stripe-shrink arithmetic.
 
 use super::expiry::{
-    LONG_TTL, MAX_INLINE_TTL_MS, NEVER_EXPIRES, clamp_tti_ms, encode_expiry, idle_elapsed_ms,
-    touch_stamp,
+    LONG_TTL, MAX_INLINE_TTL_MS, MAX_STAMP_LEAD_MS, MAX_TTI_MS, NEVER_EXPIRES, clamp_tti_ms,
+    encode_expiry, idle_elapsed_ms, touch_stamp,
 };
 use super::housekeeping::should_shrink_stripe;
 use super::keys::{digest_slot, part_index_from_hash, stripe_index_from_hash};
@@ -144,8 +144,27 @@ fn idle_elapsed_recovers_any_gap_under_the_stamp_span() {
     let earlier: u64 = kani::any();
     let now: u64 = kani::any();
     kani::assume(now >= earlier);
-    kani::assume(now - earlier <= MAX_INLINE_TTL_MS);
+    kani::assume(now - earlier <= MAX_TTI_MS);
     assert_eq!(idle_elapsed_ms(now, touch_stamp(earlier)), now - earlier);
+}
+
+/// A stamp ahead of the observer's `now` by up to the lead window reads as
+/// zero idle, across a rollover of the stamp.
+#[kani::proof]
+fn idle_elapsed_is_zero_for_a_stamp_ahead_of_now() {
+    let earlier: u64 = kani::any();
+    let now: u64 = kani::any();
+    kani::assume(earlier > now && earlier - now <= MAX_STAMP_LEAD_MS);
+    assert_eq!(idle_elapsed_ms(now, touch_stamp(earlier)), 0);
+}
+
+/// No stamp and no `now` ever reads as more idle than the ceiling a
+/// configured time-to-idle is clamped to.
+#[kani::proof]
+fn idle_elapsed_never_exceeds_the_clamped_tti_ceiling() {
+    let now: u64 = kani::any();
+    let stamp: u32 = kani::any();
+    assert!(idle_elapsed_ms(now, stamp) <= MAX_TTI_MS);
 }
 
 /// A clamped time-to-idle never exceeds the stamp's span or the value asked for.
@@ -153,8 +172,9 @@ fn idle_elapsed_recovers_any_gap_under_the_stamp_span() {
 fn clamped_tti_stays_within_the_stamp_span() {
     let tti_ms: u64 = kani::any();
     let clamped = clamp_tti_ms(tti_ms);
-    assert!(clamped <= MAX_INLINE_TTL_MS);
+    assert!(clamped <= MAX_TTI_MS);
     assert!(clamped <= tti_ms);
+    assert!(clamped + MAX_STAMP_LEAD_MS <= u64::from(u32::MAX));
 }
 
 /// Any hash lands inside the bucket table, the part table and the flat digest table.

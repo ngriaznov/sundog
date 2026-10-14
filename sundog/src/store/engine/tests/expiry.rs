@@ -453,42 +453,42 @@ fn idle_elapsed_ms_is_correct_across_a_touch_stamp_rollover() {
 }
 
 #[test]
-fn clamp_tti_ms_caps_a_tti_past_max_inline_ttl_ms_to_it() {
+fn clamp_tti_ms_caps_a_tti_past_max_tti_ms_to_it() {
     assert_eq!(
         clamp_tti_ms(1_000),
         1_000,
         "well under the ceiling: untouched"
     );
     assert_eq!(
-        clamp_tti_ms(MAX_INLINE_TTL_MS),
-        MAX_INLINE_TTL_MS,
+        clamp_tti_ms(MAX_TTI_MS),
+        MAX_TTI_MS,
         "exactly at the ceiling: untouched"
     );
     assert_eq!(
-        clamp_tti_ms(MAX_INLINE_TTL_MS + 1),
-        MAX_INLINE_TTL_MS,
+        clamp_tti_ms(MAX_TTI_MS + 1),
+        MAX_TTI_MS,
         "one past the ceiling: capped"
     );
     assert_eq!(
         clamp_tti_ms(u64::MAX),
-        MAX_INLINE_TTL_MS,
+        MAX_TTI_MS,
         "far past the ceiling: capped"
     );
 }
 
 #[test]
-fn engine_new_clamps_a_configured_tti_past_max_inline_ttl_ms() {
-    let past_ceiling = Duration::from_millis(MAX_INLINE_TTL_MS + 10_000);
+fn engine_new_clamps_a_configured_tti_past_max_tti_ms() {
+    let past_ceiling = Duration::from_millis(MAX_TTI_MS + 10_000);
     let engine = engine_u32_string(u64::MAX, Some(past_ceiling));
-    assert_eq!(engine.tti_ms, Some(MAX_INLINE_TTL_MS));
+    assert_eq!(engine.tti_ms, Some(MAX_TTI_MS));
 }
 
 #[test]
-fn tti_past_max_inline_ttl_ms_still_expires_within_the_clamped_bound() {
-    // With no clamp, a tti this far past MAX_INLINE_TTL_MS would leave
+fn tti_past_max_tti_ms_still_expires_within_the_clamped_bound() {
+    // With no clamp, a tti this far past MAX_TTI_MS would leave
     // the entry readable forever. Two separate engines, since a read
     // would reset the idle clock the second assertion checks.
-    let past_ceiling = Duration::from_millis(MAX_INLINE_TTL_MS + 10_000);
+    let past_ceiling = Duration::from_millis(MAX_TTI_MS + 10_000);
 
     let still_within = engine_u32_string(u64::MAX, Some(past_ceiling));
     let _ = put(
@@ -501,7 +501,7 @@ fn tti_past_max_inline_ttl_ms_still_expires_within_the_clamped_bound() {
         0,
     );
     assert_eq!(
-        still_within.get(&1, MAX_INLINE_TTL_MS - 1),
+        still_within.get(&1, MAX_TTI_MS - 1),
         Some("a".to_string()),
         "still within the clamped tti"
     );
@@ -509,8 +509,123 @@ fn tti_past_max_inline_ttl_ms_still_expires_within_the_clamped_bound() {
     let past_clamp = engine_u32_string(u64::MAX, Some(past_ceiling));
     let _ = put(&past_clamp, 1, key_bytes(1), "a".into(), hlc(1, 1), None, 0);
     assert_eq!(
-        past_clamp.get(&1, MAX_INLINE_TTL_MS),
+        past_clamp.get(&1, MAX_TTI_MS),
         None,
         "idle past the clamped tti"
+    );
+}
+
+#[test]
+fn idle_elapsed_ms_is_zero_for_a_stamp_ahead_of_now() {
+    assert_eq!(
+        idle_elapsed_ms(999, touch_stamp(1_000)),
+        0,
+        "a stamp newer than the observer's now is zero idle, not ~49 days"
+    );
+}
+
+#[test]
+fn idle_elapsed_ms_reads_the_lead_window_as_zero_and_the_gap_below_it_exactly() {
+    let now = 5_000_000_000u64;
+    assert_eq!(idle_elapsed_ms(now, touch_stamp(now + 1)), 0, "1 ms ahead");
+    assert_eq!(
+        idle_elapsed_ms(now, touch_stamp(now + MAX_STAMP_LEAD_MS)),
+        0,
+        "exactly at the edge of the lead window"
+    );
+    assert_eq!(
+        idle_elapsed_ms(now, touch_stamp(now - MAX_TTI_MS)),
+        MAX_TTI_MS,
+        "a gap of exactly MAX_TTI_MS is the true gap"
+    );
+    assert_eq!(
+        idle_elapsed_ms(now, touch_stamp(now - MAX_TTI_MS - 1)),
+        0,
+        "one past MAX_TTI_MS is the first lead value"
+    );
+    assert_eq!(
+        idle_elapsed_ms(now, touch_stamp(now + MAX_STAMP_LEAD_MS + 1)),
+        MAX_TTI_MS,
+        "a lead past the window reads as the oldest representable gap"
+    );
+    // A stamp 15 ms ahead whose truncation straddles the u32 rollover.
+    let straddling_now = (1u64 << 32) - 10;
+    assert_eq!(
+        idle_elapsed_ms(straddling_now, touch_stamp((1u64 << 32) + 5)),
+        0
+    );
+    // A stamp near u32::MAX with now just past the rollover is the true small gap.
+    assert_eq!(
+        idle_elapsed_ms((1u64 << 32) + 10, touch_stamp(u64::from(u32::MAX) - 4)),
+        15
+    );
+}
+
+#[test]
+fn clamp_tti_ms_leaves_room_for_the_lead_window() {
+    assert_eq!(clamp_tti_ms(u64::MAX), MAX_TTI_MS);
+    assert_eq!(MAX_TTI_MS + MAX_STAMP_LEAD_MS, u64::from(u32::MAX));
+    const { assert!(MAX_TTI_MS <= MAX_INLINE_TTL_MS) };
+}
+
+#[test]
+fn a_read_sampled_before_the_latest_touch_still_sees_the_entry() {
+    let engine = engine_u32_string(u64::MAX, Some(Duration::from_millis(100)));
+    let _ = put(&engine, 1, key_bytes(1), "a".into(), hlc(1, 1), None, 1_000);
+    assert_eq!(engine.get(&1, 1_001), Some("a".to_string()));
+    assert_eq!(
+        engine.get(&1, 1_000),
+        Some("a".to_string()),
+        "a reader whose now was sampled before the latest touch still sees the entry"
+    );
+}
+
+#[test]
+fn a_sweep_sampled_before_a_touch_keeps_the_touched_entry() {
+    let engine = engine_u32_string(u64::MAX, Some(Duration::from_millis(100)));
+    let _ = put(&engine, 1, key_bytes(1), "a".into(), hlc(1, 1), None, 1_000);
+    assert_eq!(engine.get(&1, 1_001), Some("a".to_string()));
+    engine.sweep(999);
+    assert_eq!(
+        engine.live_entry_count(),
+        1,
+        "a sweep that sampled now before a touch does not delete the touched entry"
+    );
+}
+
+#[test]
+fn a_touched_entry_is_present_to_an_observer_whose_now_is_behind_the_touch() {
+    let engine = engine_u32_string(u64::MAX, Some(Duration::from_millis(100)));
+    let _ = put(&engine, 1, key_bytes(1), "a".into(), hlc(1, 1), None, 1_000);
+    assert_eq!(engine.get(&1, 1_010), Some("a".to_string()));
+
+    assert!(engine.contains_key(&1, 1_005), "contains_key");
+    assert_eq!(engine.keys(1_005), vec![1], "keys");
+    let mut seen = Vec::new();
+    engine.for_each_key(1_005, |k| seen.push(k));
+    assert_eq!(seen, vec![1], "for_each_key");
+    assert!(
+        matches!(
+            engine.inspect(key_bytes(1).as_ref(), 1_005),
+            LocalRecord::Live { .. }
+        ),
+        "inspect does not report the entry lapsed"
+    );
+    assert!(
+        engine.record_for(key_bytes(1).as_ref(), 1_005).is_some(),
+        "record_for"
+    );
+}
+
+#[test]
+fn a_touched_entry_still_idles_out_once_the_observer_catches_up() {
+    let engine = engine_u32_string(u64::MAX, Some(Duration::from_millis(100)));
+    let _ = put(&engine, 1, key_bytes(1), "a".into(), hlc(1, 1), None, 1_000);
+    assert_eq!(engine.get(&1, 1_010), Some("a".to_string()));
+    assert_eq!(engine.get(&1, 1_109), Some("a".to_string()), "99 ms idle");
+    assert_eq!(
+        engine.get(&1, 1_209),
+        None,
+        "100 ms idle after the 1_109 touch"
     );
 }

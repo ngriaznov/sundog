@@ -522,3 +522,41 @@ async fn dead_on_arrival_ttl_record_never_resurrects_a_locally_expired_entry() {
         "same guarantee via apply_remote_batch"
     );
 }
+
+#[tokio::test]
+async fn a_clock_stepped_back_does_not_idle_out_a_just_read_entry() {
+    let clock = Arc::new(std::sync::atomic::AtomicU64::new(1_000_000));
+    let reader = Arc::clone(&clock);
+    let shard = Shard::<u32, String>::new(
+        SmolStr::new("test"),
+        Mode::Local,
+        NodeId::from(1),
+        10_000,
+        None,
+        Some(Duration::from_millis(100)),
+    )
+    .with_clock(Arc::new(move || {
+        reader.load(std::sync::atomic::Ordering::SeqCst)
+    }));
+    shard.insert(1, "v".into()).await.expect("insert");
+    assert_eq!(shard.get(&1).await, Some("v".into()));
+
+    clock.store(1_000_000 - 500, std::sync::atomic::Ordering::SeqCst);
+
+    assert_eq!(shard.get(&1).await, Some("v".into()), "get");
+    assert!(shard.contains_key(&1).await, "contains_key");
+    assert!(shard.contains_key_sync(&1), "contains_key_sync");
+    assert_eq!(shard.keys(), vec![1], "keys");
+    assert_eq!(
+        shard.entry_count().await,
+        1,
+        "entry_count sweeps and counts"
+    );
+    ShardOps::run_pending_tasks(&shard).await;
+    assert_eq!(
+        shard.entry_count().await,
+        1,
+        "run_pending_tasks leaves the entry live"
+    );
+    assert_eq!(shard.get(&1).await, Some("v".into()), "still readable");
+}

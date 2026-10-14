@@ -1020,6 +1020,37 @@ fn install_new_never_resurrects_a_tombstoned_key() {
 }
 
 #[test]
+fn install_new_stamped_ahead_of_the_clock_stays_live_under_tti() {
+    let engine = engine_u32_string(u64::MAX, Some(Duration::from_millis(100)));
+    let key = 1u32;
+    let kb = key_bytes(key);
+    let hash = hash_key_bytes(kb.as_ref());
+    let bucket = stripe_index_from_hash(hash);
+
+    // A warm reopen stamps the entry's last access with its write version's
+    // wall time, which a restarted clock can trail.
+    let inserted = SpillSink::install_new(
+        &engine,
+        bucket,
+        &kb,
+        hash,
+        hlc(1_010, 1),
+        None,
+        loc(0, 0, 4, 0),
+        1,
+    );
+
+    assert!(inserted);
+    assert!(
+        matches!(
+            engine.inspect(kb.as_ref(), 1_005),
+            LocalRecord::Live { spilled: true, .. }
+        ),
+        "an entry stamped ahead of the reader's clock is zero idle, not lapsed"
+    );
+}
+
+#[test]
 fn install_new_never_overwrites_an_already_present_live_entry() {
     let engine = engine_u32_string(u64::MAX, None);
     let key = 1u32;

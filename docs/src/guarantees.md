@@ -109,7 +109,14 @@ a new value. On the node applying a write, a value that reads as absent
 there, expired or idle, never folds either.
 
 `CacheBuilder::tti`, an idle timeout, is local to one node and applies only
-to `Local` and `Invalidation` caches.
+to `Local` and `Invalidation` caches. It is measured on the observing
+node's clock. A read, a sweep or a merge that sampled its clock before a
+later touch, or after the wall clock stepped back by up to 24 hours, counts
+the entry as just used: it is never idle because of that, and eviction ranks
+it hottest. A step back of more than 24 hours is not covered. A `tti` longer
+than about 48.7 days is capped at that, and idle time, both for `tti` and for
+the eviction ranking in every mode with a capacity, is exact only up to that
+span: an entry that sat unswept for longer is not guaranteed to stay deleted.
 
 ## Per mode
 

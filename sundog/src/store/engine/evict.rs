@@ -600,7 +600,9 @@ where
     /// victim's own [`Engine::evict_victim_locked`] call, so the same
     /// pre-lock budget carries across every victim this lock hold evicts.
     /// Victims are ranked coldest-first by [`idle_elapsed_ms`] as of
-    /// `now_ms`, correct across a `last_access_ms` rollover. With
+    /// `now_ms`, correct across a `last_access_ms` rollover; a stamp ahead
+    /// of `now_ms` ranks as zero idle, hottest, and the ranking is exact up
+    /// to `MAX_TTI_MS` (~48.7 days) of idle. With
     /// `only_if_dense`, a sample of fewer than [`EVICTION_SAMPLE`]
     /// candidates gives up nothing, so a sparse stripe is never drained.
     /// `on_refusal` applies to every victim of the batch.

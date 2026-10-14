@@ -13,6 +13,7 @@ mod rules;
 #[cfg(feature = "spill")]
 mod spill_gate;
 mod startup;
+mod tti_clock;
 mod warm_reconcile;
 mod writes;
 

@@ -55,6 +55,23 @@ pub(super) fn decode_expiry(
     }
 }
 
+/// The part of the 32-bit stamp ring reserved for a stamp that leads the
+/// observer's `now_ms` (24 hours): a reader that sampled its clock before a
+/// later touch, or a wall clock that stepped back, sees the stamp ahead of
+/// it by at most this much, and reads zero idle.
+pub(super) const MAX_STAMP_LEAD_MS: u64 = 86_400_000;
+
+/// The largest idle gap [`idle_elapsed_ms`] reports and the ceiling
+/// [`clamp_tti_ms`] enforces: the stamp ring less [`MAX_STAMP_LEAD_MS`]
+/// (~48.71 days). Gaps and leads share one ring, so they cannot both own all
+/// of it.
+pub(super) const MAX_TTI_MS: u64 = (u32::MAX as u64) - MAX_STAMP_LEAD_MS;
+
+const _: () = assert!(
+    MAX_TTI_MS + MAX_STAMP_LEAD_MS == u32::MAX as u64 && MAX_TTI_MS <= MAX_INLINE_TTL_MS,
+    "the idle gaps and the lead window split the stamp ring exactly, inside the inline ttl range"
+);
+
 /// Truncates `now_ms` to [`Live::last_access_ms`]'s stored form (the low 32
 /// bits); [`idle_elapsed_ms`] recovers the true gap from this alone.
 #[allow(
@@ -67,20 +84,25 @@ pub(super) fn touch_stamp(now_ms: u64) -> u32 {
 }
 
 /// Milliseconds since an entry was last touched at
-/// [`touch_stamp`]`(earlier now)`, correct as long as the true gap is under
-/// ~49.71 days, the ceiling [`clamp_tti_ms`] enforces.
+/// [`touch_stamp`]`(earlier now)`. Exact for a true gap up to
+/// [`MAX_TTI_MS`], the ceiling [`clamp_tti_ms`] enforces. A stamp ahead of
+/// `now_ms` by up to [`MAX_STAMP_LEAD_MS`] reads as zero idle: the reader
+/// sampled its clock before a later touch, or the wall clock stepped back.
+/// A lead past that window, or an unswept entry idle past [`MAX_TTI_MS`],
+/// reads as a gap in the other region.
 #[allow(
     clippy::cast_possible_truncation,
     reason = "matches touch_stamp's own truncation of now_ms before the wrapping subtraction"
 )]
 pub(super) fn idle_elapsed_ms(now_ms: u64, last_access_ms: u32) -> u64 {
-    u64::from((now_ms as u32).wrapping_sub(last_access_ms))
+    let gap = u64::from((now_ms as u32).wrapping_sub(last_access_ms));
+    if gap > MAX_TTI_MS { 0 } else { gap }
 }
 
-/// Clamps a configured time-to-idle to [`MAX_INLINE_TTL_MS`], past which
-/// [`idle_elapsed_ms`] never fires and the entry stays readable forever.
+/// Clamps a configured time-to-idle to [`MAX_TTI_MS`], past which
+/// [`idle_elapsed_ms`] cannot tell an idle entry from a freshly touched one.
 pub(super) fn clamp_tti_ms(tti_ms: u64) -> u64 {
-    tti_ms.min(MAX_INLINE_TTL_MS)
+    tti_ms.min(MAX_TTI_MS)
 }
 
 /// Whether a read of `live` at `now_ms` sees nothing: past its expiry, or
