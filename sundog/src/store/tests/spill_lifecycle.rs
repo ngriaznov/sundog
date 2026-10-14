@@ -1153,25 +1153,13 @@ async fn a_second_checkpointed_close_does_not_checkpoint_again() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Closes that overlap run one checkpoint between them: the late one waits
-/// for the first and returns when it is done.
+/// The sum of `sundog_spill_checkpoint_entries_total{stage="snapshot"}` the
+/// recorder behind `snapshotter` has seen: the entries listed per checkpoint,
+/// so one checkpoint of the one entry reads 1.
 #[cfg(feature = "spill")]
-#[tokio::test]
-async fn overlapping_checkpointed_closes_checkpoint_once() {
-    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-    let recorder = DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
-    let _guard = metrics::set_default_local_recorder(&recorder);
-    let (shard, dir) = shard_with_one_entry_and_a_warm_tier("overlap").await;
-
-    tokio::join!(
-        shard.close_spill_checkpointed(),
-        shard.close_spill_checkpointed(),
-        shard.close_spill_checkpointed(),
-    );
-
-    assert!(shard.spill_tier_closed());
-    let listed: u64 = snapshotter
+fn snapshot_stage_total(snapshotter: &metrics_util::debugging::Snapshotter) -> u64 {
+    use metrics_util::debugging::DebugValue;
+    snapshotter
         .snapshot()
         .into_vec()
         .into_iter()
@@ -1186,9 +1174,30 @@ async fn overlapping_checkpointed_closes_checkpoint_once() {
             DebugValue::Counter(n) => n,
             _ => 0,
         })
-        .sum();
+        .sum()
+}
+
+/// Closes that overlap run one checkpoint between them: the late one waits
+/// for the first and returns when it is done.
+#[cfg(feature = "spill")]
+#[tokio::test]
+async fn overlapping_checkpointed_closes_checkpoint_once() {
+    use metrics_util::debugging::DebuggingRecorder;
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let (shard, dir) = shard_with_one_entry_and_a_warm_tier("overlap").await;
+
+    tokio::join!(
+        shard.close_spill_checkpointed(),
+        shard.close_spill_checkpointed(),
+        shard.close_spill_checkpointed(),
+    );
+
+    assert!(shard.spill_tier_closed());
     assert_eq!(
-        listed, 1,
+        snapshot_stage_total(&snapshotter),
+        1,
         "one snapshot of the one entry, not one per caller"
     );
     let _ = snapshot_file(&dir);
@@ -1216,6 +1225,87 @@ async fn a_checkpointed_close_dropped_mid_way_is_run_by_the_next_call() {
     shard.close_spill_checkpointed().await;
 
     assert!(shard.spill_tier_closed());
+    let _ = snapshot_file(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A close dropped while its checkpoint is joining the flusher, such as a
+/// caller's timeout, leaves the checkpoint running: the next close waits for
+/// that run instead of starting a second one beside its blocking disk work,
+/// and the cache checkpoints once.
+#[cfg(all(feature = "spill", not(feature = "sim")))]
+#[tokio::test]
+async fn a_checkpointed_close_dropped_in_a_blocking_stage_is_not_run_twice() {
+    use metrics_util::debugging::DebuggingRecorder;
+    use std::time::Duration;
+    const KEYS: u32 = 20;
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let dir = std::env::temp_dir().join(format!(
+        "sundog-shard-close-once-dropped-blocking-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id(),
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let cfg = spill::SpillConfig::new(&dir, 1 << 20)
+        .region_bytes(4096)
+        .warm_reopen(true);
+    let shard = Shard::<u32, String>::new(
+        SmolStr::new("dropped-blocking"),
+        Mode::Local,
+        NodeId::from(306u64),
+        3, // a tiny weight cap: the writes evict onto the flusher's queue
+        None,
+        None,
+    );
+    shard
+        .attach_spill(&cfg)
+        .expect("a brand-new directory opens cold");
+    // The flusher parks after the first job it takes, so the checkpoint's
+    // join on it waits.
+    shard.debug_pause_spill_flusher();
+    for k in 0..KEYS {
+        shard.insert(k, "v".repeat(40)).await.expect("insert");
+    }
+
+    // The first close parks joining the paused flusher, then its caller gives up.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), shard.close_spill_checkpointed())
+            .await
+            .is_err(),
+        "the checkpoint waits on the paused flusher"
+    );
+    assert!(!shard.spill_tier_closed());
+
+    // A second close waits for that run: it does not finish beside it.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), shard.close_spill_checkpointed())
+            .await
+            .is_err(),
+        "the second close waits for the checkpoint under way"
+    );
+    assert!(
+        !shard.spill_tier_closed(),
+        "a second checkpoint did not start beside the first"
+    );
+
+    shard.debug_resume_spill_flusher();
+    tokio::time::timeout(Duration::from_secs(10), shard.close_spill_checkpointed())
+        .await
+        .expect("the close ends once the flusher runs");
+
+    assert!(shard.spill_tier_closed());
+    assert_eq!(
+        shard.debug_spill_checkpoint_runs(),
+        1,
+        "the retry waited for the checkpoint under way and wrote no second one"
+    );
+    assert_eq!(
+        snapshot_stage_total(&snapshotter),
+        u64::from(KEYS),
+        "one checkpoint listed each entry once"
+    );
     let _ = snapshot_file(&dir);
     let _ = std::fs::remove_dir_all(&dir);
 }

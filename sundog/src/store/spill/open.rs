@@ -140,6 +140,8 @@ impl SpillTier {
             keep_resident_when_refused: AtomicBool::new(false),
             #[cfg(test)]
             flusher_paused: AtomicBool::new(false),
+            #[cfg(test)]
+            checkpoint_flushes: AtomicU64::new(0),
             flusher_jobs_drained: AtomicU64::new(0),
             flusher_jobs_abandoned: AtomicU64::new(0),
         });
@@ -313,6 +315,8 @@ impl SpillTier {
             keep_resident_when_refused: AtomicBool::new(false),
             #[cfg(test)]
             flusher_paused: AtomicBool::new(false),
+            #[cfg(test)]
+            checkpoint_flushes: AtomicU64::new(0),
             flusher_jobs_drained: AtomicU64::new(0),
             flusher_jobs_abandoned: AtomicU64::new(0),
         });

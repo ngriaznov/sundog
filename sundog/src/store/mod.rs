@@ -510,10 +510,11 @@ where
     /// Set once the first forwarded record dropped instead of held has been
     /// logged at `warn`; later drops log at `debug` and only count.
     skew_drop_warned: AtomicBool,
-    /// Runs the spill tier's checkpointed close once: later and concurrent
-    /// closers wait for the first and find it done, and a first close
-    /// dropped mid-way leaves the cell empty for the next to run.
-    spill_close: tokio::sync::OnceCell<()>,
+    /// Runs the spill tier's checkpointed close once. The flag is true once
+    /// a close finished; the lock is held for the whole checkpoint by the
+    /// task running it, so later and concurrent closers, and one that
+    /// follows a dropped first caller, wait for that run and find it done.
+    spill_close: Arc<tokio::sync::Mutex<bool>>,
     /// The resolver every decision runs through: `raw_resolver` wrapped in
     /// a [`SettlingResolver`] carrying `crdt_retire_after_ms` and this
     /// shard's clock, rebuilt whenever any of the three changes.

@@ -115,7 +115,10 @@ All notable changes to this project are documented in this file. Format follows
   now owned, which could drop that cache's later entries from the next warm
   reopen. A close now acts on the cluster only for the shard the registry
   holds, and a cache checkpoints its spill tier once: a second or concurrent
-  close waits for the first and does nothing more.
+  close waits for the first and does nothing more. The checkpoint runs on its
+  own task, so a `close` cut short by a timeout leaves it running and the next
+  `close` waits for it instead of starting a second checkpoint beside its
+  disk writes.
 - **A part pull that times out after a view change is retried every
   `ae_interval`.** A `Distributed` node that gains a part and whose pull runs
   out `state_transfer_budget` keeps pulling it on the anti-entropy tick until

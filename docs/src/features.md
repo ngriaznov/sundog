@@ -78,7 +78,9 @@ live co-owner confirms it, or after the warm-up finds no co-owner to ask.
 A cache checkpoints once. A second `close` from another clone, or a `close`
 after `shutdown`, waits for the first to finish and writes nothing, so it
 cannot overwrite the snapshot of a cache that has reopened the directory
-since.
+since. The checkpoint runs on its own task: a `close` dropped part-way, such
+as one cut short by a timeout, leaves it running, and the next `close` waits
+for it.
 
 A warm reopen advances the node's clock past the greatest version it
 replays, so a write or delete made after the restart stamps after every

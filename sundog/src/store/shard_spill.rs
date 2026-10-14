@@ -4,7 +4,6 @@
 #[cfg(feature = "spill")]
 use std::collections::HashSet;
 use std::hash::Hash;
-#[cfg(feature = "spill")]
 use std::sync::Arc;
 #[cfg(all(feature = "spill", not(feature = "sim"), test))]
 use std::time::Duration;
@@ -16,7 +15,7 @@ use serde::de::DeserializeOwned;
 
 use super::Shard;
 #[cfg(feature = "spill")]
-use super::{Mode, PartId, SpillRead, encode_key, engine, now_ms, spill};
+use super::{Mode, PartId, SmolStr, SpillRead, encode_key, engine, now_ms, spill};
 #[cfg(feature = "spill")]
 use crate::hlc::Hlc;
 #[cfg(feature = "spill")]
@@ -375,178 +374,39 @@ where
     /// it, and one that finds it done returns at once, so a second clone's
     /// close, or one after the sweep, cannot checkpoint a closed tier into
     /// files a reopened cache has since taken over, which could bring back
-    /// an entry the reopened cache deleted. A call dropped before it
-    /// finishes leaves the close undone, and the next call runs it.
+    /// an entry the reopened cache deleted.
+    ///
+    /// The checkpoint runs on its own task, which holds the close gate until
+    /// it ends, so a caller dropped part-way, such as one cut short by a
+    /// timeout, leaves the checkpoint running. The next call waits for that
+    /// run and finds it done; it never starts a second checkpoint beside the
+    /// first's blocking disk work. A checkpoint that ends without finishing,
+    /// because its task panicked, leaves the close undone, and the next call
+    /// runs it.
     pub(crate) async fn close_spill_checkpointed(&self) {
-        self.spill_close
-            .get_or_init(|| self.checkpoint_and_close_spill())
-            .await;
-    }
-
-    /// The body of [`Shard::close_spill_checkpointed`].
-    #[cfg_attr(
-        not(feature = "spill"),
-        allow(
-            clippy::unused_self,
-            clippy::unused_async,
-            reason = "the tier accessor, and everything this awaits, only exist under \
-                      feature = \"spill\""
-        )
-    )]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one scripted checkpoint sequence, logging and metering each stage in order"
-    )]
-    async fn checkpoint_and_close_spill(&self) {
+        let mut gate = Arc::clone(&self.spill_close).lock_owned().await;
+        if *gate {
+            return;
+        }
         #[cfg(feature = "spill")]
         if let Some(tier) = self.engine.spill().cloned() {
-            tracing::debug!(
-                cache = %self.name,
-                bytes_used = tier.bytes_used(),
-                "sundog spill: closing tier"
-            );
-            if tier.warm_reopen_value() {
-                let now = self.now_ms();
-                let engine = Arc::clone(&self.engine);
-                let resident =
-                    tokio::task::spawn_blocking(move || engine.checkpoint_resident_entries(now))
-                        .await
-                        .unwrap_or_else(|err| {
-                            tracing::warn!(
-                                cache = %self.name,
-                                error = %err,
-                                "sundog spill: resident-entry scan task panicked; the \
-                                 checkpoint below covers only already-spilled entries",
-                            );
-                            Vec::new()
-                        });
-                tracing::info!(
+            let name = self.name.clone();
+            let engine = Arc::clone(&self.engine);
+            let now = self.now_ms();
+            let checkpoint = tokio::spawn(async move {
+                checkpoint_and_close_spill(name, engine, tier, now).await;
+                *gate = true;
+            });
+            if let Err(err) = checkpoint.await {
+                tracing::warn!(
                     cache = %self.name,
-                    count = resident.len(),
-                    "sundog spill: checkpoint captured resident entries",
+                    error = %err,
+                    "sundog spill: checkpointed close task ended early; the next close runs it",
                 );
-                record_checkpoint_stage(&self.name, "captured", resident.len() as u64);
-
-                let sink = Arc::clone(&self.engine) as Arc<dyn spill::SpillSink>;
-                let checkpoint_tier = Arc::clone(&tier);
-                let flush_outcome = tokio::task::spawn_blocking(move || {
-                    checkpoint_tier.checkpoint_flush(sink.as_ref(), resident)
-                })
-                .await
-                .unwrap_or_else(|err| {
-                    tracing::warn!(
-                        cache = %self.name,
-                        error = %err,
-                        "sundog spill: checkpoint flush task panicked; the snapshot below \
-                         still covers every already-spilled entry",
-                    );
-                    spill::CheckpointFlushOutcome::default()
-                });
-                let newly_written = flush_outcome.written;
-                tracing::info!(
-                    cache = %self.name,
-                    count = newly_written.len(),
-                    "sundog spill: checkpoint wrote records",
-                );
-                record_checkpoint_stage(&self.name, "written", newly_written.len() as u64);
-                tracing::info!(
-                    cache = %self.name,
-                    jobs_drained = flush_outcome.jobs_drained,
-                    jobs_abandoned = flush_outcome.jobs_abandoned,
-                    "sundog spill: checkpoint drained the flush queue",
-                );
-                record_checkpoint_stage(&self.name, "drained", flush_outcome.jobs_drained);
-                record_checkpoint_stage(&self.name, "abandoned", flush_outcome.jobs_abandoned);
-
-                // Re-validates under the stripe lock: a concurrent write may have
-                // changed the key since capture, so a losing entry is dropped here.
-                let engine = Arc::clone(&self.engine);
-                let (_survivors, finalize_counts) = tokio::task::spawn_blocking(move || {
-                    engine.finalize_checkpoint_writes(newly_written, now)
-                })
-                .await
-                .unwrap_or_else(|err| {
-                    tracing::warn!(
-                        cache = %self.name,
-                        error = %err,
-                        "sundog spill: checkpoint finalize task panicked; the snapshot below \
-                         drops every entry this checkpoint just wrote",
-                    );
-                    (Vec::new(), engine::CheckpointFinalizeCounts::default())
-                });
-                tracing::info!(
-                    cache = %self.name,
-                    kept = finalize_counts.kept,
-                    dropped_version_changed = finalize_counts.dropped_version_changed,
-                    dropped_tombstoned = finalize_counts.dropped_tombstoned,
-                    dropped_gone = finalize_counts.dropped_gone,
-                    dropped_expired = finalize_counts.dropped_expired,
-                    "sundog spill: checkpoint finalized writes",
-                );
-                record_checkpoint_stage(&self.name, "kept", finalize_counts.kept);
-                record_checkpoint_stage(
-                    &self.name,
-                    "dropped_version_changed",
-                    finalize_counts.dropped_version_changed,
-                );
-                record_checkpoint_stage(
-                    &self.name,
-                    "dropped_tombstoned",
-                    finalize_counts.dropped_tombstoned,
-                );
-                record_checkpoint_stage(&self.name, "dropped_gone", finalize_counts.dropped_gone);
-                record_checkpoint_stage(
-                    &self.name,
-                    "dropped_expired",
-                    finalize_counts.dropped_expired,
-                );
-
-                let engine = Arc::clone(&self.engine);
-                let entries = tokio::task::spawn_blocking(move || engine.snapshot_spilled(now))
-                    .await
-                    .unwrap_or_else(|err| {
-                        tracing::warn!(
-                            cache = %self.name,
-                            error = %err,
-                            "sundog spill: spilled-pointer scan task panicked; the \
-                             checkpoint below covers only entries this checkpoint just wrote",
-                        );
-                        Vec::new()
-                    });
-                tracing::info!(
-                    cache = %self.name,
-                    count = entries.len(),
-                    "sundog spill: checkpoint listed already-spilled entries",
-                );
-                record_checkpoint_stage(&self.name, "listed", entries.len() as u64);
-
-                // `entries` already includes every survivor:
-                // `finalize_checkpoint_writes` flipped each to `Spilled` before this
-                // scan ran, so extending again would double-count.
-                tracing::info!(
-                    cache = %self.name,
-                    count = entries.len(),
-                    "sundog spill: checkpoint snapshot total",
-                );
-                record_checkpoint_stage(&self.name, "snapshot", entries.len() as u64);
-
-                let snapshot_tier = Arc::clone(&tier);
-                let closed = tokio::task::spawn_blocking(move || {
-                    snapshot_tier.write_checkpoint_snapshot(&entries, now);
-                    snapshot_tier.close();
-                })
-                .await;
-                if let Err(err) = closed {
-                    tracing::warn!(
-                        cache = %self.name,
-                        error = %err,
-                        "sundog spill: checkpoint snapshot task panicked",
-                    );
-                }
-            } else {
-                tier.close();
             }
+            return;
         }
+        *gate = true;
     }
 
     /// Test-only: takes every byte of the spill tier's flush-queue
@@ -568,11 +428,213 @@ where
             .expect("the flusher drains its queue")
     }
 
+    /// Test-only: parks the spill tier's flusher before its next job, so a
+    /// checkpointed close joining it waits until
+    /// [`Shard::debug_resume_spill_flusher`].
+    ///
+    /// # Panics
+    ///
+    /// Panics without a spill tier.
+    #[cfg(all(feature = "spill", test, not(feature = "sim")))]
+    pub(crate) fn debug_pause_spill_flusher(&self) {
+        self.engine
+            .spill()
+            .expect("a spill tier is attached")
+            .pause_flusher();
+    }
+
+    /// Test-only: undoes [`Shard::debug_pause_spill_flusher`].
+    ///
+    /// # Panics
+    ///
+    /// Panics without a spill tier.
+    #[cfg(all(feature = "spill", test, not(feature = "sim")))]
+    pub(crate) fn debug_resume_spill_flusher(&self) {
+        self.engine
+            .spill()
+            .expect("a spill tier is attached")
+            .resume_flusher();
+    }
+
+    /// Test-only: how many checkpoint writes the spill tier has started.
+    ///
+    /// # Panics
+    ///
+    /// Panics without a spill tier.
+    #[cfg(all(feature = "spill", test, not(feature = "sim")))]
+    pub(crate) fn debug_spill_checkpoint_runs(&self) -> u64 {
+        self.engine
+            .spill()
+            .expect("a spill tier is attached")
+            .checkpoint_flushes()
+    }
+
     /// Whether this shard's attached spill tier is closed by
     /// Whether this shard's spill tier is closed (by either close path) or
     /// none is attached. Test-only: lets a test check closure directly.
     #[cfg(all(feature = "spill", test, not(feature = "sim")))]
     pub(crate) fn spill_tier_closed(&self) -> bool {
         self.engine.spill().is_none_or(|tier| tier.is_closed())
+    }
+}
+
+/// The body of [`Shard::close_spill_checkpointed`]: closes `tier`, first
+/// checkpointing `engine`'s entries to it when warm reopen is on, each step a
+/// separate blocking task. Owns everything it touches so the task running it
+/// outlives any caller.
+#[cfg(feature = "spill")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scripted checkpoint sequence, logging and metering each stage in order"
+)]
+async fn checkpoint_and_close_spill<K, V>(
+    name: SmolStr,
+    engine: Arc<engine::Engine<K, V>>,
+    tier: Arc<spill::SpillTier>,
+    now: u64,
+) where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    tracing::debug!(
+        cache = %name,
+        bytes_used = tier.bytes_used(),
+        "sundog spill: closing tier"
+    );
+    if tier.warm_reopen_value() {
+        let scan_engine = Arc::clone(&engine);
+        let resident =
+            tokio::task::spawn_blocking(move || scan_engine.checkpoint_resident_entries(now))
+                .await
+                .unwrap_or_else(|err| {
+                    tracing::warn!(
+                        cache = %name,
+                        error = %err,
+                        "sundog spill: resident-entry scan task panicked; the \
+                         checkpoint below covers only already-spilled entries",
+                    );
+                    Vec::new()
+                });
+        tracing::info!(
+            cache = %name,
+            count = resident.len(),
+            "sundog spill: checkpoint captured resident entries",
+        );
+        record_checkpoint_stage(&name, "captured", resident.len() as u64);
+
+        let sink = Arc::clone(&engine) as Arc<dyn spill::SpillSink>;
+        let checkpoint_tier = Arc::clone(&tier);
+        let flush_outcome = tokio::task::spawn_blocking(move || {
+            checkpoint_tier.checkpoint_flush(sink.as_ref(), resident)
+        })
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(
+                cache = %name,
+                error = %err,
+                "sundog spill: checkpoint flush task panicked; the snapshot below \
+                 still covers every already-spilled entry",
+            );
+            spill::CheckpointFlushOutcome::default()
+        });
+        let newly_written = flush_outcome.written;
+        tracing::info!(
+            cache = %name,
+            count = newly_written.len(),
+            "sundog spill: checkpoint wrote records",
+        );
+        record_checkpoint_stage(&name, "written", newly_written.len() as u64);
+        tracing::info!(
+            cache = %name,
+            jobs_drained = flush_outcome.jobs_drained,
+            jobs_abandoned = flush_outcome.jobs_abandoned,
+            "sundog spill: checkpoint drained the flush queue",
+        );
+        record_checkpoint_stage(&name, "drained", flush_outcome.jobs_drained);
+        record_checkpoint_stage(&name, "abandoned", flush_outcome.jobs_abandoned);
+
+        // Re-validates under the stripe lock: a concurrent write may have
+        // changed the key since capture, so a losing entry is dropped here.
+        let finalize_engine = Arc::clone(&engine);
+        let (_survivors, finalize_counts) = tokio::task::spawn_blocking(move || {
+            finalize_engine.finalize_checkpoint_writes(newly_written, now)
+        })
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(
+                cache = %name,
+                error = %err,
+                "sundog spill: checkpoint finalize task panicked; the snapshot below \
+                 drops every entry this checkpoint just wrote",
+            );
+            (Vec::new(), engine::CheckpointFinalizeCounts::default())
+        });
+        tracing::info!(
+            cache = %name,
+            kept = finalize_counts.kept,
+            dropped_version_changed = finalize_counts.dropped_version_changed,
+            dropped_tombstoned = finalize_counts.dropped_tombstoned,
+            dropped_gone = finalize_counts.dropped_gone,
+            dropped_expired = finalize_counts.dropped_expired,
+            "sundog spill: checkpoint finalized writes",
+        );
+        record_checkpoint_stage(&name, "kept", finalize_counts.kept);
+        record_checkpoint_stage(
+            &name,
+            "dropped_version_changed",
+            finalize_counts.dropped_version_changed,
+        );
+        record_checkpoint_stage(
+            &name,
+            "dropped_tombstoned",
+            finalize_counts.dropped_tombstoned,
+        );
+        record_checkpoint_stage(&name, "dropped_gone", finalize_counts.dropped_gone);
+        record_checkpoint_stage(&name, "dropped_expired", finalize_counts.dropped_expired);
+
+        let list_engine = Arc::clone(&engine);
+        let entries = tokio::task::spawn_blocking(move || list_engine.snapshot_spilled(now))
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    cache = %name,
+                    error = %err,
+                    "sundog spill: spilled-pointer scan task panicked; the \
+                     checkpoint below covers only entries this checkpoint just wrote",
+                );
+                Vec::new()
+            });
+        tracing::info!(
+            cache = %name,
+            count = entries.len(),
+            "sundog spill: checkpoint listed already-spilled entries",
+        );
+        record_checkpoint_stage(&name, "listed", entries.len() as u64);
+
+        // `entries` already includes every survivor:
+        // `finalize_checkpoint_writes` flipped each to `Spilled` before this
+        // scan ran, so extending again would double-count.
+        tracing::info!(
+            cache = %name,
+            count = entries.len(),
+            "sundog spill: checkpoint snapshot total",
+        );
+        record_checkpoint_stage(&name, "snapshot", entries.len() as u64);
+
+        let snapshot_tier = Arc::clone(&tier);
+        let closed = tokio::task::spawn_blocking(move || {
+            snapshot_tier.write_checkpoint_snapshot(&entries, now);
+            snapshot_tier.close();
+        })
+        .await;
+        if let Err(err) = closed {
+            tracing::warn!(
+                cache = %name,
+                error = %err,
+                "sundog spill: checkpoint snapshot task panicked",
+            );
+        }
+    } else {
+        tier.close();
     }
 }

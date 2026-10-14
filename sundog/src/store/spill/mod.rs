@@ -333,6 +333,10 @@ struct Inner {
     /// `flush_queue_bytes`, for as long as it needs to.
     #[cfg(test)]
     flusher_paused: AtomicBool,
+    /// Test-only: how many times [`SpillTier::checkpoint_flush`] has run,
+    /// so a test can show a checkpoint ran once.
+    #[cfg(test)]
+    checkpoint_flushes: AtomicU64,
     /// Lifetime count of jobs [`flusher_loop`] pulled off its channel.
     /// [`SpillTier::checkpoint_flush`] diffs this around its join to
     /// report this drain's count.

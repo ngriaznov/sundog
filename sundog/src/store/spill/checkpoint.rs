@@ -20,6 +20,12 @@ use super::{
 };
 
 impl SpillTier {
+    /// Test-only: how many times [`SpillTier::checkpoint_flush`] has run.
+    #[cfg(test)]
+    pub(crate) fn checkpoint_flushes(&self) -> u64 {
+        self.inner.checkpoint_flushes.load(Ordering::Relaxed)
+    }
+
     /// The checkpoint half of a warm-reopen-enabled close: blocks until the
     /// flusher thread [`SpillTier::attach`] started drains its queue and
     /// exits (the only place the spill module joins that thread; run this in a
@@ -35,6 +41,10 @@ impl SpillTier {
         sink: &dyn SpillSink,
         entries: Vec<(Bytes, Hlc, Option<u64>, Bytes)>,
     ) -> CheckpointFlushOutcome {
+        #[cfg(test)]
+        self.inner
+            .checkpoint_flushes
+            .fetch_add(1, Ordering::Relaxed);
         *self.sender.lock() = None;
         let drained_before = self.inner.flusher_jobs_drained.load(Ordering::Relaxed);
         let abandoned_before = self.inner.flusher_jobs_abandoned.load(Ordering::Relaxed);

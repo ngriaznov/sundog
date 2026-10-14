@@ -164,7 +164,7 @@ where
             skew_hold: StdMutex::new(SkewHold::new(SKEW_HOLD_MAX_RECORDS, SKEW_HOLD_MAX_BYTES)),
             skew_wake: Notify::new(),
             skew_drop_warned: AtomicBool::new(false),
-            spill_close: tokio::sync::OnceCell::new(),
+            spill_close: Arc::new(tokio::sync::Mutex::new(false)),
             resolver: Arc::new(LwwResolver),
             raw_resolver: Arc::new(LwwResolver),
             crdt_bounds: ClusterConfig::default().crdt_compaction_bounds(),

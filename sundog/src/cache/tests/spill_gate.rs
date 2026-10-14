@@ -735,3 +735,67 @@ async fn a_close_after_the_shutdown_sweep_does_not_checkpoint_again() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A `close` cut short by a timeout while its checkpoint is joining the
+/// flusher leaves the checkpoint running. The next `close` waits for it,
+/// starts no second one, and the cache reopens warm.
+#[tokio::test]
+async fn a_close_dropped_in_a_blocking_stage_is_not_checkpointed_twice() {
+    let dir = fresh_spill_dir("dropped-blocking-close");
+    let cluster = solo_cluster_for("cache-it-spill-dropped-blocking-close").await;
+    let first = cluster
+        .cache::<u32, String>("warm-close")
+        .mode(Mode::Local)
+        .max_capacity(3)
+        .spill(
+            SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .warm_reopen(true),
+        )
+        .open()
+        .await
+        .expect("opens");
+    // The flusher parks after the first job it takes, so the checkpoint's
+    // join on it waits.
+    first.shard.debug_pause_spill_flusher();
+    for k in 0..20 {
+        first.insert(k, format!("value-{k}")).await.expect("insert");
+    }
+    let other = first.clone();
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), first.clone().close())
+            .await
+            .is_err(),
+        "the checkpoint waits on the paused flusher"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), other.clone().close())
+            .await
+            .is_err(),
+        "the second close waits for the checkpoint under way"
+    );
+    assert!(
+        !first.shard.spill_tier_closed(),
+        "a second checkpoint did not start beside the first"
+    );
+
+    first.shard.debug_resume_spill_flusher();
+    tokio::time::timeout(Duration::from_secs(10), other.close())
+        .await
+        .expect("the close ends once the flusher runs");
+    assert!(first.shard.spill_tier_closed());
+    assert_eq!(
+        first.shard.debug_spill_checkpoint_runs(),
+        1,
+        "the retry waited for the checkpoint under way and wrote no second one"
+    );
+
+    let second = open_warm(&cluster, &dir).await;
+    for k in 0..20 {
+        assert_eq!(second.get(&k).await, Some(format!("value-{k}")));
+    }
+    second.close().await;
+    cluster.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
