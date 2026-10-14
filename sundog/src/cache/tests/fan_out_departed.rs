@@ -153,6 +153,114 @@ async fn a_distributed_owner_tells_the_co_owner_of_a_zero_ttl_rearm() {
     a.shutdown().await;
 }
 
+/// A write the owner's fan-out finds gone reaches the other owner through the
+/// awaiting path: `b` wrote the key, its entry left before the drain, and
+/// `c` still holds the older value. The drain is driven by hand so the entry
+/// is gone when it reads the written view.
+#[tokio::test]
+async fn a_distributed_owner_invalidates_the_co_owner_of_a_departed_write() {
+    use crate::cluster::fan_out::fan_out_batch;
+    use crate::store::{FanOutItem, ShardOps};
+
+    let ((a, _cache_a), (b, cache_b), (c, cache_c), key) =
+        three_node_distributed("cache-it-fan-out-distributed-departed", "prices").await;
+    cache_b.insert(key, "old".into()).await.expect("insert");
+    wait_until(
+        Duration::from_secs(10),
+        "both owners hold the value",
+        async || cache_b.ttl_of(&key).is_some() && cache_c.ttl_of(&key).is_some(),
+    )
+    .await;
+    let key_bytes = encode_key(&key).expect("u32 encodes");
+    let stored = ShardOps::records_for(&*cache_b.shard, vec![key_bytes.clone()]).await;
+    let written = crate::hlc::Hlc {
+        wall_ms: stored[0].ver.wall_ms + 5,
+        ..stored[0].ver
+    };
+    // The write the drain is about to send is gone from `b`: a release or a
+    // sweep would leave the same, and no record of it remains to ship.
+    ShardOps::invalidate(&*cache_b.shard, key_bytes, written).await;
+    assert_eq!(cache_b.get(&key).await, None, "b's entry is gone");
+    assert_eq!(cache_c.get(&key).await.as_deref(), Some("old"));
+
+    fan_out_batch(
+        &cache_b.shard,
+        &b,
+        &SmolStr::new("prices"),
+        Mode::distributed(),
+        vec![FanOutItem::Applied(key, written)],
+    )
+    .await;
+
+    wait_until(
+        Duration::from_secs(10),
+        "the co-owner drops the older value",
+        async || cache_c.get(&key).await.is_none(),
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + SETTLE;
+    while tokio::time::Instant::now() < deadline {
+        assert_eq!(cache_b.get(&key).await, None, "b read the old value again");
+        assert_eq!(cache_c.get(&key).await, None, "c read the old value again");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    c.shutdown().await;
+    b.shutdown().await;
+    a.shutdown().await;
+}
+
+/// A node whose shard has no ownership view yet names no owner to tell, so a
+/// departed write sends nothing: the co-owner keeps its value.
+#[tokio::test]
+async fn a_distributed_departed_write_without_a_view_tells_nobody() {
+    use crate::cluster::fan_out::fan_out_batch;
+    use crate::store::FanOutItem;
+
+    let ((a, _cache_a), (b, cache_b), (c, cache_c), key) =
+        three_node_distributed("cache-it-fan-out-distributed-no-view", "prices").await;
+    cache_b.insert(key, "old".into()).await.expect("insert");
+    wait_until(
+        Duration::from_secs(10),
+        "both owners hold the value",
+        async || cache_b.ttl_of(&key).is_some() && cache_c.ttl_of(&key).is_some(),
+    )
+    .await;
+    let viewless = Shard::<u32, String>::new(
+        SmolStr::new("prices"),
+        Mode::distributed(),
+        b.node_id(),
+        u64::MAX,
+        None,
+        None,
+    );
+    assert!(viewless.ownership_view().is_none());
+    let written = crate::hlc::Hlc {
+        wall_ms: now_ms() + 60_000,
+        logical: 0,
+        node: b.node_id(),
+    };
+
+    fan_out_batch(
+        &viewless,
+        &b,
+        &SmolStr::new("prices"),
+        Mode::distributed(),
+        vec![FanOutItem::Applied(key, written)],
+    )
+    .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(1_000);
+    while tokio::time::Instant::now() < deadline {
+        assert_eq!(cache_c.get(&key).await.as_deref(), Some("old"));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    c.shutdown().await;
+    b.shutdown().await;
+    a.shutdown().await;
+}
+
 /// `b` holds an older value for every key; `a`, capped at ten entries,
 /// writes a hundred new ones in a single call, so most are evicted before
 /// the fan-out drains. Every old key leaves `b` all the same.
