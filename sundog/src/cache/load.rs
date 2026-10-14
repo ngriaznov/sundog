@@ -172,7 +172,9 @@ where
     /// and `Mode::Distributed`: each key goes to the node its loads gather
     /// on, per [`load_target`], one request per node, and this node's own
     /// keys to its loader, all at once. A peer that declines or cannot be
-    /// reached has its keys loaded here instead; a peer whose loader fails
+    /// reached has its keys loaded here instead, and so does a key no owner
+    /// can load; a `Mode::Distributed` node that does not own such a key
+    /// answers with the value and keeps no copy. A peer whose loader fails
     /// fails the batch with [`RemoteLoaderError`].
     pub(super) async fn route_load(&self, keys: Vec<K>) -> Result<Sourced<K, V>, LoadError> {
         let mode = self.shard.mode();
@@ -221,8 +223,11 @@ where
     /// Asks `peer` to load `keys`. A record it stores comes back to be
     /// stored here too in `Mode::Invalidation`, where each node caches its
     /// own working set, and only answered with in `Mode::Distributed`,
-    /// where `peer` owns the key and this node does not.
-    async fn load_on(
+    /// where `peer` owns the key and this node does not. Keys loaded here
+    /// because `peer` declined or could not be reached come back to store;
+    /// the shard stores them only where it owns them, so a `Mode::Distributed`
+    /// non-owner answers with them and keeps no copy.
+    pub(super) async fn load_on(
         &self,
         peer: NodeId,
         keys: Vec<(K, bytes::Bytes)>,

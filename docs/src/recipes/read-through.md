@@ -74,8 +74,13 @@ them to its own load, so the source sees one query however many nodes miss.
 
 In `Invalidation` each node keeps the value it read. In `Distributed` the
 owners keep it, and a node that owns nothing of the key keeps no copy, as
-with `fetch`. A node that declines or cannot be reached has the key loaded
-locally. A node whose loader fails fails the read with a `CacheError::Loader`
+with `fetch`. That holds for every load that runs on a non-owner: a
+`get_or_load` there, and a `load` that runs on the node itself because no owner
+has a loader or an owner declined or could not be reached. The node answers
+with the value, stores it nowhere and sends it to no one, and a later `get`
+there is `None`. A non-owner's `get_or_load` therefore runs its loader on every
+call, where `load` gathers the key's loads on an owner and queries the source
+once. A node that declines or cannot be reached has the key loaded locally. A node whose loader fails fails the read with a `CacheError::Loader`
 carrying a `RemoteLoaderError` that names it. `Local` and `Replicated` caches
 load on the node that misses, and a `Replicated` value reaches every node once
 loaded.

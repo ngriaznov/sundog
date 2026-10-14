@@ -10,6 +10,7 @@ mod forwarding;
 mod lifecycle;
 mod loading;
 mod merge_expiry;
+mod nonowner_fill;
 mod observability;
 mod rules;
 #[cfg(feature = "spill")]

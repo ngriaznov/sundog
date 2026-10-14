@@ -21,6 +21,16 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **A read-through fill on a `Distributed` node that does not own the key
+  keeps no copy there.** `get_or_load`, `get_or_insert_with`, `load` and
+  `load_many` on a non-owner answer the caller and every joined waiter with
+  the loaded value and store it nowhere, so `get` on that node returns `None`
+  as documented and a later remove or write can no longer leave a stale value
+  behind. The fill is not sent to the owners either. A non-owner runs the
+  loader on every `get_or_load`; `load` gathers a key's loads on an owner that
+  has a loader. A refresh-ahead reload skips an entry a node holds only
+  through disown grace. A non-owner at the memory ceiling no longer counts
+  `sundog_ceiling_refusals_total{kind="fill"}`.
 - **A swept expired entry keeps out the value it overwrote.** In a
   `Replicated` or `Distributed` cache whose resolver does not merge, the sweep
   turns an entry that reached its deadline into a tombstone at the entry's

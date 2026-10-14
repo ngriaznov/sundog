@@ -78,7 +78,9 @@ A write for a part this node does not own goes to that part's owners. The
 forwarded batch carries the writer's ownership view, and an owner whose view
 differs passes it on once more, so a write routed under a view that has since
 changed still reaches every current owner.
-`get` reads this node's copy and returns `None` off a non-owner. `fetch` is
+`get` reads this node's copy and returns `None` off a non-owner, and a
+read-through fill does not change that: `get_or_load` and `load` on a
+non-owner answer with the loaded value and keep no copy. `fetch` is
 the network-aware read: it answers locally when this node owns the part
 and otherwise asks the owners in order, returning `Ok(None)` for a real
 miss or `CacheError::FetchUnavailable` when no owner answers within

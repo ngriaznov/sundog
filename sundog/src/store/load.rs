@@ -147,7 +147,10 @@ where
 /// What a [`SourceFn`] returned for one batch: the values to store as fills
 /// and the values to answer with but not store, such as a value another
 /// node loaded for a key this node does not own. A key in neither is one
-/// the source does not hold.
+/// the source does not hold. A `store` value goes through
+/// [`Shard::get_or_load`]'s fill route, so on a `Mode::Distributed` node
+/// that does not own the key it answers like an `answer` value and is
+/// stored nowhere.
 pub(crate) struct Sourced<K, V> {
     pub(crate) store: HashMap<K, V>,
     pub(crate) answer: HashMap<K, V>,
@@ -324,7 +327,9 @@ where
     /// `None` when the source does not hold it. Concurrent misses on one key
     /// collapse into one load, and keys missing within the loader's batch
     /// window share one loader call. A loaded value is stored like a
-    /// [`Shard::get_or_load`] fill, under the cache's default TTL.
+    /// [`Shard::get_or_load`] fill, under the cache's default TTL: a
+    /// `Mode::Distributed` shard that does not own the key's part returns it
+    /// and stores it nowhere.
     ///
     /// # Errors
     ///
@@ -478,7 +483,9 @@ where
     /// [`Shard::load_many`] reads them here: the record stored for each key
     /// the cache or source holds, or the loaded value alone where the fill
     /// was not stored. A `Mode::Distributed` shard declines while any
-    /// requested key's part is cold or unverified here, as a fetch does. An
+    /// requested key's part is cold or unverified here, as a fetch does. A
+    /// key whose part this shard's view does not own, a requester's view
+    /// being stale, is loaded and reported `uncached`, not stored. An
     /// undecodable key counts as one the source lacks.
     pub(crate) async fn serve_load_encoded(&self, keys: Vec<Bytes>) -> LoadServe {
         if self.loader.is_none() {
@@ -682,7 +689,8 @@ where
 
     /// One source call: fills each key's slot before ending its in-flight
     /// load, so every waiter it wakes finds the outcome. A key the source
-    /// returns to store is stored like a [`Shard::get_or_load`] fill, one
+    /// returns to store is stored like a [`Shard::get_or_load`] fill, which
+    /// a `Mode::Distributed` non-owner answers without storing, one
     /// it returns to answer with ends uncached, a key it leaves out ends
     /// absent, and a failure fails every key. Each counts as a miss.
     /// Dropping this future mid-call releases every load it holds.

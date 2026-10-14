@@ -274,7 +274,8 @@ where
     }
 
     /// Reloads the keys of `requests` whose entry here is still the version
-    /// asked about, or older, and still due, in loader calls of at most
+    /// asked about, or older, still due, and in a part this node owns, in
+    /// loader calls of at most
     /// [`super::Loader::max_keys`] keys. A value
     /// the loader returns replaces the entry like any load, stamped before
     /// the call so a write that lands meanwhile wins. A key the source no
@@ -317,6 +318,12 @@ where
             if held > request.ver
                 || !refresh_due(now_ms, held.wall_ms, expires_at_ms, refresh.permille)
             {
+                continue;
+            }
+            // An entry held only through disown grace belongs to its new
+            // owners: the reload would be stored nowhere (see `fill_route`),
+            // so the loader does not run for it.
+            if !self.owns_key(request.key_bytes.as_ref()) {
                 continue;
             }
             let Some(inflight) = self.engine.begin_refresh(&request.key_bytes, hash) else {

@@ -824,6 +824,14 @@ where
     /// call returns the loaded value without storing it, and the next read
     /// loads afresh.
     ///
+    /// In [`Mode::Distributed`] a node that does not own the key's part
+    /// answers with the loaded value and keeps no copy, so a later `get` of
+    /// it there is `None` and a later remove or write elsewhere leaves no
+    /// stale value behind. Each such call runs `loader`: a non-owner has no
+    /// copy to hit. [`Cache::load`] runs the load on an owner that has a
+    /// loader, and is the way to read through with one source query per
+    /// key.
+    ///
     /// # Errors
     ///
     /// Returns [`CacheError::Loader`] if `loader` fails, or
@@ -839,7 +847,9 @@ where
     }
 
     /// [`Cache::get_or_load`] for a loader that never fails; `Result` remains
-    /// only for [`CacheError::Codec`].
+    /// only for [`CacheError::Codec`]. A [`Mode::Distributed`] non-owner
+    /// answers with `make`'s value and keeps no copy, as `get_or_load`
+    /// does.
     ///
     /// # Errors
     ///
@@ -860,7 +870,11 @@ where
     /// [`CacheBuilder::batch_window`] share one loader call. A loaded value
     /// is written under the cache's default TTL and fans out per [`Mode`]
     /// like a [`Cache::get_or_load`] fill; a key the source lacks is not
-    /// cached, so the next read asks again.
+    /// cached, so the next read asks again. In [`Mode::Distributed`] the
+    /// load runs on the first owner of the key's part that has a loader and
+    /// is warm for it; a node that owns nothing of the part answers with the
+    /// value and keeps no copy, also when the load runs here because no
+    /// owner can load or an owner declined or could not be reached.
     ///
     /// # Errors
     ///

@@ -309,13 +309,45 @@ pub enum SimFanOut<K> {
 }
 
 /// Whether a [`Shard::get_or_load`] fill goes out to peers. A fill copies
-/// data from its source and changes nothing there. `Replicated` and
-/// `Distributed` send it so a peer holding the key skips its own loader
-/// call. `Invalidation` sends nothing: an invalidation would drop every
-/// peer's copy of the same data, and two nodes reading one key would evict
-/// each other on every fill. Pure; unit tested directly.
+/// data from its source and changes nothing there. Only a fill the shard
+/// stores goes out ([`fill_route`]); in `Replicated` and `Distributed` it is
+/// sent so a peer holding the key skips its own loader call. `Invalidation`
+/// sends nothing: an invalidation would drop every peer's copy of the same
+/// data, and two nodes reading one key would evict each other on every
+/// fill. Pure; unit tested directly.
 pub(super) const fn fill_fans_out(mode: Mode) -> bool {
     !matches!(mode, Mode::Invalidation)
+}
+
+/// What a read-through fill does with its value once the loader returns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FillRoute {
+    /// The shard stores the value, subject to the fill guards, and fans it
+    /// out per [`fill_fans_out`].
+    Install,
+    /// The value answers the caller and every joined waiter and is stored
+    /// nowhere; `counts_refusal` is whether the memory ceiling refused it.
+    Uncached { counts_refusal: bool },
+}
+
+/// Where a fill whose loader returned goes. A shard stores only what it owns:
+/// a `Mode::Distributed` node that owns nothing of the key's part keeps no
+/// copy and sends nothing, since no write or removal of that key would ever
+/// reach a copy it held. An owner at the memory ceiling answers uncached and
+/// counts the refusal; a non-owner stores nothing, so it refuses nothing.
+/// Pure; unit tested directly.
+pub(super) const fn fill_route(owns: bool, at_ceiling: bool) -> FillRoute {
+    if !owns {
+        FillRoute::Uncached {
+            counts_refusal: false,
+        }
+    } else if at_ceiling {
+        FillRoute::Uncached {
+            counts_refusal: true,
+        }
+    } else {
+        FillRoute::Install
+    }
 }
 
 /// Whether the records a drain sends carry values: every mode but an

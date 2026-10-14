@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::engine::JoinOutcome;
-use super::fan_out::fill_fans_out;
+use super::fan_out::{FillRoute, fill_fans_out, fill_route};
 use super::{
     Event, FanOutItem, Origin, PartId, Shard, SharedLoaderFailure, encode_key, engine, read_timing,
 };
@@ -35,8 +35,9 @@ where
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
     /// Ends a loader run that returned `value` for `key`, the load stamped
-    /// `ver` before it started, through [`Shard::store_loaded`], and counts
-    /// the run as a miss.
+    /// `ver` before it started, through [`Shard::store_loaded`], which
+    /// stores the value only where this shard stores a fill, and counts the
+    /// run as a miss.
     pub(super) fn finish_fill(
         &self,
         key: &K,
@@ -52,11 +53,15 @@ where
 
     /// Stores a loaded `value` for `key` through
     /// [`engine::Engine::complete_fresh_load`], the load stamped `ver`
-    /// before it started, or hands it to joined waiters uncached at the
-    /// ceiling. A stored value fans out per [`fill_fans_out`] and emits
-    /// [`Event::Created`], or [`Event::Updated`] over a live entry; one a
-    /// write, removal or invalidation overtook stores and sends nothing.
-    /// Returns whether the value was stored.
+    /// before it started, or hands it to the caller and joined waiters
+    /// without storing it ([`fill_route`]): a node that owns nothing of
+    /// the key's part in `Mode::Distributed` keeps no copy, judged on the
+    /// shard's view when the fill completes, and a shard at the ceiling
+    /// takes no more. A stored value fans out per [`fill_fans_out`] and
+    /// emits [`Event::Created`], or [`Event::Updated`] over a live entry; one
+    /// a write, removal or invalidation overtook stores and sends nothing,
+    /// and a value stored nowhere sends nothing and emits no event. Returns
+    /// whether the value was stored.
     pub(super) fn store_loaded(
         &self,
         key: &K,
@@ -66,10 +71,11 @@ where
         inflight: &engine::Inflight<V>,
         value: V,
     ) -> bool {
-        if self.at_ceiling().is_some() {
+        let route = fill_route(self.owns_key(key_bytes), self.at_ceiling().is_some());
+        if let FillRoute::Uncached { counts_refusal } = route {
             self.engine
                 .finish_uncached(key_bytes, hash, inflight, value);
-            if let Some(refusals) = &self.ceiling_refusals {
+            if counts_refusal && let Some(refusals) = &self.ceiling_refusals {
                 refusals.fills.increment(1);
             }
             return false;
@@ -276,6 +282,13 @@ where
     /// and every joined waiter without storing it, and counts
     /// `sundog_ceiling_refusals_total{cache, kind="fill"}`.
     ///
+    /// In `Mode::Distributed` a shard that does not own the key's part
+    /// when the fill completes returns the value the same way and stores
+    /// it nowhere: it sends nothing to the owners, emits no event and
+    /// counts no refusal. A non-owner holds no copy for a hit, so every
+    /// call there runs `loader`; callers joined to a run in flight share
+    /// its value.
+    ///
     /// An invalidation for `key` that lands while `loader` runs, from a peer
     /// or [`Shard::invalidate_local`], means the loader may have read the
     /// source before the change it announces: the fill returns its value to
@@ -383,7 +396,8 @@ where
     }
 
     /// [`Shard::get_or_load`] for a loader that never fails: same stampede
-    /// collapse on concurrent misses, same fan-out of the fill. The
+    /// collapse on concurrent misses, same fan-out of a stored fill and
+    /// same absence of a copy on a `Mode::Distributed` non-owner. The
     /// `Result` remains only for [`CacheError::Codec`]; `make` itself
     /// cannot fail.
     ///

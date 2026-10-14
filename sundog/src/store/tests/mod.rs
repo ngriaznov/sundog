@@ -29,6 +29,7 @@ mod capacity;
 mod compact_pass_tests;
 mod conflict_resolvers;
 mod distributed;
+mod distributed_fill;
 mod expiry_tombstone;
 mod fan_out_view;
 mod gc_digests;
