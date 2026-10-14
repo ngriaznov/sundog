@@ -1139,6 +1139,10 @@ async fn anti_entropy_repairs_a_sketch_fallback_listing_larger_than_one_frame() 
         // 2 cells per partition, too small to peel the 24-key difference.
         ae_sketch_cells: 6,
         ae_interval: Duration::from_hours(1),
+        // Hashing and moving 4.7 MB per round starves gossip on a busy test
+        // runner, and a failure detector that drops the peer for a moment
+        // fails the round with "not a known mesh member".
+        phi_threshold: 1_000.0,
         ..loopback_config()
     };
     let (cluster_a, cluster_b) =
