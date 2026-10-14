@@ -83,29 +83,27 @@ forwarded batch carries the writer's ownership view, and an owner whose view
 differs passes it on once more, so a write routed under a view that has since
 changed still reaches every current owner. A forwarded write is held by no
 replica until an owner applies it, so anti-entropy cannot repair it. An owner
-whose clock refuses the write's stamp for clock skew holds it in memory
-until its clock is within `max_clock_skew` of the stamp (see
-[guarantees](guarantees.md#conflicting-writes)). The
-sender's writer holds a batch whose send failed and sends it again on its next
-connection, along with what it wrote in the last second, at most 1 MiB of it,
-and it notices a peer that closed the connection before it writes. A
-partition that never delivers a close can still lose the batches in flight. A node passes a
-re-forwarded batch to a lane for each owner, so one owner that stops reading
-holds back only its own lane. A lane holds 64 MiB per peer; past that, batches
-for that peer are dropped and counted in `sundog_backlog_dropped_total`. When
-the node is not an owner of those records, its pass-through copy was the only
-one, and anti-entropy cannot repair it.
-`get` reads this node's copy and returns `None` off a non-owner, and a
-read-through fill does not change that: `get_or_load` and `load` on a
-non-owner answer with the loaded value and keep no copy. `fetch` is
-the network-aware read: it answers locally when this node owns the part
-and otherwise asks the owners in order, returning `Ok(None)` for a real
+whose clock refuses the write's stamp for clock skew holds it in memory until
+its clock is within `max_clock_skew` of the stamp (see
+[guarantees](guarantees.md#conflicting-writes)). The sender's writer holds a
+batch whose send failed and sends it again on its next connection, along with
+what it wrote in the last second, at most 1 MiB of it, and it notices a peer
+that closed the connection before it writes. A partition that never delivers a
+close can still lose the batches in flight. A node passes a re-forwarded batch
+to a lane for each owner, so one owner that stops reading holds back only its
+own lane. A lane holds 64 MiB per peer; past that, batches for that peer are
+dropped and counted in `sundog_backlog_dropped_total`. When the node is not an
+owner of those records, its pass-through copy was the only one, and
+anti-entropy cannot repair it. `get` reads this node's copy and returns `None`
+off a non-owner, and a read-through fill does not change that: `get_or_load`
+and `load` on a non-owner answer with the loaded value and keep no copy.
+`fetch` is the network-aware read: it answers locally when this node owns the
+part and otherwise asks the owners in order, returning `Ok(None)` for a real
 miss or `CacheError::FetchUnavailable` when no owner answers within
-`fetch_timeout`, or while the part is still cold on every owner that
-answers. A part is cold on its new owner until the owner has pulled it,
-a few seconds after a membership change. `owners_of` reports a key's owners,
-and `explain` shows how a read of a key decides on this node and what each
-owner answers.
+`fetch_timeout`, or while the part is still cold on every owner that answers.
+A part is cold on its new owner until the owner has pulled it, a few seconds
+after a membership change. `owners_of` reports a key's owners, and `explain`
+shows how a read of a key decides on this node and what each owner answers.
 
 ```rust
 {{#include ../cookbook/src/deploy.rs:distributed}}

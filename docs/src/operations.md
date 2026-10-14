@@ -151,14 +151,14 @@ for that peer alone.
 
 ### Repairs climb steadily
 
-A steady rise in `sundog_ae_repaired_total` means replication messages are
-not arriving and anti-entropy is doing replication's job. Look for
-`sundog_backlog_dropped_total` on the sending side and for peers flapping
-in `sundog_live_peers`. Flapping under jitter calls for a higher
-`phi_threshold`. A peer whose connection broke after carrying frames is
-steered to first by the next anti-entropy round, once the writer has
-redialed it. A connection that closes within half a second of opening steers
-rounds only if it left frames waiting to be resent. A writer marks its peer at most every five seconds; a
+A steady rise in `sundog_ae_repaired_total` means replication messages are not
+arriving and anti-entropy is doing replication's job. Look for
+`sundog_backlog_dropped_total` on the sending side and for peers flapping in
+`sundog_live_peers`. Flapping under jitter calls for a higher `phi_threshold`.
+A peer whose connection broke after carrying frames is steered to first by the
+next anti-entropy round, once the writer has redialed it. A connection that
+closes within half a second of opening steers rounds only if it left frames
+waiting to be resent. A writer marks its peer at most every five seconds; a
 mark held back by that spacing is set as soon as the spacing ends, on the
 connection then live.
 

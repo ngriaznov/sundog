@@ -151,9 +151,10 @@ its copy of every part it owned, and a delete made meanwhile reaches only
 this side. A graceful leave is not an absence: the leaver hands its parts
 off and keeps nothing.
 
-The tombstone an expired entry leaves in `Replicated` and `Distributed`
-under a non-merging resolver is kept by the same rules, counted from the entry's expiry instead of from the
-delete. `sundog_tombstones{cache}` reports how many a node holds.
+The tombstone an expired entry leaves in `Replicated` and `Distributed` under
+a non-merging resolver is kept by the same rules, counted from the entry's
+expiry instead of from the delete. `sundog_tombstones{cache}` reports how many
+a node holds.
 
 A member gone longer than `tombstone_max_ttl` returns after the tombstone
 is collected, and its stale copy can come back, limited by that copy's own
@@ -211,22 +212,22 @@ as a longer value that anti-entropy delivered first. That record is the
 resolver's winner, so the write sends it as a record, not as a departed
 invalidation.
 
-In `Replicated` and `Distributed` under a non-merging resolver, the sweep
-that removes an expired entry keeps a tombstone at the entry's version. A
-replica that missed the overwrite cannot bring the overwritten value back, whether or not the sweep
-had run when the older copy arrived, and anti-entropy removes that copy from
-the replica that still holds it. The tombstone counts its retention from the
-entry's expiry, so every replica that learns of it, by sweeping or from a
-peer, collects it at the same instant: `tombstone_ttl`, and up to
-`tombstone_max_ttl` while a member is absent, as for a delete. A replica
+In `Replicated` and `Distributed` under a non-merging resolver, the sweep that
+removes an expired entry keeps a tombstone at the entry's version. A replica
+that missed the overwrite cannot bring the overwritten value back, whether or
+not the sweep had run when the older copy arrived, and anti-entropy removes
+that copy from the replica that still holds it. The tombstone counts its
+retention from the entry's expiry, so every replica that learns of it, by
+sweeping or from a peer, collects it at the same instant: `tombstone_ttl`, and
+up to `tombstone_max_ttl` while a member is absent, as for a delete. A replica
 that already collected it does not take it back from one that has not.
 Shortening a lifetime takes the same path: once the shortened entry expires
 and is swept, a node cut off for the whole lifetime loses its longer-lived
-copy to anti-entropy instead of bringing the entry back. After the
-retention ends, a copy that was cut off longer is accepted again, limited by
-its own expiry, as after a delete. Nodes sweep on their own clocks, which
-differ by up to `max_clock_skew`, so a peer can take a tombstone that much
-before its own clock reaches the expiry.
+copy to anti-entropy instead of bringing the entry back. After the retention
+ends, a copy that was cut off longer is accepted again, limited by its own
+expiry, as after a delete. Nodes sweep on their own clocks, which differ by up
+to `max_clock_skew`, so a peer can take a tombstone that much before its own
+clock reaches the expiry.
 
 A `Distributed` owner of a part it has not yet verified declines a peer's
 fetch for a key it holds nothing for, and the peer asks the next owner. An

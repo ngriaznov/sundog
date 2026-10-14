@@ -9,7 +9,8 @@ All notable changes to this project are documented in this file. Format follows
 
 - **`sundog_tombstones{cache}`** gauge: the tombstones a node holds for a
   cache, its deletes and, in a `Replicated` or `Distributed` cache whose
-  resolver does not merge, its swept expired entries, refreshed every five seconds with `sundog_cache_entries`.
+  resolver does not merge, its swept expired entries, refreshed every five
+  seconds with `sundog_cache_entries`.
 - **`sundog_clock_skew_held{cache}`, `sundog_clock_skew_held_bytes{cache}`
   and `sundog_clock_skew_hold_dropped_total{cache, reason}`**: the forwarded
   writes an owner holds for clock skew, the memory they take, and the ones it
@@ -27,15 +28,16 @@ All notable changes to this project are documented in this file. Format follows
 ### Fixed
 
 - **An `Invalidation` cache no longer folds a retired `PnCounter` writer into
-  its folded total.** A fold keeps one scalar per replica and a merge takes the
-  larger of two, which is exact only when one replica's folded writers include
-  the other's. The nodes of an `Invalidation` cache hold different writers, so
-  two nodes could fold disjoint sets while cut off and keep only the larger
-  total, losing the other for good. The sweep still retires a dead writer in
-  every mode, which keeps its exact total, and folds it in `Replicated`,
-  `Distributed` and `Local` caches, whose replicas of a part fold nested sets;
-  an `Invalidation` cache keeps one small retired entry for every dead writer.
-  `OrSet`, which has no folded total, follows the same rule.
+  its folded total.** A fold keeps one scalar per replica and a merge takes
+  the larger of two, which is exact only when one replica's folded writers
+  include the other's. The nodes of an `Invalidation` cache hold different
+  writers, so two nodes could fold disjoint sets while cut off and keep only
+  the larger total, losing the other for good. The sweep still retires a dead
+  writer in every mode, which keeps its exact total, and folds it in
+  `Replicated`, `Distributed` and `Local` caches, whose replicas of a part
+  fold nested sets; an `Invalidation` cache keeps one small retired entry for
+  every dead writer. `OrSet`, which has no folded total, follows the same
+  rule.
 - **A fold receipt lives from the fold, not from the retirement.** `PnCounter`
   and `OrSet` stamp the receipt that stage two leaves with the fold instant,
   never lowering a stamp the writer already has. A fold that membership churn
@@ -45,22 +47,23 @@ All notable changes to this project are documented in this file. Format follows
   contribution twice (`PnCounter`) or bring removed elements back (`OrSet`).
   The receipt lives its full lifetime after the fold, about two bounds plus a
   sweep period longer than one stamped at the retirement, and a receipt
-  stamped more than that lifetime ahead of the clock expires, so one fast clock
-  cannot keep a receipt alive on every replica. Replicas that fold the same
-  writer at different sweeps carry different stamps and merge them by maximum
-  in one anti-entropy exchange. The stored layout and the wire are unchanged.
+  stamped more than that lifetime ahead of the clock expires, so one fast
+  clock cannot keep a receipt alive on every replica. Replicas that fold the
+  same writer at different sweeps carry different stamps and merge them by
+  maximum in one anti-entropy exchange. The stored layout and the wire are
+  unchanged.
 - **Merged values stay bounded under rolling replacement.** The CRDT sweep
-  retires a `PnCounter` or `OrSet` writer slot of a node this node never saw as
-  a member: such a node counts as gone from the later of this node's start and
-  the sweep's first sight of its writer, so the sweep retires the slot once this
-  node has run for `crdt_retire_after` and folds it by the usual rules. Only a
-  node that watched the writer leave for the whole bound retired it before, so a
-  fleet that replaced every node faster than that kept one slot per deploy and
-  shipped the whole value on every write. The sweep waits a full bound after it
-  first meets a writer, so a live node that gossip has not shown yet is a peer
-  by then and never retires. A fleet that replaces every node faster than
-  `crdt_retire_after` lowers it. The sweep reads resident records, so a spilled
-  record keeps its slots until it is read back.
+  retires a `PnCounter` or `OrSet` writer slot of a node this node never saw
+  as a member: such a node counts as gone from the later of this node's start
+  and the sweep's first sight of its writer, so the sweep retires the slot
+  once this node has run for `crdt_retire_after` and folds it by the usual
+  rules. Only a node that watched the writer leave for the whole bound retired
+  it before, so a fleet that replaced every node faster than that kept one
+  slot per deploy and shipped the whole value on every write. The sweep waits
+  a full bound after it first meets a writer, so a live node that gossip has
+  not shown yet is a peer by then and never retires. A fleet that replaces
+  every node faster than `crdt_retire_after` lowers it. The sweep reads
+  resident records, so a spilled record keeps its slots until it is read back.
 - **A `Mode::Distributed` write forwarded by a non-owner survives an owner's
   clock-skew refusal.** The writer keeps no copy of a forwarded insert,
   remove or merge, so an owner that refused its stamp for being further ahead
@@ -100,40 +103,40 @@ All notable changes to this project are documented in this file. Format follows
   again first on the next connection, along with the last second of what it
   wrote, at most 1 MiB of it, which a peer that closed the link may not have
   received, so a `Distributed` write forwarded to an owner survives a stale
-  link. The writer
-  reads its link to notice a peer that closed it before a write fails, and
-  dials at most once per 500 ms. After a redial that follows a connection that
-  carried frames and lasted at least that long, or that left frames held, it
-  marks the peer for the next anti-entropy round, at most every five seconds;
-  a mark the spacing defers is set on the live connection once the spacing has
-  passed, so it is delayed and never skipped. A receiver can see a frame twice; applying one is idempotent. A drop of the
-  oldest queued invalidation or of a message that fails to encode marks the
-  peer and counts in `sundog_backlog_dropped_total{peer}` too. Anti-entropy
-  repairs `Replicated` and owner-to-owner loss only: a non-owner's forwarded
-  write is held by no replica, and a partition that never delivers a close can
-  still lose the frames in flight.
-- **Closing a clone of a cache after its name was reopened leaves the
-  reopened cache alone.** A close acts on the cluster only for the shard the
-  registry holds. A close that acted on the name would remove the new cache
-  from the shard registry, `Cluster::health`, the gossiped mode and loader and
-  the shutdown spill sweep, so peers would stop seeing it and inbound
-  replication, anti-entropy, fetch and load lookups by name would fail, and
-  it would checkpoint the closed spill tier a second time into the directory
-  the reopened cache owns, which could drop that cache's later entries from
-  the next warm reopen. A cache checkpoints its spill tier once: a second or concurrent
-  close waits for the first and does nothing more. The checkpoint runs on its
-  own task, so a `close` cut short by a timeout leaves it running and the next
-  `close` waits for it instead of starting a second checkpoint beside its
-  disk writes.
+  link. The writer reads its link to notice a peer that closed it before a
+  write fails, and dials at most once per 500 ms. After a redial that follows
+  a connection that carried frames and lasted at least that long, or that left
+  frames held, it marks the peer for the next anti-entropy round, at most
+  every five seconds; a mark the spacing defers is set on the live connection
+  once the spacing has passed, so it is delayed and never skipped. A receiver
+  can see a frame twice; applying one is idempotent. A drop of the oldest
+  queued invalidation or of a message that fails to encode marks the peer and
+  counts in `sundog_backlog_dropped_total{peer}` too. Anti-entropy repairs
+  `Replicated` and owner-to-owner loss only: a non-owner's forwarded write is
+  held by no replica, and a partition that never delivers a close can still
+  lose the frames in flight.
+- **Closing a clone of a cache after its name was reopened leaves the reopened
+  cache alone.** A close acts on the cluster only for the shard the registry
+  holds. A close that acted on the name would remove the new cache from the
+  shard registry, `Cluster::health`, the gossiped mode and loader and the
+  shutdown spill sweep, so peers would stop seeing it and inbound replication,
+  anti-entropy, fetch and load lookups by name would fail, and it would
+  checkpoint the closed spill tier a second time into the directory the
+  reopened cache owns, which could drop that cache's later entries from the
+  next warm reopen. A cache checkpoints its spill tier once: a second or
+  concurrent close waits for the first and does nothing more. The checkpoint
+  runs on its own task, so a `close` cut short by a timeout leaves it running
+  and the next `close` waits for it instead of starting a second checkpoint
+  beside its disk writes.
 - **A part pull that times out after a view change is retried every
   `ae_interval`.** A `Distributed` node that gains a part and whose pull runs
   out `state_transfer_budget` keeps pulling it on the anti-entropy tick until
   it lands, where the part stayed cold and stale until the next membership
   change. Reads of its keys are then served locally again and no longer answer
-  `FetchUnavailable` when the other owner is briefly unreachable. A view change
-  published during a retry preempts it. `sundog_rebalance_pull_timeouts_total`
-  counts every timed-out view-change pull and retry, so `max_pull_timeouts` in
-  the scale gate sees them.
+  `FetchUnavailable` when the other owner is briefly unreachable. A view
+  change published during a retry preempts it.
+  `sundog_rebalance_pull_timeouts_total` counts every timed-out view-change
+  pull and retry, so `max_pull_timeouts` in the scale gate sees them.
 - **A read-through fill on a `Distributed` node that does not own the key
   keeps no copy there.** `get_or_load`, `get_or_insert_with`, `load` and
   `load_many` on a non-owner answer the caller and every joined waiter with
@@ -153,24 +156,24 @@ All notable changes to this project are documented in this file. Format follows
   when the older copy arrived, and anti-entropy removes that copy from the
   replica that still holds it. The same holds for a lifetime shortened with
   `expire`: a cut-off peer's longer-lived copy is deleted instead of bringing
-  the entry back. The tombstone counts its `tombstone_ttl` (and, while a member
-  is absent, `tombstone_max_ttl`) from the entry's expiry, and every node
-  collects on a wall-clock grid of a quarter of `tombstone_ttl`, so every
+  the entry back. The tombstone counts its `tombstone_ttl` (and, while a
+  member is absent, `tombstone_max_ttl`) from the entry's expiry, and every
+  node collects on a wall-clock grid of a quarter of `tombstone_ttl`, so every
   replica collects it at the same instant, give or take their clock skew. A
   tombstone that arrives already past that retention, holding nothing it
   displaces, is dropped instead of being handed back and forth between
-  replicas that collected it and replicas that have not. The expiry travels as the tombstone record's `expires_at_ms`; a
-  peer on protocol 8 reads the record as an ordinary delete. A sweep leaves a
-  bucket's digest unchanged, and a `Distributed` owner of a cold part answers
-  a peer's fetch for a swept key with a miss, as for a deleted one, instead
-  of declining. Each expired entry of such a cache costs a tombstone for
-  the retention, and while a member is absent for up to `tombstone_max_ttl`: a
-  TTL-heavy cache holds that many tombstones, outside `max_capacity` and the
-  memory ceiling, so size for the expiry rate times the retention.
-  `LocalRecord` reports a swept key as `Tombstone` in these caches. `Local`,
-  `Invalidation` and merging caches keep nothing, and report it as
-  `Absent`: a merging cache already reads an expired side as absent on every
-  node.
+  replicas that collected it and replicas that have not. The expiry travels as
+  the tombstone record's `expires_at_ms`; a peer on protocol 8 reads the
+  record as an ordinary delete. A sweep leaves a bucket's digest unchanged,
+  and a `Distributed` owner of a cold part answers a peer's fetch for a swept
+  key with a miss, as for a deleted one, instead of declining. Each expired
+  entry of such a cache costs a tombstone for the retention, and while a
+  member is absent for up to `tombstone_max_ttl`: a TTL-heavy cache holds that
+  many tombstones, outside `max_capacity` and the memory ceiling, so size for
+  the expiry rate times the retention. `LocalRecord` reports a swept key as
+  `Tombstone` in these caches. `Local`, `Invalidation` and merging caches keep
+  nothing, and report it as `Absent`: a merging cache already reads an expired
+  side as absent on every node.
 - **A merge waiting in its coalesce window no longer outlives a remove, a
   clear or a newer tombstone.** `Cache::remove`, `remove_sync`, `remove_many`
   and `clear` discard a fold still pending for the key, `clear` covers keys
