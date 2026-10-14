@@ -88,6 +88,15 @@ replayed entry and wins over it, even when the system clock restarted behind
 those stamps. If a replayed stamp leads the system clock by more than
 `max_clock_skew`, the node logs a warning once.
 
+That floor covers the entries the snapshot holds. A delete stamped ahead of
+the restarted clock leaves a tombstone, which the snapshot does not hold, so
+the floor does not include its stamp. A peer that still keeps that tombstone
+refuses the node's lower-stamped write of the same key until the clock passes
+it, and anti-entropy then deletes the value the node wrote. A
+tombstone the node receives from a peer pulls its clock past the tombstone's
+stamp when that stamp is within `max_clock_skew`, so only a write made before
+it arrives, or against a stamp ahead by more than `max_clock_skew`, meets it.
+
 The snapshot holds no tombstones and no expired entries. A crash leaves no
 snapshot, a successful warm reopen deletes the one it replayed, so a second
 open with no clean close between is cold, and a node down longer than

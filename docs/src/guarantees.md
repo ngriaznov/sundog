@@ -64,6 +64,17 @@ the system clock catches up, the node's writes stay ordered at the replayed
 stamp, and peers may refuse them under `max_clock_skew` like any write
 stamped ahead.
 
+The floor covers the entries the snapshot holds. The snapshot holds no
+tombstones, so a delete this node stamped ahead of its restarted clock is not
+in it. In `Replicated` and `Distributed`, a peer keeps that tombstone for
+`tombstone_ttl` and refuses the node's lower-stamped write of the same key;
+anti-entropy then sends the tombstone back and the node deletes the value it
+wrote. A tombstone the node receives from a peer pulls its clock past the
+tombstone's stamp when that stamp is within `max_clock_skew`, so a write made
+after the node has received it stamps past it. A write made before then, or
+against a stamp ahead by more than `max_clock_skew`, is lost this way until
+the system clock passes the tombstone's stamp.
+
 ### Values that merge
 
 A value that combines, a counter or a set, does not have to lose writes. A

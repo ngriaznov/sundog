@@ -191,7 +191,8 @@ All notable changes to this project are documented in this file. Format follows
   every replayed entry. A clock that restarts behind a replayed stamp no
   longer ranks the new write below the old entry, which returned `Ok`,
   changed nothing and left a deleted key readable. A replayed stamp that
-  leads the system clock by more than `max_clock_skew` logs a warning.
+  leads the system clock by more than `max_clock_skew` logs a warning. The seed covers the entries the snapshot holds; a delete
+  stamped ahead of the restarted clock is not in it.
 - **A full spill flush queue no longer stalls the writer.** With the default
   `flush_queue_bytes`, small values could pass the byte budget and then find
   the flusher's channel full, and the eviction pass counted the abandoned
