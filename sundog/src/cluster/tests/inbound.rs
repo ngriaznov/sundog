@@ -210,6 +210,7 @@ struct WedgedLoop {
     tx: mpsc::Sender<InboundMsg>,
     invalidated: Arc<Mutex<Vec<Bytes>>>,
     view: Arc<OwnershipView>,
+    mesh: Mesh,
     cancel: CancellationToken,
     task: JoinHandle<()>,
 }
@@ -245,7 +246,7 @@ impl WedgedLoop {
         let task = tokio::spawn(inbound_loop(
             shards,
             Arc::new(InboundActivity::default()),
-            mesh,
+            mesh.clone(),
             NodeId::from(Self::SELF),
             rx,
             cancel.clone(),
@@ -254,6 +255,7 @@ impl WedgedLoop {
             tx,
             invalidated,
             view,
+            mesh,
             cancel,
             task,
         }
@@ -540,6 +542,55 @@ mod reforwarder {
         assert!(warn_due(None, start));
         assert!(!warn_due(Some(start), start + Duration::from_secs(4)));
         assert!(warn_due(Some(start), start + Duration::from_secs(5)));
+    }
+
+    /// A stale-view batch whose one record cannot be framed is dropped at the
+    /// re-forward: the owner it was for is marked dirty and the drop counted.
+    #[tokio::test]
+    async fn a_re_forwarded_record_that_does_not_encode_marks_its_owner_dirty_and_is_counted() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let rig = WedgedLoop::start().await;
+        let sender = NodeId::from(WedgedLoop::SENDER);
+        let wedged = NodeId::from(WedgedLoop::WEDGED);
+        // A key the wedged peer owns, so the re-forward targets it.
+        let key = (0u32..10_000)
+            .find(|&key| {
+                let record = wire_record_for_u32(key);
+                crate::cluster::inbound::reforward_groups(
+                    &rig.view,
+                    NodeId::from(WedgedLoop::SELF),
+                    sender,
+                    rig.view.view_hash() ^ 1,
+                    0,
+                    &[record],
+                )
+                .is_some_and(|groups| groups.iter().any(|group| group.owners == vec![wedged]))
+            })
+            .expect("some key is owned by the third node");
+        let too_large = WireRecord {
+            value: Some(Bytes::from(vec![0u8; crate::wire::MAX_FRAME + 1])),
+            ..wire_record_for_u32(key)
+        };
+        rig.tx
+            .send(stale_batch(&rig.view, sender, vec![too_large]))
+            .await
+            .expect("inbound open");
+
+        let mut dirty = Vec::new();
+        for _ in 0..100 {
+            dirty = rig.mesh.take_dirty_peers();
+            if !dirty.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        rig.cancel.cancel();
+        rig.task.abort();
+        assert_eq!(dirty, vec![wedged]);
+        assert_eq!(backlog_dropped(&snapshotter, WedgedLoop::WEDGED), 1);
     }
 
     #[tokio::test]

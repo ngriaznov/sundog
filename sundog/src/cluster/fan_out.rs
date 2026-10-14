@@ -312,30 +312,55 @@ fn plan_departed_sends(
 }
 
 /// Sends each of `plan`'s departed writes as [`Msg::Invalidate`].
-async fn send_departed(cluster: &Cluster, cache_name: &SmolStr, plan: Vec<DepartedSend>) {
+async fn send_departed(mesh: &Mesh, cache_name: &SmolStr, plan: Vec<DepartedSend>) {
     for DepartedSend {
         targets,
         class,
         records,
     } in plan
     {
-        let frames =
-            encode_frames_for(cluster.mesh(), &targets, invalidations(cache_name, records));
+        let frames = encode_frames_for(mesh, &targets, invalidations(cache_name, records));
         for peer in targets {
             match class {
                 DepartedClass::Drop => {
-                    cluster
-                        .mesh()
-                        .send_frames(peer, MsgClass::Invalidate, frames.iter().cloned());
+                    mesh.send_frames(peer, MsgClass::Invalidate, frames.iter().cloned());
                 }
                 DepartedClass::Awaiting => {
-                    cluster
-                        .mesh()
-                        .send_frames_awaiting(peer, frames.clone())
-                        .await;
+                    mesh.send_frames_awaiting(peer, frames.clone()).await;
                 }
             }
         }
+    }
+}
+
+/// Sends a `Mode::Invalidation` write of `records` to `peers` (each a node
+/// with the protocol it speaks) per [`invalidation_sends`].
+fn broadcast_invalidation(
+    mesh: &Mesh,
+    peers: &[(NodeId, u16)],
+    merges: bool,
+    cache_name: &SmolStr,
+    records: Vec<WireRecord>,
+) {
+    for InvalidationSend { peers, msgs } in invalidation_sends(merges, peers, cache_name, records) {
+        let frames = encode_frames_for(mesh, &peers, msgs);
+        for peer in peers {
+            mesh.send_frames(peer, MsgClass::Invalidate, frames.iter().cloned());
+        }
+    }
+}
+
+/// Sends a `Mode::Replicated` write of `records` to every one of `live` as
+/// batched replicate frames.
+fn broadcast_replicate(
+    mesh: &Mesh,
+    live: &[NodeId],
+    cache_name: &SmolStr,
+    records: Vec<WireRecord>,
+) {
+    let frames = encode_frames_for(mesh, live, batch_replicate(cache_name, records));
+    for &peer in live {
+        mesh.send_frames(peer, MsgClass::Replicate, frames.iter().cloned());
     }
 }
 
@@ -429,7 +454,7 @@ pub(crate) async fn fan_out_batch<K, V>(
             shard.merges(),
             departed,
         );
-        send_departed(cluster, cache_name, plan).await;
+        send_departed(cluster.mesh(), cache_name, plan).await;
         return;
     }
 
@@ -446,30 +471,19 @@ pub(crate) async fn fan_out_batch<K, V>(
                 .into_iter()
                 .map(|peer| (peer.node, peer.protocol))
                 .collect();
-            for InvalidationSend { peers, msgs } in
-                invalidation_sends(shard.merges(), &peers, cache_name, records)
-            {
-                let frames = encode_frames_for(cluster.mesh(), &peers, msgs);
-                for peer in peers {
-                    cluster
-                        .mesh()
-                        .send_frames(peer, MsgClass::Invalidate, frames.iter().cloned());
-                }
-            }
+            broadcast_invalidation(cluster.mesh(), &peers, shard.merges(), cache_name, records);
         }
         // Pre-batched by the same budget/count rules `net::conn`'s writer
         // uses for coalescing, so a drained burst can't flood the outbox
         // into drop-newest. The writer-side coalescer still catches trickle
         // writes arriving one drained event at a time.
         Mode::Replicated => {
-            let live = cluster.live_peer_ids();
-            let frames =
-                encode_frames_for(cluster.mesh(), &live, batch_replicate(cache_name, records));
-            for peer in live {
-                cluster
-                    .mesh()
-                    .send_frames(peer, MsgClass::Replicate, frames.iter().cloned());
-            }
+            broadcast_replicate(
+                cluster.mesh(),
+                &cluster.live_peer_ids(),
+                cache_name,
+                records,
+            );
         }
     }
     let peers = cluster.live_peer_ids();
@@ -481,7 +495,7 @@ pub(crate) async fn fan_out_batch<K, V>(
         shard.merges(),
         departed,
     );
-    send_departed(cluster, cache_name, plan).await;
+    send_departed(cluster.mesh(), cache_name, plan).await;
 }
 
 // The grouping logic is pure and mesh-free; this is `fan_out_by_owner_set`'s
@@ -1178,5 +1192,235 @@ mod tests {
             !lww.is_empty(),
             "the same carriers go out where the resolver does not merge"
         );
+    }
+
+    /// `encode_frames_for` at every send site, against a real mesh whose
+    /// peers never connect: a message that does not encode reaches none of
+    /// the peers it was for, so each is marked dirty and the drop counted.
+    #[cfg(not(feature = "sim"))]
+    mod encode_failures {
+        use super::*;
+        use crate::net::test_support::{BucketPullHandler, peer_at, spawn_mesh};
+        use crate::wire::{MAX_FRAME, PROTOCOL_VERSION};
+
+        const SELF: u64 = 1;
+        const PEER: u64 = 2;
+        const OTHER: u64 = 3;
+
+        /// A mesh on node 1 with peers 2 and 3 in its table, neither
+        /// reachable.
+        async fn mesh_with_peers() -> Mesh {
+            let (mesh, _inbound) =
+                spawn_mesh(NodeId::from(SELF), Arc::new(BucketPullHandler::default())).await;
+            let unreachable = "127.0.0.1:1".parse().expect("valid addr");
+            mesh.update_peers(vec![
+                peer_at(NodeId::from(PEER), unreachable),
+                peer_at(NodeId::from(OTHER), unreachable),
+            ]);
+            mesh
+        }
+
+        /// The value of `sundog_backlog_dropped_total` per peer. A snapshot
+        /// reads the counters out, so a test takes one.
+        fn backlog_dropped(
+            snapshotter: &metrics_util::debugging::Snapshotter,
+        ) -> std::collections::HashMap<NodeId, u64> {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .filter(|(key, ..)| key.key().name() == "sundog_backlog_dropped_total")
+                .filter_map(|(key, _, _, value)| {
+                    let peer = key
+                        .key()
+                        .labels()
+                        .find(|label| label.key() == "peer")
+                        .map(|label| label.value().to_owned())?;
+                    let peer = [PEER, OTHER]
+                        .into_iter()
+                        .map(NodeId::from)
+                        .find(|node| node.to_string() == peer)?;
+                    match value {
+                        metrics_util::debugging::DebugValue::Counter(n) => Some((peer, n)),
+                        _ => None,
+                    }
+                })
+                .collect()
+        }
+
+        /// A record whose value cannot fit a frame.
+        fn too_large_value(key: u32) -> WireRecord {
+            WireRecord {
+                value: Some(Bytes::from(vec![0u8; MAX_FRAME + 1])),
+                ..wire_record_for_u32(key)
+            }
+        }
+
+        /// A tombstone whose key cannot fit a frame, so its invalidation
+        /// does not encode.
+        fn too_large_key(key: u32) -> WireRecord {
+            WireRecord {
+                key: Bytes::from(vec![0u8; MAX_FRAME + 1]),
+                value: None,
+                ..wire_record_for_u32(key)
+            }
+        }
+
+        fn assert_peer_marked_and_counted(
+            mesh: &Mesh,
+            snapshotter: &metrics_util::debugging::Snapshotter,
+            peer: u64,
+            dropped: u64,
+        ) {
+            assert_eq!(mesh.take_dirty_peers(), vec![NodeId::from(peer)]);
+            assert_eq!(
+                backlog_dropped(snapshotter),
+                std::collections::HashMap::from([(NodeId::from(peer), dropped)])
+            );
+        }
+
+        #[tokio::test]
+        async fn encode_frames_for_drops_an_unencodable_message_and_marks_every_target_dirty() {
+            let recorder = metrics_util::debugging::DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let mesh = mesh_with_peers().await;
+            let peers = [NodeId::from(PEER), NodeId::from(OTHER)];
+            let msgs = batch_replicate(
+                &SmolStr::new("c"),
+                vec![
+                    too_large_value(1),
+                    wire_record_for_u32(2),
+                    too_large_value(3),
+                ],
+            );
+            let sent = msgs.len();
+
+            let frames = encode_frames_for(&mesh, &peers, msgs);
+
+            assert_eq!(sent, 3, "the three records travel as three messages");
+            assert_eq!(frames.len(), 1, "only the message that fits is framed");
+            let mut dirty = mesh.take_dirty_peers();
+            dirty.sort();
+            assert_eq!(dirty, peers.to_vec(), "every target is marked");
+            assert_eq!(
+                backlog_dropped(&snapshotter),
+                std::collections::HashMap::from([
+                    (NodeId::from(PEER), 2),
+                    (NodeId::from(OTHER), 2)
+                ]),
+                "each target counts both unencodable messages"
+            );
+        }
+
+        #[tokio::test]
+        async fn encode_frames_for_marks_and_counts_nothing_when_every_message_encodes() {
+            let recorder = metrics_util::debugging::DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let mesh = mesh_with_peers().await;
+
+            let frames = encode_frames_for(
+                &mesh,
+                &[NodeId::from(PEER)],
+                batch_replicate(&SmolStr::new("c"), vec![wire_record_for_u32(1)]),
+            );
+
+            assert_eq!(frames.len(), 1);
+            assert_eq!(mesh.take_dirty_peers(), Vec::<NodeId>::new());
+            assert!(backlog_dropped(&snapshotter).is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_distributed_fan_out_marks_the_owner_when_a_forwarded_record_does_not_encode() {
+            let recorder = metrics_util::debugging::DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let mesh = mesh_with_peers().await;
+            let self_node = NodeId::from(SELF);
+            let view = OwnershipView::compute(
+                self_node,
+                vec![self_node, NodeId::from(PEER)],
+                std::num::NonZeroU8::new(2).expect("nonzero"),
+            );
+
+            fan_out_by_owner_set(
+                &mesh,
+                &SmolStr::new("c"),
+                &view,
+                self_node,
+                vec![too_large_value(1)],
+            )
+            .await;
+
+            assert_peer_marked_and_counted(&mesh, &snapshotter, PEER, 1);
+        }
+
+        #[tokio::test]
+        async fn an_invalidation_broadcast_marks_the_peer_when_an_invalidation_does_not_encode() {
+            let recorder = metrics_util::debugging::DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let mesh = mesh_with_peers().await;
+
+            broadcast_invalidation(
+                &mesh,
+                &[(NodeId::from(PEER), PROTOCOL_VERSION)],
+                false,
+                &SmolStr::new("c"),
+                vec![too_large_key(1)],
+            );
+
+            assert_peer_marked_and_counted(&mesh, &snapshotter, PEER, 1);
+        }
+
+        #[tokio::test]
+        async fn a_replicate_broadcast_marks_every_live_peer_when_a_record_does_not_encode() {
+            let recorder = metrics_util::debugging::DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let mesh = mesh_with_peers().await;
+
+            broadcast_replicate(
+                &mesh,
+                &[NodeId::from(PEER), NodeId::from(OTHER)],
+                &SmolStr::new("c"),
+                vec![too_large_value(1)],
+            );
+
+            let mut dirty = mesh.take_dirty_peers();
+            dirty.sort();
+            assert_eq!(dirty, vec![NodeId::from(PEER), NodeId::from(OTHER)]);
+            assert_eq!(
+                backlog_dropped(&snapshotter),
+                std::collections::HashMap::from([
+                    (NodeId::from(PEER), 1),
+                    (NodeId::from(OTHER), 1)
+                ])
+            );
+        }
+
+        #[tokio::test]
+        async fn a_departed_send_marks_its_targets_when_an_invalidation_does_not_encode() {
+            for class in [DepartedClass::Drop, DepartedClass::Awaiting] {
+                let recorder = metrics_util::debugging::DebuggingRecorder::new();
+                let snapshotter = recorder.snapshotter();
+                let _guard = metrics::set_default_local_recorder(&recorder);
+                let mesh = mesh_with_peers().await;
+
+                send_departed(
+                    &mesh,
+                    &SmolStr::new("c"),
+                    vec![DepartedSend {
+                        targets: vec![NodeId::from(PEER)],
+                        class,
+                        records: vec![too_large_key(1)],
+                    }],
+                )
+                .await;
+
+                assert_peer_marked_and_counted(&mesh, &snapshotter, PEER, 1);
+            }
+        }
     }
 }
