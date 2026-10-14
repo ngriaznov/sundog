@@ -12,16 +12,36 @@ enum Step {
     /// Publish the view over `self` plus these others (bit i set
     /// means node `i + 2` is eligible).
     Publish(u8),
-    /// Rebalance the latest published view. `superseded` pulls
-    /// only the parts `landed` selects and does not settle.
-    Rebalance { superseded: bool, landed: u64 },
+    /// Rebalance the latest published view. A superseded or timed-out
+    /// pull lands only the parts `landed` selects; a superseded one does
+    /// not settle, a timed-out one does.
+    Rebalance { pull: Pull, landed: u64 },
+    /// Retry the parts a pull planned and did not land, on the tick:
+    /// only once the latest published view is the one the task settled.
+    Retry { landed: u64 },
+}
+
+/// How a rebalance pull ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pull {
+    Landed,
+    Superseded,
+    TimedOut,
 }
 
 fn step() -> impl Strategy<Value = Step> {
     prop_oneof![
         (1u8..16).prop_map(Step::Publish),
-        (any::<bool>(), any::<u64>())
-            .prop_map(|(superseded, landed)| Step::Rebalance { superseded, landed }),
+        (
+            prop_oneof![
+                Just(Pull::Landed),
+                Just(Pull::Superseded),
+                Just(Pull::TimedOut)
+            ],
+            any::<u64>()
+        )
+            .prop_map(|(pull, landed)| Step::Rebalance { pull, landed }),
+        any::<u64>().prop_map(|landed| Step::Retry { landed }),
     ]
 }
 
@@ -40,6 +60,9 @@ fn view_for(mask: u8, granularity: Granularity) -> Arc<OwnershipView> {
         granularity,
     ))
 }
+
+/// The `state_transfer_budget` the model's retries run under.
+const RETRY_BUDGET: Duration = Duration::from_secs(1);
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
@@ -90,39 +113,73 @@ proptest! {
                     }
                     published = next;
                 }
-                Step::Rebalance { superseded, landed } => {
+                Step::Rebalance { pull, landed } => {
                     let new = Arc::clone(&published);
                     let mut repull = residency.take_lost();
                     repull.extend(unfinished.iter());
                     let plan = plan_view_change(&prev, &pulled, &new, &[], &repull);
                     residency.mark_cold(&plan.to_pull);
-                    let landing: Vec<PartId> = if superseded {
+                    let landing: Vec<PartId> = if pull == Pull::Landed {
+                        plan.to_pull.clone()
+                    } else {
                         plan.to_pull
                             .iter()
                             .copied()
                             .filter(|part| landed & (1 << (part.index() % 64)) != 0)
                             .collect()
-                    } else {
-                        plan.to_pull.clone()
                     };
                     residency.mark_serving(&landing);
                     for part in &landing {
                         complete[part.index()] = true;
                     }
-                    unfinished = plan
-                        .to_pull
-                        .iter()
-                        .copied()
-                        .filter(|&part| residency.is_cold(part))
-                        .collect();
-                    if !superseded {
+                    unfinished = still_cold(plan.to_pull.iter().copied(), |part| {
+                        residency.is_cold(part)
+                    });
+                    if pull != Pull::Superseded {
                         residency.settle(&new);
                         pulled = Arc::clone(&new);
                     }
                     prev = new;
                 }
+                Step::Retry { landed } => {
+                    // The task retries only on a tick, and a published view
+                    // it has not yet handled is handled first.
+                    if Arc::ptr_eq(&pulled, &published) {
+                        let retry = retry_parts(&unfinished, &published, RETRY_BUDGET, |part| {
+                            residency.is_cold(part)
+                        });
+                        let landing: Vec<PartId> = retry
+                            .into_iter()
+                            .filter(|part| landed & (1 << (part.index() % 64)) != 0)
+                            .collect();
+                        residency.mark_serving(&landing);
+                        for part in &landing {
+                            complete[part.index()] = true;
+                        }
+                        unfinished = still_cold(unfinished.iter(), |part| residency.is_cold(part));
+                    }
+                }
             }
             check(&published, &complete)?;
+        }
+
+        // Liveness: retries alone complete what a timed-out pull left, with
+        // no further view published.
+        if Arc::ptr_eq(&pulled, &published) {
+            let retry = retry_parts(&unfinished, &published, RETRY_BUDGET, |part| {
+                residency.is_cold(part)
+            });
+            residency.mark_serving(&retry);
+            for part in &retry {
+                complete[part.index()] = true;
+            }
+            for part in published.owned_parts() {
+                prop_assert!(complete[part.index()], "part {part} still misses writes after a retry");
+                prop_assert!(
+                    !residency.is_cold(part) && !residency.is_unsettled(part),
+                    "part {part} still reads as cold after a retry"
+                );
+            }
         }
 
         // Liveness: one completed rebalance of the latest view leaves

@@ -60,7 +60,7 @@ addresses once it forms, under `cluster formed`.
 | `sundog_owned_parts{cache}` | parts this node owns, of 65,536 |
 | `sundog_owned_buckets{cache}` | the same share in buckets: owned parts over 64 |
 | `sundog_rebalance_parts_total{cache, direction}` | parts pulled `in`, released `out`, or `served` to another node's pull |
-| `sundog_rebalance_pull_timeouts_total{cache}` | part pulls that timed out repeatedly and left the rest to anti-entropy |
+| `sundog_rebalance_pull_timeouts_total{cache}` | part pulls that ran out `state_transfer_budget`: each view-change pull or retry that times out, and an open-time warm-up that gives up after repeated timeouts and leaves the rest to anti-entropy |
 | `sundog_fetch_total{cache, outcome}` | `fetch` calls by outcome: `local`, `remote`, `miss` or `error` |
 | `sundog_fetch_duration_seconds{cache, outcome}` | histogram of every `fetch` that asked an owner, under its outcome: `remote`, `miss`, `error`, or `local` after a view change |
 | `sundog_forwarded_writes_total{cache}` | writes sent on to a part's owners, or passed on because they arrived under another node's view |
@@ -130,7 +130,9 @@ A `Replicated` cache has not finished pulling its snapshot. Check
 `sundog_state_transfer_records_total` for progress and the logs for the
 chosen donor. A cache whose transfer exceeds `state_transfer_budget` opens
 cold and keeps pulling in the background, then opens warm after three
-timed-out pulls with what arrived; raise the budget for large caches.
+timed-out pulls with what arrived; raise the budget for large caches. A
+`Distributed` part gained after open is pulled under the same budget, and a
+pull that times out is retried every `ae_interval` until it lands.
 
 ### Writes slow down
 

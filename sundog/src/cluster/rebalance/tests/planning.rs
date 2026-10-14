@@ -473,3 +473,147 @@ async fn rebalance_task_releases_a_bucket_held_under_a_view_it_never_observed() 
     cancel.cancel();
     cluster.shutdown().await;
 }
+
+/// Every part of a two-node, two-owner view is owned here with a co-owner.
+fn co_owned_view() -> OwnershipView {
+    view(NodeId::from(1), vec![NodeId::from(1), NodeId::from(2)], 2)
+}
+
+fn unfinished_of(parts: &[PartId]) -> PartSet {
+    parts.iter().copied().collect()
+}
+
+#[test]
+fn retry_parts_covers_only_cold_parts_the_view_owns_with_a_co_owner() {
+    let view = co_owned_view();
+    let parts: Vec<PartId> = PartId::all().take(6).collect();
+    let cold: HashSet<PartId> = parts[..4].iter().copied().collect();
+
+    let retry = retry_parts(
+        &unfinished_of(&parts),
+        &view,
+        Duration::from_secs(20),
+        |part| cold.contains(&part),
+    );
+
+    assert_eq!(
+        retry,
+        parts[..4].to_vec(),
+        "the parts that landed are not retried"
+    );
+}
+
+#[test]
+fn retry_parts_leaves_a_part_owned_alone_to_sole_owned() {
+    let alone = view(NodeId::from(1), vec![NodeId::from(1)], 2);
+    let parts: Vec<PartId> = PartId::all().take(3).collect();
+    assert!(
+        parts.iter().all(|&part| alone.owners_of(part).len() == 1),
+        "a lone node owns each part alone"
+    );
+
+    assert_eq!(
+        retry_parts(
+            &unfinished_of(&parts),
+            &alone,
+            Duration::from_secs(20),
+            |_| true
+        ),
+        Vec::<PartId>::new()
+    );
+}
+
+#[test]
+fn retry_parts_leaves_a_part_the_view_no_longer_owns_to_the_next_view_change() {
+    let view = view(NodeId::from(1), (1..=9u64).map(NodeId::from).collect(), 2);
+    let unowned: Vec<PartId> = PartId::all()
+        .filter(|&part| !view.owns(part))
+        .take(4)
+        .collect();
+    let owned: Vec<PartId> = PartId::all()
+        .filter(|&part| view.owns(part))
+        .take(4)
+        .collect();
+    let all: Vec<PartId> = unowned.iter().chain(&owned).copied().collect();
+
+    assert_eq!(
+        retry_parts(&unfinished_of(&all), &view, Duration::from_secs(20), |_| {
+            true
+        }),
+        owned
+    );
+}
+
+#[test]
+fn retry_parts_is_empty_for_nothing_unfinished_and_for_a_zero_budget() {
+    let view = co_owned_view();
+    assert_eq!(
+        retry_parts(&PartSet::new(), &view, Duration::from_secs(20), |_| true),
+        Vec::<PartId>::new()
+    );
+    let parts: Vec<PartId> = PartId::all().take(3).collect();
+    assert_eq!(
+        retry_parts(&unfinished_of(&parts), &view, Duration::ZERO, |_| true),
+        Vec::<PartId>::new(),
+        "a zero budget runs no pull, so there is nothing to retry"
+    );
+}
+
+#[test]
+fn retry_parts_lists_parts_in_ascending_order() {
+    let view = co_owned_view();
+    let mut parts: Vec<PartId> = PartId::all().step_by(131).take(20).collect();
+    parts.reverse();
+
+    let retry = retry_parts(
+        &unfinished_of(&parts),
+        &view,
+        Duration::from_secs(20),
+        |_| true,
+    );
+
+    let mut sorted = parts.clone();
+    sorted.sort_unstable();
+    assert_eq!(retry, sorted);
+}
+
+#[test]
+fn still_cold_drops_the_parts_that_landed() {
+    let parts: Vec<PartId> = PartId::all().take(5).collect();
+    let landed: HashSet<PartId> = parts[1..3].iter().copied().collect();
+
+    let kept = still_cold(parts.iter().copied(), |part| !landed.contains(&part));
+
+    assert_eq!(
+        kept.iter().collect::<Vec<_>>(),
+        vec![parts[0], parts[3], parts[4]]
+    );
+    assert!(still_cold(PartSet::new().iter(), |_| true).is_empty());
+}
+
+#[test]
+fn a_retry_counts_a_timeout_and_restarts_the_tick_only_for_a_pull_that_ran() {
+    let effects = |end| {
+        let effects = retry_effects(end);
+        (effects.count_timeout, effects.reset_ticker)
+    };
+    assert_eq!(effects(RetryEnd::Ran(Outcome::TimedOut)), (true, true));
+    for outcome in [
+        Outcome::Completed,
+        Outcome::Superseded,
+        Outcome::Unverified,
+        Outcome::NoDonor,
+    ] {
+        assert_eq!(
+            effects(RetryEnd::Ran(outcome)),
+            (false, true),
+            "{outcome:?} is no timeout, and the pull used its time"
+        );
+    }
+    assert_eq!(
+        effects(RetryEnd::ViewChanged),
+        (false, false),
+        "a view change cuts the retry short; the next turn handles it"
+    );
+    assert_eq!(effects(RetryEnd::Cancelled), (false, false));
+}

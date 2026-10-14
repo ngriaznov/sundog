@@ -527,13 +527,111 @@ impl PullRequest<'_> {
     }
 }
 
+/// Counts one pull that ran out `state_transfer_budget` under
+/// `sundog_rebalance_pull_timeouts_total{cache}`: an open-time warm-up that
+/// gives up, a view-change pull that times out, or a retry that does.
+fn count_pull_timeout(cache: &SmolStr) {
+    metrics::counter!(
+        "sundog_rebalance_pull_timeouts_total",
+        "cache" => cache.to_string()
+    )
+    .increment(1);
+}
+
+/// The parts of `unfinished` a retry pulls: those `view` owns with a
+/// co-owner to pull from and that are still cold, in ascending part order.
+/// None for a zero `budget`, which runs no pull at all. A part owned alone is
+/// left to [`sole_owned`], which serves it once its absent co-owners have
+/// been gone for `budget`; a part `view` does not own is left to the next
+/// view change, which plans it afresh. Pure; unit tested directly.
+pub(crate) fn retry_parts(
+    unfinished: &PartSet,
+    view: &OwnershipView,
+    budget: Duration,
+    is_cold: impl Fn(PartId) -> bool,
+) -> Vec<PartId> {
+    if budget.is_zero() {
+        return Vec::new();
+    }
+    let mut parts: Vec<PartId> = unfinished
+        .iter()
+        .filter(|&part| view.owns(part) && view.owners_of(part).len() > 1 && is_cold(part))
+        .collect();
+    parts.sort_unstable();
+    parts
+}
+
+/// The parts of `unfinished` that are still cold: what the next view change
+/// replans, so a part that landed, by a retry or any other path, is not
+/// marked cold and pulled again. Pure; unit tested directly.
+pub(crate) fn still_cold(
+    unfinished: impl IntoIterator<Item = PartId>,
+    is_cold: impl Fn(PartId) -> bool,
+) -> PartSet {
+    unfinished
+        .into_iter()
+        .filter(|&part| is_cold(part))
+        .collect()
+}
+
+/// How a retry pull ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryEnd {
+    /// The task was cancelled mid-pull.
+    Cancelled,
+    /// A view was published mid-pull, and the next turn of the loop handles
+    /// it.
+    ViewChanged,
+    /// The pull ended on its own.
+    Ran(Outcome),
+}
+
+/// What the loop does after a retry ends in `end`: counts a timeout and
+/// restarts the tick only for a pull that ran its course, so a pull that
+/// used the whole budget is followed by one `ae_interval` of quiet instead of
+/// the immediate catch-up tick a delayed interval produces. A retry a view
+/// change cut short counts nothing and leaves the tick alone. Pure; unit
+/// tested directly.
+pub(crate) const fn retry_effects(end: RetryEnd) -> RetryEffects {
+    RetryEffects {
+        count_timeout: matches!(end, RetryEnd::Ran(Outcome::TimedOut)),
+        reset_ticker: matches!(end, RetryEnd::Ran(_)),
+    }
+}
+
+/// The follow-up [`retry_effects`] decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RetryEffects {
+    pub(crate) count_timeout: bool,
+    pub(crate) reset_ticker: bool,
+}
+
+/// Runs `pull` for the parts a retry covers until it ends, `cancel` fires or
+/// a view is published. `views` is a clone of the loop's own receiver, so
+/// it sees a change the loop has not yet taken, and the loop still sees that
+/// change on its next turn and replans from `unfinished`. Dropping a pull
+/// mid-way is safe: records it applied stay, and the marks it cleared stay
+/// cleared.
+async fn run_retry(
+    pull: PullRequest<'_>,
+    mut views: tokio::sync::watch::Receiver<Arc<OwnershipView>>,
+    cancel: &CancellationToken,
+) -> RetryEnd {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => RetryEnd::Cancelled,
+        _ = views.changed() => RetryEnd::ViewChanged,
+        outcome = pull.run() => RetryEnd::Ran(outcome),
+    }
+}
+
 /// Retries [`PullRequest::run`] for whatever this node's [`OwnershipTracker`]
 /// owns, after an initial `open()`-time pull that
 /// [`state_transfer::Outcome::needs_warm_up`] left cold: waits for a
 /// co-owner when there is none, then retries every `retry_interval` until a
 /// pass lands or repeated timeouts mark the cache warm with whatever
-/// landed, counted under `sundog_rebalance_pull_timeouts_total{cache}`.
-/// Shares [`state_transfer::next_warm_up_step`]'s decision and
+/// landed, counted under `sundog_rebalance_pull_timeouts_total{cache}`
+/// ([`count_pull_timeout`]). Shares [`state_transfer::next_warm_up_step`]'s decision and
 /// [`state_transfer::MAX_WARM_UP_ATTEMPTS`] cap with the whole-cache
 /// analogue, [`state_transfer::warm_up_task`].
 #[expect(
@@ -612,11 +710,7 @@ pub(crate) async fn warm_up_task(
                     attempts = attempt,
                     "rebalance pull timed out repeatedly; opening warm with what landed, anti-entropy carries the rest"
                 );
-                metrics::counter!(
-                    "sundog_rebalance_pull_timeouts_total",
-                    "cache" => cache.to_string()
-                )
-                .increment(1);
+                count_pull_timeout(&cache);
                 // No donor left to try: whatever landed, warm-reloaded or
                 // not, is declared servable.
                 residency.mark_all_serving();
@@ -971,6 +1065,13 @@ fn owners_needing_confirmation(
 /// that owner co-owns was acked. `disown_grace` still gates which parts
 /// reach this hand-off, so an ack only accelerates confirmation, never the
 /// release timing floor.
+///
+/// A pull that runs out `state_transfer_budget` leaves its parts cold, and the
+/// same tick pulls them again, after the release pass, until they land
+/// ([`retry_parts`]). A cancel or a newly published view ends a retry
+/// at once, and the view change replans whatever is still cold. Every
+/// timed-out view-change pull and retry counts under
+/// `sundog_rebalance_pull_timeouts_total{cache}` ([`count_pull_timeout`]).
 #[expect(
     clippy::too_many_arguments,
     reason = "a long-running per-cache background task carries this cache's full context for its whole lifetime; a struct would only rename these same eight fields"
@@ -1104,20 +1205,23 @@ pub(crate) async fn rebalance_task(
                         outcome = pull.run() => outcome,
                     }
                 };
+                if outcome == Outcome::TimedOut {
+                    count_pull_timeout(&cache);
+                }
                 // What the pull planned and did not land is pulled again on
-                // the next change; a pull the view moves past is also planned
-                // again from the same starting point, which is already
-                // published, so nothing gained is skipped.
-                unfinished = planned
-                    .into_iter()
-                    .filter(|&part| residency.is_cold(part))
-                    .collect();
+                // the next tick, and replanned on the next change; a pull the
+                // view moves past is also planned again from the same
+                // starting point, which is already published, so nothing
+                // gained is skipped.
+                unfinished = still_cold(planned, |part| residency.is_cold(part));
                 if outcome != Outcome::Superseded {
                     residency.settle(&new_view);
                     pulled_view = new_view;
                 }
             }
             _ = ticker.tick() => {
+                // Parts that landed, by a pull of any kind, are not replanned.
+                unfinished = still_cold(unfinished.iter(), |part| residency.is_cold(part));
                 // A part held cold for an absent co-owner serves once that
                 // absence outlasts `budget`, the same bound a pull waits for
                 // a donor, or is pulled on the view change its return brings.
@@ -1209,24 +1313,62 @@ pub(crate) async fn rebalance_task(
                             acked = acked.len(),
                             "no released part's owners all answered its hand-off; holding until the next tick"
                         );
-                        continue;
+                    } else {
+                        let removed = shard.release_parts(&due).await;
+                        residency.unmark(&due);
+                        metrics::counter!(
+                            "sundog_rebalance_parts_total",
+                            "cache" => cache.to_string(),
+                            "direction" => "out"
+                        )
+                        .increment(u64::try_from(due.len()).unwrap_or(u64::MAX));
+                        tracing::debug!(
+                            cache = %cache,
+                            parts = due.len(),
+                            removed,
+                            reconciled = reconciled.len(),
+                            acked = acked.len(),
+                            "released parts past their disown grace"
+                        );
                     }
-                    let removed = shard.release_parts(&due).await;
-                    residency.unmark(&due);
-                    metrics::counter!(
-                        "sundog_rebalance_parts_total",
-                        "cache" => cache.to_string(),
-                        "direction" => "out"
+                }
+                // Last in the tick, so a pull that keeps timing out never
+                // holds a release behind it: parts a pull planned and did not
+                // land are pulled again, preempted by a cancel or a view
+                // change.
+                let retry = retry_parts(&unfinished, &ownership.current(), budget, |part| {
+                    residency.is_cold(part)
+                });
+                if !retry.is_empty() {
+                    tracing::debug!(cache = %cache, count = retry.len(), "parts still cold after a pull that did not land; retrying");
+                    let end = run_retry(
+                        PullRequest {
+                            cluster: &cluster,
+                            shard: &shard,
+                            ownership: &ownership,
+                            residency: &residency,
+                            cache: &cache,
+                            parts: retry,
+                            budget,
+                            concurrency,
+                            // The ongoing rebalance loop, well past open()'s membership wait.
+                            trust_sole_owner: true,
+                        },
+                        view_rx.clone(),
+                        &cancel,
                     )
-                    .increment(u64::try_from(due.len()).unwrap_or(u64::MAX));
-                    tracing::debug!(
-                        cache = %cache,
-                        parts = due.len(),
-                        removed,
-                        reconciled = reconciled.len(),
-                        acked = acked.len(),
-                        "released parts past their disown grace"
-                    );
+                    .await;
+                    if end == RetryEnd::Cancelled {
+                        return;
+                    }
+                    let effects = retry_effects(end);
+                    if effects.count_timeout {
+                        count_pull_timeout(&cache);
+                    }
+                    unfinished = still_cold(unfinished.iter(), |part| residency.is_cold(part));
+                    if effects.reset_ticker {
+                        ticker.reset();
+                    }
                 }
             }
         }

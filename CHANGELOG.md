@@ -21,6 +21,15 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **A part pull that times out after a view change is retried every
+  `ae_interval`.** A `Distributed` node that gains a part and whose pull runs
+  out `state_transfer_budget` keeps pulling it on the anti-entropy tick until
+  it lands, where the part stayed cold and stale until the next membership
+  change. Reads of its keys are then served locally again and no longer answer
+  `FetchUnavailable` when the other owner is briefly unreachable. A view change
+  published during a retry preempts it. `sundog_rebalance_pull_timeouts_total`
+  counts every timed-out view-change pull and retry, so `max_pull_timeouts` in
+  the scale gate sees them.
 - **A read-through fill on a `Distributed` node that does not own the key
   keeps no copy there.** `get_or_load`, `get_or_insert_with`, `load` and
   `load_many` on a non-owner answer the caller and every joined waiter with

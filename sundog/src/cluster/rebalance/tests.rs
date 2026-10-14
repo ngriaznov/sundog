@@ -16,6 +16,7 @@ mod planning;
 mod pull_group;
 mod pull_request;
 mod release;
+mod retry;
 
 fn view(self_node: NodeId, eligible: Vec<NodeId>, k: u8) -> OwnershipView {
     OwnershipView::compute(self_node, eligible, NonZeroU8::new(k).expect("nonzero"))

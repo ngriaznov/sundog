@@ -227,7 +227,9 @@ back, the copy is dropped when the grace ends, and once every view agrees
 the key reads its current value. sundog keeps answering here rather than
 failing reads until membership settles. A part a node has just gained, or regained after losing it,
 counts as cold until its pull lands, so the node asks the other owners
-rather than answering a miss from an incomplete copy. The same holds when
+rather than answering a miss from an incomplete copy. A pull that runs out
+`state_transfer_budget` is retried every anti-entropy interval until it
+lands, and the part reads as cold until then. The same holds when
 the failure detector drops a key's other owners and leaves a node owning its
 part alone: an owner dropped that way can be stalled or across a partition
 and still hold the key, so the part stays cold and the node answers

@@ -159,7 +159,11 @@ pub struct ClusterConfig {
     /// out opens cold, declining to donate, and keeps pulling in the
     /// background every `ae_interval`; after three timed-out pulls it opens
     /// warm with what landed. Zero is honored: `open()` skips the transfer
-    /// entirely and the cache is warm with what it has. A warm reopen's
+    /// entirely and the cache is warm with what it has. A [`Mode::Distributed`]
+    /// part this node gains after open is pulled under the same budget; a pull
+    /// that times out is retried every `ae_interval` until it lands, and the
+    /// part reads as cold, never from a possibly incomplete copy, until then.
+    /// A warm reopen's
     /// reconciliation loop (see [`reconcile_byte_budget`](Self::reconcile_byte_budget))
     /// also runs on this bound, and so does the wait of a
     /// [`Mode::Distributed`] part this node owns alone because the failure
