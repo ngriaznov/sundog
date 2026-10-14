@@ -253,14 +253,21 @@ pub(crate) fn newest_per_key<K: Hash + Eq + Clone>(items: Vec<(K, Hlc)>) -> Vec<
 
 /// Splits what the written view returned for a burst of `writes` into the
 /// records to send and the writes that departed. A write departs when no
-/// record came back for its key, or when the one that did is older than the
-/// version written: the entry was evicted, swept, disowned or went idle, or
-/// an older copy refilled the key. A departed write's older record is left
-/// out of `records`, so the peers receive only the invalidation and never
-/// reinstall, in either arrival order, the value it dropped. A record newer
-/// than the write stays: it carries a later write's value. Pure; unit tested
-/// directly.
-pub(crate) fn partition_writes(writes: &[(Bytes, Hlc)], fetched: Vec<WireRecord>) -> FanOutRecords {
+/// record came back for its key, or, for a `version_ordered` resolver, when
+/// the one that did is older than the version written: the entry was
+/// evicted, swept, disowned or went idle, or an older copy refilled the key.
+/// A departed write's older record is left out of `records`, so the peers
+/// receive only the invalidation and never reinstall, in either arrival
+/// order, the value it dropped. A record newer than the write stays: it
+/// carries a later write's value. A resolver that is not `version_ordered`
+/// (one that reads values) may keep a record at a lower version than the
+/// write, because that record is its winner, not an old refill: it is sent
+/// as a record and the key does not depart. Pure; unit tested directly.
+pub(crate) fn partition_writes(
+    writes: &[(Bytes, Hlc)],
+    fetched: Vec<WireRecord>,
+    version_ordered: bool,
+) -> FanOutRecords {
     let mut written: HashMap<&Bytes, Hlc> = HashMap::with_capacity(writes.len());
     for (key, ver) in writes {
         written
@@ -271,9 +278,10 @@ pub(crate) fn partition_writes(writes: &[(Bytes, Hlc)], fetched: Vec<WireRecord>
     let mut covered: HashMap<Bytes, Hlc> = HashMap::with_capacity(fetched.len());
     let mut records = Vec::with_capacity(fetched.len());
     for rec in fetched {
-        if written
-            .get(&rec.key)
-            .is_some_and(|queued| rec.ver < *queued)
+        if version_ordered
+            && written
+                .get(&rec.key)
+                .is_some_and(|queued| rec.ver < *queued)
         {
             continue;
         }

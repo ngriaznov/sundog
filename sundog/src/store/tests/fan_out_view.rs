@@ -86,7 +86,7 @@ fn newest_per_key_leaves_distinct_keys_and_empty_input_alone() {
 
 #[test]
 fn a_write_with_no_fetched_record_is_departed_at_its_version() {
-    let split = partition_writes(&[write(1, hlc(4, 1))], Vec::new());
+    let split = partition_writes(&[write(1, hlc(4, 1))], Vec::new(), true);
     assert!(split.records.is_empty(), "nothing expected");
     assert_eq!(split.departed.len(), 1);
     let gone = &split.departed[0];
@@ -103,6 +103,7 @@ fn a_fetched_record_at_or_past_the_written_version_is_not_departed() {
     let split = partition_writes(
         &[write(1, hlc(4, 1)), write(2, hlc(4, 1))],
         vec![equal.clone(), newer.clone()],
+        true,
     );
     assert_eq!(split.records, vec![equal, newer]);
     assert!(split.departed.is_empty(), "nothing expected");
@@ -115,6 +116,7 @@ fn a_fetched_record_older_than_the_write_is_departed_and_never_sent() {
     let split = partition_writes(
         &[write(1, hlc(4, 1)), write(2, hlc(4, 1))],
         vec![older, current.clone()],
+        true,
     );
     assert_eq!(
         split.records,
@@ -127,12 +129,40 @@ fn a_fetched_record_older_than_the_write_is_departed_and_never_sent() {
 }
 
 #[test]
+fn a_fetched_record_older_than_the_write_is_the_winner_of_a_value_reading_resolver() {
+    let winner = wire(1, hlc(2, 1));
+    let current = wire(2, hlc(4, 1));
+    let split = partition_writes(
+        &[write(1, hlc(4, 1)), write(2, hlc(4, 1))],
+        vec![winner.clone(), current.clone()],
+        false,
+    );
+    assert_eq!(
+        split.records,
+        vec![winner, current],
+        "the lower-version record is the resolver's winner and ships as a record"
+    );
+    assert!(
+        split.departed.is_empty(),
+        "no departed carrier is emitted for a key that has a record"
+    );
+}
+
+#[test]
+fn a_value_reading_resolver_still_departs_a_write_with_no_record() {
+    let split = partition_writes(&[write(1, hlc(4, 1))], Vec::new(), false);
+    assert!(split.records.is_empty(), "nothing expected");
+    assert_eq!(split.departed.len(), 1);
+    assert_eq!(split.departed[0].ver, hlc(4, 1));
+}
+
+#[test]
 fn a_tombstone_at_a_newer_version_covers_the_write() {
     let tombstone = WireRecord {
         value: None,
         ..wire(1, hlc(8, 1))
     };
-    let split = partition_writes(&[write(1, hlc(4, 1))], vec![tombstone.clone()]);
+    let split = partition_writes(&[write(1, hlc(4, 1))], vec![tombstone.clone()], true);
     assert_eq!(split.records, vec![tombstone]);
     assert!(split.departed.is_empty(), "nothing expected");
 }
@@ -146,6 +176,7 @@ fn a_key_queued_twice_is_departed_once_at_its_highest_version() {
             write(1, hlc(5, 1)),
         ],
         Vec::new(),
+        true,
     );
     assert_eq!(split.departed.len(), 1);
     assert_eq!(split.departed[0].ver, hlc(6, 1));
@@ -153,7 +184,7 @@ fn a_key_queued_twice_is_departed_once_at_its_highest_version() {
 
 #[test]
 fn partitioning_nothing_yields_nothing() {
-    let split = partition_writes(&[], Vec::new());
+    let split = partition_writes(&[], Vec::new(), true);
     assert!(
         split.records.is_empty() && split.departed.is_empty(),
         "nothing expected"
@@ -571,6 +602,49 @@ async fn a_stored_record_older_than_the_write_is_departed_and_not_shipped() {
     );
     assert_eq!(fan.departed.len(), 1);
     assert_eq!(fan.departed[0].ver, queued);
+}
+
+#[tokio::test]
+async fn a_lower_version_winner_of_a_value_reading_resolver_ships_and_is_not_departed() {
+    let clock = clock_at(T0);
+    let a = replicated(&clock).with_resolver(Arc::new(
+        crate::store::tests::conflict_resolvers::LongestValueWins,
+    ));
+    a.insert(1, "a".into()).await.expect("insert");
+    let _ = a.fan_out_queue().drain();
+    clock.store(T0 + 100, Ordering::SeqCst);
+    a.insert(1, "bb".into()).await.expect("insert");
+    let queued = drained(&a);
+    // Anti-entropy delivers the longer value, stamped before the queued
+    // write, before the drain: the resolver prefers it, so it is stored at
+    // the lower version.
+    let longer = WireRecord {
+        key: key_bytes(&1u32),
+        value: Some(Bytes::from(
+            postcard::to_stdvec(&"ccc".to_string()).expect("encodes"),
+        )),
+        ver: hlc(T0 + 50, 2),
+        expires_at_ms: None,
+    };
+    ShardOps::apply_remote_batch(&a, vec![longer.clone()]).await;
+    assert_eq!(
+        a.get(&1).await,
+        Some("ccc".to_string()),
+        "the resolver's winner"
+    );
+
+    let fan = a.fan_out_records(&queued).await;
+
+    assert!(
+        fan.departed.is_empty(),
+        "the winner is not an old refill, so the peers' copy of it is not invalidated"
+    );
+    assert_eq!(fan.records.len(), 1);
+    assert_eq!(fan.records[0].value, longer.value);
+    assert_eq!(
+        fan.records[0].ver, longer.ver,
+        "it travels at the version it is stored at"
+    );
 }
 
 #[tokio::test]

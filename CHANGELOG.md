@@ -232,9 +232,12 @@ All notable changes to this project are documented in this file. Format follows
   and `Replicated`, the part's other owners in `Distributed`, which waits for
   outbox space. A merging resolver sends nothing for a departed write, in
   every mode, so a peer keeps its merged counter or set. A record older than
-  the write is never sent beside its invalidation. A lost invalidation is not resent, and the invalidation does
-  not leave a version floor, so a partitioned or late-joining peer can still
-  bring an older value back through anti-entropy.
+  the write is never sent beside its invalidation, unless the resolver reads
+  values: its stored record at a lower version is its winner, so it travels as
+  a record and the key sends no invalidation. A lost invalidation is not
+  resent, and the invalidation does not leave a version floor, so a
+  partitioned or late-joining peer can still bring an older value back through
+  anti-entropy.
 
 ## [0.6.7] – 2026-10-13
 

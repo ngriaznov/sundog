@@ -6,7 +6,7 @@ use super::*;
 /// length. `(len, ver)` compared lexicographically satisfies
 /// `ConflictResolver::winner`'s contract.
 #[derive(Debug, Clone, Copy)]
-struct LongestValueWins;
+pub(super) struct LongestValueWins;
 
 impl ConflictResolver for LongestValueWins {
     fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {

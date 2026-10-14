@@ -464,8 +464,11 @@ where
     /// records, and a spilled entry's value is read off disk. A write with
     /// no entry at its version (evicted, swept, disowned, idle, or a spilled
     /// value that cannot be read) is reported departed, to invalidate the
-    /// peers' older copy; see [`partition_writes`]. A key that fails to
-    /// encode is dropped.
+    /// peers' older copy. An entry stored at a lower version than the write
+    /// counts as gone only for a resolver that prefers the greater version;
+    /// for a resolver that reads values it is the winner and ships as a
+    /// record. See [`partition_writes`]. A key that fails to encode is
+    /// dropped.
     pub(crate) async fn fan_out_records(&self, writes: &[(K, Hlc)]) -> FanOutRecords {
         let now = self.now_ms();
         let queued: Vec<(Bytes, Hlc)> = writes
@@ -475,7 +478,9 @@ where
         let keys: Vec<Bytes> = queued.iter().map(|(key, _)| key.clone()).collect();
         let ships_values = fan_out_ships_values(self.mode, self.resolver.merges());
         let fetched = self.written_records(&keys, now, ships_values).await;
-        partition_writes(&queued, fetched)
+        let version_ordered =
+            !exchanges_both_records(self.resolver.merges(), self.resolver.needs_value_bytes());
+        partition_writes(&queued, fetched, version_ordered)
     }
 
     /// The written view of `keys` (see [`Shard::fan_out_records`]): the

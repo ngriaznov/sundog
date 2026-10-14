@@ -185,6 +185,10 @@ rather than disappearing, so a departed write there comes from a sweep or
 from an ownership release. With a merging resolver a departed write sends
 nothing, in every mode: a peer's merged copy is the best one left, and a bare
 invalidation cannot say which contributions the writer's copy lacked.
+A resolver that reads values may store a lower version than the write, such
+as a longer value that anti-entropy delivered first. That record is the
+resolver's winner, so the write sends it as a record, not as a departed
+invalidation.
 
 In `Replicated` and `Distributed`, the sweep that removes an expired entry
 keeps a tombstone at the entry's version. A replica that missed the
