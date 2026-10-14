@@ -530,6 +530,16 @@ where
         (self.clock_fn)()
     }
 
+    /// Whether the caller is the one to warn that the clock runs `lead_ms`
+    /// behind its own last stamp: the lead is past `max_clock_skew`, and no
+    /// earlier caller, [`Shard::stamp_local`] or a warm reopen's clock seed,
+    /// has warned. Claims the warning, so a node logs it once however the
+    /// lead arose.
+    pub(super) fn claim_clock_jump_warning(&self, lead_ms: u64) -> bool {
+        clock_jumped(lead_ms, self.max_clock_skew_ms)
+            && !self.clock_jump_warned.swap(true, Ordering::Relaxed)
+    }
+
     pub(super) fn stamp_local(&self) -> Hlc {
         let now = self.now_ms();
         let (stamp, lead_ms) = {
@@ -537,9 +547,7 @@ where
             let lead_ms = clock.lead_ms(now);
             (clock.now(now), lead_ms)
         };
-        if clock_jumped(lead_ms, self.max_clock_skew_ms)
-            && !self.clock_jump_warned.swap(true, Ordering::Relaxed)
-        {
+        if self.claim_clock_jump_warning(lead_ms) {
             tracing::warn!(
                 cache = %self.name,
                 behind_ms = lead_ms,
@@ -603,9 +611,10 @@ where
     /// clock with no skew bound, so every later local stamp exceeds it: the
     /// stamps were written here, and a bound would re-create the lost
     /// write. Returns whether the clock now runs ahead of the system clock by
-    /// more than `max_clock_skew`, which it warns about once: the node's
-    /// writes stay ordered at the replayed stamp, and peers may refuse them
-    /// until the system clock catches up.
+    /// more than `max_clock_skew`, which it warns about once, and the first
+    /// local write after it does not warn again: the node's writes stay
+    /// ordered at the replayed stamp, and peers may refuse them until the
+    /// system clock catches up.
     #[cfg(feature = "spill")]
     pub(super) fn seed_clock_from_replay(&self, max_ver: Option<Hlc>) -> bool {
         let Some(ver) = max_ver else {
@@ -618,7 +627,7 @@ where
             .unwrap_or_else(PoisonError::into_inner)
             .lead_ms(self.now_ms());
         let jumped = clock_jumped(lead_ms, self.max_clock_skew_ms);
-        if jumped {
+        if self.claim_clock_jump_warning(lead_ms) {
             tracing::warn!(
                 cache = %self.name,
                 ahead_ms = lead_ms,

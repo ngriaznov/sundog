@@ -1081,6 +1081,88 @@ fn seed_clock_from_replay_flags_only_a_replayed_stamp_ahead_of_max_clock_skew() 
     );
 }
 
+/// Counts the `WARN` events a subscriber sees.
+#[cfg(feature = "spill")]
+#[derive(Clone, Default)]
+struct WarnCount(Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(feature = "spill")]
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCount {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if *event.metadata().level() == tracing::Level::WARN {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// A reopen that replays a stamp past `max_clock_skew` warns once. The first
+/// local write after it sees the same lead and stays quiet, and so do the
+/// writes after that.
+#[cfg(feature = "spill")]
+#[test]
+fn a_reopen_lead_past_max_clock_skew_warns_once_not_again_at_the_first_write() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let warns = WarnCount::default();
+    let _guard = crate::cluster::test_support::scoped_subscriber(
+        tracing_subscriber::registry().with(warns.clone()),
+    );
+    let now = crate::store::now_ms();
+    let shard = Shard::<u32, String>::new(
+        SmolStr::new("warm-hlc-warn-once"),
+        Mode::Local,
+        NodeId::from(404u64),
+        1 << 20,
+        None,
+        None,
+    )
+    .with_max_clock_skew(Some(Duration::from_secs(1)))
+    .with_clock(Arc::new(move || now));
+    let replayed = Hlc {
+        wall_ms: now + 600_000,
+        logical: 0,
+        node: NodeId::from(404u64),
+    };
+    let count = || warns.0.load(std::sync::atomic::Ordering::Relaxed);
+
+    assert!(shard.seed_clock_from_replay(Some(replayed)));
+    assert_eq!(count(), 1, "the reopen warns");
+    let _ = shard.stamp_local();
+    let _ = shard.stamp_local();
+    assert_eq!(count(), 1, "the writes after the reopen do not warn again");
+}
+
+/// Which caller claims the clock-jump warning: only the first, and only for a
+/// lead past `max_clock_skew`.
+#[test]
+fn the_clock_jump_warning_is_claimed_once_for_a_lead_past_the_bound() {
+    let shard = Shard::<u32, String>::new(
+        SmolStr::new("clock-jump-claim"),
+        Mode::Local,
+        NodeId::from(404u64),
+        1 << 20,
+        None,
+        None,
+    )
+    .with_max_clock_skew(Some(Duration::from_secs(1)));
+    assert!(!shard.claim_clock_jump_warning(1_000), "within the bound");
+    assert!(
+        !shard.claim_clock_jump_warning(1_000),
+        "a lead within the bound claims nothing"
+    );
+    assert!(
+        shard.claim_clock_jump_warning(1_001),
+        "the first past it claims"
+    );
+    assert!(
+        !shard.claim_clock_jump_warning(5_000),
+        "later callers find it claimed"
+    );
+}
+
 /// A `Mode::Local` shard with a warm-reopen spill tier in a fresh directory,
 /// holding one entry, and that directory.
 #[cfg(feature = "spill")]

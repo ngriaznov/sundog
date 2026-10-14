@@ -86,7 +86,8 @@ A warm reopen advances the node's clock past the greatest version it
 replays, so a write or delete made after the restart stamps after every
 replayed entry and wins over it, even when the system clock restarted behind
 those stamps. If a replayed stamp leads the system clock by more than
-`max_clock_skew`, the node logs a warning once.
+`max_clock_skew`, the node logs one warning, at the reopen, and the first
+write after it does not repeat it.
 
 That floor covers the entries the snapshot holds. A delete stamped ahead of
 the restarted clock leaves a tombstone, which the snapshot does not hold, so
