@@ -351,6 +351,43 @@ async fn a_lapsed_record_replicated_to_a_peer_leaves_it_with_no_value() {
 }
 
 #[tokio::test]
+async fn a_lapsed_record_replicated_to_a_peer_leaves_the_digests_equal_through_both_sweeps() {
+    let clock = clock_at(T0);
+    let a = replicated(&clock);
+    let b = replicated(&clock);
+    a.insert(1, "old".into()).await.expect("insert");
+    ShardOps::apply_remote_batch(&b, ShardOps::records_for(&a, vec![key_bytes(&1u32)]).await).await;
+    let _ = a.fan_out_queue().drain();
+    a.insert_with_ttl(1, "new".into(), Duration::ZERO)
+        .await
+        .expect("insert");
+    let fan = a.fan_out_records(&drained(&a)).await;
+    ShardOps::apply_remote_batch(&b, fan.records).await;
+
+    assert_eq!(
+        ShardOps::digests(&a).await,
+        ShardOps::digests(&b).await,
+        "writer and peer agree on the lapsed entry, so anti-entropy has nothing to repair"
+    );
+
+    clock.store(T0 + 1, Ordering::SeqCst);
+    ShardOps::run_pending_tasks(&a).await;
+    assert_eq!(
+        ShardOps::digests(&a).await,
+        ShardOps::digests(&b).await,
+        "the writer's sweep leaves the digest alone while the peer has not swept"
+    );
+    ShardOps::run_pending_tasks(&b).await;
+    assert_eq!(
+        ShardOps::digests(&a).await,
+        ShardOps::digests(&b).await,
+        "both have swept"
+    );
+    assert_digest_matches_full_recompute(&a).await;
+    assert_digest_matches_full_recompute(&b).await;
+}
+
+#[tokio::test]
 async fn a_merging_zero_ttl_write_ships_what_the_writer_stores() {
     let clock = clock_at(T0);
     let reader = Arc::clone(&clock);

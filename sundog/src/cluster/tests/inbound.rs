@@ -300,8 +300,9 @@ async fn a_wedged_live_peer_does_not_stall_the_inbound_loop_on_a_stale_view_refo
     );
 }
 
-/// A loop parked on a wedged live peer used to see the cancel only once the
-/// failure detector removed the peer, which held `Cluster::shutdown` up.
+/// A cancel ends the loop at once while a live peer is wedged, so
+/// `Cluster::shutdown` does not wait for the failure detector to remove the
+/// peer.
 #[tokio::test]
 async fn the_inbound_loop_returns_promptly_on_cancel_with_a_wedged_live_peer() {
     let rig = WedgedLoop::start().await;

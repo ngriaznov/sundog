@@ -10,7 +10,6 @@ All notable changes to this project are documented in this file. Format follows
 - **`sundog_tombstones{cache}`** gauge: the tombstones a node holds for a
   cache, its deletes and, in a `Replicated` or `Distributed` cache, its swept
   expired entries, refreshed every five seconds with `sundog_cache_entries`.
-
 - **`sundog_clock_skew_held{cache}`, `sundog_clock_skew_held_bytes{cache}`
   and `sundog_clock_skew_hold_dropped_total{cache, reason}`**: the forwarded
   writes an owner holds for clock skew, the memory they take, and the ones it
@@ -37,7 +36,6 @@ All notable changes to this project are documented in this file. Format follows
   `Distributed` and `Local` caches, whose replicas of a part fold nested sets;
   an `Invalidation` cache keeps one small retired entry for every dead writer.
   `OrSet`, which has no folded total, follows the same rule.
-
 - **A fold receipt lives from the fold, not from the retirement.** `PnCounter`
   and `OrSet` stamp the receipt that stage two leaves with the fold instant,
   never lowering a stamp the writer already has. A fold that membership churn
@@ -50,7 +48,6 @@ All notable changes to this project are documented in this file. Format follows
   cannot keep a receipt alive on every replica. Replicas that fold the same
   writer at different sweeps carry different stamps and merge them by maximum
   in one anti-entropy exchange. The stored layout and the wire are unchanged.
-
 - **Merged values stay bounded under rolling replacement.** The CRDT sweep
   retires a `PnCounter` or `OrSet` writer slot of a node this node never saw as
   a member: such a node counts as gone from the later of this node's start and
@@ -63,7 +60,6 @@ All notable changes to this project are documented in this file. Format follows
   by then and never retires. A fleet that replaces every node faster than
   `crdt_retire_after` lowers it. The sweep reads resident records, so a spilled
   record keeps its slots until it is read back.
-
 - **A `Mode::Distributed` write forwarded by a non-owner survives an owner's
   clock-skew refusal.** The writer keeps no copy of a forwarded insert,
   remove or merge, so an owner that refused its stamp for being further ahead
