@@ -83,6 +83,15 @@ of expiries. Tombstones sit outside `max_capacity` and the memory ceiling.
 before an absent member makes it grow, and lower `tombstone_max_ttl` if a day
 of expiries does not fit.
 
+Every node collects on a wall-clock grid, at each multiple of a quarter of
+`tombstone_ttl` (at least a second), so replicas collect the tombstones of
+expired entries, whose retention counts from the expiry, at the same
+instants. A tombstone that one replica has collected and another still holds
+is offered again by each anti-entropy round, and the receiver drops it. That
+window is the clock skew between the two nodes, and in one case longer: a
+node that defers collection for an absent member keeps its tombstones while
+the other does not, which lasts until the deferral ends.
+
 ## Allocator
 
 sundog sets no global allocator; your service chooses. Under glibc's

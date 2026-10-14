@@ -1097,9 +1097,26 @@ async fn open_cache_gauge_task(shards: ShardRegistry, cancel: CancellationToken)
     }
 }
 
+/// The wait from `now_ms`, in epoch milliseconds, to the next multiple of
+/// `period` on the wall clock: the next instant of the grid every node
+/// shares, strictly after `now_ms`, so a tick that lands on the grid waits a
+/// whole period for the next. A zero `period` counts as one millisecond.
+/// Pure; unit tested directly.
+fn until_next_grid_tick(now_ms: u64, period: Duration) -> Duration {
+    let period_ms = u64::try_from(period.as_millis()).unwrap_or(u64::MAX).max(1);
+    Duration::from_millis(period_ms - now_ms % period_ms)
+}
+
 /// Periodically garbage-collects one shard's expired tombstones and flushes
-/// pending housekeeping via `ShardOps::run_pending_tasks`, at a quarter of
-/// `tombstone_ttl` so a tombstone is never held much past its deadline.
+/// pending housekeeping via `ShardOps::run_pending_tasks`, once on start and
+/// then at every multiple of a quarter of `tombstone_ttl` on the wall clock,
+/// so a tombstone is never held much past its deadline. The ticks sit on a
+/// grid every node shares ([`until_next_grid_tick`]), not on a phase counted
+/// from when the node started: replicas collect the tombstone of an expired
+/// entry, whose deadline is anchored on the expiry, at the same instants,
+/// and a tombstone that one replica has collected and another still holds,
+/// which anti-entropy would offer again each round, lasts as long as the
+/// clock skew between them, not up to a whole period.
 /// `mode` and `absence` decide each tick whether collection past
 /// `tombstone_ttl` defers via [`absence::should_defer_gc`]: a
 /// `Mode::Replicated` tombstone survives up to `tombstone_max_ttl` while any
@@ -1115,10 +1132,8 @@ pub(crate) async fn tombstone_gc_task(
     cancel: CancellationToken,
 ) {
     let period = (tombstone_ttl / 4).max(Duration::from_secs(1));
-    let mut ticker = tokio::time::interval(period);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        if cancel.run_until_cancelled(ticker.tick()).await.is_none() {
+        if cancel.is_cancelled() {
             return;
         }
         shard.run_pending_tasks().await;
@@ -1131,6 +1146,14 @@ pub(crate) async fn tombstone_gc_task(
             view.as_deref(),
         );
         shard.gc_tombstones(defer).await;
+        let wait = until_next_grid_tick(crate::store::now_ms(), period);
+        if cancel
+            .run_until_cancelled(tokio::time::sleep(wait))
+            .await
+            .is_none()
+        {
+            return;
+        }
     }
 }
 

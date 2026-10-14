@@ -198,3 +198,51 @@ async fn report_mode_conflicts_logs_a_late_conflict_against_a_live_peer() {
 
     cluster.shutdown().await;
 }
+
+#[test]
+fn the_gc_grid_tick_is_the_next_multiple_of_the_period() {
+    let period = Duration::from_secs(150);
+    assert_eq!(
+        until_next_grid_tick(1, period),
+        Duration::from_millis(149_999)
+    );
+    assert_eq!(
+        until_next_grid_tick(149_999, period),
+        Duration::from_millis(1),
+        "one millisecond short of a multiple"
+    );
+    assert_eq!(
+        until_next_grid_tick(150_000, period),
+        period,
+        "a tick on the grid waits a whole period for the next"
+    );
+    assert_eq!(
+        until_next_grid_tick(1_700_000_123_456, period),
+        Duration::from_millis(150_000 - 1_700_000_123_456 % 150_000)
+    );
+}
+
+#[test]
+fn every_node_reaches_the_same_gc_instant_from_any_start() {
+    let period = Duration::from_secs(150);
+    for start in [0u64, 1, 74_999, 75_000, 149_999, 1_700_000_000_123] {
+        let wait = u64::try_from(until_next_grid_tick(start, period).as_millis())
+            .expect("a wait of at most one period fits");
+        let instant = start + wait;
+        assert_eq!(instant % 150_000, 0, "start {start}");
+        assert!(
+            instant > start && instant - start <= 150_000,
+            "start {start}"
+        );
+        let after = until_next_grid_tick(instant, period);
+        assert_eq!(after, period, "the following tick is one period on");
+    }
+}
+
+#[test]
+fn a_zero_gc_period_waits_a_millisecond() {
+    assert_eq!(
+        until_next_grid_tick(5, Duration::ZERO),
+        Duration::from_millis(1)
+    );
+}

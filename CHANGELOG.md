@@ -144,11 +144,12 @@ All notable changes to this project are documented in this file. Format follows
   replica that still holds it. The same holds for a lifetime shortened with
   `expire`: a cut-off peer's longer-lived copy is deleted instead of bringing
   the entry back. The tombstone counts its `tombstone_ttl` (and, while a member
-  is absent, `tombstone_max_ttl`) from the entry's expiry, so every replica
-  collects it at the same instant, and a tombstone that arrives already past
-  that retention, holding nothing it displaces, is dropped instead of being
-  handed back and forth between replicas that collected it and replicas that
-  have not. The expiry travels as the tombstone record's `expires_at_ms`; a
+  is absent, `tombstone_max_ttl`) from the entry's expiry, and every node
+  collects on a wall-clock grid of a quarter of `tombstone_ttl`, so every
+  replica collects it at the same instant, give or take their clock skew. A
+  tombstone that arrives already past that retention, holding nothing it
+  displaces, is dropped instead of being handed back and forth between
+  replicas that collected it and replicas that have not. The expiry travels as the tombstone record's `expires_at_ms`; a
   peer on release 8 reads the record as an ordinary delete. A sweep no longer
   changes a bucket's digest, and a `Distributed` owner of a cold part now
   answers a peer's fetch for a swept key with a miss, as for a deleted one,

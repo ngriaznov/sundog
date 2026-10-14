@@ -86,7 +86,8 @@ impl Ring {
     /// One anti-entropy exchange of `local` against `peer`, classified by
     /// the round's own [`diff_bucket`] over the buckets whose digests
     /// differ, then pulled and pushed through the records both sides serve.
-    async fn exchange(&self, local: usize, peer: usize) {
+    /// Returns the records the round moved.
+    async fn exchange(&self, local: usize, peer: usize) -> usize {
         let (local, peer) = (self.ops(local), self.ops(peer));
         let (mine, theirs) = (local.digests().await, peer.digests().await);
         let (mut push, mut pull) = (Vec::new(), Vec::new());
@@ -97,12 +98,14 @@ impl Ring {
                 diff_bucket(&l, &p, &mut push, &mut pull, false);
             }
         }
+        let moved = pull.len() + push.len();
         if !pull.is_empty() {
             local.apply_remote_batch(peer.records_for(pull).await).await;
         }
         if !push.is_empty() {
             peer.apply_remote_batch(local.records_for(push).await).await;
         }
+        moved
     }
 
     /// Advances one second: each replica whose phase falls on this step
@@ -121,7 +124,7 @@ impl Ring {
             for a in 0..self.shards.len() {
                 for b in 0..self.shards.len() {
                     if a != b {
-                        self.exchange(a, b).await;
+                        let _ = self.exchange(a, b).await;
                     }
                 }
             }
@@ -229,4 +232,109 @@ async fn a_stream_of_expiring_entries_leaves_no_tombstones_behind() {
             "the value an expired overwrite replaced does not come back on replica {node}"
         );
     }
+}
+
+/// Sweeps both replicas and collects on the ones in `collect`, all at the
+/// ring's current instant.
+async fn sweep_then_collect(ring: &Ring, collect: &[usize]) {
+    for node in 0..ring.shards.len() {
+        ring.ops(node).run_pending_tasks().await;
+    }
+    for &node in collect {
+        ring.ops(node).gc_tombstones(false).await;
+    }
+}
+
+/// Two replicas holding the same lapsed expiry tombstones move no record in
+/// an exchange, before they collect and after both have. While only one has
+/// collected, every exchange moves the whole set both ways round: the window
+/// the gc grid shrinks to the replicas' clock skew, by collecting on both at
+/// the same instant.
+#[tokio::test]
+async fn an_exchange_moves_no_record_once_both_replicas_collect_the_same_tombstones() {
+    const KEYS: u32 = 20;
+    let ring = Ring::new(&[0, 0]);
+    let expires_at = START_MS + 20_000;
+    for key in 0..KEYS {
+        ring.apply_everywhere(&record(key, Some("old"), START_MS, None))
+            .await;
+        ring.apply_everywhere(&record(key, Some("new"), START_MS + 1, Some(expires_at)))
+            .await;
+    }
+    ring.clock.store(expires_at + 1_000, Ordering::SeqCst);
+    sweep_then_collect(&ring, &[]).await;
+    assert_eq!(ring.tombstones(), vec![u64::from(KEYS); 2], "both swept");
+    assert_eq!(
+        ring.exchange(0, 1).await,
+        0,
+        "the same tombstones on both sides need no repair"
+    );
+
+    ring.clock
+        .store(expires_at + TOMBSTONE_TTL_MS + 1_000, Ordering::SeqCst);
+    ring.ops(0).gc_tombstones(false).await;
+    assert_eq!(ring.tombstones(), vec![0, u64::from(KEYS)]);
+    assert_eq!(
+        ring.exchange(0, 1).await,
+        KEYS as usize,
+        "a tombstone one replica collected and the other holds is offered again"
+    );
+    assert_eq!(
+        ring.exchange(1, 0).await,
+        KEYS as usize,
+        "and again by the next round, from either side"
+    );
+
+    ring.ops(1).gc_tombstones(false).await;
+    assert_eq!(ring.tombstones(), vec![0, 0]);
+    assert_eq!(ring.exchange(0, 1).await, 0, "both collected");
+    assert_eq!(ring.exchange(1, 0).await, 0, "both collected");
+}
+
+/// The records moved by the exchanges after every step, from a ring on
+/// `phases`, until its expiry tombstones have drained.
+async fn records_moved_while_draining(phases: &[u64]) -> usize {
+    const KEYS: u32 = 20;
+    let ring = Ring::new(phases);
+    let expires_at = START_MS + 20_000;
+    for key in 0..KEYS {
+        ring.apply_everywhere(&record(key, Some("old"), START_MS, None))
+            .await;
+        ring.apply_everywhere(&record(key, Some("new"), START_MS + 1, Some(expires_at)))
+            .await;
+    }
+    let mut moved = 0;
+    let mut step = 0;
+    while ring.now() < expires_at + TOMBSTONE_TTL_MS + 2 * GC_PERIOD_STEPS * 1_000 {
+        step += 1;
+        ring.step(step).await;
+        for a in 0..phases.len() {
+            for b in 0..phases.len() {
+                if a != b {
+                    moved += ring.exchange(a, b).await;
+                }
+            }
+        }
+    }
+    assert_eq!(
+        ring.tombstones(),
+        vec![0; phases.len()],
+        "every tombstone drained"
+    );
+    moved
+}
+
+/// Replicas that collect at the same instants never offer a lapsed tombstone
+/// the other has dropped, where replicas on phases of their own do.
+#[tokio::test]
+async fn replicas_collecting_on_one_grid_never_move_a_lapsed_tombstone() {
+    assert_eq!(
+        records_moved_while_draining(&[0, 0, 0]).await,
+        0,
+        "no exchange moved a record"
+    );
+    assert!(
+        records_moved_while_draining(&[0, 5]).await > 0,
+        "replicas on offset phases move the tombstones one has collected"
+    );
 }
