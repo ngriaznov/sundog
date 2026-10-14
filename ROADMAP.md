@@ -72,16 +72,16 @@ test node for its own `Cache::explain` over the control port the fleet
 already uses. A production node has no control port, so there `explain`
 stays a library call.
 
-The production surface is a protocol 9 request, built when the trigger
-shows. `PROTOCOL_EXPLAIN` follows `PROTOCOL_INVALIDATION_FOLD` and raises
-`PROTOCOL_VERSION` to 9. `Msg::Explain` asks an owner for its marks of a
+The production surface is a protocol 10 request, built when the trigger
+shows. `PROTOCOL_EXPLAIN` follows `PROTOCOL_AE_LISTING_CHUNKS` and raises
+`PROTOCOL_VERSION` to 10. `Msg::Explain` asks an owner for its marks of a
 key's part, and `Msg::ExplainReply` answers with them, the owner's view
 hash, what it makes of a fetch and why it declines; both append to `Msg`.
 The reply tells a cache that is not open, a cache that is not
 `Distributed` and a part tracker not yet attached apart, which `Declined`
 does not. A responder answers the request only to a peer whose hello
-speaks protocol 9, and the observer sends it only to owners whose gossiped
-protocol is 9 or more, so release N interoperates with N-1. The observer
+speaks protocol 10, and the observer sends it only to owners whose gossiped
+protocol is 10 or more, so release N interoperates with N-1. The observer
 then dials data ports, which it does not do today, and the lens's `e`
 asks the owners it computes in place of a control port.
 

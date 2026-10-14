@@ -252,6 +252,10 @@ impl Mesh {
     }
 
     /// The `AeSketch` fallback: full listings for `buckets`, answered like [`Mesh::ae_round`].
+    /// A listing too large for one frame arrives in several, which this
+    /// joins: the result holds one element per bucket, its entries in the
+    /// responder's order. The whole reply, every frame of it, completes
+    /// within one request timeout.
     ///
     /// # Errors
     ///

@@ -220,7 +220,7 @@ async fn dispatch_one(
             }
         }
         Msg::AeEntries { cache, buckets } => {
-            serve_ae_entries(framed, cache, buckets, handler, cancel).await
+            serve_ae_entries(framed, cache, buckets, handler, cancel, peer_protocol).await
         }
         Msg::AePull { cache, keys } => serve_ae_pull(framed, cache, keys, handler, cancel).await,
         Msg::AePullHashes {

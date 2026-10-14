@@ -1079,3 +1079,131 @@ async fn a_tombstone_and_a_value_settle_by_version_even_for_a_resolver_preferrin
         pair.shutdown().await;
     }
 }
+
+// --- A sketch-fallback listing larger than one frame ---
+
+/// `count` distinct `len`-byte `Vec<u8>` cache keys that all hash into one
+/// anti-entropy bucket, found by extending one hashed prefix with a counter
+/// so the search costs a state clone per candidate rather than a hash of the
+/// whole key.
+fn fat_keys_in_one_bucket(count: usize, len: usize) -> Vec<Vec<u8>> {
+    use xxhash_rust::xxh3::Xxh3;
+
+    let template = postcard::to_stdvec(&vec![0u8; len]).expect("key encodes");
+    let (prefix, _) = template.split_at(template.len() - 8);
+    let mut state = Xxh3::new();
+    state.update(prefix);
+    let mut by_bucket: HashMap<u64, Vec<u64>> = HashMap::new();
+    let suffixes = (0u64..)
+        .find_map(|i| {
+            let mut candidate = state.clone();
+            candidate.update(&i.to_be_bytes());
+            let bucket = candidate.digest() & 0x3FF;
+            let found = by_bucket.entry(bucket).or_default();
+            found.push(i);
+            (found.len() == count).then(|| found.clone())
+        })
+        .expect("some bucket fills up");
+    suffixes
+        .into_iter()
+        .map(|i| {
+            let mut key = vec![0u8; len];
+            key[len - 8..].copy_from_slice(&i.to_be_bytes());
+            key
+        })
+        .collect()
+}
+
+#[test]
+fn fat_keys_in_one_bucket_share_the_bucket_the_store_assigns() {
+    let keys = fat_keys_in_one_bucket(8, 1_000);
+    assert_eq!(keys.len(), 8);
+    let buckets: HashSet<u16> = keys
+        .iter()
+        .map(|key| crate::store::bucket_of(&postcard::to_stdvec(key).expect("key encodes")))
+        .collect();
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(keys.iter().collect::<HashSet<_>>().len(), 8, "all distinct");
+}
+
+#[tokio::test]
+async fn anti_entropy_repairs_a_sketch_fallback_listing_larger_than_one_frame() {
+    // 96 keys of 48 KiB make one bucket whose listing is about 4.7 MB, past
+    // the 4 MiB frame cap, so the fallback listing arrives in three messages.
+    const KEYS: usize = 96;
+    let config = ClusterConfig {
+        ae_sketch_min_bucket: 4,
+        // 2 cells per partition, too small to peel the 24-key difference.
+        ae_sketch_cells: 6,
+        ae_interval: Duration::from_hours(1),
+        ..loopback_config()
+    };
+    let (cluster_a, cluster_b) =
+        two_node_cluster_with_config("cluster-it-ae-fat-listing", config).await;
+    let open = |cluster: &Cluster| {
+        cluster
+            .cache::<Vec<u8>, String>("fat")
+            .mode(Mode::Replicated)
+            .open()
+    };
+    let cache_a = open(&cluster_a).await.expect("a opens");
+    let cache_b = open(&cluster_b).await.expect("b opens");
+    let name = SmolStr::new("fat");
+    let shard_a = registered_shard(&cluster_a, &name);
+    let shard_b = registered_shard(&cluster_b, &name);
+
+    let keys = fat_keys_in_one_bucket(KEYS, 48 * 1024);
+    let writer = NodeId::from(9);
+    let record = |key: &Vec<u8>| WireRecord {
+        key: Bytes::from(postcard::to_stdvec(key).expect("key encodes")),
+        value: Some(Bytes::from(
+            postcard::to_stdvec("v").expect("value encodes"),
+        )),
+        ver: Hlc {
+            wall_ms: 50,
+            logical: 0,
+            node: writer,
+        },
+        expires_at_ms: None,
+    };
+    for key in &keys {
+        shard_b.apply_remote(record(key)).await;
+    }
+    // a lacks the 24 keys in the middle of b's listing and holds the rest,
+    // so the keys it shares with b sit in the first and last slices and the
+    // keys it pulls in the middle one.
+    let first_missing = KEYS / 2 - 12;
+    let missing = first_missing..first_missing + 24;
+    for (i, key) in keys.iter().enumerate() {
+        if !missing.contains(&i) {
+            shard_a.apply_remote(record(key)).await;
+        }
+    }
+    assert_eq!(cache_a.entry_count().await, (KEYS - 24) as u64);
+    assert_eq!(cache_b.entry_count().await, KEYS as u64);
+
+    let decoded = Arc::new(AtomicUsize::new(0));
+    let fallback = Arc::new(AtomicUsize::new(0));
+    let _guard = scoped_subscriber(AeSketchOutcomeSubscriber {
+        decoded: Arc::clone(&decoded),
+        fallback: Arc::clone(&fallback),
+    });
+    let outcome = run_round_against(cluster_a.mesh(), &shard_a, &name, cluster_b.node_id()).await;
+
+    assert_eq!(outcome, RoundOutcome::Reconciled);
+    assert_eq!(
+        fallback.load(Ordering::SeqCst),
+        1,
+        "the difference is past the sketch, so the round lists the bucket"
+    );
+    wait_until(
+        Duration::from_secs(10),
+        "a pulls every key it lacked, whichever slice of the listing named it",
+        async || cache_a.entry_count().await == KEYS as u64,
+    )
+    .await;
+    assert_eq!(shard_a.digests().await, shard_b.digests().await);
+
+    cluster_a.shutdown().await;
+    cluster_b.shutdown().await;
+}

@@ -14,6 +14,7 @@ use crate::error::CodecError;
 use crate::net::{
     AeMismatch, AePartReply, AeRoundOutcome, BucketStreamItem, FetchOutcome, LoadOutcome,
 };
+use crate::store::KeyVersion;
 use crate::wire::{self, Msg, WireRecord};
 
 /// A checked-out or dialed connection: `framed`, its `pool`, and any
@@ -46,7 +47,10 @@ async fn collect_replies<T>(
     }
 }
 
-/// Reads `AeBucket` replies into a `(bucket, entries)` list.
+/// Reads `AeBucket` replies into a `(bucket, entries)` list, one element per
+/// bucket in order of first appearance: a responder on
+/// [`crate::wire::PROTOCOL_AE_LISTING_CHUNKS`] sends a large bucket as several
+/// messages, which this concatenates in arrival order.
 pub(in crate::net) async fn collect_ae_buckets(
     reply: Reply,
 ) -> Result<crate::store::BucketEntries, CodecError> {
@@ -55,10 +59,24 @@ pub(in crate::net) async fn collect_ae_buckets(
             bucket, entries, ..
         } = msg
         {
-            out.push((bucket, wire_to_key_versions(entries)));
+            merge_bucket_chunk(out, bucket, wire_to_key_versions(entries));
         }
     })
     .await
+}
+
+/// Appends `entries` to `out`'s element for `bucket`, or pushes a new element
+/// when `out` holds none. Looks the bucket up rather than checking only the
+/// last element, so interleaved chunks of two buckets never split one.
+pub(super) fn merge_bucket_chunk(
+    out: &mut crate::store::BucketEntries,
+    bucket: u16,
+    entries: Vec<KeyVersion>,
+) {
+    match out.iter_mut().find(|(id, _)| *id == bucket) {
+        Some((_, existing)) => existing.extend(entries),
+        None => out.push((bucket, entries)),
+    }
 }
 
 /// Reads digest replies into one [`AeMismatch`] list, per [`push_mismatch`].

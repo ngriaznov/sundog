@@ -506,6 +506,149 @@ async fn ae_entries_returns_full_listings_for_the_requested_buckets() {
     assert_eq!(got, vec![(3, kv(entries.clone())), (7, kv(entries))]);
 }
 
+/// `count` entries with 32-byte keys, the big-endian index leading, at one
+/// version: about 50 bytes each on the wire.
+fn large_bucket_entries(count: u64) -> Vec<(Bytes, Hlc)> {
+    (0..count)
+        .map(|i| {
+            let mut key = [0u8; 32];
+            key[..8].copy_from_slice(&i.to_be_bytes());
+            (
+                Bytes::copy_from_slice(&key),
+                Hlc {
+                    wall_ms: 5,
+                    logical: 0,
+                    node: NodeId::from(1),
+                },
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn ae_entries_returns_a_bucket_listing_larger_than_one_frame() {
+    let entries = large_bucket_entries(300_000);
+    let handler = Arc::new(FixtureHandler {
+        bucket_entries: entries.clone(),
+        ..Default::default()
+    });
+    let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+    let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+    client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+
+    let got = client
+        .ae_entries(NodeId::from(1), SmolStr::new("users"), vec![3])
+        .await
+        .expect("a large bucket listing is served under MAX_FRAME");
+
+    assert_eq!(
+        got.len(),
+        1,
+        "the chunks of one bucket join into one element"
+    );
+    let (bucket, listing) = &got[0];
+    assert_eq!(*bucket, 3);
+    assert_eq!(listing.len(), 300_000);
+    assert!(
+        listing
+            .iter()
+            .zip(&entries)
+            .all(|(got, (key, version))| got.key == *key && got.version == *version),
+        "the joined listing keeps the responder's entries in order"
+    );
+}
+
+/// A raw `AeEntries` request for buckets `[3, 7]` of cache `users` from a
+/// peer that said hello with `protocol`, and the replies up to `ReqDone`.
+async fn ae_entries_replies_for_protocol(server: &Mesh, protocol: u16) -> Vec<Msg> {
+    let hello = wire::encode(&Msg::Hello {
+        node: NodeId::from(2),
+        incarnation: 1,
+        protocol,
+        cluster: wire::UNNAMED_CLUSTER,
+    })
+    .expect("encodes");
+    let mut peer = raw_request_conn(server.local_addr(), hello).await;
+    let request = wire::encode(&Msg::AeEntries {
+        cache: SmolStr::new("users"),
+        buckets: vec![3, 7],
+    })
+    .expect("encodes");
+    peer.send(request).await.expect("request sends");
+    replies_until_req_done(&mut peer).await
+}
+
+#[tokio::test]
+async fn a_protocol_eight_peer_gets_one_ae_bucket_per_bucket() {
+    let handler = Arc::new(FixtureHandler {
+        bucket_entries: large_bucket_entries(1_000),
+        ..Default::default()
+    });
+    let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+    let replies = ae_entries_replies_for_protocol(&server, wire::PROTOCOL_INVALIDATION_FOLD).await;
+    let sizes: Vec<(u16, usize)> = replies
+        .iter()
+        .map(|msg| match msg {
+            Msg::AeBucket {
+                bucket, entries, ..
+            } => (*bucket, entries.len()),
+            other => panic!("only AeBucket replies, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(sizes, vec![(3, 1_000), (7, 1_000)]);
+}
+
+#[tokio::test]
+async fn a_protocol_nine_peer_gets_a_large_bucket_in_several_ae_bucket_messages() {
+    let handler = Arc::new(FixtureHandler {
+        bucket_entries: large_bucket_entries(300_000),
+        ..Default::default()
+    });
+    let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+    let hello = wire::encode(&Msg::Hello {
+        node: NodeId::from(2),
+        incarnation: 1,
+        protocol: wire::PROTOCOL_AE_LISTING_CHUNKS,
+        cluster: wire::UNNAMED_CLUSTER,
+    })
+    .expect("encodes");
+    let mut peer = raw_request_conn(server.local_addr(), hello).await;
+    let request = wire::encode(&Msg::AeEntries {
+        cache: SmolStr::new("users"),
+        buckets: vec![3],
+    })
+    .expect("encodes");
+    peer.send(request).await.expect("request sends");
+
+    let mut frames = Vec::new();
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(10), peer.next())
+            .await
+            .expect("a reply arrives")
+            .expect("connection stays open")
+            .expect("frame reads");
+        assert!(frame.len() <= wire::MAX_FRAME, "{} bytes", frame.len());
+        let msg = wire::decode(&frame.freeze()).expect("reply decodes");
+        if matches!(msg, Msg::ReqDone) {
+            break;
+        }
+        frames.push(msg);
+    }
+    assert!(frames.len() > 1, "{} AeBucket messages", frames.len());
+    let mut total = 0;
+    for msg in frames {
+        let Msg::AeBucket {
+            bucket, entries, ..
+        } = msg
+        else {
+            panic!("only AeBucket replies");
+        };
+        assert_eq!(bucket, 3);
+        total += entries.len();
+    }
+    assert_eq!(total, 300_000);
+}
+
 #[tokio::test]
 async fn ae_pull_hashes_resolves_only_the_requested_hash_to_records() {
     // Two entries, one hash requested: the default `records_for_hashes`

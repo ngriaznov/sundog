@@ -64,7 +64,9 @@ pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 /// - 8: A merging `Mode::Invalidation` cache sends [`Msg::Replicate`] and
 ///   [`Msg::ReplicateBatch`] records in place of [`Msg::Invalidate`]. See
 ///   [`PROTOCOL_INVALIDATION_FOLD`].
-pub const PROTOCOL_VERSION: u16 = 8;
+/// - 9: A reply to [`Msg::AeEntries`] may carry one bucket's listing across
+///   several [`Msg::AeBucket`] messages. See [`PROTOCOL_AE_LISTING_CHUNKS`].
+pub const PROTOCOL_VERSION: u16 = 9;
 
 /// The oldest peer protocol this build still serves in full.
 pub const MIN_PROTOCOL_VERSION: u16 = 1;
@@ -127,6 +129,15 @@ pub const PROTOCOL_LOAD: u16 = 7;
 /// the record as an ordinary replicated entry. A merged record uses the
 /// existing replicate frames.
 pub const PROTOCOL_INVALIDATION_FOLD: u16 = 8;
+
+/// The protocol under which a responder may answer one bucket of an
+/// [`Msg::AeEntries`] request with several [`Msg::AeBucket`] messages, each
+/// holding a slice of the bucket's listing, which the requester concatenates
+/// in arrival order. A requester joins the messages of a bucket whatever the
+/// responder's protocol; a responder sends a peer on an older protocol one
+/// message per bucket, since that peer would read each message as the whole
+/// bucket.
+pub const PROTOCOL_AE_LISTING_CHUNKS: u16 = 9;
 
 /// The `cluster` a [`Msg::Hello`] carries when its sender names none: a
 /// peer older than [`PROTOCOL_CLUSTER_ID`], or a bare [`crate::net::Mesh`]
@@ -232,7 +243,10 @@ pub enum Msg {
         buckets: Vec<(u16, u64)>,
     },
     /// Anti-entropy round, step 2: `(key, version)` pairs live in the
-    /// mismatched `bucket` on the sender.
+    /// mismatched `bucket` on the sender. A reply to [`Msg::AeEntries`] may
+    /// repeat it for one bucket, each message holding the next slice of the
+    /// listing, and the receiver concatenates them; see
+    /// [`PROTOCOL_AE_LISTING_CHUNKS`].
     AeBucket {
         cache: SmolStr,
         bucket: u16,
@@ -269,7 +283,10 @@ pub enum Msg {
     },
     /// Anti-entropy round, step 2 fallback: the sketch-fallback request for
     /// the full `(key, version)` listing of these buckets, after one or
-    /// more `AeSketch` replies failed to decode. Answered like `AeDigest`.
+    /// more `AeSketch` replies failed to decode. Answered like `AeDigest`,
+    /// except that a listing too large for one frame arrives as several
+    /// [`Msg::AeBucket`] messages to a peer on [`PROTOCOL_AE_LISTING_CHUNKS`]
+    /// or later.
     AeEntries { cache: SmolStr, buckets: Vec<u16> },
     /// Anti-entropy round, step 3, sketch-decoded path: the sketch-decoded
     /// counterpart to [`Msg::AePull`], requesting records for the entries
@@ -544,6 +561,12 @@ pub(crate) fn replicate_frame_len(cache_len: usize, key_len: usize, value_len: u
 /// The widest postcard encoding of one [`Cell`]: each of its six integer
 /// fields at its maximum varint width.
 pub(crate) const CELL_MAX_WIRE_LEN: usize = 5 + 10 + 10 + 5 + 10 + 10;
+
+/// The widest postcard encoding of one `(key, version)` entry of a
+/// [`Msg::AeBucket`] or [`Msg::AePart`] listing, beyond the key's own bytes:
+/// the key's length, then the version's `wall_ms`, `logical` and `node`, each
+/// as a varint at its maximum width.
+pub(crate) const AE_ENTRY_MAX_WIRE_LEN: usize = 10 + 10 + 5 + 10;
 
 /// An upper bound on the byte length a [`Msg::AeSketch`] with `cells` cells
 /// and a `cache_len`-byte cache name encodes to: the frame discriminant, the
@@ -1325,6 +1348,78 @@ mod tests {
     }
 
     #[test]
+    fn a_protocol_8_peer_supports_no_chunked_ae_listing() {
+        const { assert!(PROTOCOL_VERSION >= PROTOCOL_AE_LISTING_CHUNKS) };
+        assert!(!peer_supports(7, PROTOCOL_AE_LISTING_CHUNKS));
+        assert!(!peer_supports(8, PROTOCOL_AE_LISTING_CHUNKS));
+        assert!(peer_supports(9, PROTOCOL_AE_LISTING_CHUNKS));
+        assert!(peer_supports(PROTOCOL_VERSION, PROTOCOL_AE_LISTING_CHUNKS));
+    }
+
+    /// The protocol numbers are an interop contract with released nodes.
+    #[test]
+    fn the_ae_listing_chunks_protocol_is_9() {
+        assert_eq!(PROTOCOL_AE_LISTING_CHUNKS, 9);
+    }
+
+    /// An entry's non-key bytes never exceed [`AE_ENTRY_MAX_WIRE_LEN`], even
+    /// with every varint at its widest and a key whose length varint crosses
+    /// a width boundary.
+    #[test]
+    fn ae_entry_max_wire_len_bounds_a_real_encode_at_the_widest_varints() {
+        let widest = Hlc {
+            wall_ms: u64::MAX,
+            logical: u32::MAX,
+            node: NodeId::from(u64::MAX),
+        };
+        let cache = SmolStr::new("c");
+        let empty = encode(&Msg::AeBucket {
+            cache: cache.clone(),
+            bucket: 0,
+            entries: Vec::new(),
+        })
+        .expect("encodes")
+        .len();
+        for key_len in [0usize, 1, 127, 128, 16_383, 16_384, 70_000] {
+            let encoded = encode(&Msg::AeBucket {
+                cache: cache.clone(),
+                bucket: 0,
+                entries: vec![(Bytes::from(vec![7u8; key_len]), widest)],
+            })
+            .expect("encodes")
+            .len();
+            let growth = encoded - empty;
+            assert!(
+                growth <= key_len + AE_ENTRY_MAX_WIRE_LEN,
+                "key of {key_len} bytes grows the frame by {growth}"
+            );
+        }
+        // The version's three varints take their full width.
+        let one = encode(&Msg::AeBucket {
+            cache,
+            bucket: 0,
+            entries: vec![(Bytes::new(), widest)],
+        })
+        .expect("encodes")
+        .len();
+        assert_eq!(one - empty, 1 + 10 + 5 + 10, "length byte plus the version");
+    }
+
+    /// An empty listing's frame with the longest cache name leaves almost
+    /// all of the frame for entries.
+    #[test]
+    fn an_ae_bucket_frame_envelope_stays_under_three_hundred_bytes() {
+        let envelope = encode(&Msg::AeBucket {
+            cache: SmolStr::new("c".repeat(255)),
+            bucket: u16::MAX,
+            entries: Vec::new(),
+        })
+        .expect("encodes")
+        .len();
+        assert!(envelope < 300, "{envelope}");
+    }
+
+    #[test]
     fn a_protocol_7_peer_supports_no_merged_invalidation_record() {
         const { assert!(PROTOCOL_VERSION >= PROTOCOL_INVALIDATION_FOLD) };
         assert!(!peer_supports(7, PROTOCOL_INVALIDATION_FOLD));
@@ -1334,12 +1429,12 @@ mod tests {
     }
 
     /// The protocol numbers are an interop contract with released nodes: a
-    /// peer on protocol 7 gets no merged record, and the build's own
-    /// protocol is the fold protocol.
+    /// peer on protocol 7 gets no merged record, and this build speaks the
+    /// fold protocol.
     #[test]
     fn the_invalidation_fold_protocol_is_8_and_this_build_speaks_it() {
         assert_eq!(PROTOCOL_INVALIDATION_FOLD, 8);
-        assert_eq!(PROTOCOL_VERSION, PROTOCOL_INVALIDATION_FOLD);
+        const { assert!(PROTOCOL_VERSION >= PROTOCOL_INVALIDATION_FOLD) };
     }
 
     #[test]

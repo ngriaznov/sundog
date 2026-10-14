@@ -100,6 +100,229 @@ fn listing_or_sketch_crosses_over_past_min_bucket() {
     }
 }
 
+/// A `(key, version)` entry whose key is `key_len` bytes holding `n`.
+fn listing_entry(n: u64, key_len: usize) -> crate::store::KeyVersion {
+    let mut key = vec![0u8; key_len.max(8)];
+    key[..8].copy_from_slice(&n.to_be_bytes());
+    key.truncate(key_len.max(8));
+    crate::store::KeyVersion {
+        key: Bytes::from(key),
+        version: Hlc {
+            wall_ms: n,
+            logical: 0,
+            node: NodeId::from(1),
+        },
+    }
+}
+
+/// The estimate [`super::serve::chunk_ae_listing`] charges a slice.
+fn listing_cost(slice: &[crate::store::KeyVersion]) -> usize {
+    slice
+        .iter()
+        .map(|kv| kv.key.len() + wire::AE_ENTRY_MAX_WIRE_LEN)
+        .sum()
+}
+
+#[test]
+fn chunk_ae_listing_keeps_every_entry_in_order_across_chunks() {
+    let entries: Vec<_> = (0..50).map(|n| listing_entry(n, 16)).collect();
+    let budget = 10 * (16 + wire::AE_ENTRY_MAX_WIRE_LEN);
+    let chunks = super::serve::chunk_ae_listing(entries.clone(), budget);
+    assert_eq!(chunks.len(), 5, "fifty equal entries, ten per slice");
+    for chunk in &chunks {
+        assert!(listing_cost(chunk) <= budget, "{}", listing_cost(chunk));
+    }
+    let joined: Vec<_> = chunks.into_iter().flatten().collect();
+    assert_eq!(joined, entries, "the slices concatenate to the listing");
+}
+
+#[test]
+fn chunk_ae_listing_does_not_split_a_listing_that_fits() {
+    let entries: Vec<_> = (0..4).map(|n| listing_entry(n, 16)).collect();
+    let exact = listing_cost(&entries);
+    assert_eq!(
+        super::serve::chunk_ae_listing(entries.clone(), exact),
+        vec![entries.clone()],
+        "a listing that fills the budget exactly is one slice"
+    );
+    assert_eq!(
+        super::serve::chunk_ae_listing(entries.clone(), exact - 1).len(),
+        2,
+        "one byte under splits it"
+    );
+}
+
+#[test]
+fn chunk_ae_listing_returns_one_empty_chunk_for_an_empty_bucket() {
+    assert_eq!(
+        super::serve::chunk_ae_listing(Vec::new(), 100),
+        vec![Vec::new()]
+    );
+    assert_eq!(
+        super::serve::chunk_ae_listing(Vec::new(), 0),
+        vec![Vec::new()],
+        "a zero budget still answers an empty bucket"
+    );
+}
+
+#[test]
+fn chunk_ae_listing_puts_an_oversized_entry_alone() {
+    let small = listing_entry(1, 8);
+    let big = listing_entry(2, 1_000);
+    let chunks = super::serve::chunk_ae_listing(
+        vec![small.clone(), big.clone(), small.clone()],
+        100 + wire::AE_ENTRY_MAX_WIRE_LEN,
+    );
+    assert_eq!(chunks, vec![vec![small.clone()], vec![big], vec![small]]);
+}
+
+#[test]
+fn every_chunk_of_a_listing_encodes_under_max_frame_whatever_the_key_length() {
+    // A 255-byte cache name is the widest envelope; keys straddle the
+    // varint width boundaries of the key length and the entry count.
+    let cache = SmolStr::new("c".repeat(255));
+    for key_len in [8usize, 33, 127, 128, 200, 4_096, 16_384, 70_000] {
+        let per_entry = key_len + wire::AE_ENTRY_MAX_WIRE_LEN;
+        let budget = MAX_FRAME / 2;
+        for count in [
+            budget / per_entry - 1,
+            budget / per_entry,
+            budget / per_entry + 1,
+            2 * budget / per_entry + 3,
+        ] {
+            let entries: Vec<_> = (0..count as u64)
+                .map(|n| listing_entry(n, key_len))
+                .collect();
+            let replies =
+                super::serve::ae_entries_replies(&cache, vec![(7, entries.clone())], true, budget);
+            let mut joined = Vec::new();
+            for reply in replies {
+                let encoded = wire::encode(&reply)
+                    .unwrap_or_else(|error| panic!("key {key_len}, {count} entries: {error}"));
+                assert!(encoded.len() <= MAX_FRAME);
+                let Msg::AeBucket { entries, .. } = reply else {
+                    panic!("only AeBucket replies");
+                };
+                joined.extend(entries);
+            }
+            assert_eq!(
+                joined.len(),
+                entries.len(),
+                "key {key_len}, {count} entries"
+            );
+        }
+    }
+}
+
+#[test]
+fn ae_entries_replies_send_one_message_per_bucket_for_an_unchunked_peer() {
+    let cache = SmolStr::new("users");
+    let entries: Vec<_> = (0..100).map(|n| listing_entry(n, 32)).collect();
+    let replies = super::serve::ae_entries_replies(
+        &cache,
+        vec![(3, entries.clone()), (7, Vec::new())],
+        false,
+        64,
+    );
+    assert_eq!(
+        replies,
+        vec![
+            Msg::AeBucket {
+                cache: cache.clone(),
+                bucket: 3,
+                entries: super::framing::key_versions_to_wire(entries),
+            },
+            Msg::AeBucket {
+                cache,
+                bucket: 7,
+                entries: Vec::new(),
+            },
+        ],
+        "a peer below the chunking protocol reads each message as a whole bucket"
+    );
+}
+
+#[test]
+fn ae_entries_replies_split_a_chunked_bucket_and_keep_an_empty_one() {
+    let cache = SmolStr::new("users");
+    let entries: Vec<_> = (0..100).map(|n| listing_entry(n, 32)).collect();
+    let budget = 30 * (32 + wire::AE_ENTRY_MAX_WIRE_LEN);
+    let replies = super::serve::ae_entries_replies(
+        &cache,
+        vec![(3, entries.clone()), (7, Vec::new())],
+        true,
+        budget,
+    );
+    let buckets: Vec<(u16, usize)> = replies
+        .iter()
+        .map(|msg| match msg {
+            Msg::AeBucket {
+                bucket, entries, ..
+            } => (*bucket, entries.len()),
+            other => panic!("only AeBucket replies, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(buckets, vec![(3, 30), (3, 30), (3, 30), (3, 10), (7, 0)]);
+}
+
+#[test]
+fn ae_entries_replies_encode_under_max_frame_when_chunked_at_the_real_budget() {
+    let cache = SmolStr::new("users");
+    let entries: Vec<_> = (0..300_000).map(|n| listing_entry(n, 32)).collect();
+    let replies = super::serve::ae_entries_replies(
+        &cache,
+        vec![(3, entries)],
+        true,
+        super::serve::AE_LISTING_BUDGET,
+    );
+    assert!(replies.len() > 1, "{} replies", replies.len());
+    for reply in &replies {
+        wire::encode(reply).expect("every reply fits one frame");
+    }
+}
+
+#[test]
+fn merge_bucket_chunk_concatenates_chunks_of_one_bucket() {
+    let mut out = Vec::new();
+    super::reply::merge_bucket_chunk(&mut out, 3, vec![listing_entry(1, 8)]);
+    super::reply::merge_bucket_chunk(&mut out, 3, vec![listing_entry(2, 8)]);
+    assert_eq!(
+        out,
+        vec![(3, vec![listing_entry(1, 8), listing_entry(2, 8)])]
+    );
+}
+
+#[test]
+fn merge_bucket_chunk_keeps_first_appearance_order_across_buckets() {
+    let mut out = Vec::new();
+    super::reply::merge_bucket_chunk(&mut out, 7, vec![listing_entry(1, 8)]);
+    super::reply::merge_bucket_chunk(&mut out, 3, vec![listing_entry(2, 8)]);
+    super::reply::merge_bucket_chunk(&mut out, 9, Vec::new());
+    assert_eq!(
+        out,
+        vec![
+            (7, vec![listing_entry(1, 8)]),
+            (3, vec![listing_entry(2, 8)]),
+            (9, Vec::new()),
+        ]
+    );
+}
+
+#[test]
+fn merge_bucket_chunk_merges_interleaved_chunks_of_one_bucket() {
+    let mut out = Vec::new();
+    super::reply::merge_bucket_chunk(&mut out, 3, vec![listing_entry(1, 8)]);
+    super::reply::merge_bucket_chunk(&mut out, 7, vec![listing_entry(2, 8)]);
+    super::reply::merge_bucket_chunk(&mut out, 3, vec![listing_entry(3, 8)]);
+    assert_eq!(
+        out,
+        vec![
+            (3, vec![listing_entry(1, 8), listing_entry(3, 8)]),
+            (7, vec![listing_entry(2, 8)]),
+        ]
+    );
+}
+
 /// Below [`super::pool::REQ_POOL_MAX_IDLE`] a pooled connection stays fresh;
 /// at or past it, `ReqPool::checkout` must treat it as stale. Uses
 /// tokio's paused clock so the boundary is exact rather than

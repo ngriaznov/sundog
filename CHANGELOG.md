@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **The wire protocol is 9** (`wire::PROTOCOL_AE_LISTING_CHUNKS`). A reply to
+  an anti-entropy listing request may carry one bucket across several
+  `AeBucket` messages. A responder chunks only for a peer on protocol 9 or
+  later, and a requester joins the messages whatever the responder speaks, so
+  release 9 interoperates with release 8 in both directions.
+
 ### Fixed
 
 - **A just-read entry is never idle because of a clock behind its last read.**
@@ -47,6 +55,14 @@ All notable changes to this project are documented in this file. Format follows
   that prefers values can no longer revive a deleted key or bury a newer
   value under an older tombstone. `LwwResolver` and the `crdt` resolvers
   already decided that pair by version.
+- **An anti-entropy sketch-fallback listing of a large bucket completes.** A
+  responder streams a bucket's full listing in frames of about 2 MiB and the
+  requester joins them. The listing used to travel as one frame, which a
+  bucket of about 84,000 entries or more pushed past the 4 MiB frame cap, so
+  the round failed on every attempt and the replicas stayed divergent. A
+  protocol 8 requester still fails on such a bucket until it upgrades. A
+  digest-path listing, bounded by `ae_sketch_min_bucket`, is still one frame,
+  and a single key within a few hundred bytes of the frame cap fits no frame.
 
 ## [0.6.7] – 2026-10-13
 

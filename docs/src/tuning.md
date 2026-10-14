@@ -42,7 +42,7 @@ Cache-level settings, `mode`, `max_capacity`, `max_resident_bytes`, `ttl`,
 | `fan_out_wait_timeout` | 30 s | a writer waiting for backlog room should give up sooner and write over capacity |
 | `ae_sketch_min_bucket` | 384 entries | a bucket past this answers a mismatch with a fixed-size sketch instead of a listing |
 | `ae_part_min_bucket` | 4,096 entries | a bucket past this narrows a mismatch to 64 part digests first |
-| `ae_sketch_cells` | 240 | differences per round regularly exceed the 100 elements a default sketch decodes |
+| `ae_sketch_cells` | 240 | differences per round regularly exceed the 100 elements a default sketch decodes; a difference past that falls back to a full listing of the bucket, streamed in frames of about 2 MiB |
 
 ## Deletes
 

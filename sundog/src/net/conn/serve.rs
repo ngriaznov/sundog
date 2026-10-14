@@ -12,8 +12,8 @@ use super::framing::{
 };
 use crate::net::{AeServeOutcome, LoadServe, MeshInner, RequestHandler};
 use crate::node::NodeId;
-use crate::store::{BucketDigest, BucketPart, BucketPartDigests, KeyVersion};
-use crate::wire::{self, MAX_FRAME, Msg, WireRecord};
+use crate::store::{BucketDigest, BucketEntries, BucketPart, BucketPartDigests, KeyVersion};
+use crate::wire::{self, AE_ENTRY_MAX_WIRE_LEN, MAX_FRAME, Msg, WireRecord};
 
 /// Serves one state-transfer request. Returns `true` when this connection
 /// is done, `false` once the final `done: true` chunk
@@ -692,28 +692,97 @@ pub(super) fn listing_or_sketch(
     }
 }
 
+/// The encoded bytes of keys and versions one [`Msg::AeBucket`] reply to an
+/// `AeEntries` request carries before [`chunk_ae_listing`] starts the next:
+/// half a frame, leaving room for the cache name and the bucket.
+pub(super) const AE_LISTING_BUDGET: usize = MAX_FRAME / 2;
+
+/// Splits one bucket's `entries` into slices whose encoded size stays within
+/// `budget`, in order: a slice holds an entry only while its keys' bytes plus
+/// [`AE_ENTRY_MAX_WIRE_LEN`] each fit, and a slice larger than `budget` is a
+/// single entry whose key alone is that large. Always at least one slice, so
+/// an empty bucket still answers with an empty listing. A listing that fits
+/// is returned whole, without moving an entry. Pure; unit tested directly.
+///
+/// A key within a few hundred bytes of [`MAX_FRAME`] fits in no frame, so a
+/// listing that holds one still fails to send.
+pub(super) fn chunk_ae_listing(entries: Vec<KeyVersion>, budget: usize) -> Vec<Vec<KeyVersion>> {
+    let cost = |kv: &KeyVersion| kv.key.len() + AE_ENTRY_MAX_WIRE_LEN;
+    let total = entries
+        .iter()
+        .fold(0usize, |sum, kv| sum.saturating_add(cost(kv)));
+    if total <= budget {
+        return vec![entries];
+    }
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    let mut used = 0usize;
+    for kv in entries {
+        let len = cost(&kv);
+        if used > 0 && used + len > budget {
+            chunks.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        used += len;
+        current.push(kv);
+    }
+    chunks.push(current);
+    chunks
+}
+
+/// The [`Msg::AeBucket`] replies to an `AeEntries` request, from the
+/// handler's `listings`: one message per bucket, or, when `chunked`, as many
+/// messages per bucket as [`chunk_ae_listing`] cuts at `budget`. A peer
+/// below [`wire::PROTOCOL_AE_LISTING_CHUNKS`] reads each message as a whole
+/// bucket, so it gets the unchunked shape. Pure; unit tested directly.
+pub(super) fn ae_entries_replies(
+    cache: &SmolStr,
+    listings: BucketEntries,
+    chunked: bool,
+    budget: usize,
+) -> Vec<Msg> {
+    listings
+        .into_iter()
+        .flat_map(|(bucket, entries)| {
+            let slices = if chunked {
+                chunk_ae_listing(entries, budget)
+            } else {
+                vec![entries]
+            };
+            slices.into_iter().map(move |slice| (bucket, slice))
+        })
+        .map(|(bucket, entries)| Msg::AeBucket {
+            cache: cache.clone(),
+            bucket,
+            entries: key_versions_to_wire(entries),
+        })
+        .collect()
+}
+
 /// Serves an `AeEntries` request: the sketch fallback, full listings for the
 /// named `buckets`, requested explicitly rather than chosen by the responder.
+/// A bucket larger than [`AE_LISTING_BUDGET`] arrives as several
+/// [`Msg::AeBucket`] messages for a peer that speaks
+/// [`wire::PROTOCOL_AE_LISTING_CHUNKS`], and as one, which a large enough
+/// bucket pushes past [`MAX_FRAME`], for an older peer.
 pub(super) async fn serve_ae_entries(
     framed: &mut PeerFramed,
     cache: SmolStr,
     buckets: Vec<u16>,
     handler: &dyn RequestHandler,
     cancel: &CancellationToken,
+    peer_protocol: u16,
 ) -> bool {
     let mut replies: Vec<Msg> = if buckets.is_empty() {
         Vec::new()
     } else {
-        handler
-            .entries_for_buckets(cache.clone(), buckets)
-            .await
-            .into_iter()
-            .map(|(bucket, entries)| Msg::AeBucket {
-                cache: cache.clone(),
-                bucket,
-                entries: key_versions_to_wire(entries),
-            })
-            .collect()
+        let listings = handler.entries_for_buckets(cache.clone(), buckets).await;
+        ae_entries_replies(
+            &cache,
+            listings,
+            wire::peer_supports(peer_protocol, wire::PROTOCOL_AE_LISTING_CHUNKS),
+            AE_LISTING_BUDGET,
+        )
     };
     replies.push(Msg::ReqDone);
     send_batch_or_cancelled(framed, &replies, cancel).await
