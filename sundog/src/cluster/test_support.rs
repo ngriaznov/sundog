@@ -68,12 +68,12 @@ pub(crate) async fn wait_for_no_peers(cluster: &Cluster) {
 /// [`super::anti_entropy::run_round_against`] takes it: the same handle
 /// `Cache::open` installs in the registry.
 pub(crate) fn registered_shard(cluster: &Cluster, cache: &SmolStr) -> Arc<dyn ShardOps> {
-    cluster
-        .shards()
-        .read_shards()
-        .get(cache)
-        .cloned()
-        .expect("the cache was opened, so its shard is registered")
+    registry_entry(cluster, cache).expect("the cache was opened, so its shard is registered")
+}
+
+/// `cluster`'s registered shard for `cache`, or `None` once it is forgotten.
+pub(crate) fn registry_entry(cluster: &Cluster, cache: &SmolStr) -> Option<Arc<dyn ShardOps>> {
+    cluster.shards().read_shards().get(cache).cloned()
 }
 
 /// Polls `cond` every 20ms until it returns `true`, or panics with `msg` once

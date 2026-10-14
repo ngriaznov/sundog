@@ -160,6 +160,7 @@ where
             skew_rejected,
             skew_warned: AtomicBool::new(false),
             clock_jump_warned: AtomicBool::new(false),
+            spill_close: tokio::sync::OnceCell::new(),
             resolver: Arc::new(LwwResolver),
             raw_resolver: Arc::new(LwwResolver),
             crdt_bounds: ClusterConfig::default().crdt_compaction_bounds(),

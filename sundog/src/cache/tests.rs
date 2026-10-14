@@ -15,6 +15,7 @@ mod observability;
 mod rules;
 #[cfg(feature = "spill")]
 mod spill_gate;
+mod stale_close;
 mod startup;
 mod tti_clock;
 mod warm_reconcile;

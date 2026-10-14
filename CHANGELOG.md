@@ -21,6 +21,16 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **Closing a clone of a cache after its name was reopened leaves the
+  reopened cache alone.** The close used to remove the new cache from the
+  shard registry, `Cluster::health`, the gossiped mode and loader and the
+  shutdown spill sweep, so peers stopped seeing it and inbound replication,
+  anti-entropy, fetch and load lookups by name failed. It also checkpointed
+  the closed spill tier a second time into the directory the reopened cache
+  now owned, which could drop that cache's later entries from the next warm
+  reopen. A close now acts on the cluster only for the shard the registry
+  holds, and a cache checkpoints its spill tier once: a second or concurrent
+  close waits for the first and does nothing more.
 - **A part pull that times out after a view change is retried every
   `ae_interval`.** A `Distributed` node that gains a part and whose pull runs
   out `state_transfer_budget` keeps pulling it on the anti-entropy tick until

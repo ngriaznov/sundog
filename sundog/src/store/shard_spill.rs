@@ -370,6 +370,20 @@ where
     /// A no-op otherwise, and always a no-op in a non-`spill` build. Called
     /// by `Cache::close` and, for a cache still registered at cluster
     /// shutdown, by `Cluster::shutdown`'s sweep.
+    ///
+    /// Runs once per shard. A call that finds the close under way waits for
+    /// it, and one that finds it done returns at once, so a second clone's
+    /// close, or one after the sweep, cannot checkpoint a closed tier into
+    /// files a reopened cache has since taken over, which could bring back
+    /// an entry the reopened cache deleted. A call dropped before it
+    /// finishes leaves the close undone, and the next call runs it.
+    pub(crate) async fn close_spill_checkpointed(&self) {
+        self.spill_close
+            .get_or_init(|| self.checkpoint_and_close_spill())
+            .await;
+    }
+
+    /// The body of [`Shard::close_spill_checkpointed`].
     #[cfg_attr(
         not(feature = "spill"),
         allow(
@@ -383,7 +397,7 @@ where
         clippy::too_many_lines,
         reason = "one scripted checkpoint sequence, logging and metering each stage in order"
     )]
-    pub(crate) async fn close_spill_checkpointed(&self) {
+    async fn checkpoint_and_close_spill(&self) {
         #[cfg(feature = "spill")]
         if let Some(tier) = self.engine.spill().cloned() {
             tracing::debug!(

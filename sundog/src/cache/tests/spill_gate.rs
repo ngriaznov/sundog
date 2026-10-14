@@ -623,3 +623,115 @@ async fn an_invalidation_cache_reopened_warm_behind_its_replayed_stamps_honours_
     cluster.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A `Mode::Local` cache over a warm-reopen tier in `dir`.
+async fn open_warm(cluster: &Cluster, dir: &std::path::Path) -> Cache<u32, String> {
+    cluster
+        .cache::<u32, String>("warm-close")
+        .mode(Mode::Local)
+        .spill(
+            SpillConfig::new(dir, 1 << 20)
+                .region_bytes(4096)
+                .warm_reopen(true),
+        )
+        .open()
+        .await
+        .expect("opens")
+}
+
+async fn solo_cluster_for(label: &'static str) -> Cluster {
+    Cluster::builder(label)
+        .seeds(std::iter::empty())
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("build succeeds")
+}
+
+/// The snapshot file a checkpointed close wrote under `dir`.
+fn snapshot_under(dir: &std::path::Path) -> std::path::PathBuf {
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in std::fs::read_dir(next).expect("the spill directory lists") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.file_name().is_some_and(|name| name == "snapshot") {
+                return path;
+            }
+        }
+    }
+    panic!(
+        "a checkpointed close writes a snapshot under {}",
+        dir.display()
+    );
+}
+
+/// A clone closed after the name was reopened does not checkpoint its old
+/// tier over the files the reopened cache wrote: its entries survive the
+/// next warm reopen.
+#[tokio::test]
+async fn a_stale_close_after_a_warm_reopen_leaves_the_reopened_spill_tier_intact() {
+    let dir = fresh_spill_dir("stale-close");
+    let cluster = solo_cluster_for("cache-it-spill-stale-close").await;
+    let first = open_warm(&cluster, &dir).await;
+    first.insert(1, "one".to_string()).await.expect("insert");
+    let stale = first.clone();
+    first.close().await;
+
+    let second = open_warm(&cluster, &dir).await;
+    assert_eq!(second.get(&1).await, Some("one".to_string()), "warm replay");
+    second.insert(2, "two".to_string()).await.expect("insert");
+    second.close().await;
+    stale.close().await;
+
+    let third = open_warm(&cluster, &dir).await;
+    assert_eq!(third.get(&1).await, Some("one".to_string()));
+    assert_eq!(
+        third.get(&2).await,
+        Some("two".to_string()),
+        "the stale close did not rewrite the snapshot the reopened cache wrote"
+    );
+    third.close().await;
+    cluster.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two clones closing together run one checkpoint: both return once it is
+/// done, and the next warm reopen replays the entry.
+#[tokio::test]
+async fn two_clones_closing_at_once_leave_one_checkpoint_to_reopen_warm() {
+    let dir = fresh_spill_dir("join-close");
+    let cluster = solo_cluster_for("cache-it-spill-join-close").await;
+    let first = open_warm(&cluster, &dir).await;
+    first.insert(1, "one".to_string()).await.expect("insert");
+    let other = first.clone();
+    tokio::join!(first.close(), other.close());
+
+    let second = open_warm(&cluster, &dir).await;
+    assert_eq!(second.get(&1).await, Some("one".to_string()));
+    second.close().await;
+    cluster.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A close after the cluster's shutdown sweep has already checkpointed the
+/// cache writes no second checkpoint.
+#[tokio::test]
+async fn a_close_after_the_shutdown_sweep_does_not_checkpoint_again() {
+    let dir = fresh_spill_dir("after-shutdown");
+    let cluster = solo_cluster_for("cache-it-spill-close-after-shutdown").await;
+    let cache = open_warm(&cluster, &dir).await;
+    cache.insert(1, "one".to_string()).await.expect("insert");
+    cluster.shutdown().await;
+    let snapshot = snapshot_under(&dir);
+    std::fs::write(&snapshot, b"written by someone else").expect("overwrites the snapshot");
+
+    cache.close().await;
+
+    assert_eq!(
+        std::fs::read(&snapshot).expect("reads the snapshot"),
+        b"written by someone else"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

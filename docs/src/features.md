@@ -75,6 +75,11 @@ against the same directory replays the snapshot instead of starting empty,
 reading no values into RAM. A replayed bucket answers `fetch` only after a
 live co-owner confirms it, or after the warm-up finds no co-owner to ask.
 
+A cache checkpoints once. A second `close` from another clone, or a `close`
+after `shutdown`, waits for the first to finish and writes nothing, so it
+cannot overwrite the snapshot of a cache that has reopened the directory
+since.
+
 A warm reopen advances the node's clock past the greatest version it
 replays, so a write or delete made after the restart stamps after every
 replayed entry and wins over it, even when the system clock restarted behind

@@ -497,6 +497,10 @@ where
     /// Set once this node's clock has been logged as further behind its
     /// own last stamp than `max_clock_skew_ms`.
     clock_jump_warned: AtomicBool,
+    /// Runs the spill tier's checkpointed close once: later and concurrent
+    /// closers wait for the first and find it done, and a first close
+    /// dropped mid-way leaves the cell empty for the next to run.
+    spill_close: tokio::sync::OnceCell<()>,
     /// The resolver every decision runs through: `raw_resolver` wrapped in
     /// a [`SettlingResolver`] carrying `crdt_retire_after_ms` and this
     /// shard's clock, rebuilt whenever any of the three changes.

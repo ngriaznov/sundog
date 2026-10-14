@@ -1080,3 +1080,142 @@ fn seed_clock_from_replay_flags_only_a_replayed_stamp_ahead_of_max_clock_skew() 
         "the seeded clock stamps past the replayed version"
     );
 }
+
+/// A `Mode::Local` shard with a warm-reopen spill tier in a fresh directory,
+/// holding one entry, and that directory.
+#[cfg(feature = "spill")]
+async fn shard_with_one_entry_and_a_warm_tier(
+    label: &str,
+) -> (Shard<u32, String>, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "sundog-shard-close-once-{label}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id(),
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let cfg = spill::SpillConfig::new(&dir, 1 << 20)
+        .region_bytes(4096)
+        .warm_reopen(true);
+    let shard = Shard::<u32, String>::new(
+        SmolStr::new(label),
+        Mode::Local,
+        NodeId::from(305u64),
+        1 << 20,
+        None,
+        None,
+    );
+    shard
+        .attach_spill(&cfg)
+        .expect("a brand-new directory opens cold");
+    shard.insert(1u32, "v".repeat(40)).await.expect("insert");
+    (shard, dir)
+}
+
+/// The snapshot file a checkpointed close wrote under `dir`.
+#[cfg(feature = "spill")]
+fn snapshot_file(dir: &std::path::Path) -> std::path::PathBuf {
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in std::fs::read_dir(next).expect("the spill directory lists") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.file_name().is_some_and(|name| name == "snapshot") {
+                return path;
+            }
+        }
+    }
+    panic!(
+        "a checkpointed close writes a snapshot under {}",
+        dir.display()
+    );
+}
+
+/// A repeat close, such as a stale clone's close or one after the cluster's
+/// shutdown sweep, writes no second checkpoint: the files the first wrote are
+/// as they were, since a reopened cache may own them by then.
+#[cfg(feature = "spill")]
+#[tokio::test]
+async fn a_second_checkpointed_close_does_not_checkpoint_again() {
+    let (shard, dir) = shard_with_one_entry_and_a_warm_tier("twice").await;
+    shard.close_spill_checkpointed().await;
+    let snapshot = snapshot_file(&dir);
+    std::fs::write(&snapshot, b"written by someone else").expect("overwrites the snapshot");
+
+    shard.close_spill_checkpointed().await;
+
+    assert_eq!(
+        std::fs::read(&snapshot).expect("reads the snapshot"),
+        b"written by someone else",
+        "the second close leaves the snapshot alone"
+    );
+    assert!(shard.spill_tier_closed());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Closes that overlap run one checkpoint between them: the late one waits
+/// for the first and returns when it is done.
+#[cfg(feature = "spill")]
+#[tokio::test]
+async fn overlapping_checkpointed_closes_checkpoint_once() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let (shard, dir) = shard_with_one_entry_and_a_warm_tier("overlap").await;
+
+    tokio::join!(
+        shard.close_spill_checkpointed(),
+        shard.close_spill_checkpointed(),
+        shard.close_spill_checkpointed(),
+    );
+
+    assert!(shard.spill_tier_closed());
+    let listed: u64 = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(key, ..)| {
+            key.key().name() == "sundog_spill_checkpoint_entries_total"
+                && key
+                    .key()
+                    .labels()
+                    .any(|label| label.key() == "stage" && label.value() == "snapshot")
+        })
+        .map(|(_, _, _, value)| match value {
+            DebugValue::Counter(n) => n,
+            _ => 0,
+        })
+        .sum();
+    assert_eq!(
+        listed, 1,
+        "one snapshot of the one entry, not one per caller"
+    );
+    let _ = snapshot_file(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A close dropped before it finishes, such as a caller's timeout, leaves the
+/// tier open and nothing claimed: the next close runs the whole checkpoint.
+#[cfg(feature = "spill")]
+#[tokio::test]
+async fn a_checkpointed_close_dropped_mid_way_is_run_by_the_next_call() {
+    let (shard, dir) = shard_with_one_entry_and_a_warm_tier("dropped").await;
+    {
+        let mut closing = std::pin::pin!(shard.close_spill_checkpointed());
+        assert!(
+            futures::poll!(closing.as_mut()).is_pending(),
+            "the checkpoint waits on a blocking task"
+        );
+    }
+    assert!(
+        !shard.spill_tier_closed(),
+        "a close dropped at its first wait closed nothing"
+    );
+
+    shard.close_spill_checkpointed().await;
+
+    assert!(shard.spill_tier_closed());
+    let _ = snapshot_file(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -281,7 +281,9 @@ pub trait ShardOps: Send + Sync {
     /// checkpoint of every live entry and a snapshot a later warm reopen
     /// replays. The default just calls `close_spill`, so an implementor with
     /// no spill tier keeps working, cold on the next open. Called by
-    /// `crate::cache::Cache::close` and cluster shutdown.
+    /// `crate::cache::Cache::close` and cluster shutdown. The `Shard` one runs
+    /// once: a later or concurrent call waits for the first and does nothing
+    /// more.
     fn close_spill_checkpointed(&self) -> BoxFuture<'_, ()> {
         self.close_spill();
         Box::pin(async {})

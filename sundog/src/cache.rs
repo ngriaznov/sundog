@@ -1166,9 +1166,13 @@ where
     /// when this returns. Closing the spill tier lets its flusher thread
     /// drain its queue and exit on its own.
     ///
-    /// Closing is idempotent. A clone kept past `close` keeps working as a
-    /// local, detached cache: its reads and writes reach the same in-memory
-    /// [`Shard`], and nothing replicates. The one exception is a
+    /// Closing is idempotent: a close from another clone, or from
+    /// [`Cluster::shutdown`], waits for the first close to finish and then
+    /// does nothing, and a close that comes after the name was reopened
+    /// leaves the reopened cache registered, advertised and checkpointable.
+    /// A clone kept past `close` keeps working as a local, detached cache:
+    /// its reads and writes reach the same in-memory [`Shard`], and nothing
+    /// replicates. The one exception is a
     /// `Mode::Distributed` write for a bucket this node does not own, which
     /// has no local copy to land in: it fails with [`CacheError::Closed`]
     /// rather than being accepted and never sent. A cache never explicitly closed
@@ -1187,7 +1191,7 @@ where
         self.tasks.wait().await;
         self.shard.fan_out_queue().close();
         self.shard.close_spill_checkpointed().await;
-        self.cluster.forget_cache(self.shard.name());
+        self.cluster.forget_cache(self.shard.name(), &self.shard);
     }
 }
 

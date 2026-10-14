@@ -55,6 +55,19 @@ use inbound::inbound_loop;
 /// Shared with the [`RequestHandler`] passed to [`Mesh::spawn`].
 type ShardRegistry = Arc<RwLock<HashMap<SmolStr, Arc<dyn ShardOps>>>>;
 
+/// Whether `registry` holds `shard` itself under `name`: the same allocation,
+/// not another cache that took the name since. The test behind
+/// [`Cluster::forget_cache`]. Pure; unit tested directly.
+fn registry_holds<S: ShardOps + ?Sized>(
+    registry: &HashMap<SmolStr, Arc<dyn ShardOps>>,
+    name: &str,
+    shard: &Arc<S>,
+) -> bool {
+    registry
+        .get(name)
+        .is_some_and(|held| std::ptr::addr_eq(Arc::as_ptr(held), Arc::as_ptr(shard)))
+}
+
 /// One-line accessors for [`ShardRegistry`]'s lock, on the lock type itself
 /// so they resolve through autoderef from an owned or borrowed registry.
 trait ShardRegistryExt {
@@ -426,14 +439,24 @@ impl Cluster {
     /// The cluster-side half of [`crate::cache::Cache::close`]: drops `name`
     /// from the shard registry, this node's local mode map and warmth set,
     /// and clears its gossiped mode and loader so live peers stop seeing
-    /// either advertised.
-    /// Idempotent: closing an already-forgotten name changes nothing.
-    pub(crate) fn forget_cache(&self, name: &str) {
-        self.inner.shards.write_shards().remove(name);
+    /// either advertised. Acts only when the registry holds `shard` under
+    /// `name` ([`registry_holds`]) and answers whether it did, so a close
+    /// that finds the name free, or reopened as another cache, changes
+    /// nothing, gossip included: the close that freed the name already
+    /// cleared it. The registry stays write-locked through the clears, so an
+    /// `open` of the name, which reserves it under that lock before it
+    /// advertises, lands strictly after them.
+    pub(crate) fn forget_cache<S: ShardOps + ?Sized>(&self, name: &str, shard: &Arc<S>) -> bool {
+        let mut registry = self.inner.shards.write_shards();
+        if !registry_holds(&registry, name, shard) {
+            return false;
+        }
+        registry.remove(name);
         self.inner.local_modes.write_modes().remove(name);
         self.inner.warmth.forget(name);
         self.inner.membership.clear_cache_mode(name);
         self.inner.membership.clear_loader(name);
+        true
     }
 
     /// Gossips that this node has a loader for cache `name`, so peers pick
