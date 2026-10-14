@@ -44,8 +44,8 @@ fn finish_spill_handoff_err_releases_the_jobs_admitted_bytes() {
     let queued_before = tier.queued_bytes();
     let outcome = engine.evict_one_sampled(bucket, 0);
     assert_eq!(
-        outcome.removed_weight, 30,
-        "the hand-off still commits and frees the weight right away"
+        outcome.removed_weight, 0,
+        "the abandoned hand-off frees nothing, so the pass reports no progress"
     );
     let queued_after = tier.queued_bytes();
 

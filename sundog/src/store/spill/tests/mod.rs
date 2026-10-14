@@ -6,8 +6,9 @@ use crate::store::engine::OnRefusal;
 use super::open::snapshot_loc_end;
 use super::record::{build_header, decode_record_with_key, split_record};
 use super::rules::{
-    FLUSH_QUEUE_CAPACITY, FLUSH_QUEUE_SLOTS_MAX, next_region_index, record_fits, record_fits_queue,
-    record_too_large, records_fitting_region, refusal_drop_reason,
+    FLUSH_QUEUE_CAPACITY, FLUSH_QUEUE_SLOTS_MAX, admission_charge, next_region_index, record_fits,
+    record_fits_queue, record_too_large, records_fitting_region, refusal_drop_reason,
+    slot_charge_floor,
 };
 use super::*;
 
@@ -47,6 +48,73 @@ fn flush_queue_slots_stays_at_the_floor_for_a_tiny_byte_budget() {
 #[test]
 fn flush_queue_slots_clamps_at_the_ceiling_for_a_huge_byte_budget() {
     assert_eq!(flush_queue_slots(u64::MAX), FLUSH_QUEUE_SLOTS_MAX);
+}
+
+#[test]
+fn slot_charge_floor_is_zero_at_or_below_the_slot_header_product() {
+    let threshold = (FLUSH_QUEUE_SLOTS_MAX * HEADER_LEN) as u64;
+    assert_eq!(slot_charge_floor(0), 0);
+    assert_eq!(slot_charge_floor(1), 0);
+    assert_eq!(
+        slot_charge_floor((FLUSH_QUEUE_CAPACITY * HEADER_LEN) as u64 - 1),
+        0,
+        "a budget under the low clamp's product keeps its raised slot count"
+    );
+    assert_eq!(slot_charge_floor(12 << 20), 0, "12 MiB");
+    assert_eq!(slot_charge_floor(threshold), 0, "exactly the product");
+    assert_eq!(flush_queue_slots(threshold), FLUSH_QUEUE_SLOTS_MAX);
+}
+
+#[test]
+fn slot_charge_floor_is_the_budget_share_of_a_slot_above_it() {
+    let threshold = (FLUSH_QUEUE_SLOTS_MAX * HEADER_LEN) as u64;
+    assert_eq!(
+        slot_charge_floor(threshold + 1),
+        49,
+        "one byte past the product"
+    );
+    assert_eq!(slot_charge_floor(64 << 20), 256, "the default budget");
+    assert_eq!(slot_charge_floor(1 << 30), 4096);
+    assert_eq!(slot_charge_floor(u64::MAX), u32::MAX, "saturates");
+}
+
+#[test]
+fn slot_charge_floor_times_slots_covers_the_budget() {
+    // The budget divided by the floor never exceeds the slot count, so the
+    // byte budget admits no more jobs than the channel holds.
+    for budget in [
+        0,
+        1,
+        (FLUSH_QUEUE_CAPACITY * HEADER_LEN) as u64 - 1,
+        (FLUSH_QUEUE_CAPACITY * HEADER_LEN) as u64,
+        4 << 20,
+        (FLUSH_QUEUE_SLOTS_MAX * HEADER_LEN) as u64,
+        (FLUSH_QUEUE_SLOTS_MAX * HEADER_LEN) as u64 + 1,
+        64 << 20,
+        (64 << 20) + 1,
+        1 << 30,
+        1 << 40,
+    ] {
+        let charge = u64::from(admission_charge(
+            u32::try_from(HEADER_LEN).unwrap(),
+            slot_charge_floor(budget),
+        ));
+        assert!(
+            budget / charge <= flush_queue_slots(budget) as u64,
+            "budget {budget}: {} jobs at {charge} bytes against {} slots",
+            budget / charge,
+            flush_queue_slots(budget)
+        );
+    }
+}
+
+#[test]
+fn admission_charge_is_the_larger_of_record_and_floor() {
+    assert_eq!(admission_charge(300, 256), 300, "a record over the floor");
+    assert_eq!(admission_charge(60, 256), 256, "a record under the floor");
+    assert_eq!(admission_charge(256, 256), 256, "equal");
+    assert_eq!(admission_charge(60, 0), 60, "no floor");
+    assert_eq!(admission_charge(0, 0), 0);
 }
 
 #[test]

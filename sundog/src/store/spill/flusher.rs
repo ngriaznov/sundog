@@ -69,7 +69,7 @@ pub(super) fn flusher_loop(
         // Credited back before the sink-upgrade check: crediting only on a
         // live sink would permanently shrink the admission budget whenever
         // the last strong SpillSink reference drops at this instant.
-        inner.admit.add_permits(job_record_len_or_zero(&first));
+        inner.admit.add_permits(job_admit_charge(inner, &first));
         let Some(sink) = sink.upgrade() else {
             return;
         };
@@ -79,7 +79,7 @@ pub(super) fn flusher_loop(
             let Ok(job) = rx.try_recv() else {
                 break;
             };
-            inner.admit.add_permits(job_record_len_or_zero(&job));
+            inner.admit.add_permits(job_admit_charge(inner, &job));
             batch_bytes += job_record_len_or_zero(&job);
             batch.push(job);
         }
@@ -120,6 +120,17 @@ fn job_record_lens(job: &SpillJob) -> Option<(u32, u32, u32)> {
 
 fn job_record_len_or_zero(job: &SpillJob) -> usize {
     job_record_lens(job).map_or(0, |(record_len, ..)| record_len as usize)
+}
+
+/// The admission bytes `job` was charged on its way into the channel,
+/// recomputed from its record rather than read from
+/// [`SpillJob::admitted_bytes`], so the credit matches the charge by
+/// construction. Not `admitted_bytes`: jobs queued outside admission carry
+/// `0` there.
+fn job_admit_charge(inner: &Inner, job: &SpillJob) -> usize {
+    job_record_lens(job).map_or(0, |(record_len, ..)| {
+        inner.admit_charge(record_len) as usize
+    })
 }
 
 /// One job drained into a flush batch, with its record length and header

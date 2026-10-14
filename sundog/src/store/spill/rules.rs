@@ -14,8 +14,11 @@ use super::{SpillConfig, SpillTier};
 /// clamped between this and [`FLUSH_QUEUE_SLOTS_MAX`].
 pub(crate) const FLUSH_QUEUE_CAPACITY: usize = 8192;
 /// Ceiling [`SpillTier::attach`]'s byte-derived slot count clamps to,
-/// guarding a huge `flush_queue_bytes` paired with tiny records from
-/// allocating an oversized channel buffer.
+/// bounding the channel buffer. A budget past `FLUSH_QUEUE_SLOTS_MAX *
+/// HEADER_LEN` bytes would admit more small records than the channel has
+/// slots, so [`slot_charge_floor`] charges each queued job at least its
+/// share of the budget, and the byte budget never admits more jobs than
+/// fit.
 pub(crate) const FLUSH_QUEUE_SLOTS_MAX: usize = 262_144;
 
 /// Region count for a capacity/region-size pair. Pure; unit-tested directly.
@@ -30,13 +33,38 @@ pub(crate) fn region_count_for(capacity_bytes: u64, region_bytes: u64) -> u32 {
 /// Slot count for [`SpillTier::attach`]'s flush channel:
 /// `flush_queue_bytes` divided by the header size, clamped to
 /// `[FLUSH_QUEUE_CAPACITY, FLUSH_QUEUE_SLOTS_MAX]`, so larger records get
-/// more slots than a fixed count would. Pure; unit tested directly.
+/// more slots than a fixed count would. [`slot_charge_floor`] keeps the byte
+/// budget from admitting more jobs than this. Pure; unit tested directly.
 pub(crate) fn flush_queue_slots(flush_queue_bytes: u64) -> usize {
     let slots = (flush_queue_bytes / HEADER_LEN as u64)
         .clamp(FLUSH_QUEUE_CAPACITY as u64, FLUSH_QUEUE_SLOTS_MAX as u64);
     // Bounded well within `usize` by the clamp; the fallback keeps this
     // total instead of panicking.
     usize::try_from(slots).unwrap_or(FLUSH_QUEUE_SLOTS_MAX)
+}
+
+/// The least admission bytes one queued job costs: the budget share of one
+/// channel slot, `flush_queue_bytes` divided by [`FLUSH_QUEUE_SLOTS_MAX`]
+/// and rounded up, once the budget exceeds what the slots hold at
+/// `HEADER_LEN` bytes a record; `0` at or below that, where every record is
+/// at least `HEADER_LEN` bytes and the slot count already covers the budget.
+/// Every job's [`admission_charge`] is at least this, so the byte budget
+/// admits at most [`flush_queue_slots`] jobs and a send on the channel an
+/// admission passed never finds it full. Saturates to `u32::MAX`. Pure; unit
+/// tested directly.
+pub(crate) fn slot_charge_floor(flush_queue_bytes: u64) -> u32 {
+    if flush_queue_bytes <= (FLUSH_QUEUE_SLOTS_MAX * HEADER_LEN) as u64 {
+        return 0;
+    }
+    u32::try_from(flush_queue_bytes.div_ceil(FLUSH_QUEUE_SLOTS_MAX as u64)).unwrap_or(u32::MAX)
+}
+
+/// The admission bytes one queued job of `record_len` bytes costs: its
+/// record length, or `floor` ([`slot_charge_floor`]) when that is larger.
+/// The flusher returns the same amount when the job leaves the channel.
+/// Pure; unit tested directly.
+pub(crate) fn admission_charge(record_len: u32, floor: u32) -> u32 {
+    record_len.max(floor)
 }
 
 /// Whether `record_len` more bytes fit in a region of `region_bytes` bytes

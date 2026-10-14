@@ -546,3 +546,95 @@ async fn reserve_tracks_waiters_wait_seconds_and_wait_timeouts() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_default_budget_never_admits_more_jobs_than_the_channel_has_slots() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let dir = temp_dir("default-budget-slots");
+    let budget = 64 << 20;
+    let cfg = SpillConfig::new(&dir, 64 << 20)
+        .region_bytes(1 << 20)
+        .flush_queue_bytes(budget);
+    let slots = flush_queue_slots(budget);
+    assert_eq!(slots, FLUSH_QUEUE_SLOTS_MAX);
+    assert_eq!(slot_charge_floor(budget), 256);
+    let tier = SpillTier::open(&cfg, "cache-a").unwrap();
+    // Parked before the flusher exists, so it never takes a job off the
+    // channel.
+    tier.pause_flusher();
+    let sink = Arc::new(RecordingSink::default());
+    tier.attach(Arc::downgrade(&(Arc::clone(&sink) as Arc<dyn SpillSink>)));
+
+    let mut admitted = 0usize;
+    while admitted <= slots && tier.try_spill(job(&format!("k-{admitted}"), b"v", hlc(1, 0))) {
+        admitted += 1;
+    }
+
+    assert_eq!(
+        admitted, slots,
+        "the budget admits exactly as many small jobs as the channel holds, and every \
+         admitted job found a slot"
+    );
+    assert_eq!(tier.queued_bytes(), budget, "the budget is spent");
+    assert_eq!(
+        tier.would_accept(None, 3, 1),
+        Admission::RefusedFinal,
+        "the next small job is refused at admission, not at the channel"
+    );
+    assert_eq!(
+        dropped_since_last_snapshot(&snapshotter, "cache-a"),
+        std::collections::BTreeMap::from([("queue_full".to_string(), 2)]),
+        "the ending try_spill and the check above each count one queue_full refusal"
+    );
+
+    tier.resume_flusher();
+    drop(tier);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_job_is_credited_back_at_the_amount_it_was_charged() {
+    // 13 MiB is past the point where the floor applies: 52 bytes a job,
+    // over the 50-byte record these jobs write.
+    let dir = temp_dir("charge-credit");
+    let budget = 13 << 20;
+    let cfg = SpillConfig::new(&dir, 16 << 20)
+        .region_bytes(1 << 20)
+        .flush_queue_bytes(budget);
+    let floor = u64::from(slot_charge_floor(budget));
+    assert_eq!(floor, 52);
+    let tier = SpillTier::open(&cfg, "cache-a").unwrap();
+    assert_eq!(
+        tier.admit_charge(1, 1),
+        52,
+        "a small record costs the floor"
+    );
+    assert_eq!(
+        tier.admit_charge(100, 100),
+        u32::try_from(HEADER_LEN).unwrap() + 200,
+        "a large record costs its length"
+    );
+    tier.pause_flusher();
+    let sink = Arc::new(RecordingSink::default());
+    tier.attach(Arc::downgrade(&(Arc::clone(&sink) as Arc<dyn SpillSink>)));
+
+    for n in 0..100 {
+        assert!(tier.try_spill(job(&format!("{n:02}"), b"v", hlc(1, 0))));
+    }
+    assert_eq!(
+        tier.queued_bytes(),
+        100 * floor,
+        "each job is charged the floor"
+    );
+
+    tier.resume_flusher();
+    assert!(poll_until(POLL_TIMEOUT, || sink.install_count() == 100));
+    assert!(
+        poll_until(POLL_TIMEOUT, || tier.queued_bytes() == 0),
+        "the flusher credits back exactly what admission charged"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}

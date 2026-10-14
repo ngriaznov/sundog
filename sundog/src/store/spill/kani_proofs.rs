@@ -3,7 +3,8 @@
 use super::open::snapshot_loc_end;
 use super::record::split_record;
 use super::rules::{
-    FLUSH_QUEUE_CAPACITY, FLUSH_QUEUE_SLOTS_MAX, flush_queue_slots, record_fits, region_count_for,
+    FLUSH_QUEUE_CAPACITY, FLUSH_QUEUE_SLOTS_MAX, admission_charge, flush_queue_slots, record_fits,
+    region_count_for, slot_charge_floor,
 };
 use super::*;
 
@@ -22,6 +23,22 @@ fn flush_queue_slots_stay_within_the_clamp() {
     let slots = flush_queue_slots(flush_queue_bytes);
     assert!(slots >= FLUSH_QUEUE_CAPACITY);
     assert!(slots <= FLUSH_QUEUE_SLOTS_MAX);
+}
+
+/// The byte budget admits no more jobs than the channel has slots: every
+/// record is at least a header long, so a job costs at least a header and at
+/// least the budget's share of a slot, and the budget divided by that cost
+/// is within the slot count. Holds short of the floor saturating to
+/// `u32::MAX`.
+#[kani::proof]
+fn the_admission_charge_bounds_admitted_jobs_by_the_slot_count() {
+    let flush_queue_bytes: u64 = kani::any();
+    let record_len: u32 = kani::any();
+    kani::assume(record_len as usize >= HEADER_LEN);
+    kani::assume(flush_queue_bytes <= u64::from(u32::MAX) * FLUSH_QUEUE_SLOTS_MAX as u64);
+    let charge = admission_charge(record_len, slot_charge_floor(flush_queue_bytes));
+    assert!(charge > 0);
+    assert!(flush_queue_bytes / u64::from(charge) <= flush_queue_slots(flush_queue_bytes) as u64);
 }
 
 /// A record fits exactly when its end, taken without wrapping, is

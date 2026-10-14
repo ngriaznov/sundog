@@ -68,7 +68,10 @@ use record::{decode_record, pread_exact};
 pub(crate) use rules::flush_queue_slots;
 #[cfg(test)]
 pub(crate) use rules::region_count_for;
-pub(crate) use rules::{keeps_refused_victim_resident, spill_record_len, spilled_is_current};
+#[cfg(test)]
+pub(crate) use rules::spill_record_len;
+use rules::{admission_charge, slot_charge_floor};
+pub(crate) use rules::{keeps_refused_victim_resident, spilled_is_current};
 #[cfg(test)]
 pub(crate) use snapshot::write_stale_snapshot_for_test;
 #[cfg(all(test, not(feature = "sim")))]
@@ -303,17 +306,19 @@ struct Inner {
     warm_reopen: bool,
     /// `SpillConfig::flush_queue_bytes_value()`, validated: the byte
     /// budget `admit`'s permits encode, read back by [`SpillTier::attach`]
-    /// and [`SpillTier::queued_bytes`].
+    /// and [`SpillTier::queued_bytes`]. A job costs the larger of its record
+    /// length and its [`slot_charge_floor`] of it.
     flush_queue_bytes: u64,
     /// `SpillConfig::spill_wait_timeout_value()`, validated: consulted by
     /// [`SpillTier::reserve`] callers deciding how long to wait before
     /// non-blocking admission.
     spill_wait_timeout: Duration,
     /// One permit per byte of `flush_queue_bytes_value()`, acquired and
-    /// `.forget()`-ed on admission, returned via `add_permits` from
-    /// [`flusher_loop`] once a job leaves the channel. Bounds the
-    /// flusher's RAM backlog independently of [`FLUSH_QUEUE_CAPACITY`]'s
-    /// slot count.
+    /// `.forget()`-ed on admission as the job's [`Inner::admit_charge`],
+    /// returned via `add_permits` from [`flusher_loop`] at the same amount
+    /// once a job leaves the channel. Bounds the flusher's RAM backlog, and
+    /// admits no more jobs than the channel has slots, since a job costs at
+    /// least its budget share of one slot.
     admit: Semaphore,
     /// Set by [`SpillTier::set_keep_resident_when_refused`], `false` until
     /// then. `true` means a refused hand-off ([`SpillTier::would_accept_under`]
@@ -339,6 +344,15 @@ struct Inner {
 }
 
 impl Inner {
+    /// The admission bytes a queued job of `record_len` bytes costs, charged
+    /// at admission and credited by [`flusher_loop`] once the job leaves
+    /// the channel: [`admission_charge`] over this tier's
+    /// [`slot_charge_floor`]. Computed on demand from the budget, so every
+    /// charge and credit goes through one function.
+    fn admit_charge(&self, record_len: u32) -> u32 {
+        admission_charge(record_len, slot_charge_floor(self.flush_queue_bytes))
+    }
+
     /// Increments `sundog_spill_dropped_total{cache,reason}`. `reason` is
     /// one of: `"too_large"`, the record can never fit any region, checked
     /// by [`record_too_large`] before it is ever queued; `"closed"`, a

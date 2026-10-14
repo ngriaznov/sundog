@@ -241,7 +241,10 @@ stamp had its system clock stepped back; its writes keep their order.
 `sundog_spill_dropped_total` grows: the flusher falls behind eviction, or
 the disk fails writes. The `reason` label says which. Check disk latency,
 raise `SpillConfig::flush_queue_bytes`, or raise `max_capacity` to spill
-less.
+less. A queued value counts for the larger of its size and its share of the
+flush channel's slots, 256 bytes at the default budget, so many small values
+fill `flush_queue_bytes` faster than their size suggests; a budget over
+12 MiB raises that share.
 
 `reason="deferred"` counts refusals that deleted nothing: the entry stays
 resident for a later eviction to retry. A `Replicated` or `Distributed`

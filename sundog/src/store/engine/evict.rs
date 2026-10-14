@@ -10,9 +10,7 @@ use serde::de::DeserializeOwned;
 #[cfg(all(doc, feature = "spill"))]
 use crate::store::spill::SpillTier;
 #[cfg(feature = "spill")]
-use crate::store::spill::{
-    Admission, SpillJob, SpillSink, keeps_refused_victim_resident, spill_record_len,
-};
+use crate::store::spill::{Admission, SpillJob, SpillSink, keeps_refused_victim_resident};
 use crate::store::{BUCKET_COUNT, entry_fingerprint};
 
 #[cfg(feature = "spill")]
@@ -60,6 +58,17 @@ pub(super) fn defer_to_flusher(
     limit: u64,
 ) -> bool {
     pending_spill_weight > 0 && (refused || total_weight <= limit)
+}
+
+/// The eviction progress a spill hand-off earns: the victim's `weight` once
+/// the flusher's channel took the job, `0` once the hand-off was abandoned
+/// and the weight restored. An abandoned hand-off freed nothing, so
+/// [`Engine::evict_down_to`] must not count it as progress, or a tier that
+/// cannot take a job it admitted keeps the pass spinning. Pure; unit tested
+/// directly.
+#[cfg(feature = "spill")]
+pub(super) fn handoff_progress(weight: u32, taken: bool) -> u64 {
+    if taken { u64::from(weight) } else { 0 }
 }
 
 /// [`Engine::evict_down_to`]'s stop rule after a batch reports a nonzero
@@ -272,13 +281,13 @@ where
             }
             Admission::RefusedPending => {
                 return SpillAttempt::Pending {
-                    deficit: spill_record_len(victim_bytes.len(), encoded.len()),
+                    deficit: tier.admit_charge(victim_bytes.len(), encoded.len()),
                 };
             }
             Admission::Accepted => {}
         }
         let weight = live.weight;
-        let admitted_bytes = spill_record_len(victim_bytes.len(), encoded.len());
+        let admitted_bytes = tier.admit_charge(victim_bytes.len(), encoded.len());
         let job = SpillJob {
             stripe_idx: bucket,
             hash,
@@ -307,10 +316,15 @@ where
     /// discovered later downstream. `on_refusal` is the pass's policy, which
     /// picks the reason [`SpillTier::enqueue`] records that failure under. No
     /// tier configured is unreachable here, but still handled rather than
-    /// assumed.
+    /// assumed. Returns whether the channel took the job: a job
+    /// [`SpillTier::would_accept_under`] admitted finds a slot unless the
+    /// tier closed or its flusher is gone, and the caller then reports no
+    /// progress for the victim, through [`handoff_progress`].
     #[cfg(feature = "spill")]
-    fn finish_spill_handoff(&self, on_refusal: OnRefusal, job: SpillJob) {
-        let Some(tier) = self.spill() else { return };
+    fn finish_spill_handoff(&self, on_refusal: OnRefusal, job: SpillJob) -> bool {
+        let Some(tier) = self.spill() else {
+            return false;
+        };
         let stripe_idx = job.stripe_idx;
         let hash = job.hash;
         let ver = job.ver;
@@ -322,7 +336,9 @@ where
             tier.release(admitted_bytes);
             let job = *job;
             self.abandon(stripe_idx, &job.key_bytes, hash, ver, weight);
+            return false;
         }
+        true
     }
 
     /// Removes or spills `victim_bytes`, found at `hash` in `bucket` with
@@ -485,11 +501,11 @@ where
                     .fetch_sub(u64::from(weight), Ordering::Relaxed);
                 self.pending_spill_weight
                     .fetch_add(u64::from(weight), Ordering::Relaxed);
-                self.finish_spill_handoff(on_refusal, job);
+                let taken = self.finish_spill_handoff(on_refusal, job);
                 EvictOutcome {
-                    removed_weight: u64::from(weight),
+                    removed_weight: handoff_progress(weight, taken),
                     deficit: 0,
-                    refused: false,
+                    refused: !taken,
                 }
             }
             #[cfg(feature = "spill")]
@@ -659,7 +675,7 @@ where
         )]
         let mut refused = false;
         #[cfg(feature = "spill")]
-        let mut pending_spills: Vec<SpillJob> = Vec::new();
+        let mut pending_spills: Vec<(u32, SpillJob)> = Vec::new();
         #[cfg(feature = "spill")]
         let mut pending_weight_added = 0u64;
         for (key_bytes, _, _) in sampled.into_iter().take(victims) {
@@ -678,7 +694,7 @@ where
                 VictimOutcome::PendingSpill(weight, job) => {
                     removed_weight += u64::from(weight);
                     pending_weight_added += u64::from(weight);
-                    pending_spills.push(job);
+                    pending_spills.push((weight, job));
                 }
                 #[cfg(feature = "spill")]
                 VictimOutcome::Deferred => refused = true,
@@ -701,10 +717,19 @@ where
         // flusher's channel does not, so this is the one point per batch
         // where that per-victim cost, rather than per-eviction-pass, comes
         // off the lock.
+        // The weight an abandoned hand-off restores is still folded out of
+        // `total_weight` below, which `abandon` has just added back; only the
+        // progress this pass reports leaves it out.
         #[cfg(feature = "spill")]
-        for job in pending_spills {
-            self.finish_spill_handoff(on_refusal, job);
+        let mut progress_weight = removed_weight;
+        #[cfg(feature = "spill")]
+        for (weight, job) in pending_spills {
+            let taken = self.finish_spill_handoff(on_refusal, job);
+            progress_weight -= u64::from(weight) - handoff_progress(weight, taken);
+            refused |= !taken;
         }
+        #[cfg(not(feature = "spill"))]
+        let progress_weight = removed_weight;
         if removed_weight > 0 {
             self.total_weight
                 .fetch_sub(removed_weight, Ordering::Relaxed);
@@ -713,7 +738,7 @@ where
             self.live_count.fetch_sub(removed_count, Ordering::Relaxed);
         }
         EvictOutcome {
-            removed_weight,
+            removed_weight: progress_weight,
             deficit,
             refused,
         }

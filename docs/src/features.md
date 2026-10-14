@@ -58,6 +58,14 @@ would only have anti-entropy pull it back. A read's eviction keeps its
 victim in every mode, so a read of a spilled key behind a full queue finds
 no room, answers from disk and leaves its own entry spilled.
 
+A queued value is charged at least its share of the flush channel's 262,144
+slots, the budget divided by 262,144, which is 256 bytes at the default 64
+MiB. Many tiny values therefore fill the byte bound before the channel, and
+the refusal follows the policy above, never a stalled writer. A budget of
+12 MiB or less charges every value its length. A hand-off the channel cannot
+take because the tier closed or its flusher stopped counts as no eviction
+progress: the victim stays resident and the pass ends.
+
 ### Warm reopen
 
 With `SpillConfig::warm_reopen(true)`, a clean `close` or `shutdown` writes

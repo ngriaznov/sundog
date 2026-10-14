@@ -970,3 +970,19 @@ fn batch_eviction_keeps_an_entry_touched_after_the_evictors_now() {
     assert_eq!(engine.get(&key_cold, now + 11), None);
     assert_eq!(engine.get(&key_hot, now + 11), Some("hot".to_string()));
 }
+
+#[cfg(feature = "spill")]
+#[test]
+fn handoff_progress_credits_the_weight_only_once_the_channel_took_the_job() {
+    use super::super::evict::handoff_progress;
+
+    assert_eq!(handoff_progress(7, true), 7);
+    assert_eq!(
+        handoff_progress(7, false),
+        0,
+        "an abandoned hand-off frees nothing"
+    );
+    assert_eq!(handoff_progress(0, true), 0);
+    assert_eq!(handoff_progress(u32::MAX, true), u64::from(u32::MAX));
+    assert_eq!(handoff_progress(u32::MAX, false), 0);
+}

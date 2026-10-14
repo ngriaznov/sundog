@@ -1205,3 +1205,57 @@ fn insert_sync_completes_synchronously_while_another_task_holds_the_whole_reserv
     holder.join().expect("the holder thread does not panic");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// With a flush queue large enough that a small record is charged its share
+/// of a channel slot, a batch reserves what each of its hand-offs will cost,
+/// not the record lengths.
+#[tokio::test]
+async fn a_batch_reservation_covers_the_floor_charge_of_small_values() {
+    let dir = temp_dir("batch-reservation-floor");
+    let budget = 64 << 20;
+    let cfg = SpillConfig::new(&dir, 64 << 20)
+        .region_bytes(1 << 20)
+        .flush_queue_bytes(budget);
+    let shard = Shard::<u32, String>::new(
+        SmolStr::new("batch-reservation-floor"),
+        Mode::Local,
+        NodeId::from(1u64),
+        u64::MAX,
+        None,
+        None,
+    )
+    .with_spill(&cfg)
+    .expect("tier opens");
+    let tier = Arc::clone(shard.engine.spill().expect("with_spill attaches a tier"));
+    let floor = u64::from(tier.admit_charge(1, 1));
+    assert_eq!(floor, 256, "a small record costs its slot share");
+    assert_eq!(tier.queued_bytes(), 0);
+
+    let entries: Vec<(Bytes, Incoming<String>)> = (0..3u32)
+        .map(|key| {
+            let value = "v".to_string();
+            (
+                key_bytes(&key),
+                Incoming::Put {
+                    encoded: Bytes::from(postcard::to_stdvec(&value).expect("encodes")),
+                    value,
+                    expires_at_ms: None,
+                },
+            )
+        })
+        .collect();
+    let (reservation, deadline) = shard
+        .reserve_for_batch(entries.iter().map(|(key, incoming)| (key, incoming)))
+        .await;
+
+    assert!(reservation.is_some() && deadline.is_some());
+    assert_eq!(
+        tier.queued_bytes(),
+        3 * floor,
+        "the reservation holds the charge of each hand-off"
+    );
+    drop(reservation);
+    assert_eq!(tier.queued_bytes(), 0, "unspent budget returns on drop");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

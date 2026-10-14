@@ -106,7 +106,11 @@ impl SpillConfig {
     /// keeps a lagging disk a plain-eviction problem rather than an
     /// unbounded-RSS one. A `Replicated` or `Distributed` cache, and a read's
     /// eviction in any mode, leaves the refused victim resident instead
-    /// (`reason="deferred"`). Own-and-return.
+    /// (`reason="deferred"`). A queued value counts for the larger of its
+    /// record length and its share of the flush channel's 262,144 slots, the
+    /// budget divided by 262,144 (256 bytes at the default 64 MiB), so many
+    /// tiny values fill the budget before the channel, and a budget over
+    /// 12 MiB admits no more than 262,144 queued values. Own-and-return.
     #[must_use]
     pub fn flush_queue_bytes(mut self, bytes: u64) -> Self {
         self.flush_queue_bytes = Some(bytes);

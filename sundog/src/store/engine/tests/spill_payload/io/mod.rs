@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use super::*;
 
+mod flush_slots;
 mod held_only;
 mod refusal;
 mod reservation;
@@ -298,11 +299,12 @@ fn evict_one_sampled_abandons_the_victim_when_the_flush_queue_channel_is_full() 
 
     let outcome = engine.evict_one_sampled(bucket, 0);
     assert_eq!(
-        outcome.removed_weight, 30,
-        "the hand-off still commits and frees the weight from total_weight \
-         right away, exactly as a physical removal would; abandon only puts it \
-         back once the enqueue that follows is found to have failed"
+        outcome.removed_weight, 0,
+        "the hand-off frees the weight from total_weight right away, but abandon \
+         puts it back once the enqueue that follows fails, so the pass reports no \
+         progress"
     );
+    assert!(outcome.refused, "the abandoned hand-off reads as a refusal");
 
     assert_eq!(
         engine.get(&key, 0),

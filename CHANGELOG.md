@@ -19,6 +19,17 @@ All notable changes to this project are documented in this file. Format follows
   longer ranks the new write below the old entry, which returned `Ok`,
   changed nothing and left a deleted key readable. A replayed stamp that
   leads the system clock by more than `max_clock_skew` logs a warning.
+- **A full spill flush queue no longer stalls the writer.** With the default
+  `flush_queue_bytes`, small values could pass the byte budget and then find
+  the flusher's channel full, and the eviction pass counted the abandoned
+  hand-off as progress and ran again without end. A queued value is now
+  charged at least its share of the channel's slots, so the byte budget
+  refuses first and the refusal follows the documented policy: `Local` and
+  `Invalidation` delete the victim (`queue_full`), `Replicated`,
+  `Distributed` and read promotions leave it resident (`deferred`). A
+  hand-off the channel cannot take for another reason, a closed tier or a
+  stopped flusher, counts as no eviction progress and ends the pass with the
+  victim resident.
 
 ## [0.6.7] – 2026-10-13
 

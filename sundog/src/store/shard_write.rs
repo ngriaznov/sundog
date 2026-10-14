@@ -20,8 +20,6 @@ use crate::hlc::Hlc;
 use crate::net::REPLICATE_BATCH_COUNT;
 use crate::wire::{self, WireRecord};
 
-#[cfg(feature = "spill")]
-use super::spill;
 #[cfg(doc)]
 use super::{ConflictResolver, Mode, ShardOps};
 #[cfg(doc)]
@@ -492,7 +490,7 @@ where
 
     /// Reserves flush-queue admission for one whole
     /// [`Shard::apply_grouped`]/[`ShardOps::apply_remote_batch`] call, before
-    /// any stripe lock: sums `spill::spill_record_len` over every
+    /// any stripe lock: sums `SpillTier::admit_charge` over every
     /// `Incoming::Put`, then makes one `SpillTier::reserve` call bounded by
     /// the tier's `spill_wait_timeout`. Also returns that wait's deadline so
     /// [`Shard::retry_reservation_deficit`] shares the same budget instead of
@@ -522,7 +520,7 @@ where
             let reserved: u64 = entries
                 .map(|(key_bytes, incoming)| match incoming {
                     Incoming::Put { encoded, .. } => {
-                        u64::from(spill::spill_record_len(key_bytes.len(), encoded.len()))
+                        u64::from(tier.admit_charge(key_bytes.len(), encoded.len()))
                     }
                     Incoming::Tombstone => 0,
                 })

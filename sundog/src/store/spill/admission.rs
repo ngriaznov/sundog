@@ -104,7 +104,10 @@ impl SpillTier {
 
     /// Whether a record built from `key_len` and `value_len` bytes could be
     /// admitted right now: not closed, small enough for a region, and
-    /// within `flush_queue_bytes`. `reservation`, when given, is spent
+    /// within `flush_queue_bytes`, counted at [`SpillTier::admit_charge`].
+    /// The charge keeps the byte budget from admitting more jobs than the
+    /// channel has slots, so a send after an admission finds room unless
+    /// the tier closed or the flusher is gone. `reservation`, when given, is spent
     /// first via [`Reservation::spend`]; otherwise this falls back to
     /// `admit.try_acquire_many`. Never awaits, so, unlike
     /// [`SpillTier::enqueue`], this is cheap enough to call under a stripe
@@ -134,14 +137,14 @@ impl SpillTier {
             self.inner.record_dropped(refusal_reason("too_large"));
             return Admission::RefusedFinal;
         }
-        let record_len = spill_record_len(key_len, value_len);
+        let charge = self.admit_charge(key_len, value_len);
         let reservation_in_play = reservation.is_some();
         if let Some(reservation) = reservation
-            && reservation.spend(record_len)
+            && reservation.spend(charge)
         {
             return Admission::Accepted;
         }
-        if let Ok(permit) = self.inner.admit.try_acquire_many(record_len) {
+        if let Ok(permit) = self.inner.admit.try_acquire_many(charge) {
             permit.forget();
             Admission::Accepted
         } else if reservation_in_play {
@@ -150,6 +153,16 @@ impl SpillTier {
             self.inner.record_dropped(refusal_reason("queue_full"));
             Admission::RefusedFinal
         }
+    }
+
+    /// The admission bytes one hand-off of a `key_len`-byte key and a
+    /// `value_len`-byte value costs: its record length, or its share of a
+    /// channel slot when that is larger. [`SpillTier::would_accept_under`]
+    /// spends it, and every caller sizing a [`Reservation`], a deficit or a
+    /// job's `admitted_bytes` uses it too.
+    pub(crate) fn admit_charge(&self, key_len: usize, value_len: usize) -> u32 {
+        self.inner
+            .admit_charge(spill_record_len(key_len, value_len))
     }
 
     /// This tier's configured [`SpillConfig::spill_wait_timeout`], exposed
@@ -219,10 +232,10 @@ impl SpillTier {
         self.inner.admit.add_permits(bytes as usize);
     }
 
-    /// Enqueues `job` onto the flusher's channel. Callers that already
-    /// separately checked [`SpillTier::would_accept_under`] get `job` back
-    /// in `Err` on failure, since a full or missing channel is the only way
-    /// this can fail; a caller with no further use for the job on failure
+    /// Enqueues `job` onto the flusher's channel. A job
+    /// [`SpillTier::would_accept_under`] admitted always finds a slot, so a
+    /// caller that checked it gets `job` back in `Err` only when no flusher
+    /// is attached or it has gone; a caller with no further use for the job on failure
     /// can discard it, exactly like `try_spill`'s plain `bool`. `reason =
     /// "queue_full"` covers both a full queue and one with none
     /// attached, or `reason = "deferred"` in either case when the caller
@@ -259,9 +272,9 @@ impl SpillTier {
         }
     }
 
-    /// Bytes currently sitting in the flusher's channel, queued but not yet
-    /// taken off it: recomputed from `admit`'s available permits.
-    /// Test-facing.
+    /// Admission bytes currently sitting in the flusher's channel, queued but
+    /// not yet taken off it, each job counted at its [`SpillTier::admit_charge`]:
+    /// recomputed from `admit`'s available permits. Test-facing.
     #[cfg(all(test, not(feature = "sim")))]
     pub(crate) fn queued_bytes(&self) -> u64 {
         let available = u64::try_from(self.inner.admit.available_permits()).unwrap_or(u64::MAX);
