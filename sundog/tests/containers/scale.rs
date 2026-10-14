@@ -12,10 +12,10 @@ use std::time::Duration;
 /// (`ClusterConfig::crdt_sweep_period`) is `(crdt_retire_after / 4).max(30s)`,
 /// so with the test node's 5s bound a writer retires on one 30s-floor tick,
 /// folds on a later one, and its receipt prunes once it is older than the
-/// receipt lifetime of two bounds plus two sweep periods (70s), on the
-/// tick after that: about 120s end to end, with headroom for container
-/// boot and gossip jitter on top.
-const CRDT_COMPACT_WAIT: Duration = Duration::from_secs(240);
+/// receipt lifetime of two bounds plus two sweep periods (70s) counted from
+/// the fold, on the tick after that: about 150s end to end, with headroom
+/// for container boot and gossip jitter on top.
+const CRDT_COMPACT_WAIT: Duration = Duration::from_secs(300);
 
 /// The 100k scenario, an order of magnitude up: a cold node joins a
 /// three-node cluster holding a million entries and must warm to a full
@@ -204,7 +204,7 @@ async fn churn_at_scale_bounds_crdt_record_size_across_writer_replacement() {
     const OS_KEY: &str = "churn-set";
     /// A fully compacted counter encodes to the same size as one that
     /// never saw the churned writers, so this only leaves room for one
-    /// fold receipt still waiting out its three-bound prune on a replica.
+    /// fold receipt still waiting out its lifetime past the fold on a replica.
     const FOLD_SLACK_BYTES: u64 = 32;
 
     require_containers!();
@@ -276,7 +276,7 @@ async fn churn_at_scale_bounds_crdt_record_size_across_writer_replacement() {
     // one retires every churned writer (cadence `(crdt_retire_after /
     // 4).max(30s)`, see `cluster.rs::crdt_compact_task`); stage two folds
     // them once the cache has been quiet for `2 * crdt_retire_after` and
-    // prunes its fold receipts three bounds later, each on the next tick.
+    // prunes its fold receipts three bounds past each fold, each on the next tick.
     let bound = per_entry_before + FOLD_SLACK_BYTES;
     let started = std::time::Instant::now();
     let mut retired_done = false;

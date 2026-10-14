@@ -200,8 +200,9 @@ pub trait ConflictResolver: Send + Sync + 'static {
     /// to `None`. Called on every merge apply, right after
     /// [`ConflictResolver::merge`], with the `receipt_ttl_ms` of the same
     /// [`CompactionBounds`] as [`ConflictResolver::compact`]: for the
-    /// resolvers this crate ships it prunes fold receipts older than that,
-    /// so a receipt one replica's sweep already dropped cannot ride back in
+    /// resolvers this crate ships it prunes fold receipts more than that
+    /// past their fold, and receipts stamped that far ahead of `now_ms`, so a
+    /// receipt one replica's sweep already dropped cannot ride back in
     /// from a peer whose sweep has not reached it yet. Without this step
     /// two replicas re-import each other's receipts through anti-entropy
     /// indefinitely, since a merge only ever unions them.

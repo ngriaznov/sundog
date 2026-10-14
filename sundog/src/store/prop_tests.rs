@@ -1272,12 +1272,10 @@ proptest! {
             // and the next fold attempt small relative to `BOUND_MS`, the
             // same "sweep runs at least four times per bound" precondition
             // [`CompactionBounds::three_bounds`]'s doc names as what makes
-            // its receipt lifetime exact. A sweep run only as often as the
-            // random `Compact` steps land could let a fold's own receipt
-            // age out (relative to the writer's original retirement
-            // instant, not the fold instant) before this same step's gossip
-            // ever carries it anywhere -- a real divergence, not a flaw in
-            // the model.
+            // its receipt lifetime exact. Every replica then folds a retired
+            // writer in the same step, so the receipts the replicas carry
+            // name one fold instant and no replica is left unfolded while
+            // another's receipt ages out.
             for replica in &mut replicas {
                 if let Some(compacted) = replica.compact(now_ms, &retire_fn, Quiescence::Settled, bounds) {
                     *replica = compacted;

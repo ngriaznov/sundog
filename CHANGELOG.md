@@ -27,6 +27,19 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **A fold receipt lives from the fold, not from the retirement.** `PnCounter`
+  and `OrSet` stamp the receipt that stage two leaves with the fold instant,
+  never lowering a stamp the writer already has. A fold that membership churn
+  delays past three bounds used to write a receipt the next merge apply
+  dropped as expired, so a replica that had retired the writer but not yet
+  folded it counted its contribution twice (`PnCounter`) or brought removed
+  elements back (`OrSet`). The receipt now lives its full lifetime after the
+  fold, about two bounds plus a sweep period longer than before, and a receipt
+  stamped more than that lifetime ahead of the clock expires, so one fast clock
+  cannot keep a receipt alive on every replica. Replicas that fold the same
+  writer at different sweeps carry different stamps and merge them by maximum
+  in one anti-entropy exchange. The stored layout and the wire are unchanged.
+
 - **Merged values stay bounded under rolling replacement.** The CRDT sweep
   retires a `PnCounter` or `OrSet` writer slot of a node this node never saw as
   a member: such a node counts as gone from the later of this node's start and

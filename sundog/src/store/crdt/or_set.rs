@@ -14,8 +14,10 @@
 //! receipt so [`OrSet::merge`] can tell an already-folded writer from mere
 //! silence about one. A tag from a retired or folded writer is rejected
 //! outright; retirement is sticky here, unlike [`super::PnCounter`].
-//! `OrSet::prune_receipts` drops a receipt past `receipt_ttl_ms`, under the
-//! same trust boundary `tombstone_max_ttl` accepts for a long-gone member.
+//! `OrSet::prune_receipts` drops a receipt `receipt_ttl_ms` after the fold,
+//! however long after the retirement the fold happens, and one stamped that
+//! far ahead of the clock, under the same trust boundary `tombstone_max_ttl`
+//! accepts for a long-gone member.
 //!
 //! A tag `(w, s)` absent from a side's own `adds` is dead to that side if
 //! `w` is retired or folded there, or `s` does not exceed that side's
@@ -34,7 +36,7 @@ use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use super::WriterId;
+use super::{WriterId, receipt_expired};
 use crate::store::{
     CompactionBounds, ConflictResolver, Merged, Quiescence, RecordView, Winner, later_deadline,
 };
@@ -68,12 +70,12 @@ where
     /// drops an entry (leaving a `folded_at` receipt behind) once it has
     /// aged past twice `crdt_retire_after` and the cache is quiet.
     retired: BTreeMap<WriterId, u64>,
-    /// A per-writer receipt: `w`'s own `since_ms` the moment this replica
-    /// drops `w`'s `seen`/`retired` entries in stage two. [`Self::merge`]
-    /// trusts a side's silence about `w` as "already folded" only once its
-    /// own `folded_at` names `w` with a `since_ms` at least as late as the
-    /// merged `retired` entry's. Dropped once old enough that every
-    /// reachable replica has independently folded the same writer too; see
+    /// A per-writer receipt: the wall-clock instant this replica drops `w`'s
+    /// `seen`/`retired` entries in stage two, merged by maximum.
+    /// [`Self::merge`] trusts a side's silence about `w` as "already folded"
+    /// only once its own `folded_at` names `w`. Dropped `receipt_ttl_ms`
+    /// after the fold, so a fold that membership churn delays long past the
+    /// retirement still leaves a receipt for its whole lifetime; see
     /// [`Self::compact`].
     folded_at: BTreeMap<WriterId, u64>,
 }
@@ -151,12 +153,11 @@ where
     /// Folds `other` into a new set. `seen` merges by pointwise maximum;
     /// `retired` takes, for each writer either side retired, the
     /// *earliest* `since_ms` recorded; `folded_at` is the union, taking the
-    /// *later* `since_ms` for a writer both sides have a receipt for. A
+    /// *later* stamp for a writer both sides have a receipt for. A
     /// writer named by the merged `retired` map is dropped from
     /// `seen`/`retired` entirely, rather than resurrected, once the
-    /// *other* side's own `folded_at` names it with a `since_ms` at least
-    /// as late; see the module doc for why a receipt, not mere silence, is
-    /// what licenses that.
+    /// *other* side's own `folded_at` names it; see the module doc for why
+    /// a receipt, not mere silence, is what licenses that.
     ///
     /// A tag survives if either side's own `adds` still holds it, or it is
     /// live by the module doc's deadness rule evaluated against the
@@ -252,10 +253,12 @@ where
         }
     }
 
-    /// Drops every `folded_at` receipt older than `receipt_ttl_ms`
-    /// ([`CompactionBounds::receipt_ttl_ms`]), the point past which no
-    /// replica's stale copy of the writer is reconciled any more; `None` if
-    /// no receipt is that old. Called by
+    /// Drops every `folded_at` receipt more than `receipt_ttl_ms`
+    /// ([`CompactionBounds::receipt_ttl_ms`]) after its fold, the point past
+    /// which no replica's stale copy of the writer is reconciled any more,
+    /// and every receipt stamped more than that far ahead of `now_ms`, which
+    /// only a badly wrong clock writes; `None` if no receipt is that old.
+    /// Called by
     /// [`Self::compact`] on the sweep, and by the resolver on every merge
     /// apply through [`ConflictResolver::settle`], so a receipt one replica
     /// has already pruned cannot ride back in from a peer that has not.
@@ -264,13 +267,13 @@ where
         if !self
             .folded_at
             .values()
-            .any(|&since_ms| now_ms.saturating_sub(since_ms) > receipt_ttl_ms)
+            .any(|&stamp_ms| receipt_expired(now_ms, stamp_ms, receipt_ttl_ms))
         {
             return None;
         }
         let mut out = self.clone();
         out.folded_at
-            .retain(|_, &mut since_ms| now_ms.saturating_sub(since_ms) <= receipt_ttl_ms);
+            .retain(|_, &mut stamp_ms| !receipt_expired(now_ms, stamp_ms, receipt_ttl_ms));
         Some(out)
     }
 
@@ -281,12 +284,13 @@ where
     /// Stage one stamps a `retired` entry at `now_ms` for a writer
     /// `retire` accepts, leaving `seen` untouched. Stage two, only when
     /// `quiet`, drops `seen`/`retired` for a writer retired more than
-    /// `2 * retire_after_ms` ago and leaves a `folded_at` receipt; a
-    /// pre-existing receipt older than `3 * retire_after_ms` is pruned
-    /// first, against `self`'s state before that drop, so a writer
-    /// advances at most one stage per call, keeping [`Self::merge`]'s
-    /// reconciliation always finding a fresh receipt. Never touches
-    /// `adds`.
+    /// `2 * retire_after_ms` ago and leaves a `folded_at` receipt stamped
+    /// `now_ms`, the instant of the fold (never lowering a stamp the writer
+    /// already has), so the receipt lives its whole
+    /// `bounds.receipt_ttl_ms` however long after the retirement the fold
+    /// happens. A pre-existing receipt past its lifetime is pruned first,
+    /// against `self`'s state before that drop, so a writer advances at
+    /// most one stage per call. Never touches `adds`.
     #[must_use]
     pub(crate) fn compact(
         &self,
@@ -330,7 +334,10 @@ where
             out.retired.retain(|&writer, &mut since_ms| {
                 if now_ms.saturating_sub(since_ms) > double_bound {
                     seen.remove(&writer);
-                    folded_at.insert(writer, since_ms);
+                    folded_at
+                        .entry(writer)
+                        .and_modify(|stamp| *stamp = (*stamp).max(now_ms))
+                        .or_insert(now_ms);
                     aged_any = true;
                     false
                 } else {
@@ -453,6 +460,9 @@ where
         Some(Bytes::from(bytes))
     }
 }
+
+#[cfg(test)]
+mod receipt_tests;
 
 #[cfg(test)]
 mod tests {
@@ -845,8 +855,8 @@ mod tests {
         assert!(!aged_out.retired.contains_key(&w));
         assert_eq!(
             aged_out.folded_at.get(&w),
-            Some(&1_000),
-            "a receipt for w specifically, naming w's own since_ms"
+            Some(&1_250),
+            "a receipt for w specifically, naming the instant of the fold"
         );
         assert!(
             !aged_out.contains(&"x".to_string()),
@@ -855,11 +865,10 @@ mod tests {
     }
 
     /// A `folded_at` receipt is pruned only once it is old enough *and* the
-    /// cache is quiet, counting only from before the call that created
-    /// it: a single `compact` call that folds a writer never also prunes
-    /// that same brand-new receipt (see [`OrSet::compact`]'s doc for why),
-    /// so this needs a further, separate call once the receipt itself has
-    /// aged past three times the bound.
+    /// cache is quiet, counting from the fold that created it: a single
+    /// `compact` call that folds a writer never also prunes that same
+    /// brand-new receipt, so this needs a further, separate call once the
+    /// receipt itself has aged past three times the bound.
     #[test]
     fn a_folded_at_receipt_is_pruned_once_aged_past_three_times_the_bound_but_not_before() {
         let w = wid(1, 0);
@@ -885,17 +894,17 @@ mod tests {
 
         assert_eq!(
             folded.compact(
-                1_299,
+                1_549,
                 CompactionBounds::three_bounds(100),
                 &|_| false,
                 Quiescence::Settled
             ),
             None,
-            "299ms since the receipt was written < 3x100ms bound: too soon to prune"
+            "299ms since the fold < 3x100ms bound: too soon to prune"
         );
         assert_eq!(
             folded.compact(
-                1_400,
+                1_551,
                 CompactionBounds::three_bounds(100),
                 &|_| false,
                 Quiescence::Churning
@@ -906,7 +915,7 @@ mod tests {
 
         let pruned = folded
             .compact(
-                1_400,
+                1_551,
                 CompactionBounds::three_bounds(100),
                 &|_| false,
                 Quiescence::Settled,
@@ -1680,7 +1689,7 @@ mod tests {
 
         let folded = at_stage_two
             .compact(
-                301,
+                502,
                 CompactionBounds::three_bounds(100),
                 &|_| false,
                 Quiescence::Settled,

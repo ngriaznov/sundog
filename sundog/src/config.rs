@@ -131,7 +131,7 @@ pub struct ClusterConfig {
     /// quarter of [`crdt_retire_after`](Self::crdt_retire_after) floored at
     /// 30 seconds ([`crdt_sweep_period`](Self::crdt_sweep_period)); a test
     /// cluster with a bound of seconds sets this to something shorter,
-    /// which also shortens the fold receipt lifetime
+    /// which also shortens the fold receipt lifetime, counted from the fold
     /// ([`crdt_compaction_bounds`](Self::crdt_compaction_bounds)) the
     /// sweep period feeds.
     pub crdt_sweep_interval: Option<Duration>,
@@ -328,8 +328,8 @@ impl ClusterConfig {
     /// The [`CompactionBounds`] the sweep and the merge apply path share
     /// under this configuration: `crdt_retire_after` with a fold receipt
     /// living the longer of three bounds and two bounds plus two sweep
-    /// periods, so it outlives every reachable replica's own fold of the
-    /// same writer.
+    /// periods past the fold, so it outlives every reachable replica's own
+    /// fold of the same writer.
     #[must_use]
     pub fn crdt_compaction_bounds(&self) -> CompactionBounds {
         CompactionBounds::new(self.crdt_retire_after, self.crdt_sweep_period())

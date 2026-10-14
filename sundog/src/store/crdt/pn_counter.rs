@@ -17,8 +17,9 @@
 //! bounded `folded_p`/`folded_n` accumulator and leaves a `folded_at`
 //! receipt so [`PnCounter::merge`] can tell an already-folded writer from
 //! mere silence about one. `PnCounter::prune_receipts` drops a receipt
-//! past `receipt_ttl_ms`, under the same trust boundary `tombstone_max_ttl`
-//! accepts for a long-gone member.
+//! `receipt_ttl_ms` after the fold, however long after the retirement the
+//! fold happens, and one stamped that far ahead of the clock, under the same
+//! trust boundary `tombstone_max_ttl` accepts for a long-gone member.
 //!
 //! [`PnCounter::encode`]/[`PnCounter::decode`] are thin postcard wrappers
 //! around this type's one wire layout; a future change to it is versioned.
@@ -28,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use super::WriterId;
+use super::{WriterId, receipt_expired};
 use crate::store::{
     CompactionBounds, ConflictResolver, Merged, Quiescence, RecordView, Winner, later_deadline,
 };
@@ -64,13 +65,12 @@ pub struct PnCounter {
     /// accounts for at least as much, deciding that via [`Self::folded_at`].
     folded_p: u64,
     folded_n: u64,
-    /// A per-writer receipt: `w`'s own `since_ms` the moment this replica
-    /// folds `w` into `folded_p`/`folded_n`. [`Self::merge`] trusts a
-    /// side's silence about `w` as "already folded" only once its own
-    /// `folded_at` names `w` with a `since_ms` at least as late as the
-    /// merged `retired` entry's. Dropped once old enough that every
-    /// reachable replica has independently folded the same writer too;
-    /// see [`Self::compact`].
+    /// A per-writer receipt: the wall-clock instant this replica folds `w`
+    /// into `folded_p`/`folded_n`, merged by maximum. [`Self::merge`] trusts
+    /// a side's silence about `w` as "already folded" only once its own
+    /// `folded_at` names `w`. Dropped `receipt_ttl_ms` after the fold, so
+    /// a fold that membership churn delays long past the retirement still
+    /// leaves a receipt for its whole lifetime; see [`Self::compact`].
     folded_at: BTreeMap<WriterId, u64>,
 }
 
@@ -131,8 +131,7 @@ impl PnCounter {
     /// each writer's max `p`/`n` (over both sides' retired and still-live
     /// slots) and minimum `since_ms`, which keeps the cross-stale-retirement
     /// case exact. Stage two drops a writer from `retired` once either
-    /// side's `folded_at` receipt for it is at least as recent as the
-    /// merged entry, crediting its bound into that side's
+    /// side holds a `folded_at` receipt for it, crediting its bound into that side's
     /// `folded_p`/`folded_n` first; the merged bound is the greater of the
     /// two, never their sum. `p`/`n` are the pointwise maximum of both
     /// sides, excluding every writer now `retired`.
@@ -246,11 +245,12 @@ impl PnCounter {
     /// accepts into a `retired` entry stamped `now_ms`. Stage two, only
     /// while `quiet`, folds a `retired` entry older than
     /// `2 * bounds.retire_after_ms` into `folded_p`/`folded_n` and leaves
-    /// a `folded_at` receipt; a pre-existing receipt older than
-    /// `bounds.receipt_ttl_ms` is pruned first, against `self`'s state
-    /// before that fold, so a writer advances at most one stage per call,
-    /// keeping [`Self::merge`]'s reconciliation always finding a fresh
-    /// receipt.
+    /// a `folded_at` receipt stamped `now_ms`, the instant of the fold
+    /// (never lowering a stamp the writer already has), so the receipt
+    /// lives its whole `bounds.receipt_ttl_ms` however long after the
+    /// retirement the fold happens. A pre-existing receipt past its
+    /// lifetime is pruned first, against `self`'s state before that fold,
+    /// so a writer advances at most one stage per call.
     #[must_use]
     pub(crate) fn compact(
         &self,
@@ -300,7 +300,10 @@ impl PnCounter {
                 if now_ms.saturating_sub(r.since_ms) > double_bound {
                     folded_p = folded_p.saturating_add(r.p);
                     folded_n = folded_n.saturating_add(r.n);
-                    folded_at.insert(w, r.since_ms);
+                    folded_at
+                        .entry(w)
+                        .and_modify(|stamp| *stamp = (*stamp).max(now_ms))
+                        .or_insert(now_ms);
                     aged_any = true;
                     false
                 } else {
@@ -315,10 +318,12 @@ impl PnCounter {
         changed.then_some(out)
     }
 
-    /// Drops every `folded_at` receipt older than `receipt_ttl_ms`
-    /// ([`CompactionBounds::receipt_ttl_ms`]), the point past which no
-    /// replica's stale copy of the writer is reconciled any more (see the
-    /// module doc); `None` if no receipt is that old. Called
+    /// Drops every `folded_at` receipt more than `receipt_ttl_ms`
+    /// ([`CompactionBounds::receipt_ttl_ms`]) after its fold, the point past
+    /// which no replica's stale copy of the writer is reconciled any more
+    /// (see the module doc), and every receipt stamped more than that far
+    /// ahead of `now_ms`, which only a badly wrong clock writes; `None` if
+    /// no receipt is that old. Called
     /// by [`Self::compact`] on the sweep, and by the resolver on every
     /// merge apply through [`ConflictResolver::settle`], so a receipt one
     /// replica has already pruned cannot ride back in from a peer that has
@@ -329,13 +334,13 @@ impl PnCounter {
         if !self
             .folded_at
             .values()
-            .any(|&since_ms| now_ms.saturating_sub(since_ms) > receipt_ttl_ms)
+            .any(|&stamp_ms| receipt_expired(now_ms, stamp_ms, receipt_ttl_ms))
         {
             return None;
         }
         let mut out = self.clone();
         out.folded_at
-            .retain(|_, &mut since_ms| now_ms.saturating_sub(since_ms) <= receipt_ttl_ms);
+            .retain(|_, &mut stamp_ms| !receipt_expired(now_ms, stamp_ms, receipt_ttl_ms));
         Some(out)
     }
 
@@ -455,6 +460,9 @@ impl ConflictResolver for PnCounterResolver {
         Some(Bytes::from(bytes))
     }
 }
+
+#[cfg(test)]
+mod receipt_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1133,18 +1141,17 @@ mod tests {
         assert_eq!(folded.folded_p, 8);
         assert_eq!(
             folded.folded_at.get(&w),
-            Some(&0),
-            "a receipt for w specifically, naming w's own since_ms"
+            Some(&2_001),
+            "a receipt for w specifically, naming the instant of the fold"
         );
         assert_eq!(folded.value(), 8);
     }
 
     /// A `folded_at` receipt is pruned only once it is old enough *and* the
-    /// cache is quiet, counting only from before the call that created
-    /// it: a single `compact` call that folds a writer never also prunes
-    /// that same brand-new receipt (see [`PnCounter::compact`]'s doc for
-    /// why), so this needs a further, separate call once the receipt itself
-    /// has aged past three times the bound.
+    /// cache is quiet, counting from the fold that created it: a single
+    /// `compact` call that folds a writer never also prunes that same
+    /// brand-new receipt, so this needs a further, separate call once the
+    /// receipt itself has aged past three times the bound.
     #[test]
     fn a_folded_at_receipt_is_pruned_once_aged_past_three_times_the_bound_but_not_before() {
         let w = wid(1, 0);
@@ -1168,18 +1175,18 @@ mod tests {
         assert!(
             folded
                 .compact(
-                    2_999,
+                    5_001,
                     &|_| false,
                     Quiescence::Settled,
                     CompactionBounds::three_bounds(1_000)
                 )
                 .is_none(),
-            "999ms since the receipt was written < 3x1_000ms bound: too soon to prune"
+            "3_000ms since the fold = the 3x1_000ms bound: too soon to prune"
         );
         assert!(
             folded
                 .compact(
-                    3_001,
+                    5_002,
                     &|_| false,
                     Quiescence::Churning,
                     CompactionBounds::three_bounds(1_000)
@@ -1190,7 +1197,7 @@ mod tests {
 
         let pruned = folded
             .compact(
-                3_001,
+                5_002,
                 &|_| false,
                 Quiescence::Settled,
                 CompactionBounds::three_bounds(1_000),

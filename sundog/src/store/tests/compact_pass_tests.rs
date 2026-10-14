@@ -3,7 +3,7 @@
 use std::sync::atomic::AtomicUsize;
 
 use super::*;
-use crate::store::crdt::{PnCounter, PnCounterResolver};
+use crate::store::crdt::{OrSet, OrSetResolver, PnCounter, PnCounterResolver};
 
 fn writer(id: u64) -> crdt::WriterId {
     crdt::WriterId::new(NodeId::from(id), 1)
@@ -418,7 +418,8 @@ async fn merge_apply_settles_an_aged_receipt_a_peer_carries_back_in() {
         .expect("merge");
 
     let retire = move |w: crdt::WriterId| w == dead;
-    // Stage one at 1_000, stage two past two bounds: a receipt at 1_000.
+    // Stage one at 1_000, stage two past two bounds: a receipt stamped
+    // with the fold instant, 3_001.
     ShardOps::compact_pass(&s, 1_000, &retire, Quiescence::Settled, bounds, 100).await;
     let folded = ShardOps::compact_pass(&s, 3_001, &retire, Quiescence::Settled, bounds, 100).await;
     assert_eq!(folded.compacted, 1, "folded with a receipt");
@@ -427,14 +428,14 @@ async fn merge_apply_settles_an_aged_receipt_a_peer_carries_back_in() {
         .into_iter()
         .next()
         .expect("resident");
-    // Stage three past three bounds: the receipt is gone locally.
-    let pruned = ShardOps::compact_pass(&s, 4_001, &retire, Quiescence::Settled, bounds, 100).await;
+    // Stage three past three bounds of the fold: the receipt is gone locally.
+    let pruned = ShardOps::compact_pass(&s, 6_002, &retire, Quiescence::Settled, bounds, 100).await;
     assert_eq!(pruned.compacted, 1, "receipt pruned");
     let pruned_bytes = s.get(&1).await.expect("resident").encode().expect("encode");
 
     // A peer's copy still carrying the receipt merges in at a time
     // past the ttl: the merge unions the receipt, settle drops it.
-    now.store(4_001, std::sync::atomic::Ordering::Relaxed);
+    now.store(6_002, std::sync::atomic::Ordering::Relaxed);
     ShardOps::apply_remote(&s, with_receipt).await;
     let after = s.get(&1).await.expect("resident");
     assert_eq!(after.value(), 7, "the exact total is untouched");
@@ -600,4 +601,255 @@ async fn two_shards_compacting_independently_converge() {
         "both replicas converge to bit-identical state, not merely an equal value: \
          each now carries both writers' slots folded into its own retired map"
     );
+}
+
+/// A clock the test moves by hand, for the shards whose merge apply settles
+/// receipts against it.
+fn manual_clock() -> (
+    Arc<std::sync::atomic::AtomicU64>,
+    Arc<dyn Fn() -> u64 + Send + Sync>,
+) {
+    let now = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let clock = {
+        let now = Arc::clone(&now);
+        Arc::new(move || now.load(std::sync::atomic::Ordering::Relaxed))
+            as Arc<dyn Fn() -> u64 + Send + Sync>
+    };
+    (now, clock)
+}
+
+/// A fold that membership churn delays past the receipt lifetime leaves a
+/// receipt the merge apply keeps: replicas that retired the writer but did
+/// not fold it, and merge in the folded record one after the other, count
+/// the writer once.
+#[tokio::test]
+async fn a_late_fold_leaves_a_receipt_the_merge_apply_keeps() {
+    let bounds = CompactionBounds::three_bounds(1_000);
+    let (now, clock) = manual_clock();
+    let open = |node: u64| {
+        shard::<u32, PnCounter>(node)
+            .with_resolver(Arc::new(PnCounterResolver))
+            .with_crdt_bounds(bounds)
+            .with_clock(Arc::clone(&clock))
+    };
+    let (s, first_peer, second_peer) = (open(1), open(2), open(3));
+    let dead = writer(9);
+    let alive = writer(99);
+    let retire = move |w: crdt::WriterId| w == dead;
+    let mut retired_records = Vec::new();
+    for shard in [&s, &first_peer, &second_peer] {
+        shard
+            .merge(1, PnCounter::local_delta(dead, 3))
+            .await
+            .expect("merge");
+        shard
+            .merge(1, PnCounter::local_delta(alive, 4))
+            .await
+            .expect("merge");
+        ShardOps::compact_pass(shard, 1_000, &retire, Quiescence::Churning, bounds, 100).await;
+    }
+    for peer in [&first_peer, &second_peer] {
+        retired_records.push(
+            ShardOps::records_for(peer, vec![key_bytes(&1u32)])
+                .await
+                .into_iter()
+                .next()
+                .expect("the peer holds the key"),
+        );
+    }
+
+    // The fold waits for the cache to be quiet, far past three bounds of
+    // the retirement.
+    let folded =
+        ShardOps::compact_pass(&s, 20_000, &retire, Quiescence::Settled, bounds, 100).await;
+    assert_eq!(folded.compacted, 1, "folded with a receipt");
+    let folded_bytes = s.get(&1).await.expect("resident").encode().expect("encode");
+
+    now.store(20_001, std::sync::atomic::Ordering::Relaxed);
+    for record in retired_records {
+        ShardOps::apply_remote(&s, record).await;
+        let after = s.get(&1).await.expect("resident");
+        assert_eq!(
+            after.value(),
+            7,
+            "the writer a peer still carries as retired is counted once"
+        );
+        assert_eq!(
+            after.encode().expect("encode"),
+            folded_bytes,
+            "the receipt survived the merge apply and absorbed the peer's retired entry"
+        );
+    }
+}
+
+/// Two shards that fold one writer at different instants carry different
+/// receipt stamps; one exchange both ways leaves them identical, bytes and
+/// versions, with the exact total.
+#[tokio::test]
+async fn two_shards_folding_at_different_instants_converge_in_one_exchange() {
+    let bounds = CompactionBounds::three_bounds(1_000);
+    let (now, clock) = manual_clock();
+    let a = shard::<u32, PnCounter>(1)
+        .with_resolver(Arc::new(PnCounterResolver))
+        .with_crdt_bounds(bounds)
+        .with_clock(Arc::clone(&clock));
+    let b = shard::<u32, PnCounter>(2)
+        .with_resolver(Arc::new(PnCounterResolver))
+        .with_crdt_bounds(bounds)
+        .with_clock(clock);
+    let dead = writer(9);
+    let alive = writer(99);
+    for shard in [&a, &b] {
+        shard
+            .merge(1, PnCounter::local_delta(dead, 3))
+            .await
+            .expect("merge");
+        shard
+            .merge(1, PnCounter::local_delta(alive, 4))
+            .await
+            .expect("merge");
+    }
+    let retire = move |w: crdt::WriterId| w == dead;
+    for shard in [&a, &b] {
+        ShardOps::compact_pass(shard, 1_000, &retire, Quiescence::Churning, bounds, 100).await;
+    }
+    ShardOps::compact_pass(&a, 3_001, &retire, Quiescence::Settled, bounds, 100).await;
+    ShardOps::compact_pass(&b, 3_500, &retire, Quiescence::Settled, bounds, 100).await;
+    assert_ne!(
+        a.get(&1).await.expect("resident").encode().expect("encode"),
+        b.get(&1).await.expect("resident").encode().expect("encode"),
+        "the receipts carry the two fold instants"
+    );
+
+    now.store(3_600, std::sync::atomic::Ordering::Relaxed);
+    let rec_a = ShardOps::records_for(&a, vec![key_bytes(&1u32)])
+        .await
+        .into_iter()
+        .next()
+        .expect("a holds the key");
+    let rec_b = ShardOps::records_for(&b, vec![key_bytes(&1u32)])
+        .await
+        .into_iter()
+        .next()
+        .expect("b holds the key");
+    ShardOps::apply_remote(&a, rec_b).await;
+    ShardOps::apply_remote(&b, rec_a).await;
+
+    assert_eq!(a.get(&1).await.map(|c| c.value()), Some(7));
+    assert_eq!(a.get(&1).await, b.get(&1).await, "identical bytes");
+    assert_eq!(
+        ShardOps::digests(&a).await,
+        ShardOps::digests(&b).await,
+        "identical versions: nothing is left for anti-entropy to exchange"
+    );
+}
+
+/// An `apply_many` batch that carries two receipts for one writer, stamped
+/// by two folds, merges to the same record whatever the order.
+#[tokio::test]
+async fn a_batch_with_two_fold_stamps_for_one_writer_applies_in_either_order() {
+    let bounds = CompactionBounds::three_bounds(1_000);
+    let dead = writer(9);
+    let alive = writer(99);
+    let retire = move |w: crdt::WriterId| w == dead;
+    let mut records = Vec::new();
+    for (node, fold_at) in [(1u64, 3_001u64), (2, 3_500)] {
+        let (_, source_clock) = manual_clock();
+        let source = shard::<u32, PnCounter>(node)
+            .with_resolver(Arc::new(PnCounterResolver))
+            .with_clock(source_clock);
+        source
+            .merge(1, PnCounter::local_delta(dead, 3))
+            .await
+            .expect("merge");
+        source
+            .merge(1, PnCounter::local_delta(alive, 4))
+            .await
+            .expect("merge");
+        ShardOps::compact_pass(&source, 1_000, &retire, Quiescence::Churning, bounds, 100).await;
+        ShardOps::compact_pass(&source, fold_at, &retire, Quiescence::Settled, bounds, 100).await;
+        records.push(
+            ShardOps::records_for(&source, vec![key_bytes(&1u32)])
+                .await
+                .into_iter()
+                .next()
+                .expect("the source holds the key"),
+        );
+    }
+    let mut results = Vec::new();
+    for batch in [
+        records.clone(),
+        records.into_iter().rev().collect::<Vec<_>>(),
+    ] {
+        let (now, clock) = manual_clock();
+        now.store(3_600, std::sync::atomic::Ordering::Relaxed);
+        let target = shard::<u32, PnCounter>(3)
+            .with_resolver(Arc::new(PnCounterResolver))
+            .with_crdt_bounds(bounds)
+            .with_clock(clock);
+        ShardOps::apply_remote_batch(&target, batch).await;
+        results.push(target.get(&1).await.expect("resident"));
+    }
+    assert_eq!(results[0].value(), 7);
+    assert_eq!(results[0], results[1], "the batch order does not matter");
+}
+
+/// The `OrSet` counterpart: a fold that membership churn delays past the
+/// receipt lifetime leaves a receipt the merge apply keeps, so stale
+/// replicas that still hold a removed element, and retired the writer
+/// without folding it, do not bring the element back one after the other.
+#[tokio::test]
+async fn an_or_set_late_fold_leaves_a_receipt_the_merge_apply_keeps() {
+    let bounds = CompactionBounds::three_bounds(1_000);
+    let (now, clock) = manual_clock();
+    let open = |node: u64| {
+        shard::<u32, OrSet<String>>(node)
+            .with_resolver(Arc::new(OrSetResolver::<String>::new()))
+            .with_crdt_bounds(bounds)
+            .with_clock(Arc::clone(&clock))
+    };
+    let (s, first_stale, second_stale) = (open(1), open(2), open(3));
+    let dead = writer(9);
+    let x = "x".to_string();
+    for shard in [&s, &first_stale, &second_stale] {
+        shard
+            .merge(1, OrSet::add(dead, 0, x.clone()))
+            .await
+            .expect("add");
+    }
+    // Only `s` sees the remove.
+    let observed = s.get(&1).await.expect("resident");
+    s.merge(1, OrSet::remove(&observed, &x))
+        .await
+        .expect("remove");
+    assert!(!s.get(&1).await.expect("resident").contains(&x));
+
+    let retire = move |w: crdt::WriterId| w == dead;
+    let mut stale_records = Vec::new();
+    for shard in [&s, &first_stale, &second_stale] {
+        ShardOps::compact_pass(shard, 1_000, &retire, Quiescence::Churning, bounds, 100).await;
+    }
+    for stale in [&first_stale, &second_stale] {
+        assert!(stale.get(&1).await.expect("resident").contains(&x));
+        stale_records.push(
+            ShardOps::records_for(stale, vec![key_bytes(&1u32)])
+                .await
+                .into_iter()
+                .next()
+                .expect("the stale replica holds the key"),
+        );
+    }
+
+    let folded =
+        ShardOps::compact_pass(&s, 20_000, &retire, Quiescence::Settled, bounds, 100).await;
+    assert_eq!(folded.compacted, 1, "folded with a receipt");
+
+    now.store(20_001, std::sync::atomic::Ordering::Relaxed);
+    for record in stale_records {
+        ShardOps::apply_remote(&s, record).await;
+        assert!(
+            !s.get(&1).await.expect("resident").contains(&x),
+            "the removed element stays absent"
+        );
+    }
 }

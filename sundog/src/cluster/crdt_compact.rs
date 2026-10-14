@@ -299,9 +299,11 @@ fn sweep_is_complete(stripes_visited: usize, last_call_stripes: usize) -> bool {
 /// quarter of `ClusterConfig::crdt_retire_after` (floored at 30s), firing
 /// immediately on the first tick. Ticks need no alignment across replicas:
 /// [`crate::store::ConflictResolver::settle`] drops a pruned fold receipt
-/// again on every merge apply, so replicas compacting the same bytes agree
-/// whenever they get to it. The task owns the [`UnseenWriters`] its ticks
-/// share.
+/// again on every merge apply, so a receipt one replica pruned does not ride
+/// back in from another. Replicas fold a writer at their own sweep instants
+/// and stamp the receipt with it, so their records differ by those stamps
+/// until one exchange merges them by maximum. The task owns the
+/// [`UnseenWriters`] its ticks share.
 pub(crate) async fn crdt_compact_task(
     shard: Arc<dyn ShardOps>,
     name: SmolStr,
@@ -1282,8 +1284,8 @@ mod tests {
     /// stray tick. Pinned here because pruning alone, one node's own sweep
     /// against the other's differently-phased tick re-merging an unpruned
     /// copy back in, never converges; the resolver's `settle` step on every
-    /// merge apply is what ends it, dropping a receipt past three bounds
-    /// again the moment a peer's copy carries it back in.
+    /// merge apply is what ends it, dropping a receipt three bounds past its
+    /// fold again the moment a peer's copy carries it back in.
     #[tokio::test]
     async fn crdt_compact_task_prunes_a_folded_receipt_for_good_under_ongoing_two_node_replication()
     {

@@ -105,8 +105,8 @@ impl AbsenceTracker {
     }
 
     /// Forgets every member gone longer than `horizon`. The CRDT sweep
-    /// calls this with the fold receipt lifetime, past which nothing
-    /// reconciles a straggling copy of the member's writer either.
+    /// calls this with the fold receipt lifetime, which a fold's receipt
+    /// outlasts only by the time its fold trails the member's departure.
     pub(crate) fn prune_gone_older_than(&self, horizon: Duration) {
         let mut state = self.state();
         let now = Instant::now();

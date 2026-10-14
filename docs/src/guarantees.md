@@ -97,8 +97,15 @@ a full bound before it retires, so a live node that gossip has not shown yet
 is a peer by then and never retires. The sweep reads
 resident records only, so a spilled record keeps its slots until it is read
 back. Each fold leaves a receipt that
-every merge honors for three times `crdt_retire_after` past the retirement,
-longer when the sweep period is more than half that bound. A replica cut
+every merge honors for three times `crdt_retire_after` past the fold, longer
+when the sweep period is more than half that bound. The lifetime starts at
+the fold, which waits for a quiet cache and trails the retirement by at least
+twice the bound, so a receipt lives about five bounds past its retirement at
+the defaults, however long churn delays the fold. Replicas fold at their own
+sweeps and stamp the receipt with that instant, so their records differ by
+the stamps until one anti-entropy exchange merges them, the later stamp
+winning. A receipt stamped more than its lifetime ahead of a replica's clock
+expires there instead of outliving the others. A replica cut
 off from before the fold until after the receipt expires, still holding the
 slot every other replica has folded, counts that writer's contribution
 twice when it reconnects. Like `tombstone_max_ttl` for deletes, below, the

@@ -697,7 +697,7 @@ pub(crate) struct MemberView {
 /// clause keeps one member flapping faster than the bound from holding
 /// stage two back for good: any copy such a member can still bring back
 /// is at most a bound old, reconciled by the retired entry the fold
-/// replaces or by the fold receipt it leaves for three bounds.
+/// replaces or by the fold receipt it leaves for three bounds past the fold.
 pub(crate) fn member_is_quiet(member: &MemberView, now: Instant, bound: Duration) -> bool {
     let settled = |since: Option<Instant>, for_at_least: Duration| {
         since.is_some_and(|since| now.saturating_duration_since(since) >= for_at_least)

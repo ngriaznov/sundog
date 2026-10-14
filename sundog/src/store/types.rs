@@ -195,17 +195,6 @@ pub type BucketEntries = Vec<(u16, Vec<KeyVersion>)>;
 /// every requested `(bucket, part)` pair present, empty lists included.
 pub type PartEntries = Vec<(BucketPart, Vec<KeyVersion>)>;
 
-/// The two ages the CRDT compaction sweep and the merge apply path work
-/// with, in milliseconds: `retire_after_ms` (`ClusterConfig::crdt_retire_after`)
-/// is how long a writer must be gone before stage one retires it and, twice
-/// over, how old a retirement must be before stage two folds it;
-/// `receipt_ttl_ms` is how long a fold receipt lives after the writer's
-/// retirement instant before both the sweep and every merge apply drop it.
-/// The receipt must outlive every reachable replica's own fold of the same
-/// writer plus one anti-entropy exchange, and a replica folds on its first
-/// sweep after the retirement is two bounds old, so the receipt lives the
-/// longer of three bounds and two bounds plus two sweep periods
-/// ([`ClusterConfig::crdt_compaction_bounds`]).
 /// Whether a merging cache's membership has settled this compaction tick.
 /// `Settled` lets [`ConflictResolver::compact`]'s second stage fold aged
 /// retirements; `Churning` defers it. See `crdt_cache_is_quiet`'s doc for
@@ -237,11 +226,22 @@ impl Quiescence {
     }
 }
 
+/// The two ages the CRDT compaction sweep and the merge apply path work
+/// with, in milliseconds: `retire_after_ms` (`ClusterConfig::crdt_retire_after`)
+/// is how long a writer must be gone before stage one retires it and, twice
+/// over, how old a retirement must be before stage two folds it;
+/// `receipt_ttl_ms` is how long a fold receipt lives after the fold, before
+/// both the sweep and every merge apply drop it. A fold waits for a quiet
+/// cache, so it can happen long after the retirement; the receipt's clock
+/// starts at the fold. The lifetime is the longer of three bounds and two
+/// bounds plus two sweep periods
+/// ([`ClusterConfig::crdt_compaction_bounds`]), and the sweep's member
+/// tracker forgets a gone member after the same span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionBounds {
     /// `ClusterConfig::crdt_retire_after`, in milliseconds.
     pub retire_after_ms: u64,
-    /// How long a fold receipt lives past the writer's retirement instant.
+    /// How long a fold receipt lives past the fold.
     pub receipt_ttl_ms: u64,
 }
 
@@ -261,7 +261,7 @@ impl CompactionBounds {
         }
     }
 
-    /// Bounds with the receipt living exactly three bounds: what a sweep
+    /// Bounds with the receipt living exactly three bounds past the fold: what a sweep
     /// running at least four times per bound amounts to, and the shape
     /// every unit test of the CRDT types assumes.
     #[must_use]
