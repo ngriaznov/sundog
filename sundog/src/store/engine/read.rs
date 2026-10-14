@@ -17,7 +17,7 @@ use super::EntryState;
 use super::expiry::{decode_expiry, lapse_cause};
 use super::keys::{encode_key_for_read, hash_key_bytes, stripe_index_from_hash};
 use super::record::{decode_key, decode_value, record_key, record_value, record_value_bytes};
-use super::{Engine, is_resident, is_spilled};
+use super::{Engine, Lapsed, is_resident, is_spilled};
 
 impl<K, V> Engine<K, V>
 where
@@ -195,11 +195,29 @@ where
         }
     }
 
-    /// The full [`WireRecord`] for `key_bytes`, present entry or tombstone
-    /// alike. `None` for a currently-spilled entry: the fan-out records path
-    /// this feeds skips it, correct because a peer's next anti-entropy
-    /// round repairs it.
+    /// The full [`WireRecord`] for `key_bytes` as a read sees it, present
+    /// entry or tombstone alike. `None` for an entry that reads as absent
+    /// (past its expiry or idle) and for a currently-spilled entry, which
+    /// holds no value in memory. Anti-entropy replies read the spilled half
+    /// through `Engine::records_for_or_spilled`; the fan-out reads the
+    /// written view, `Engine::written_record_for`.
     pub(crate) fn record_for(&self, key_bytes: &[u8], now_ms: u64) -> Option<WireRecord> {
+        self.record_scoped(key_bytes, now_ms, Lapsed::Hidden)
+    }
+
+    /// The record the fan-out sends for a write: [`Engine::record_for`]
+    /// except that an entry past its expiry is returned with its past
+    /// deadline, so a peer learns the write lapsed instead of keeping the
+    /// value it replaced. An idle entry and a spilled one are still `None`.
+    /// A `spill` build reads the written view through
+    /// `Engine::written_records_or_spilled` instead.
+    #[cfg(any(not(feature = "spill"), test))]
+    pub(crate) fn written_record_for(&self, key_bytes: &[u8], now_ms: u64) -> Option<WireRecord> {
+        self.record_scoped(key_bytes, now_ms, Lapsed::Shown)
+    }
+
+    /// [`Engine::record_for`] under a record view.
+    fn record_scoped(&self, key_bytes: &[u8], now_ms: u64, lapsed: Lapsed) -> Option<WireRecord> {
         let hash = hash_key_bytes(key_bytes);
         let stripe = self.stripes[stripe_index_from_hash(hash)].read();
         if let Some(t) = stripe.tombstones.get(key_bytes) {
@@ -213,7 +231,7 @@ where
         let live = stripe
             .live
             .find(hash, |l| record_key(&l.record) == key_bytes)?;
-        if self.is_absent(live, key_bytes, &stripe.long_ttl, now_ms) {
+        if self.is_absent_under(live, key_bytes, &stripe.long_ttl, now_ms, lapsed) {
             return None;
         }
         is_resident(live).then(|| WireRecord {

@@ -105,6 +105,27 @@ pub(super) fn clamp_tti_ms(tti_ms: u64) -> u64 {
     tti_ms.min(MAX_TTI_MS)
 }
 
+/// Whether a record view hides an entry that has run past its expiry.
+/// Idleness is local to a node and never travels with a record, so both
+/// views hide an idle entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lapsed {
+    /// The readable view: an entry past its expiry or idle reads as absent.
+    Hidden,
+    /// The written view the fan-out reads: an entry past its expiry is
+    /// returned with its (past) deadline, so a peer learns the write
+    /// lapsed. An idle entry is still hidden.
+    Shown,
+}
+
+/// Whether `live` has gone idle for `tti_ms` or longer at `now_ms`. Always
+/// `false` with no time-to-idle configured.
+fn idle_at<K, V>(live: &Live<K, V>, tti_ms: Option<u64>, now_ms: u64) -> bool {
+    tti_ms.is_some_and(|tti| {
+        idle_elapsed_ms(now_ms, live.last_access_ms.load(Ordering::Relaxed)) >= tti
+    })
+}
+
 /// Whether a read of `live` at `now_ms` sees nothing: past its expiry, or
 /// idle for `tti_ms` or longer. Lazy expiry and idle eviction both hinge on
 /// this; a sweep only reclaims what it already reports absent.
@@ -115,18 +136,26 @@ pub(super) fn absent_at<K, V>(
     tti_ms: Option<u64>,
     now_ms: u64,
 ) -> bool {
-    if let Some(exp) = decode_expiry(live.wall_ms, live.expiry, key_bytes, long_ttl)
-        && now_ms >= exp
+    absent_under(live, key_bytes, long_ttl, tti_ms, now_ms, Lapsed::Hidden)
+}
+
+/// [`absent_at`] under a record view: [`Lapsed::Shown`] leaves out the
+/// expiry test, so only an idle entry is absent.
+pub(super) fn absent_under<K, V>(
+    live: &Live<K, V>,
+    key_bytes: &[u8],
+    long_ttl: &HashMap<Bytes, u64>,
+    tti_ms: Option<u64>,
+    now_ms: u64,
+    lapsed: Lapsed,
+) -> bool {
+    if lapsed == Lapsed::Hidden
+        && decode_expiry(live.wall_ms, live.expiry, key_bytes, long_ttl)
+            .is_some_and(|exp| now_ms >= exp)
     {
         return true;
     }
-    if let Some(tti) = tti_ms {
-        let last = live.last_access_ms.load(Ordering::Relaxed);
-        if idle_elapsed_ms(now_ms, last) >= tti {
-            return true;
-        }
-    }
-    false
+    idle_at(live, tti_ms, now_ms)
 }
 
 /// Why an entry [`absent_at`] reports absent no longer reads: its expiry

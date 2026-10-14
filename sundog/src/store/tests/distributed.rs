@@ -380,12 +380,12 @@ async fn a_releasing_bucket_still_answers_digests_and_entries() {
 fn fan_out_item_applied_and_forward_both_drain_through_one_queue() {
     let queue = FanOutQueue::<FanOutItem<u32>>::new(SmolStr::new("test"), true);
     let rec = wire_record(7, "v", hlc(1, 1));
-    let _ = queue.push(FanOutItem::Applied(1));
+    let _ = queue.push(FanOutItem::Applied(1, hlc(2, 1)));
     let _ = queue.push(FanOutItem::Forward(rec.clone()));
 
     assert_eq!(
         queue.drain(),
-        vec![FanOutItem::Applied(1), FanOutItem::Forward(rec)],
+        vec![FanOutItem::Applied(1, hlc(2, 1)), FanOutItem::Forward(rec)],
         "one queue drains both applied and forwarded items, in push order"
     );
 }

@@ -80,7 +80,10 @@ pub(crate) use engine::hash_key_bytes;
 #[cfg(feature = "sim")]
 #[doc(hidden)]
 pub use fan_out::SimFanOut;
-pub(crate) use fan_out::{FanOutItem, FanOutQueue};
+#[cfg(feature = "spill")]
+use fan_out::spilled_needs_read;
+pub(crate) use fan_out::{FanOutItem, FanOutQueue, FanOutRecords, newest_per_key};
+use fan_out::{fan_out_ships_values, partition_writes};
 pub(crate) use load::Sourced;
 pub use load::{DEFAULT_MAX_BATCH_KEYS, LoadError, Loader};
 pub use part::PartId;

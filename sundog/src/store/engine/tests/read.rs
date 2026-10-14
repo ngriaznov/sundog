@@ -274,3 +274,64 @@ fn engine_reads_back_an_arc_string_value_serialized_via_serdes_rc_feature() {
         "an Arc<String> value round-trips through postcard's serde `rc` support"
     );
 }
+
+#[test]
+fn written_record_for_returns_a_lapsed_entry_that_record_for_hides() {
+    let now = 2_000;
+    let (engine, _) = engine_with_every_record(now);
+    let kb = key_bytes(4);
+
+    assert_eq!(
+        engine.record_for(kb.as_ref(), now),
+        None,
+        "the readable view hides an entry past its expiry"
+    );
+    let written = engine
+        .written_record_for(kb.as_ref(), now)
+        .expect("the written view returns it");
+    assert_eq!(written.expires_at_ms, Some(1_500), "with its past deadline");
+    assert_eq!(written.ver, hlc(1_000, 1));
+    assert!(written.value.is_some());
+
+    assert_eq!(
+        engine.written_record_for(key_bytes(2).as_ref(), now),
+        engine.record_for(key_bytes(2).as_ref(), now),
+        "a live entry reads the same in both views"
+    );
+    assert_eq!(
+        engine.written_record_for(key_bytes(5).as_ref(), now),
+        engine.record_for(key_bytes(5).as_ref(), now),
+        "a tombstone reads the same in both views"
+    );
+    assert_eq!(engine.written_record_for(key_bytes(6).as_ref(), now), None);
+}
+
+#[test]
+fn written_record_for_returns_nothing_once_a_sweep_has_reclaimed_the_entry() {
+    let now = 2_000;
+    let (engine, _) = engine_with_every_record(now);
+    engine.sweep(now);
+    assert_eq!(engine.written_record_for(key_bytes(4).as_ref(), now), None);
+}
+
+#[test]
+fn written_record_for_hides_an_idle_entry_because_idleness_does_not_travel() {
+    let engine = engine_u32_string(u64::MAX, Some(Duration::from_millis(1_000)));
+    let kb = key_bytes(1);
+    let _ = put(
+        &engine,
+        1,
+        kb.clone(),
+        "a".into(),
+        hlc(1_000, 1),
+        None,
+        1_000,
+    );
+
+    assert!(engine.written_record_for(kb.as_ref(), 1_500).is_some());
+    assert_eq!(
+        engine.written_record_for(kb.as_ref(), 2_500),
+        None,
+        "idle for the whole time-to-idle"
+    );
+}

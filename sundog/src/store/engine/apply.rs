@@ -426,6 +426,7 @@ where
             key,
             value,
             created: !was_visible,
+            version: ver,
         },
         displaced_spilled,
     )
@@ -465,7 +466,10 @@ where
             max_deadline_ms: ctx.now_ms.saturating_add(ctx.tombstone_max_ttl_ms),
         },
     );
-    (ApplyOutcome::Tombstoned { key }, displaced_spilled)
+    (
+        ApplyOutcome::Tombstoned { key, version: ver },
+        displaced_spilled,
+    )
 }
 
 impl<K, V> Engine<K, V>

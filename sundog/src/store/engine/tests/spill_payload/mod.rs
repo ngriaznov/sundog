@@ -244,6 +244,29 @@ fn records_for_or_spilled_splits_a_resident_and_a_spilled_key() {
 }
 
 #[test]
+fn written_records_or_spilled_reports_a_lapsed_spilled_entry_as_a_pointer() {
+    let engine = engine_u32_string(u64::MAX, None);
+    let kb = key_bytes(1);
+    let l = loc(0, 0, 4, 0);
+    let ver = hlc(1, 1);
+    engine.debug_insert_spilled(&kb, ver, Some(500), l, 0);
+
+    let (records, spilled) = engine.records_for_or_spilled(std::slice::from_ref(&kb), 600);
+    assert!(
+        records.is_empty() && spilled.is_empty(),
+        "the readable view hides a lapsed spilled entry, as anti-entropy replies need"
+    );
+
+    let (records, spilled) = engine.written_records_or_spilled(std::slice::from_ref(&kb), 600);
+    assert!(records.is_empty(), "no resident record");
+    assert_eq!(
+        spilled,
+        vec![(kb.clone(), ver, Some(500), l)],
+        "the written view reports it with its past deadline"
+    );
+}
+
+#[test]
 fn get_by_bytes_and_record_for_return_none_for_a_spilled_entry() {
     let engine = engine_u32_string(u64::MAX, None);
     let key = 1u32;

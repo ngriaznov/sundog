@@ -119,7 +119,13 @@ where
 
 /// [`put`]'s tombstone counterpart, for a test that needs a real
 /// tombstone in place rather than a live entry.
-fn tombstone<K, V>(engine: &Engine<K, V>, key: K, key_bytes: Bytes, ver: Hlc, now_ms: u64)
+fn tombstone<K, V>(
+    engine: &Engine<K, V>,
+    key: K,
+    key_bytes: Bytes,
+    ver: Hlc,
+    now_ms: u64,
+) -> ApplyOutcome<K, V>
 where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
@@ -153,7 +159,7 @@ where
         now_ms,
         held_only: false,
     };
-    let _ = apply_locked(
+    apply_locked(
         &mut stripe,
         &ctx,
         EntryKey {
@@ -163,7 +169,8 @@ where
         },
         ver,
         Incoming::Tombstone,
-    );
+    )
+    .0
 }
 
 /// [`put`]'s counterpart for a test that needs a resolver other than

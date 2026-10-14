@@ -4,6 +4,7 @@ mod builder;
 mod distributed_fetch;
 mod explain_probes;
 mod explain_reads;
+mod fan_out_departed;
 mod forwarding;
 mod lifecycle;
 mod loading;

@@ -63,6 +63,21 @@ All notable changes to this project are documented in this file. Format follows
   protocol 8 requester still fails on such a bucket until it upgrades. A
   digest-path listing, bounded by `ae_sketch_min_bucket`, is still one frame,
   and a single key within a few hundred bytes of the frame cap fits no frame.
+- **A write that expired, was evicted or spilled before it fanned out still
+  reaches its peers.** The fan-out queue carries each write's version and
+  reads the entry back when it sends. A zero-TTL write, `expire(k, ZERO)` and
+  any write that lapses before the send replicate as an already-expired
+  record (an invalidation in a non-merging `Invalidation` cache), so a peer
+  no longer keeps the value it replaced. A spilled write is read back from
+  disk and sent, except where the peers get only an invalidation, a
+  non-merging `Invalidation` cache or a lapsed entry, which reads no disk. A
+  write whose entry is gone, evicted, swept, disowned, idle or unreadable
+  on disk, invalidates the peers' older copy: every peer in `Invalidation`
+  and `Replicated`, the part's other owners in `Distributed`, which waits for
+  outbox space. A record older than the write is never sent beside its
+  invalidation. A lost invalidation is not resent, and the invalidation does
+  not leave a version floor, so a partitioned or late-joining peer can still
+  bring an older value back through anti-entropy.
 
 ## [0.6.7] – 2026-10-13
 

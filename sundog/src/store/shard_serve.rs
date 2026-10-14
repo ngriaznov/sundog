@@ -15,11 +15,14 @@ use serde::de::DeserializeOwned;
 use super::SpillRead;
 use super::resolver::exchanges_both_records;
 use super::shard_ops::MaskedDigest;
+#[cfg(feature = "spill")]
+use super::spilled_needs_read;
 use super::{
     BUCKET_COUNT, BucketDigest, BucketEntries, BucketLen, BucketPart, BucketPartDigests,
-    CompactPassOutcome, CompactionBounds, Event, FanOutItem, Incoming, KeyVersion, Mode, Origin,
-    PartEntries, PartId, PartMask, Quiescence, Scope, ScopedDigests, Shard, ShardOps,
-    chunk_records_for_snapshot, compacted_version, crdt, encode_key, engine,
+    CompactPassOutcome, CompactionBounds, Event, FanOutItem, FanOutRecords, Incoming, KeyVersion,
+    Mode, Origin, PartEntries, PartId, PartMask, Quiescence, Scope, ScopedDigests, Shard, ShardOps,
+    chunk_records_for_snapshot, compacted_version, crdt, encode_key, engine, fan_out_ships_values,
+    partition_writes,
 };
 use crate::hlc::Hlc;
 use crate::node::NodeId;
@@ -270,11 +273,12 @@ where
         }
     }
 
-    /// [`ShardOps::records_for`] for callers that already hold typed `K`s, such
-    /// as `cluster::fan_out_batch` re-fetching for keys read off its own
-    /// `Event<K, V>`s. Encodes each key straight to the bytes
-    /// `engine::Engine::record_for` looks entries up by, with no
-    /// decode step on either end.
+    /// The readable record view for callers that already hold typed `K`s:
+    /// [`Shard::serve_load_encoded`] answering a `Load`. Encodes each key
+    /// straight to the bytes `engine::Engine::record_for` looks entries up
+    /// by, with no decode step on either end. An entry that reads as absent
+    /// or lives on disk is left out; the fan-out reads the written view
+    /// through [`Shard::fan_out_records`] instead.
     pub(crate) async fn records_for_typed(&self, keys: &[K]) -> Vec<WireRecord> {
         let now = self.now_ms();
         keys.iter()
@@ -283,6 +287,81 @@ where
                 self.engine.record_for(key_bytes.as_ref(), now)
             })
             .collect()
+    }
+
+    /// What `cluster::fan_out_batch` sends for a burst of drained writes,
+    /// each a key with the version it was written at. Reads the written
+    /// view: an entry past its expiry is returned with its past deadline, so
+    /// a zero-TTL write and `expire(k, ZERO)` reach the peers as lapsed
+    /// records, and a spilled entry's value is read off disk. A write with
+    /// no entry at its version (evicted, swept, disowned, idle, or a spilled
+    /// value that cannot be read) is reported departed, to invalidate the
+    /// peers' older copy; see [`partition_writes`]. A key that fails to
+    /// encode is dropped.
+    pub(crate) async fn fan_out_records(&self, writes: &[(K, Hlc)]) -> FanOutRecords {
+        let now = self.now_ms();
+        let queued: Vec<(Bytes, Hlc)> = writes
+            .iter()
+            .filter_map(|(key, ver)| Some((encode_key(key).ok()?, *ver)))
+            .collect();
+        let keys: Vec<Bytes> = queued.iter().map(|(key, _)| key.clone()).collect();
+        let ships_values = fan_out_ships_values(self.mode, self.resolver.merges());
+        let fetched = self.written_records(&keys, now, ships_values).await;
+        partition_writes(&queued, fetched)
+    }
+
+    /// The written view of `keys` (see [`Shard::fan_out_records`]): the
+    /// stored records, and, in a `spill` build, the spilled entries
+    /// [`spilled_needs_read`] selects, read off-lock as
+    /// [`ShardOps::records_for`] reads them. No residency filter: a write
+    /// this node applied is looked up whether or not it still owns the part.
+    async fn written_records(
+        &self,
+        keys: &[Bytes],
+        now: u64,
+        ships_values: bool,
+    ) -> Vec<WireRecord> {
+        #[cfg(feature = "spill")]
+        {
+            let (records, spilled) = self.engine.written_records_or_spilled(keys, now);
+            let spilled = spilled
+                .into_iter()
+                .filter(|(_, _, expires_at_ms, _)| {
+                    spilled_needs_read(ships_values, *expires_at_ms, now)
+                })
+                .collect();
+            self.with_spilled_reads(records, spilled).await
+        }
+        #[cfg(not(feature = "spill"))]
+        {
+            let _ = ships_values;
+            keys.iter()
+                .filter_map(|key| self.engine.written_record_for(key.as_ref(), now))
+                .collect()
+        }
+    }
+
+    /// `records` plus the `spilled` entries read off-lock, behind the
+    /// tier's read semaphore and dropped if the read fails; the one spilled
+    /// read [`ShardOps::records_for`] and [`Shard::fan_out_records`] share.
+    #[cfg(feature = "spill")]
+    async fn with_spilled_reads(
+        &self,
+        mut records: Vec<WireRecord>,
+        spilled: Vec<engine::SpilledPointer>,
+    ) -> Vec<WireRecord> {
+        if !spilled.is_empty() {
+            records.extend(
+                read_spilled_batch(
+                    self.engine.as_ref(),
+                    self.spill_read.get(),
+                    &self.name,
+                    spilled,
+                )
+                .await,
+            );
+        }
+        records
     }
 }
 
@@ -652,21 +731,7 @@ where
         #[cfg(feature = "spill")]
         {
             let (records, spilled) = self.engine.records_for_or_spilled(&keys, now);
-            Box::pin(async move {
-                let mut records = records;
-                if !spilled.is_empty() {
-                    records.extend(
-                        read_spilled_batch(
-                            self.engine.as_ref(),
-                            self.spill_read.get(),
-                            &self.name,
-                            spilled,
-                        )
-                        .await,
-                    );
-                }
-                records
-            })
+            Box::pin(self.with_spilled_reads(records, spilled))
         }
         #[cfg(not(feature = "spill"))]
         {

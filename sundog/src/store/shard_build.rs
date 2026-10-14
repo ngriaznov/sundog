@@ -410,7 +410,7 @@ where
             .drain()
             .into_iter()
             .map(|item| match item {
-                FanOutItem::Applied(key) => SimFanOut::Applied(key),
+                FanOutItem::Applied(key, _) => SimFanOut::Applied(key),
                 FanOutItem::Forward(rec) => SimFanOut::Forward(rec),
             })
             .collect()

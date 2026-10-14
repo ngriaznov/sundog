@@ -842,7 +842,10 @@ mod tests {
                 ..
             })
         ));
-        assert!(matches!(&s.fan_out.drain()[..], [FanOutItem::Applied(2)]));
+        assert!(matches!(
+            &s.fan_out.drain()[..],
+            [FanOutItem::Applied(2, _)]
+        ));
         assert_eq!(s.load(&2).await.expect("load"), Some("v2".to_string()));
         assert_eq!(calls_of(&calls), vec![vec![2]], "the second read hits");
     }

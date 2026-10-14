@@ -23,6 +23,11 @@ A write on one node sends the key and its new version to every peer, and
 each peer drops its older copy. Every node fills its own copy from its
 loader or its own writes.
 
+A write drops the peers' older copy even when this node's entry is gone
+before the write is sent. An entry that `max_capacity` evicted or the spill
+tier moved to disk, or one that expired, still sends its invalidation, so a
+peer never serves a value this node already replaced.
+
 Values cross the network only when the cache's resolver merges, as
 `PnCounterResolver` does. The write then ships the writer's merged record
 instead of the bare invalidation. A peer that holds the key folds the record

@@ -110,11 +110,12 @@ use self::apply::apply_locked;
 pub(crate) use self::checkpoint::CheckpointFinalizeCounts;
 #[cfg(doc)]
 use self::evict::VictimOutcome;
+pub(crate) use self::expiry::Lapsed;
 #[cfg(doc)]
 use self::expiry::encode_expiry;
 #[cfg(doc)]
 use self::expiry::{LONG_TTL, decode_expiry, idle_elapsed_ms};
-use self::expiry::{absent_at, clamp_tti_ms, touch_stamp};
+use self::expiry::{absent_at, absent_under, clamp_tti_ms, touch_stamp};
 pub(crate) use self::housekeeping::{CompactCandidate, CompactReplace, CompactScan};
 pub(crate) use self::inflight::{FillOutcome, FreshLoad, JoinOutcome};
 #[cfg(any(test, kani, doc))]
@@ -487,17 +488,26 @@ fn remove_live<K, V>(
 }
 
 /// The outcome of [`apply_locked`]: the caller's `key` back plus what changed,
-/// to build an [`super::Event`] and decide on fan-out.
+/// to build an [`super::Event`] and decide on fan-out. `version` is the
+/// version the write ended up stored at: after a merging resolver rebinds
+/// it, the rebound version, not the caller's stamp. The fan-out queue carries
+/// it, so a write whose entry is gone by the time it fans out still has an
+/// identity to invalidate peers with.
 pub(crate) enum ApplyOutcome<K, V> {
     /// `incoming` loses to what is already stored; nothing changes.
     Rejected,
     /// Writes a value. `created` is `false` when the value replaces an
     /// existing live entry.
-    Put { key: K, value: V, created: bool },
+    Put {
+        key: K,
+        value: V,
+        created: bool,
+        version: Hlc,
+    },
     /// Writes a tombstone, replacing whatever, live entry or nothing,
     /// preceded it. Unlike `Put`'s `created`, this carries no
     /// prior-liveness flag.
-    Tombstoned { key: K },
+    Tombstoned { key: K, version: Hlc },
 }
 
 impl<K, V> ApplyOutcome<K, V> {
@@ -506,7 +516,15 @@ impl<K, V> ApplyOutcome<K, V> {
     pub(crate) fn key(&self) -> Option<&K> {
         match self {
             Self::Rejected => None,
-            Self::Put { key, .. } | Self::Tombstoned { key } => Some(key),
+            Self::Put { key, .. } | Self::Tombstoned { key, .. } => Some(key),
+        }
+    }
+
+    /// The version the write landed at; `None` for a rejected write.
+    pub(crate) fn version(&self) -> Option<Hlc> {
+        match self {
+            Self::Rejected => None,
+            Self::Put { version, .. } | Self::Tombstoned { version, .. } => Some(*version),
         }
     }
 }
@@ -767,6 +785,19 @@ where
         now_ms: u64,
     ) -> bool {
         absent_at(live, key_bytes, long_ttl, self.tti_ms, now_ms)
+    }
+
+    /// [`Engine::is_absent`] under a record view: [`Lapsed::Shown`] reports
+    /// an entry past its expiry present.
+    fn is_absent_under(
+        &self,
+        live: &Live<K, V>,
+        key_bytes: &[u8],
+        long_ttl: &HashMap<Bytes, u64>,
+        now_ms: u64,
+        lapsed: Lapsed,
+    ) -> bool {
+        absent_under(live, key_bytes, long_ttl, self.tti_ms, now_ms, lapsed)
     }
 
     /// Whether a read updates `last_access_ms`, only when it is consulted for

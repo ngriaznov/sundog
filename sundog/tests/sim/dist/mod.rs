@@ -210,7 +210,11 @@ fn send_to_owners(mesh: &Mesh, view: &OwnershipView, self_node: NodeId, rec: &Wi
 /// current record via `ShardOps::records_for`, exactly as `Replicated`
 /// mode's own [`fan_out`] helper in `handler` does, and is sent once (a lost send
 /// still self-heals via anti-entropy, since the writing owner keeps its
-/// own copy to push again next round); a `Forward` item already carries
+/// own copy to push again next round); this models the readable view of the
+/// production drain only. The sim has no TTL or capacity operation, so the
+/// production drain's written view (a lapsed record, a departed write
+/// invalidated on the peers) never differs from it here; those cases are
+/// covered by the lib and cache tests. A `Forward` item already carries
 /// its record, since a non-owner write is never applied to `engine` in the
 /// first place, and is returned to the caller to retry across several
 /// ticks via [`dist_node_loop`]'s own retry pool, a forwarding node keeps

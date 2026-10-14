@@ -29,6 +29,7 @@ mod capacity;
 mod compact_pass_tests;
 mod conflict_resolvers;
 mod distributed;
+mod fan_out_view;
 mod gc_digests;
 mod invalidation_fold;
 mod merge_expiry;
@@ -142,10 +143,18 @@ fn key_bytes<K: Serialize>(key: &K) -> Bytes {
 /// [`FanOutItem::Forward`]: every test that calls this drains an
 /// owner's or a non-`Distributed` shard's queue, which never forwards.
 fn applied_keys<K: std::fmt::Debug>(items: Vec<FanOutItem<K>>) -> Vec<K> {
+    applied_writes(items)
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect()
+}
+
+/// [`applied_keys`] with the version each write was queued at.
+fn applied_writes<K: std::fmt::Debug>(items: Vec<FanOutItem<K>>) -> Vec<(K, Hlc)> {
     items
         .into_iter()
         .map(|item| match item {
-            FanOutItem::Applied(key) => key,
+            FanOutItem::Applied(key, ver) => (key, ver),
             FanOutItem::Forward(rec) => {
                 panic!("expected only FanOutItem::Applied, found a forwarded record: {rec:?}")
             }

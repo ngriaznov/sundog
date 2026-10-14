@@ -12,6 +12,8 @@ use crate::hlc::Hlc;
 use crate::store::spill::SpillTier;
 use crate::wire::WireRecord;
 
+#[cfg(feature = "spill")]
+use super::Lapsed;
 use super::expiry::decode_expiry;
 use super::keys::{hash_key_bytes, stripe_index_from_hash};
 use super::record::{
@@ -216,6 +218,29 @@ where
         keys: &[Bytes],
         now_ms: u64,
     ) -> (Vec<WireRecord>, Vec<SpilledPointer>) {
+        self.records_scoped_or_spilled(keys, now_ms, Lapsed::Hidden)
+    }
+
+    /// [`Engine::records_for_or_spilled`] on the written view the fan-out
+    /// reads (`Engine::written_record_for`): an entry past its expiry is
+    /// reported, resident as a record and spilled as a pointer, both with
+    /// the past deadline.
+    #[cfg(feature = "spill")]
+    pub(crate) fn written_records_or_spilled(
+        &self,
+        keys: &[Bytes],
+        now_ms: u64,
+    ) -> (Vec<WireRecord>, Vec<SpilledPointer>) {
+        self.records_scoped_or_spilled(keys, now_ms, Lapsed::Shown)
+    }
+
+    #[cfg(feature = "spill")]
+    fn records_scoped_or_spilled(
+        &self,
+        keys: &[Bytes],
+        now_ms: u64,
+        lapsed: Lapsed,
+    ) -> (Vec<WireRecord>, Vec<SpilledPointer>) {
         let mut records = Vec::new();
         let mut spilled = Vec::new();
         for key_bytes in keys {
@@ -236,7 +261,7 @@ where
             else {
                 continue;
             };
-            if self.is_absent(live, key_bytes.as_ref(), &stripe.long_ttl, now_ms) {
+            if self.is_absent_under(live, key_bytes.as_ref(), &stripe.long_ttl, now_ms, lapsed) {
                 continue;
             }
             match &live.state {

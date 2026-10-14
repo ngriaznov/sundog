@@ -121,11 +121,12 @@ where
                 key,
                 value,
                 created,
+                version,
             } => {
                 // A refusal means the cache is closing: the write landed
                 // here, as a detached local write, and fans out nowhere.
                 if notify_fan_out && matches!(origin, Origin::Local) {
-                    let _ = self.fan_out.push(FanOutItem::Applied(key.clone()));
+                    let _ = self.fan_out.push(FanOutItem::Applied(key.clone(), version));
                 }
                 if self.events.receiver_count() > 0 {
                     let event = if created {
@@ -136,11 +137,11 @@ where
                     let _ = self.events.send(event);
                 }
             }
-            ApplyOutcome::Tombstoned { key } => {
+            ApplyOutcome::Tombstoned { key, version } => {
                 // A refusal means the cache is closing: the write landed
                 // here, as a detached local write, and fans out nowhere.
                 if notify_fan_out && matches!(origin, Origin::Local) {
-                    let _ = self.fan_out.push(FanOutItem::Applied(key.clone()));
+                    let _ = self.fan_out.push(FanOutItem::Applied(key.clone(), version));
                 }
                 if self.events.receiver_count() > 0 {
                     let _ = self.events.send(Event::Removed { key, origin });
@@ -655,7 +656,7 @@ where
             by_stripe[engine::stripe_index_from_hash(batch_entry.0)].push(batch_entry);
         }
         let now = self.now_ms();
-        let mut applied_keys: Vec<K> = Vec::new();
+        let mut applied_keys: Vec<(K, Hlc)> = Vec::new();
         let mut written = engine::Written::default();
         // The reservation lives in this block only, so its unspent budget
         // is back with the tier before `retry_reservation_deficit` asks for
@@ -680,7 +681,7 @@ where
                 );
                 deficit += bucket_deficit;
                 for outcome in outcomes {
-                    applied_keys.extend(outcome.key().cloned());
+                    applied_keys.extend(outcome.key().cloned().zip(outcome.version()));
                     self.handle_apply_outcome(outcome, Origin::Local, false);
                 }
                 self.hand_off_bulk(&mut applied_keys, false);
@@ -768,15 +769,17 @@ where
     /// remainder when `flush` is set, so replication streams full frames
     /// while the rest of the write is still applying and a fill costs a
     /// bounded number of frames per peer whatever the machine's speed.
-    pub(super) fn hand_off_bulk(&self, landed: &mut Vec<K>, flush: bool) {
+    pub(super) fn hand_off_bulk(&self, landed: &mut Vec<(K, Hlc)>, flush: bool) {
         if landed.is_empty() || (!flush && landed.len() < REPLICATE_BATCH_COUNT) {
             return;
         }
         // A refusal means the cache is closing: these writes landed here,
         // as detached local writes, and fan out nowhere.
-        let _ = self
-            .fan_out
-            .extend(landed.drain(..).map(FanOutItem::Applied));
+        let _ = self.fan_out.extend(
+            landed
+                .drain(..)
+                .map(|(key, ver)| FanOutItem::Applied(key, ver)),
+        );
     }
 
     /// The error a forwarded write gets once the cache is closing: it
@@ -818,9 +821,10 @@ where
         self.events.subscribe()
     }
 
-    /// The queue of locally written keys awaiting fan-out. `fan_out_task`'s
-    /// cheaper alternative to subscribing on [`Shard::events`], since it
-    /// never reads `Event`'s `value`. Carries local writes and forwarded
+    /// The queue of locally written keys, each with the version it was
+    /// written at, awaiting fan-out. `fan_out_task`'s cheaper alternative to
+    /// subscribing on [`Shard::events`], since it never reads `Event`'s
+    /// `value`. Carries local writes and forwarded
     /// non-owner writes; see [`FanOutQueue`] and [`FanOutItem`].
     pub(crate) fn fan_out_queue(&self) -> Arc<FanOutQueue<FanOutItem<K>>> {
         Arc::clone(&self.fan_out)

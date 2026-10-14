@@ -98,7 +98,7 @@ where
         // A refusal means the cache is closing; the loaded value still
         // answers the read.
         if fill_fans_out(self.mode) {
-            let _ = self.fan_out.push(FanOutItem::Applied(key.clone()));
+            let _ = self.fan_out.push(FanOutItem::Applied(key.clone(), ver));
         }
         if self.events.receiver_count() > 0 {
             let key = key.clone();

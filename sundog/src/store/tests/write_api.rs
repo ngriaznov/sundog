@@ -157,8 +157,9 @@ async fn fan_out_queue_wakes_a_waiter_for_a_push_before_or_after_the_wait() {
 #[tokio::test]
 async fn hand_off_bulk_waits_for_a_full_batch_unless_flushed() {
     let s = shard::<u32, String>(1);
-    let mut landed: Vec<u32> =
-        (0..u32::try_from(REPLICATE_BATCH_COUNT - 1).expect("fits")).collect();
+    let mut landed: Vec<(u32, Hlc)> = (0..u32::try_from(REPLICATE_BATCH_COUNT - 1).expect("fits"))
+        .map(|key| (key, hlc(1, 1)))
+        .collect();
 
     s.hand_off_bulk(&mut landed, false);
     assert_eq!(
@@ -169,17 +170,21 @@ async fn hand_off_bulk_waits_for_a_full_batch_unless_flushed() {
     let drained = s.fan_out.drain();
     assert!(drained.is_empty(), "{drained:?}");
 
-    landed.push(u32::MAX);
+    landed.push((u32::MAX, hlc(1, 1)));
     s.hand_off_bulk(&mut landed, false);
     assert!(landed.is_empty(), "a full batch is handed off whole");
     assert_eq!(s.fan_out.drain().len(), REPLICATE_BATCH_COUNT);
 
-    let mut remainder = vec![1, 2, 3];
+    let mut remainder = vec![(1, hlc(5, 1)), (2, hlc(6, 1)), (3, hlc(7, 2))];
     s.hand_off_bulk(&mut remainder, true);
     assert!(remainder.is_empty(), "a flush hands off whatever is left");
-    assert_eq!(applied_keys(s.fan_out.drain()), vec![1, 2, 3]);
+    assert_eq!(
+        applied_writes(s.fan_out.drain()),
+        vec![(1, hlc(5, 1)), (2, hlc(6, 1)), (3, hlc(7, 2))],
+        "each key keeps the version it landed at"
+    );
 
-    let mut nothing: Vec<u32> = Vec::new();
+    let mut nothing: Vec<(u32, Hlc)> = Vec::new();
     s.hand_off_bulk(&mut nothing, true);
     assert!(
         s.fan_out.drain().is_empty(),

@@ -137,12 +137,10 @@ async fn expire_gives_a_live_entry_a_new_lifespan_and_keeps_its_value() {
         rearmed_version(before[0].ver, Some(1_030_000)),
         "the re-arm is stamped as the value's successor"
     );
-    assert!(
-        matches!(
-            s.fan_out_queue().drain().as_slice(),
-            [FanOutItem::Applied(1)]
-        ),
-        "the re-arm fans out like any local write"
+    assert_eq!(
+        applied_writes(s.fan_out_queue().drain()),
+        vec![(1, after[0].ver)],
+        "the re-arm fans out like any local write, at its rearmed version"
     );
     assert!(matches!(
         events.try_recv(),

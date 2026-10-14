@@ -1,5 +1,6 @@
 //! Shard-layer spill read path tests that go through a real spill tier.
 
+mod fan_out;
 mod pressure;
 
 use std::path::PathBuf;

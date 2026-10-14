@@ -2,6 +2,12 @@
 //! per [`Mode`]: broadcast for `Invalidation`/`Replicated`, grouped by exact
 //! target-peer set for `Distributed`. `Shard` holds no handle to `net::Mesh`,
 //! so this is the one place a write's mode decides who hears about it.
+//!
+//! The queue holds keys and the version each was written at. The drain reads
+//! the written view back: a write still stored travels as a record, a lapsed
+//! one with its past deadline, and a write whose entry is gone travels as an
+//! invalidation of the version written, so a peer never keeps serving the
+//! value the write replaced.
 
 use std::collections::HashSet;
 use std::hash::Hash;
@@ -14,10 +20,13 @@ use smol_str::SmolStr;
 use tokio_util::sync::CancellationToken;
 
 use super::{Cluster, group_in_order};
+use crate::hlc::Hlc;
 use crate::net::{MsgClass, OutFrame, batch_forward, batch_replicate};
 use crate::node::NodeId;
 use crate::ownership::OwnershipView;
-use crate::store::{FanOutItem, FanOutQueue, Mode, PartId, Shard, ShardOps};
+use crate::store::{
+    FanOutItem, FanOutQueue, FanOutRecords, Mode, PartId, Shard, ShardOps, newest_per_key,
+};
 use crate::wire::{self, Msg, WireRecord};
 
 /// Drains one opened cache's queue of locally written keys and fans them out
@@ -217,6 +226,95 @@ async fn fan_out_by_owner_set(
     }
 }
 
+/// How a departed write's invalidation is sent to a peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DepartedClass {
+    /// [`MsgClass::Invalidate`]: an overflowing outbox drops the oldest
+    /// frame. For `Invalidation` and `Replicated`, where a lost invalidation
+    /// is the same loss any invalidation has.
+    Drop,
+    /// [`Mesh::send_frames_awaiting`]: waits for outbox space, so a
+    /// co-owner of a part never keeps the older value that anti-entropy
+    /// would push back onto this node.
+    Awaiting,
+}
+
+/// The peers that receive one set of departed writes, and how.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DepartedSend {
+    targets: Vec<NodeId>,
+    class: DepartedClass,
+    records: Vec<WireRecord>,
+}
+
+/// Who hears of each departed write in `mode`: every peer in `peers` for
+/// `Invalidation` and `Replicated`, sent drop-oldest; the other owners of a
+/// write's part under `view` for `Distributed`, sent awaiting, with a part
+/// this node solely owns left out. `Local` sends nothing, and `Distributed`
+/// without a view has no owners to name. Pure; unit tested directly.
+fn plan_departed_sends(
+    mode: Mode,
+    peers: &[NodeId],
+    view: Option<&OwnershipView>,
+    self_node: NodeId,
+    departed: Vec<WireRecord>,
+) -> Vec<DepartedSend> {
+    if departed.is_empty() {
+        return Vec::new();
+    }
+    match mode {
+        Mode::Local => Vec::new(),
+        Mode::Invalidation | Mode::Replicated => {
+            if peers.is_empty() {
+                return Vec::new();
+            }
+            vec![DepartedSend {
+                targets: peers.to_vec(),
+                class: DepartedClass::Drop,
+                records: departed,
+            }]
+        }
+        Mode::Distributed { .. } => view.map_or_else(Vec::new, |view| {
+            group_by_owner_set(view, self_node, departed)
+                .into_iter()
+                .filter(|group| !group.owners.is_empty())
+                .map(|OwnerGroup { owners, records }| DepartedSend {
+                    targets: owners,
+                    class: DepartedClass::Awaiting,
+                    records,
+                })
+                .collect()
+        }),
+    }
+}
+
+/// Sends each of `plan`'s departed writes as [`Msg::Invalidate`].
+async fn send_departed(cluster: &Cluster, cache_name: &SmolStr, plan: Vec<DepartedSend>) {
+    for DepartedSend {
+        targets,
+        class,
+        records,
+    } in plan
+    {
+        let frames = encode_frames(invalidations(cache_name, records));
+        for peer in targets {
+            match class {
+                DepartedClass::Drop => {
+                    cluster
+                        .mesh()
+                        .send_frames(peer, MsgClass::Invalidate, frames.iter().cloned());
+                }
+                DepartedClass::Awaiting => {
+                    cluster
+                        .mesh()
+                        .send_frames_awaiting(peer, frames.clone())
+                        .await;
+                }
+            }
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one branch per Mode, each with its own send path"
@@ -232,40 +330,47 @@ async fn fan_out_batch<K, V>(
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
     // The queue carries local writes (every mode) and, under
-    // `Mode::Distributed`, forwarded non-owner writes. This only dedups the
-    // drained burst's applied keys; a forwarded record is used as-is, with
-    // nothing to re-fetch.
-    let mut seen: HashSet<K> = HashSet::new();
-    let mut applied_keys: Vec<K> = Vec::new();
+    // `Mode::Distributed`, forwarded non-owner writes. A burst that wrote a
+    // key twice fans out its newest write once; a forwarded record is used
+    // as-is, with nothing to re-fetch.
+    let mut applied: Vec<(K, Hlc)> = Vec::new();
     let mut forwarded: Vec<WireRecord> = Vec::new();
     for item in notified {
         match item {
-            FanOutItem::Applied(key) => {
-                if seen.insert(key.clone()) {
-                    applied_keys.push(key);
-                }
-            }
+            FanOutItem::Applied(key, ver) => applied.push((key, ver)),
             FanOutItem::Forward(rec) => forwarded.push(rec),
         }
     }
-    if applied_keys.is_empty() && forwarded.is_empty() {
+    let applied = newest_per_key(applied);
+    if applied.is_empty() && forwarded.is_empty() {
         return;
     }
 
-    // Re-fetches applied keys through `Shard::records_for_typed` rather
-    // than carrying the `Hlc`/wire bytes on `Event` itself. A missing key
-    // on re-fetch means a later write or GC already covers it, so nothing
-    // stale needs fanning out. A forwarded record never applies locally,
-    // so it travels exactly as built.
-    let mut records = shard.records_for_typed(&applied_keys).await;
+    // Reads the written view back rather than carrying wire bytes on the
+    // queue. A write with no entry left at its version (evicted, swept,
+    // disowned, idle, or unreadable on disk) is departed: no later write
+    // and no anti-entropy round covers it, so its version is sent to the
+    // peers as an invalidation, after the records. A forwarded record never
+    // applies locally, so it travels exactly as built.
+    let FanOutRecords {
+        mut records,
+        departed,
+    } = shard.fan_out_records(&applied).await;
     let applied_keys_bytes: HashSet<Bytes> = records.iter().map(|rec| rec.key.clone()).collect();
     records.extend(forwarded);
-    if records.is_empty() {
+    if records.is_empty() && departed.is_empty() {
         return;
     }
 
     if let Mode::Distributed { .. } = mode {
         let Some(view) = shard.ownership_view() else {
+            if !departed.is_empty() {
+                tracing::debug!(
+                    cache = %cache_name,
+                    departed = departed.len(),
+                    "no ownership view; departed writes not invalidated"
+                );
+            }
             return;
         };
         // A write forwarded before this node owned its part, but owned by
@@ -291,6 +396,8 @@ async fn fan_out_batch<K, V>(
             records,
         )
         .await;
+        let plan = plan_departed_sends(mode, &[], Some(&view), cluster.node_id(), departed);
+        send_departed(cluster, cache_name, plan).await;
         return;
     }
 
@@ -331,6 +438,9 @@ async fn fan_out_batch<K, V>(
             }
         }
     }
+    let peers = cluster.live_peer_ids();
+    let plan = plan_departed_sends(mode, &peers, None, cluster.node_id(), departed);
+    send_departed(cluster, cache_name, plan).await;
 }
 
 // The grouping logic is pure and mesh-free; this is `fan_out_by_owner_set`'s
@@ -662,5 +772,142 @@ mod tests {
                 }
             );
         }
+    }
+
+    fn departed_for(keys: impl IntoIterator<Item = u32>) -> Vec<WireRecord> {
+        keys.into_iter()
+            .map(|key| WireRecord {
+                value: None,
+                ..wire_record_for_u32(key)
+            })
+            .collect()
+    }
+
+    fn nodes(ids: &[u64]) -> Vec<NodeId> {
+        ids.iter().copied().map(NodeId::from).collect()
+    }
+
+    #[test]
+    fn departed_frames_encode_one_invalidate_per_departed_record() {
+        let departed = departed_for(0..3);
+        let msgs = invalidations(&SmolStr::new("c"), departed.clone());
+        let frames = encode_frames(msgs.clone());
+        assert_eq!(frames.len(), departed.len(), "every departed write encodes");
+        for (msg, rec) in msgs.iter().zip(&departed) {
+            assert!(matches!(
+                msg,
+                Msg::Invalidate { key, ver, .. } if *key == rec.key && *ver == rec.ver
+            ));
+        }
+    }
+
+    #[test]
+    fn an_invalidation_or_replicated_cache_invalidates_every_peer_drop_oldest() {
+        let departed = departed_for(0..2);
+        for mode in [Mode::Invalidation, Mode::Replicated] {
+            assert_eq!(
+                plan_departed_sends(
+                    mode,
+                    &nodes(&[2, 3]),
+                    None,
+                    NodeId::from(1),
+                    departed.clone()
+                ),
+                vec![DepartedSend {
+                    targets: nodes(&[2, 3]),
+                    class: DepartedClass::Drop,
+                    records: departed.clone(),
+                }],
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_departed_or_nobody_to_tell_plans_no_send() {
+        for mode in [Mode::Invalidation, Mode::Replicated, Mode::Local] {
+            assert!(
+                plan_departed_sends(mode, &nodes(&[2]), None, NodeId::from(1), Vec::new())
+                    .is_empty(),
+                "{mode:?}: no departed write"
+            );
+            assert!(
+                plan_departed_sends(mode, &[], None, NodeId::from(1), departed_for(0..1))
+                    .is_empty(),
+                "{mode:?}: no peer"
+            );
+        }
+        assert!(
+            plan_departed_sends(
+                Mode::Local,
+                &nodes(&[2]),
+                None,
+                NodeId::from(1),
+                departed_for(0..1)
+            )
+            .is_empty(),
+            "a local cache has no peers to invalidate"
+        );
+    }
+
+    #[test]
+    fn distributed_departed_writes_group_by_the_part_other_owners_and_await() {
+        let self_node = NodeId::from(1);
+        let eligible: Vec<NodeId> = (1..=5u64).map(NodeId::from).collect();
+        let owners = std::num::NonZeroU8::new(2).expect("nonzero");
+        let view = OwnershipView::compute(self_node, eligible, owners);
+        let departed = departed_for(0..40);
+
+        let plan = plan_departed_sends(
+            Mode::Distributed { owners },
+            &[],
+            Some(&view),
+            self_node,
+            departed.clone(),
+        );
+
+        let expected: Vec<OwnerGroup> = group_by_owner_set(&view, self_node, departed.clone())
+            .into_iter()
+            .filter(|group| !group.owners.is_empty())
+            .collect();
+        assert!(!expected.is_empty(), "some part has another owner");
+        assert_eq!(plan.len(), expected.len());
+        for (send, group) in plan.iter().zip(&expected) {
+            assert_eq!(send.targets, group.owners);
+            assert_eq!(send.records, group.records);
+            assert_eq!(
+                send.class,
+                DepartedClass::Awaiting,
+                "a co-owner must not keep the older value anti-entropy would push back"
+            );
+            assert!(!send.targets.contains(&self_node));
+        }
+        let sent: usize = plan.iter().map(|send| send.records.len()).sum();
+        let sole_owned = departed
+            .iter()
+            .filter(|rec| {
+                view.owners_of(PartId::of_key(&rec.key))
+                    .iter()
+                    .all(|&n| n == self_node)
+            })
+            .count();
+        assert_eq!(
+            sent + sole_owned,
+            departed.len(),
+            "a part this node solely owns has nobody to tell"
+        );
+    }
+
+    #[test]
+    fn distributed_departed_writes_without_a_view_plan_no_send() {
+        let owners = std::num::NonZeroU8::new(2).expect("nonzero");
+        let plan = plan_departed_sends(
+            Mode::Distributed { owners },
+            &nodes(&[2]),
+            None,
+            NodeId::from(1),
+            departed_for(0..3),
+        );
+        assert_eq!(plan, Vec::new(), "no view names no owner");
     }
 }

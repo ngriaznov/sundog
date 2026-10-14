@@ -111,6 +111,16 @@ concurrent with it, can lose to one. A `Distributed` node that does not
 hold the key asks an owner for it, as `fetch` does. `ttl_of` reads the
 lifetime left on this node's copy.
 
+A write that has already expired when it is sent, a zero TTL included,
+reaches every peer as an already-expired record, so the peers drop the value
+it replaced. In `Invalidation` with a resolver that does not merge, the
+peers get the invalidation instead. A write whose entry is gone by the time
+it is sent, swept, disowned or idle, invalidates the older copy on every
+peer that receives the frame; a frame lost to an overflowing outbox is not
+resent. In `Replicated` and `Distributed` an evicted entry spills to disk
+rather than disappearing, so a departed write there comes from a sweep or
+from an ownership release.
+
 Shortening a lifetime is not a delete. A node cut off for the whole
 lifetime keeps its copy's old deadline and can bring the entry back until
 that deadline passes; `remove` is the delete.

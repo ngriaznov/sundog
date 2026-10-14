@@ -605,3 +605,74 @@ fn apply_locked_put_overwrite_tombstone_evict_interleaving_matches_pre_slab_beha
         }
     }
 }
+
+#[test]
+fn apply_outcome_reports_the_stored_version() {
+    let engine = engine_u32_string(u64::MAX, None);
+    let put_ver = hlc(10, 1);
+    let outcome = put(&engine, 1, key_bytes(1), "a".into(), put_ver, None, 0);
+    assert_eq!(outcome.version(), Some(put_ver), "a created put");
+    assert!(matches!(
+        outcome,
+        ApplyOutcome::Put { version, .. } if version == put_ver
+    ));
+
+    let newer = hlc(20, 1);
+    let outcome = put(&engine, 1, key_bytes(1), "b".into(), newer, None, 0);
+    assert_eq!(outcome.version(), Some(newer), "an overwrite");
+
+    let stale = put(&engine, 1, key_bytes(1), "c".into(), hlc(5, 1), None, 0);
+    assert!(matches!(stale, ApplyOutcome::Rejected));
+    assert_eq!(stale.version(), None, "a rejected write has no version");
+    assert_eq!(stale.key(), None);
+
+    let tomb_ver = hlc(30, 1);
+    let outcome = tombstone(&engine, 1, key_bytes(1), tomb_ver, 0);
+    assert!(matches!(
+        outcome,
+        ApplyOutcome::Tombstoned { version, .. } if version == tomb_ver
+    ));
+    assert_eq!(outcome.version(), Some(tomb_ver), "a tombstone");
+    assert_eq!(outcome.key(), Some(&1));
+}
+
+#[test]
+fn a_merged_put_reports_the_version_it_is_stored_at_not_the_callers_stamp() {
+    let engine: Engine<u32, std::collections::BTreeSet<String>> =
+        Engine::new(u64::MAX, None, None, None);
+    let resolver = UnionSetResolver;
+    let _ = put_with_resolver(
+        &engine,
+        1,
+        key_bytes(1),
+        string_set(&["a"]),
+        hlc(1, 1),
+        None,
+        0,
+        &resolver,
+    );
+    let caller_stamp = hlc(5, 2);
+    let merged = put_with_resolver(
+        &engine,
+        1,
+        key_bytes(1),
+        string_set(&["b"]),
+        caller_stamp,
+        None,
+        0,
+        &resolver,
+    );
+
+    let stored = engine
+        .record_for(key_bytes(1).as_ref(), 0)
+        .expect("merged key is live");
+    assert_ne!(
+        stored.ver, caller_stamp,
+        "the union is a new value, stored at a minted version"
+    );
+    assert_eq!(
+        merged.version(),
+        Some(stored.ver),
+        "the outcome carries the rebound version the fan-out will look the entry up at"
+    );
+}
