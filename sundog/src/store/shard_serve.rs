@@ -57,6 +57,33 @@ where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
+    /// [`ShardOps::invalidate`]'s body. `tombstone` says the caller knows the
+    /// record is a tombstone, as a held-only batch does for its removals: a
+    /// pending [`Shard::merge`] fold older than it is then discarded. A bare
+    /// invalidation may as well be a peer's write, so a fold older than it is
+    /// applied first and the copy dropped after, and no contribution is lost.
+    fn invalidate_key(&self, key: &[u8], ver: Hlc, tombstone: bool) {
+        if !self.observe_remote(ver) {
+            return;
+        }
+        let Ok(decoded_key) = postcard::from_bytes::<K>(key) else {
+            tracing::warn!(cache = %self.name, "invalidate: undecodable key bytes");
+            return;
+        };
+        let hash = engine::hash_key_bytes(key);
+        if tombstone {
+            self.discard_pending_merge_before(&decoded_key, ver);
+        } else {
+            self.flush_pending_merge_before(&decoded_key, hash, ver);
+        }
+        if self.engine.invalidate(key, hash, ver).is_some() {
+            let _ = self.events.send(Event::Removed {
+                key: decoded_key,
+                origin: Origin::Remote(ver.node),
+            });
+        }
+    }
+
     /// The inbound-apply guard, applied to a batch before decoding: keeps
     /// the records this node's current view owns, forwards the ones for a
     /// bucket mid disown-grace on to its current owners, and drops the rest.
@@ -464,7 +491,7 @@ where
                 engine::ApplyScope::Any => (recs, Vec::new()),
             };
             for rec in removals {
-                self.invalidate(rec.key, rec.ver).await;
+                self.invalidate_key(rec.key.as_ref(), rec.ver, true);
             }
             let mut decoded: Vec<RemoteEntry<K, V>> = Vec::with_capacity(recs.len());
             for rec in recs {
@@ -566,22 +593,7 @@ where
     }
 
     fn invalidate(&self, key: Bytes, ver: Hlc) -> BoxFuture<'_, ()> {
-        Box::pin(async move {
-            if !self.observe_remote(ver) {
-                return;
-            }
-            let Ok(decoded_key) = postcard::from_bytes::<K>(&key) else {
-                tracing::warn!(cache = %self.name, "invalidate: undecodable key bytes");
-                return;
-            };
-            let hash = engine::hash_key_bytes(key.as_ref());
-            if self.engine.invalidate(key.as_ref(), hash, ver).is_some() {
-                let _ = self.events.send(Event::Removed {
-                    key: decoded_key,
-                    origin: Origin::Remote(ver.node),
-                });
-            }
-        })
+        Box::pin(async move { self.invalidate_key(key.as_ref(), ver, false) })
     }
 
     #[allow(private_interfaces, reason = "see ShardOps::serve_load")]

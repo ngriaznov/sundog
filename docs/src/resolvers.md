@@ -119,7 +119,8 @@ give merged values a lifetime as they give any other value one:
   longest lifetime among its parts, so a longer-lived record can carry a
   contribution back to a node that had already dropped it as expired.
   `merge_coalesce_window` changes which contributions survive for the same
-  reason. Anti-entropy settles replicas that hold the key; `Invalidation`
+  reason; a remove discards the contributions pending before it, and a
+  flushed fold carries the version of its last call. Anti-entropy settles replicas that hold the key; `Invalidation`
   runs none, so there the difference stays until the next write or the
   expiry.
 - **Expiry ends a value, not a writer's running total.** A writer that
@@ -130,7 +131,9 @@ give merged values a lifetime as they give any other value one:
 - **A delete is a tombstone.** `Cache::remove` writes a tombstone, and a
   tombstone and a value settle by version, as under every resolver.
   A writer's next write after the remove sends its whole running total
-  again, so a remove does not reset a count; a new key does.
+  again, so a remove does not reset a count; a new key does. A fold still
+  waiting in `merge_coalesce_window` dies with the remove, and a merge made
+  after it starts a new fold.
 
 ## What a CRDT costs
 
@@ -142,7 +145,8 @@ give merged values a lifetime as they give any other value one:
   encodes the result.** `CacheBuilder::merge_coalesce_window` folds a key's
   consecutive `Cache::merge` and `Cache::merge_with_ttl` calls in memory and
   applies them once per window. A read does not see a fold still waiting in
-  its window, and a crash loses it. `insert` never waits in a window, and
+  its window, a remove discards it, a crash loses it, and the flushed record
+  carries the version of its last call. `insert` never waits in a window, and
   `open` refuses a nonzero window for a resolver that does not merge.
 - **The value grows with its writers.** Each writer, one run of one node,
   owns a slot, so every restart adds one. The slots of writers whose node is

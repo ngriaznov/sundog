@@ -267,3 +267,78 @@ async fn a_peers_record_during_a_load_leaves_the_loaded_value_uncached() {
     assert_eq!(loaded.expect("load"), Some("stale".to_string()));
     assert_eq!(s.get(&2).await, None, "neither value is cached");
 }
+
+/// An `Invalidation` counter shard that coalesces `merge` calls for a minute.
+fn coalescing_counter_shard(clock: &Arc<AtomicU64>) -> Shard<u32, PnCounter> {
+    counter_shard(Mode::Invalidation, 1, clock).with_merge_coalesce_window(Duration::from_secs(60))
+}
+
+#[tokio::test]
+async fn an_invalidation_newer_than_a_pending_merge_flushes_it_then_removes_the_copy() {
+    let clock = Arc::new(AtomicU64::new(T0));
+    let s = coalescing_counter_shard(&clock);
+    s.merge(1, delta(11, 5)).await.expect("merge");
+    let (merged_at, _) = s.pending_merge_snapshot(&1).expect("pending");
+
+    ShardOps::invalidate(&s, key_bytes(&1u32), hlc(T0 + 10, 12)).await;
+    s.flush_all_pending_merges();
+
+    assert_eq!(
+        counter_value(&s),
+        None,
+        "the invalidation lands after the merge it follows, so no copy stays"
+    );
+    assert_eq!(
+        applied_writes(s.fan_out_queue().drain()),
+        vec![(1, merged_at)],
+        "the merge replicated at its own version before the copy dropped: peers keep the contribution"
+    );
+}
+
+#[tokio::test]
+async fn an_invalidation_older_than_a_pending_merge_keeps_it() {
+    let clock = Arc::new(AtomicU64::new(T0));
+    let s = coalescing_counter_shard(&clock);
+    s.merge(1, delta(11, 5)).await.expect("merge");
+
+    ShardOps::invalidate(&s, key_bytes(&1u32), hlc(T0 - 10, 12)).await;
+    assert!(
+        s.pending_merge_snapshot(&1).is_some(),
+        "the fold is still pending"
+    );
+    s.flush_all_pending_merges();
+
+    assert_eq!(counter_value(&s), Some(5));
+}
+
+#[tokio::test]
+async fn a_tombstone_record_in_invalidation_mode_discards_a_pending_fold() {
+    let clock = Arc::new(AtomicU64::new(T0));
+    let s = coalescing_counter_shard(&clock);
+    s.merge(1, delta(11, 5)).await.expect("merge");
+
+    ShardOps::apply_remote(&s, record(12, None, T0 + 10, None)).await;
+    s.flush_all_pending_merges();
+
+    assert_eq!(
+        counter_value(&s),
+        None,
+        "a known tombstone newer than the merge call outvotes it"
+    );
+    assert!(
+        s.fan_out_queue().drain().is_empty(),
+        "the discarded fold replicates nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_tombstone_record_older_than_a_pending_fold_leaves_it_in_invalidation_mode() {
+    let clock = Arc::new(AtomicU64::new(T0));
+    let s = coalescing_counter_shard(&clock);
+    s.merge(1, delta(11, 5)).await.expect("merge");
+
+    ShardOps::apply_remote(&s, record(12, None, T0 - 10, None)).await;
+    s.flush_all_pending_merges();
+
+    assert_eq!(counter_value(&s), Some(5));
+}

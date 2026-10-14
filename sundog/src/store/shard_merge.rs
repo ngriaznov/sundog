@@ -6,6 +6,7 @@ use std::collections::hash_map::{Entry, OccupiedEntry};
 use std::future::Future;
 use std::hash::Hash;
 use std::sync::PoisonError;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -38,6 +39,22 @@ pub(super) fn merge_deadline_ms(started_at_ms: u64, window: Duration) -> u64 {
 /// `tokio::time`.
 pub(super) fn merge_window_elapsed(now_ms: u64, deadline_ms: u64) -> bool {
     now_ms >= deadline_ms
+}
+
+/// Whether a tombstone at `tombstone_ver` discards a pending fold whose last
+/// call was stamped `pending_ver`: only a tombstone newer than the call does.
+/// A fold stamped at or after the tombstone would have applied over it with
+/// no window, so it stays. Pure, so the ordering has a unit test of its own.
+pub(super) fn pending_merge_superseded(pending_ver: Hlc, tombstone_ver: Hlc) -> bool {
+    pending_ver < tombstone_ver
+}
+
+/// The version a pending fold carries once a call stamped `call_ver` folds
+/// into it: the newer of the two. Two `merge` calls stamp before they take
+/// the stripe lock, so the later stamp can fold first; keeping the maximum
+/// stops the earlier one from lowering the version the flush applies at.
+pub(super) fn folded_pending_ver(pending_ver: Hlc, call_ver: Hlc) -> Hlc {
+    pending_ver.max(call_ver)
 }
 
 /// Pops every `(deadline_ms, seq) -> key` entry from `by_deadline` whose
@@ -89,6 +106,17 @@ where
     ///
     /// [`Shard::get`]/[`Shard::get_sync`] never consult a pending fold: it
     /// stays invisible to reads for up to one whole window.
+    ///
+    /// A pending fold orders against other writes as its last call did. The
+    /// flush applies it at the version of that call, so an insert after the
+    /// call outranks it as it would with no window. A
+    /// [`Shard::remove`], [`Shard::remove_many`] or [`Shard::clear`] of the
+    /// key discards the fold, and a merge after the remove opens a fresh
+    /// one. A tombstone from a peer newer than the last call discards it
+    /// too; a peer's invalidation newer than the call applies the fold first
+    /// and then drops the copy. A tombstone older than the last call leaves
+    /// the fold whole, including contributions folded in before the
+    /// tombstone's version.
     ///
     /// # Errors
     ///
@@ -181,7 +209,9 @@ where
                     encoded,
                     expires_at_ms,
                     ver,
+                    deadline_key: (deadline_ms, seq),
                 });
+                self.pending_merge_count.fetch_add(1, Ordering::AcqRel);
                 drop(stripe);
                 self.merge_wake.notify_one();
             }
@@ -250,7 +280,7 @@ where
                 entry.value = merged_value;
                 entry.encoded = merged_bytes;
                 entry.expires_at_ms = merged_expires_at_ms;
-                entry.ver = ver;
+                entry.ver = folded_pending_ver(entry.ver, ver);
             }
             // The pending entry is all that is alive: the new call adds
             // nothing.
@@ -260,7 +290,7 @@ where
                 entry.value = value;
                 entry.encoded = encoded;
                 entry.expires_at_ms = expires_at_ms;
-                entry.ver = ver;
+                entry.ver = folded_pending_ver(entry.ver, ver);
             }
             (Fold::Both | Fold::Winner, None) => {
                 match self.resolver.winner(key_bytes.as_ref(), a, b) {
@@ -269,7 +299,7 @@ where
                         entry.value = value;
                         entry.encoded = encoded;
                         entry.expires_at_ms = expires_at_ms;
-                        entry.ver = ver;
+                        entry.ver = folded_pending_ver(entry.ver, ver);
                     }
                     Winner::A => {
                         // The incoming call lost outright: nothing about the pending entry
@@ -283,15 +313,15 @@ where
 
     /// Applies one flushed [`PendingMerge`] through
     /// [`Shard::apply_or_forward`], exactly as if its folded value were
-    /// freshly [`Shard::insert`]ed: a fresh version stamped now, so
-    /// replication and events see the fold as one write happening at flush
-    /// time, not backdated to whichever `merge` call opened the window.
-    /// Pushes onto the fan-out queue without awaiting room first, unlike
-    /// `Shard::merge`'s immediate-apply branch: this runs from the
+    /// [`Shard::insert`]ed by the last call it folds: at that call's own
+    /// version, so replication and events see one record that orders against
+    /// every remove, clear and write issued after the call as the call itself
+    /// would have, and a forwarded fold carries the call's version to the
+    /// owners. Pushes onto the fan-out queue without awaiting room first,
+    /// unlike `Shard::merge`'s immediate-apply branch: this runs from the
     /// merge-coalesce sweep and from `Drop`, where no async runtime may be
     /// left to await on.
-    fn flush_one_pending_merge(&self, key: K, pending: PendingMerge<V>) {
-        let ver = self.stamp_local();
+    pub(super) fn flush_one_pending_merge(&self, key: K, pending: PendingMerge<V>) {
         let incoming = Incoming::Put {
             value: pending.value,
             expires_at_ms: pending.expires_at_ms,
@@ -302,7 +332,100 @@ where
         // `Drop`) has anywhere to hand an error to, the same fate an
         // ordinary local write racing a close already gets, documented on
         // `Shard::insert`.
-        let _ = self.apply_or_forward(key, pending.key_bytes, ver, incoming);
+        let _ = self.apply_or_forward(key, pending.key_bytes, pending.ver, incoming);
+    }
+
+    /// Whether any fold is pending. One load: the tombstone paths check it
+    /// before they encode or lock anything.
+    fn has_pending_merges(&self) -> bool {
+        self.pending_merge_count.load(Ordering::Acquire) != 0
+    }
+
+    /// The number of pending folds.
+    #[cfg(test)]
+    pub(super) fn pending_merge_count(&self) -> usize {
+        self.pending_merge_count.load(Ordering::Acquire)
+    }
+
+    /// Takes `key`'s pending fold out when `superseded` says so of its
+    /// version. `hash` is `key`'s encoded-bytes hash, which picks the stripe.
+    fn take_pending_merge_if(
+        &self,
+        key: &K,
+        hash: u64,
+        superseded: impl FnOnce(Hlc) -> bool,
+    ) -> Option<PendingMerge<V>> {
+        let mut stripe = self.pending_merges[engine::stripe_index_from_hash(hash)]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !superseded(stripe.entries.get(key)?.ver) {
+            return None;
+        }
+        let taken = stripe.remove(key);
+        if taken.is_some() {
+            self.pending_merge_count.fetch_sub(1, Ordering::AcqRel);
+        }
+        taken
+    }
+
+    /// Drops `key`'s pending fold, whatever its version. A local remove or
+    /// clear calls this before it stamps its tombstone, so a `merge` stamped
+    /// after the tombstone folds into nothing and opens a fresh fold, and one
+    /// stamped before it that lands late is applied at its own older version
+    /// and loses.
+    pub(super) fn discard_pending_merge(&self, key: &K, key_bytes: &[u8]) {
+        if !self.has_pending_merges() {
+            return;
+        }
+        let hash = engine::hash_key_bytes(key_bytes);
+        drop(self.take_pending_merge_if(key, hash, |_| true));
+    }
+
+    /// Drops `key`'s pending fold when a tombstone at `tombstone_ver` is newer
+    /// than the fold's last call ([`pending_merge_superseded`]). The path for
+    /// a tombstone this node did not stamp.
+    pub(super) fn discard_pending_merge_before(&self, key: &K, tombstone_ver: Hlc) {
+        if !self.has_pending_merges() {
+            return;
+        }
+        let Ok(key_bytes) = encode_key(key) else {
+            return;
+        };
+        let hash = engine::hash_key_bytes(key_bytes.as_ref());
+        drop(self.take_pending_merge_if(key, hash, |pending_ver| {
+            pending_merge_superseded(pending_ver, tombstone_ver)
+        }));
+    }
+
+    /// Applies `key`'s pending fold now when `ver` is newer than its last
+    /// call, so a peer's invalidation of the key lands after the merge it
+    /// follows. A bare invalidation cannot say whether the peer removed the
+    /// key or wrote it, and the fold's contribution has replicated nowhere
+    /// yet, so dropping it would lose it from the cluster; applying it
+    /// first, then invalidating, replays the order a zero window gives.
+    pub(super) fn flush_pending_merge_before(&self, key: &K, hash: u64, ver: Hlc) {
+        if !self.has_pending_merges() {
+            return;
+        }
+        if let Some(pending) = self.take_pending_merge_if(key, hash, |pending_ver| {
+            pending_merge_superseded(pending_ver, ver)
+        }) {
+            self.flush_one_pending_merge(key.clone(), pending);
+        }
+    }
+
+    /// The keys with a pending fold, for [`Shard::clear`]: a key that exists
+    /// only as a fold is not among the stored keys.
+    pub(super) fn pending_merge_keys(&self) -> Vec<K> {
+        if !self.has_pending_merges() {
+            return Vec::new();
+        }
+        let mut keys = Vec::new();
+        for stripe_lock in &*self.pending_merges {
+            let stripe = stripe_lock.lock().unwrap_or_else(PoisonError::into_inner);
+            keys.extend(stripe.entries.keys().cloned());
+        }
+        keys
     }
 
     /// Flushes every key whose [`Shard::merge`] coalescing window has
@@ -319,10 +442,13 @@ where
         for stripe_lock in &*self.pending_merges {
             let due: Vec<(K, PendingMerge<V>)> = {
                 let mut stripe = stripe_lock.lock().unwrap_or_else(PoisonError::into_inner);
-                drain_due_deadlines(&mut stripe.by_deadline, now_ms)
+                let due: Vec<_> = drain_due_deadlines(&mut stripe.by_deadline, now_ms)
                     .into_iter()
                     .filter_map(|key| stripe.entries.remove(&key).map(|entry| (key, entry)))
-                    .collect()
+                    .collect();
+                self.pending_merge_count
+                    .fetch_sub(due.len(), Ordering::AcqRel);
+                due
             };
             for (key, entry) in due {
                 self.flush_one_pending_merge(key, entry);
@@ -342,7 +468,10 @@ where
             let due: Vec<(K, PendingMerge<V>)> = {
                 let mut stripe = stripe_lock.lock().unwrap_or_else(PoisonError::into_inner);
                 stripe.by_deadline.clear();
-                std::mem::take(&mut stripe.entries).into_iter().collect()
+                let due: Vec<_> = std::mem::take(&mut stripe.entries).into_iter().collect();
+                self.pending_merge_count
+                    .fetch_sub(due.len(), Ordering::AcqRel);
+                due
             };
             for (key, entry) in due {
                 self.flush_one_pending_merge(key, entry);

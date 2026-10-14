@@ -1,6 +1,7 @@
 //! The write path of a [`Shard`]: single and bulk inserts, removes, `clear`, the apply and
 //! forward helpers they share, and the fan-out backpressure and memory-ceiling checks.
 
+use std::collections::HashSet;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Duration;
@@ -138,6 +139,11 @@ where
                 }
             }
             ApplyOutcome::Tombstoned { key, version } => {
+                // A local tombstone discarded the key's fold before it
+                // stamped; one from a peer discards a fold older than it.
+                if !matches!(origin, Origin::Local) {
+                    self.discard_pending_merge_before(&key, version);
+                }
                 // A refusal means the cache is closing: the write landed
                 // here, as a detached local write, and fans out nowhere.
                 if notify_fan_out && matches!(origin, Origin::Local) {
@@ -694,7 +700,8 @@ where
     }
 
     /// Stamps and applies a local tombstone, then fans it out per [`Mode`], as
-    /// [`Shard::insert`] does.
+    /// [`Shard::insert`] does. A [`Shard::merge`] fold still pending for the
+    /// key is discarded first.
     ///
     /// # Errors
     ///
@@ -711,6 +718,9 @@ where
     /// As [`Shard::remove`].
     pub fn remove_sync(&self, key: &K) -> Result<(), CacheError> {
         let key_bytes = encode_key(key)?;
+        // Before the stamp: a merge stamped after the tombstone folds into
+        // nothing, and one stamped before it flushes at its own older version.
+        self.discard_pending_merge(key, key_bytes.as_ref());
         let ver = self.stamp_local();
         if !self.owns_key(key_bytes.as_ref()) {
             let rec = self.forward_write(key.clone(), key_bytes, Incoming::Tombstone, ver);
@@ -742,6 +752,8 @@ where
         let mut prepared = Vec::new();
         for key in keys {
             let key_bytes = encode_key(&key)?;
+            // Before the stamp, as in `Shard::remove_sync`.
+            self.discard_pending_merge(&key, key_bytes.as_ref());
             let ver = self.stamp_local();
             let hash = engine::hash_key_bytes(key_bytes.as_ref());
             prepared.push((hash, key, key_bytes, ver));
@@ -793,15 +805,26 @@ where
     }
 
     /// Tombstones every key this node currently holds, via
-    /// [`Shard::remove_many`] over a snapshot of [`Shard::keys`], cost
-    /// O(entries). An entry a peer holds that never reached
+    /// [`Shard::remove_many`] over a snapshot of [`Shard::keys`] and of the
+    /// keys with a [`Shard::merge`] fold still pending in its coalesce
+    /// window, cost O(entries). A pending fold is discarded and its key
+    /// tombstoned like any other. An entry a peer holds that never reached
     /// this node survives untouched.
     ///
     /// # Errors
     ///
     /// As [`Shard::remove_many`].
     pub async fn clear(&self) -> Result<(), CacheError> {
-        self.remove_many(self.keys()).await
+        // Pending keys first: a flush between the two snapshots moves a key
+        // from pending to stored, so taking them in this order sees it in at
+        // least one of them.
+        let mut keys = self.pending_merge_keys();
+        if keys.is_empty() {
+            return self.remove_many(self.keys()).await;
+        }
+        let pending: HashSet<K> = keys.iter().cloned().collect();
+        keys.extend(self.keys().into_iter().filter(|key| !pending.contains(key)));
+        self.remove_many(keys).await
     }
 
     /// Drops the local copy of `key` without writing a tombstone or fanning

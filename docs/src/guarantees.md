@@ -93,6 +93,16 @@ expiry. Give every entry a TTL and deletes stay deleted whatever the
 downtime. Without TTLs, raise `tombstone_max_ttl` above the longest outage
 you tolerate.
 
+A remove or clear outvotes a merge still waiting in its
+`merge_coalesce_window`: the pending fold is discarded, `clear` covers a key
+that exists only as a pending fold, and a merge made after the remove opens
+a fresh fold. A tombstone from a peer discards a pending fold made before
+it. A tombstone stamped between two calls folded into one pending record,
+which only a peer whose clock runs behind produces, leaves the whole fold in
+place. A fold that flushes carries the version of its last `merge` call, so
+every write and remove stamped after that call outranks it, as with no
+window.
+
 ## Expiry
 
 A TTL-expired entry never returns. Every record carries its absolute

@@ -388,3 +388,149 @@ async fn close_flushes_a_pending_coalesced_merge() {
 
     cluster.shutdown().await;
 }
+
+/// A counter cache whose merges coalesce for `window`, on a one-node cluster.
+async fn coalescing_counter_cache(
+    cluster_name: &str,
+    window: Duration,
+) -> (Cluster, Cache<u32, PnCounter>) {
+    let cluster = Cluster::builder(cluster_name)
+        .seeds(std::iter::empty())
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("build succeeds");
+    let cache = cluster
+        .cache::<u32, PnCounter>("counters")
+        .resolver(Arc::new(PnCounterResolver))
+        .merge_coalesce_window(window)
+        .open()
+        .await
+        .expect("open succeeds");
+    (cluster, cache)
+}
+
+/// Long enough for a 50 ms window and its flush sweep to have run.
+const PAST_THE_WINDOW: Duration = Duration::from_millis(400);
+
+#[tokio::test]
+async fn remove_after_a_pending_merge_leaves_the_key_removed() {
+    let (cluster, cache) =
+        coalescing_counter_cache("cache-it-remove-pending-merge", Duration::from_millis(50)).await;
+    let writer = cache.writer_id();
+    cache
+        .merge(1, PnCounter::local_delta(writer, 5))
+        .await
+        .expect("merge");
+
+    cache.remove(&1).await.expect("remove");
+    tokio::time::sleep(PAST_THE_WINDOW).await;
+
+    assert_eq!(
+        cache.get(&1).await,
+        None,
+        "the merge was pending when the remove came, and the window passing does not bring it back"
+    );
+    let survivor = cache.clone();
+    cache.close().await;
+    assert_eq!(survivor.get(&1).await, None, "nor does the close flush");
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn remove_sync_after_a_pending_merge_leaves_the_key_removed() {
+    let (cluster, cache) = coalescing_counter_cache(
+        "cache-it-remove-sync-pending-merge",
+        Duration::from_millis(50),
+    )
+    .await;
+    let writer = cache.writer_id();
+    cache
+        .merge(1, PnCounter::local_delta(writer, 5))
+        .await
+        .expect("merge");
+
+    cache.remove_sync(&1).expect("remove_sync");
+    tokio::time::sleep(PAST_THE_WINDOW).await;
+
+    assert_eq!(cache.get(&1).await, None);
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn remove_many_after_a_pending_merge_leaves_the_key_removed() {
+    let (cluster, cache) = coalescing_counter_cache(
+        "cache-it-remove-many-pending-merge",
+        Duration::from_millis(50),
+    )
+    .await;
+    let writer = cache.writer_id();
+    cache
+        .merge(1, PnCounter::local_delta(writer, 5))
+        .await
+        .expect("merge");
+    cache
+        .merge(2, PnCounter::local_delta(writer, 6))
+        .await
+        .expect("merge another key");
+
+    cache.remove_many([1u32]).await.expect("remove_many");
+    tokio::time::sleep(PAST_THE_WINDOW).await;
+
+    assert_eq!(cache.get(&1).await, None);
+    assert_eq!(
+        cache.get(&2).await.map(|c| c.value()),
+        Some(6),
+        "a key the remove did not name keeps its fold"
+    );
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn clear_after_a_pending_merge_leaves_the_key_removed() {
+    let (cluster, cache) =
+        coalescing_counter_cache("cache-it-clear-pending-merge", Duration::from_millis(50)).await;
+    let writer = cache.writer_id();
+    cache
+        .merge(1, PnCounter::local_delta(writer, 5))
+        .await
+        .expect("merge");
+
+    cache.clear().await.expect("clear");
+    tokio::time::sleep(PAST_THE_WINDOW).await;
+
+    assert_eq!(
+        cache.get(&1).await,
+        None,
+        "a clear covers a key that exists only as a pending fold"
+    );
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_merge_after_a_remove_counts_only_the_later_contribution() {
+    let (cluster, cache) = coalescing_counter_cache(
+        "cache-it-merge-after-remove-pending",
+        Duration::from_millis(50),
+    )
+    .await;
+    let writer = cache.writer_id();
+    cache
+        .merge(1, PnCounter::local_delta(writer, 5))
+        .await
+        .expect("merge before the remove");
+    cache.remove(&1).await.expect("remove");
+    cache
+        .merge(1, PnCounter::local_delta(writer, 3))
+        .await
+        .expect("merge after the remove");
+
+    tokio::time::sleep(PAST_THE_WINDOW).await;
+
+    assert_eq!(
+        cache.get(&1).await.map(|c| c.value()),
+        Some(3),
+        "the 5 the remove deleted does not come back with the 3"
+    );
+    cluster.shutdown().await;
+}

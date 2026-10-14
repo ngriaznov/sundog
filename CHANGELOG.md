@@ -15,6 +15,18 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **A merge waiting in its coalesce window no longer outlives a remove, a
+  clear or a newer tombstone.** `Cache::remove`, `remove_sync`, `remove_many`
+  and `clear` discard a fold still pending for the key, `clear` covers keys
+  that exist only as pending folds, and a tombstone from a peer discards a
+  fold made before it. A merge made after the remove starts a fresh fold,
+  where the old one used to flush with it. A flushed fold carries the version
+  of its last `merge` call instead of the flush time, so a delete or an
+  insert made after the call outranks it as it does with no window. A peer's
+  invalidation newer than a pending fold in an `Invalidation` cache applies
+  the fold first and then drops the copy, so the contribution still reaches
+  the peers. The version of a flushed fold is observable through events and
+  `explain`.
 - **A just-read entry is never idle because of a clock behind its last read.**
   An entry read after the clock a concurrent reader, a sweep or a merge
   sampled, or after a backward step of the wall clock of up to 24 hours, no

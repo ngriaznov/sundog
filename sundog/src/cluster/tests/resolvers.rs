@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::hlc::Hlc;
+use crate::store::Event;
 use crate::store::crdt::{OrSet, OrSetResolver, PnCounter, PnCounterResolver};
 use crate::store::{ConflictResolver, RecordView, Winner, crdt};
 use crate::wire::WireRecord;
@@ -367,4 +368,66 @@ async fn get_then_insert_read_modify_write_loses_updates_under_the_default_lww_r
     cluster_a.shutdown().await;
     cluster_b.shutdown().await;
     cluster_c.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_remove_after_a_pending_merge_never_reaches_the_peer_as_a_value() {
+    let (cluster_a, cluster_b) = two_node_cluster("cluster-it-pending-merge-remove").await;
+    let window = Duration::from_millis(150);
+    let cache_a = cluster_a
+        .cache::<u32, PnCounter>("counters")
+        .mode(Mode::Replicated)
+        .resolver(Arc::new(PnCounterResolver))
+        .merge_coalesce_window(window)
+        .open()
+        .await
+        .expect("a opens");
+    let cache_b = cluster_b
+        .cache::<u32, PnCounter>("counters")
+        .mode(Mode::Replicated)
+        .resolver(Arc::new(PnCounterResolver))
+        .open()
+        .await
+        .expect("b opens");
+    wait_for_cache_advertised(&cluster_a, "counters").await;
+    wait_for_cache_advertised(&cluster_b, "counters").await;
+    let mut events_b = cache_b.events();
+    let writer = cache_a.writer_id();
+
+    cache_a
+        .merge(1, PnCounter::local_delta(writer, 5))
+        .await
+        .expect("merge");
+    cache_a.remove(&1).await.expect("remove");
+    // A second key, merged and left to flush, proves the window passed and
+    // replication ran while key 1 stayed gone.
+    cache_a
+        .merge(2, PnCounter::local_delta(writer, 7))
+        .await
+        .expect("merge a bystander");
+    wait_until(
+        Duration::from_secs(10),
+        "the bystander's fold reaches the peer",
+        async || cache_b.get(&2).await.is_some(),
+    )
+    .await;
+
+    assert_eq!(cache_a.get(&1).await, None);
+    assert_eq!(
+        cache_b.get(&1).await,
+        None,
+        "the peer never held the removed key"
+    );
+    while let Ok(event) = events_b.try_recv() {
+        assert!(
+            !matches!(
+                &event,
+                Event::Created { key: 1, .. } | Event::Updated { key: 1, .. }
+            ),
+            "the peer never saw a value for the removed key: {event:?}"
+        );
+    }
+
+    cluster_a.shutdown().await;
+    cluster_b.shutdown().await;
 }

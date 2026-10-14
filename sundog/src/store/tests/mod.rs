@@ -35,6 +35,7 @@ mod invalidation_fold;
 mod merge_expiry;
 mod merging;
 mod ownership;
+mod pending_merge;
 mod read_through;
 #[cfg(feature = "spill")]
 mod spill_lifecycle;

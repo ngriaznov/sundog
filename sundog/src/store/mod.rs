@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 #[cfg(feature = "spill")]
 use std::sync::OnceLock;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -216,8 +216,10 @@ pub(crate) enum LocalRearm {
 /// until [`Shard::flush_due_pending_merges`] (or a close/drop flush that
 /// ignores the deadline) hands it to the ordinary write path as a single
 /// [`Shard::apply`], the same versioned apply every other write goes
-/// through, so the fold gets its own fresh version and folds again, this
-/// time against whatever is stored.
+/// through, which folds it again against whatever is stored. The flush
+/// applies it at [`Self::ver`], so the fold orders against every other write
+/// as its last call did; a tombstone newer than that version discards it
+/// instead.
 struct PendingMerge<V> {
     /// `K`'s encoded bytes, kept so a flush never re-encodes the key.
     key_bytes: Bytes,
@@ -227,12 +229,16 @@ struct PendingMerge<V> {
     /// them without a re-encode.
     encoded: Bytes,
     expires_at_ms: Option<u64>,
-    /// The version stamped by whichever `merge` call last folded into this
-    /// entry, used only as the "incoming" side of the next fold's
-    /// [`RecordView`], discarded at flush time in favor of a fresh stamp,
-    /// since the flush itself, not any one call that built up to it, is the
-    /// write that lands.
+    /// The newest version stamped by a `merge` call folded into this entry:
+    /// the "incoming" side of the next fold's [`RecordView`], and the
+    /// version the flush applies the fold at. The folded content is applied
+    /// as of its last call, so a remove, clear or tombstone stamped between
+    /// the call and the flush outvotes it exactly as it outvotes a write
+    /// with no window.
     ver: Hlc,
+    /// The `by_deadline` row this entry owns, so a discard removes its row
+    /// and a later fold for the same key never flushes early on a stale one.
+    deadline_key: (u64, u64),
 }
 
 /// One [`Shard::merge`] coalescing stripe: the pending folds whose key
@@ -253,13 +259,20 @@ struct PendingMergeStripe<K, V> {
     next_seq: u64,
 }
 
-impl<K, V> PendingMergeStripe<K, V> {
+impl<K: Hash + Eq, V> PendingMergeStripe<K, V> {
     fn new() -> Self {
         Self {
             entries: HashMap::new(),
             by_deadline: BTreeMap::new(),
             next_seq: 0,
         }
+    }
+
+    /// Takes `key`'s pending fold out, with its deadline row.
+    fn remove(&mut self, key: &K) -> Option<PendingMerge<V>> {
+        let entry = self.entries.remove(key)?;
+        self.by_deadline.remove(&entry.deadline_key);
+        Some(entry)
     }
 }
 
@@ -502,6 +515,10 @@ where
     /// contention, across many mutexes instead of one. Only ever non-empty
     /// while `merge_window` is non-zero.
     pending_merges: Box<[StdMutex<PendingMergeStripe<K, V>>]>,
+    /// The number of entries across [`Self::pending_merges`], kept exact
+    /// under the stripe locks. A tombstone checks it before it encodes or
+    /// locks anything, so a shard with nothing pending pays one load.
+    pending_merge_count: AtomicUsize,
     /// Notified whenever [`Shard::merge`] opens a fresh coalescing window
     /// (a key with nothing already pending), so
     /// `crate::cache::tasks::merge_coalesce_task`'s sweep can recompute its

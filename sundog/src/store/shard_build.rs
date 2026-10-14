@@ -2,7 +2,7 @@
 //! derive a record's version and expiry.
 
 use std::hash::Hash;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 
@@ -173,6 +173,7 @@ where
                 .map(|_| StdMutex::new(PendingMergeStripe::new()))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
+            pending_merge_count: AtomicUsize::new(0),
             merge_wake: Notify::new(),
             max_capacity,
             tti,

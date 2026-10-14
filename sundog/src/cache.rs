@@ -959,6 +959,13 @@ where
     /// not yet flushed is invisible to a read for as long as it stays
     /// pending, up to one whole window from the call that opened it.
     ///
+    /// A pending fold orders against other writes as its last call did: the
+    /// flushed record carries that call's version, so an insert, remove or
+    /// tombstone stamped after the call outranks it. [`Cache::remove`],
+    /// [`Cache::remove_sync`], [`Cache::remove_many`] and [`Cache::clear`]
+    /// discard a fold still pending for the key, a merge after the remove
+    /// opens a fresh fold, and a newer tombstone from a peer discards it too.
+    ///
     /// The folded record carries the cache's default TTL, if any; a
     /// merging resolver keeps the later deadline of the two sides.
     ///
@@ -1079,7 +1086,9 @@ where
         }
     }
 
-    /// Removes `key`: writes a tombstone and fans it out per [`Mode`].
+    /// Removes `key`: writes a tombstone and fans it out per [`Mode`]. A
+    /// [`Cache::merge`] fold still pending in its coalesce window is
+    /// discarded with the key.
     ///
     /// # Errors
     ///
@@ -1109,7 +1118,9 @@ where
 
     /// Tombstones every key this node currently holds, not a coordinated
     /// cluster-wide reset: an entry never reached from a peer, or a
-    /// concurrent write outracing the tombstone's HLC, survives.
+    /// concurrent write outracing the tombstone's HLC, survives. A key whose
+    /// [`Cache::merge`] fold is still pending in its coalesce window counts
+    /// as held: the fold is discarded and the key tombstoned.
     ///
     /// # Errors
     ///

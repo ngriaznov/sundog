@@ -246,7 +246,7 @@ async fn merged_outcome_stores_the_merged_bytes_under_a_merge_derived_version_an
 /// Falls back to plain `Hlc` order when either side lacks a value,
 /// matching every other merging resolver's tombstone/spill guard.
 #[derive(Debug, Clone, Copy, Default)]
-struct SumResolver;
+pub(super) struct SumResolver;
 
 impl ConflictResolver for SumResolver {
     fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
