@@ -1139,10 +1139,12 @@ where
     /// [`Cache::merge`] fold is still pending in its coalesce window counts
     /// as held: the fold is discarded and the key tombstoned, including a
     /// fold a flush is applying as the clear begins. In a
-    /// [`Mode::Distributed`] cache a key this node does not own is not held:
-    /// its pending fold is applied, which forwards it to the owners, and no
-    /// tombstone is written, so a non-owner's `clear` never deletes a value
-    /// at the owners.
+    /// [`Mode::Distributed`] cache a key this node does not own and holds
+    /// only as a pending fold is not held: the fold is applied, which
+    /// forwards it to the owners, and no tombstone is written, so a
+    /// non-owner's `clear` never deletes a value at the owners. A disown-grace
+    /// copy of such a key that this node still stores is held, and is
+    /// tombstoned.
     ///
     /// # Errors
     ///

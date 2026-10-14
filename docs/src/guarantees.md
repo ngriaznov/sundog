@@ -166,10 +166,11 @@ A remove or clear outvotes a merge still waiting in its
 that exists only as a pending fold, and a merge made after the remove opens
 a fresh fold. A `clear` also covers a fold a flush is applying as the clear
 begins: it waits for that flush, so the key is removed. In a `Distributed`
-cache a node clears only the keys it holds, and a key it does not own is not
-one: `clear` applies that key's pending fold, which forwards it to the
+cache a node clears the keys it holds. A key it does not own and holds only as
+a pending fold is not one: `clear` applies that fold, which forwards it to the
 owners, and writes no tombstone, so a non-owner's `clear` never deletes a
-value at the owners. A tombstone from a peer discards a pending fold made before
+value at the owners. A disown-grace copy of such a key is still stored here
+and is tombstoned. A tombstone from a peer discards a pending fold made before
 it. A tombstone stamped between two calls folded into one pending record,
 which only a peer whose clock runs behind produces, leaves the whole fold in
 place. A fold that flushes carries the version of its last `merge` call, so

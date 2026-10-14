@@ -813,8 +813,9 @@ where
     /// non-owner holds no entry of its own, so for a key it does not own that
     /// exists only as a pending fold, `clear` applies the fold, which
     /// forwards it to the owners, and writes no tombstone: a non-owner's
-    /// `clear` never deletes a value at the owners. An entry a peer holds
-    /// that never reached this node survives untouched.
+    /// `clear` never deletes a value at the owners. A copy of such a key the
+    /// node still stores, mid disown-grace, is tombstoned like any held entry.
+    /// An entry a peer holds that never reached this node survives untouched.
     ///
     /// # Errors
     ///

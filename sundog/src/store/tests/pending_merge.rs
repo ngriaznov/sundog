@@ -475,6 +475,55 @@ async fn an_owner_clear_discards_a_pending_fold_and_tombstones_the_key() {
     );
 }
 
+/// A key the node no longer owns but still stores, mid disown-grace, is held:
+/// `clear` forwards its pending fold to the owners and then its tombstone, which
+/// outranks the fold.
+#[tokio::test]
+async fn a_non_owner_clear_tombstones_a_disown_grace_copy_after_forwarding_its_fold() {
+    let self_node = NodeId::from(1);
+    let residency = Arc::new(ResidencySet::new());
+    let (s, _view, tx) =
+        distributed_shard::<u32, u32>(self_node, vec![self_node], 1, Arc::clone(&residency));
+    let s = s
+        .with_resolver(Arc::new(SumResolver))
+        .with_merge_coalesce_window(WINDOW);
+    let moved = OwnershipView::compute(
+        self_node,
+        vec![self_node, NodeId::from(2)],
+        NonZeroU8::new(1).expect("nonzero"),
+    );
+    let key = (0..1_000_000u32)
+        .find(|&k| !moved.owns(PartId::of_key(&key_bytes(&k))))
+        .expect("some bucket flips ownership once a second node joins");
+    s.insert(key, 7)
+        .await
+        .expect("the sole owner stores the key");
+    tx.send(Arc::new(moved)).expect("receiver still alive");
+    residency.mark_releasing(&[PartId::of_key(&key_bytes(&key))]);
+    s.merge(key, 2).await.expect("the non-owner's merge waits");
+    assert_eq!(s.keys(), [key], "the grace copy is still stored here");
+    assert_eq!(s.pending_merge_count(), 1);
+    s.fan_out_queue().drain();
+
+    s.clear().await.expect("clear");
+
+    assert_eq!(s.pending_merge_count(), 0);
+    let recs = forwarded(s.fan_out_queue().drain());
+    assert_eq!(
+        recs.len(),
+        2,
+        "the fold, then the key's tombstone: {recs:?}"
+    );
+    assert!(!recs[0].is_tombstone(), "the fold goes first, as a value");
+    assert!(recs[1].is_tombstone(), "the grace copy is tombstoned");
+    assert_eq!(recs[0].key, key_bytes(&key));
+    assert_eq!(recs[1].key, key_bytes(&key));
+    assert!(
+        recs[1].ver > recs[0].ver,
+        "the tombstone outranks the fold at the owners"
+    );
+}
+
 #[tokio::test]
 async fn an_owner_discards_its_pending_fold_for_a_forwarded_newer_tombstone() {
     let (s, key, _unowned) = distributed_coalescing_shard();

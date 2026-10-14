@@ -464,8 +464,9 @@ where
     /// Marks a flush in flight until the returned guard drops. Every path that
     /// takes a fold out of its stripe holds it from the take through the last
     /// apply of what it took, so a key is always either pending or stored,
-    /// never between the two, to [`Shard::clear`]'s snapshot, which waits for
-    /// the guards to drop. A guard is never held across an await.
+    /// never between the two, to [`Shard::clear`]'s split of the pending keys,
+    /// which waits for the guards to drop. A guard is never held across an
+    /// await.
     fn begin_flush(&self) -> RwLockReadGuard<'_, ()> {
         self.merge_flush_gate
             .read()
@@ -497,21 +498,26 @@ where
     }
 
     /// The keys [`Shard::clear`] tombstones, and the pending folds it settles
-    /// on the way. Waits for every flush in flight, so each pending key is
-    /// still pending and each flushed one is stored, and snapshots both under
-    /// that one wait. A fold for a key this node owns is discarded by the
-    /// tombstone and listed with the stored keys. A fold for a key this node
-    /// does not own, which only a `Mode::Distributed` shard has, is applied as
-    /// a zero window would have, which forwards it to the owners, and is not
-    /// listed: this node holds nothing of that key for a tombstone to remove,
-    /// and a tombstone forwarded for it would delete the owners' copy.
+    /// on the way. Waits for every flush in flight and splits the pending keys
+    /// under that wait, so at that instant each key is pending or stored. The
+    /// stored keys are listed after the wait ends, pending first: a key stored
+    /// at the split instant is still stored then, and a key a later flush
+    /// stores was pending at the split and is already listed. A fold for a key
+    /// this node owns is discarded by the tombstone and listed with the stored
+    /// keys. A fold for a key this node does not own, which only a
+    /// `Mode::Distributed` shard has, is applied as a zero window would have,
+    /// which forwards it to the owners, and is not listed on its own account:
+    /// this node holds nothing of that key for a tombstone to remove, and a
+    /// tombstone forwarded for it would delete the owners' copy. A copy of such
+    /// a key the node still stores, mid disown-grace, is listed with the stored
+    /// keys and tombstoned.
     pub(super) fn keys_to_clear(&self) -> Vec<K> {
-        let _clearing = self
+        let mut keys = Vec::new();
+        let mut forwarded = Vec::new();
+        let clearing = self
             .merge_flush_gate
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        let mut keys = Vec::new();
-        let mut forwarded = Vec::new();
         if self.has_pending_merges() {
             for stripe_lock in &*self.pending_merges {
                 let mut stripe = stripe_lock.lock().unwrap_or_else(PoisonError::into_inner);
@@ -531,6 +537,7 @@ where
         for (key, entry) in forwarded {
             self.flush_one_pending_merge(key, entry);
         }
+        drop(clearing);
         let pending: HashSet<K> = keys.iter().cloned().collect();
         keys.extend(self.keys().into_iter().filter(|key| !pending.contains(key)));
         keys
