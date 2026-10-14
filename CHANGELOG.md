@@ -133,7 +133,8 @@ All notable changes to this project are documented in this file. Format follows
   behind. The fill is not sent to the owners either. A non-owner runs the
   loader on every `get_or_load`; `load` gathers a key's loads on an owner that
   has a loader. A refresh-ahead reload skips an entry a node holds only
-  through disown grace. A non-owner at the memory ceiling no longer counts
+  through disown grace, and a read after the node regains the part asks for
+  the reload again. A non-owner at the memory ceiling no longer counts
   `sundog_ceiling_refusals_total{kind="fill"}`.
 - **A swept expired entry keeps out the value it overwrote.** In a
   `Replicated` or `Distributed` cache whose resolver does not merge, the sweep

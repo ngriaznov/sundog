@@ -323,7 +323,10 @@ where
             // An entry held only through disown grace belongs to its new
             // owners: the reload would be stored nowhere (see `fill_route`),
             // so the loader does not run for it.
+            // The read that asked claimed the version, so the claim is
+            // released: a read after the node regains the part asks again.
             if !self.owns_key(request.key_bytes.as_ref()) {
+                refresh.release(&request.key_bytes, hash, 0);
                 continue;
             }
             let Some(inflight) = self.engine.begin_refresh(&request.key_bytes, hash) else {

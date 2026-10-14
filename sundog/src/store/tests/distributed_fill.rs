@@ -469,6 +469,46 @@ async fn a_refresh_of_an_entry_held_through_disown_grace_calls_no_loader_and_cha
 }
 
 #[tokio::test]
+async fn a_read_asks_for_a_refresh_again_after_the_node_regains_the_part_a_refresh_skipped() {
+    const T0: u64 = 1_000_000;
+    let clock = Arc::new(AtomicU64::new(T0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (s, view, tx) = refreshing_distributed_shard(&clock, &calls);
+    let mut requests = s.take_refresh_requests().expect("refresh is on");
+    let crowded = crowded_view();
+    let key = key_moved_away(&view, &crowded);
+    s.insert(key, "held".to_string())
+        .await
+        .expect("owner insert");
+    let held = key_bytes(&key);
+    let hash = crate::store::engine::hash_key_bytes(held.as_ref());
+    let LocalRecord::Live { version: ver, .. } = s.local_record(&held).1 else {
+        panic!("the owner holds the entry");
+    };
+    let expires_at_ms = Some(T0 + 10_000);
+    let now = T0 + 9_000;
+    clock.store(now, Ordering::SeqCst);
+    tx.send(crowded).expect("receiver alive");
+
+    // A read of the disown-grace copy asks, and the refresh skips it.
+    s.note_read(&key, held.as_ref(), hash, ver, expires_at_ms, now);
+    let request = requests.try_recv().expect("the read asks for a reload");
+    assert_eq!(
+        s.refresh(vec![request]).await,
+        crate::store::refresh::RefreshTally::default()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "no loader call");
+
+    // The node regains the part: the entry is owned again at the same version.
+    tx.send(view).expect("receiver alive");
+    s.note_read(&key, held.as_ref(), hash, ver, expires_at_ms, now);
+    assert!(
+        requests.try_recv().is_ok(),
+        "a read after the part returns asks again"
+    );
+}
+
+#[tokio::test]
 async fn a_refresh_of_an_owned_entry_still_reloads_it() {
     const T0: u64 = 1_000_000;
     let clock = Arc::new(AtomicU64::new(T0));
