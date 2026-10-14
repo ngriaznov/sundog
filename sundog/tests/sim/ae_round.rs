@@ -24,7 +24,7 @@ fn decode_sketch_into(
     push_keys: &mut Vec<Bytes>,
     pull_hashes: &mut Vec<(u16, Vec<u64>)>,
     undecodable_buckets: &mut Vec<u16>,
-    merging: bool,
+    both_ways: bool,
 ) {
     let mut local_sketch = sundog::Iblt::new(cells.len());
     for (key, ver) in local_entries {
@@ -36,7 +36,7 @@ fn decode_sketch_into(
     {
         Ok(decoded) => {
             let mut hashes = Vec::new();
-            sundog::diff_decoded(local_entries, &decoded, push_keys, &mut hashes, merging);
+            sundog::diff_decoded(local_entries, &decoded, push_keys, &mut hashes, both_ways);
             if !hashes.is_empty() {
                 pull_hashes.push((bucket, hashes));
             }
@@ -60,7 +60,7 @@ async fn classify_ae_mismatches<S: ShardOps>(
     pull_hashes: &mut Vec<(u16, Vec<u64>)>,
     undecodable_buckets: &mut Vec<u16>,
     wanted_parts: &mut Vec<(u16, u8)>,
-    merging: bool,
+    both_ways: bool,
 ) {
     for mismatch in mismatched {
         match mismatch {
@@ -74,7 +74,7 @@ async fn classify_ae_mismatches<S: ShardOps>(
                     &kv_to_tuples(peer_entries),
                     push_keys,
                     pull_keys,
-                    merging,
+                    both_ways,
                 )
                 .await;
             }
@@ -87,7 +87,7 @@ async fn classify_ae_mismatches<S: ShardOps>(
                     push_keys,
                     pull_hashes,
                     undecodable_buckets,
-                    merging,
+                    both_ways,
                 );
             }
             AeMismatch::PartDigests(bucket, digests) => {
@@ -122,7 +122,7 @@ async fn resolve_wanted_parts<S: ShardOps>(
     pull_keys: &mut Vec<Bytes>,
     pull_hashes: &mut Vec<(u16, Vec<u64>)>,
     undecodable_buckets: &mut Vec<u16>,
-    merging: bool,
+    both_ways: bool,
 ) -> bool {
     let wanted_bucket_parts: Vec<BucketPart> = wanted_parts
         .iter()
@@ -156,7 +156,7 @@ async fn resolve_wanted_parts<S: ShardOps>(
                             &kv_to_tuples(peer_entries),
                             push_keys,
                             pull_keys,
-                            merging,
+                            both_ways,
                         );
                     }
                     AePartReply::Sketch {
@@ -175,7 +175,7 @@ async fn resolve_wanted_parts<S: ShardOps>(
                             push_keys,
                             pull_hashes,
                             undecodable_buckets,
-                            merging,
+                            both_ways,
                         );
                     }
                     // `AePartReply` is `#[non_exhaustive]`: an unmodelled
@@ -218,10 +218,10 @@ pub(crate) async fn ae_round_with_sketch<S: ShardOps>(
     bucket_listings: Option<&AtomicUsize>,
 ) -> bool {
     // Read once per round, exactly as `run_round_against` reads
-    // `shard.merges()`: a merging resolver has both sides exchange a
-    // mismatched key in the same round instead of only the greater version
-    // pushing to the lesser side.
-    let merging = ShardOps::merges(shard);
+    // `shard.ae_exchanges_both()`: a resolver that merges or reads values has
+    // both sides exchange a mismatched key in the same round instead of only
+    // the greater version pushing to the lesser side.
+    let both_ways = ShardOps::ae_exchanges_both(shard);
     let local_buckets: Vec<(u16, u64)> = ShardOps::digests(shard)
         .await
         .into_iter()
@@ -251,7 +251,7 @@ pub(crate) async fn ae_round_with_sketch<S: ShardOps>(
         &mut pull_hashes,
         &mut undecodable_buckets,
         &mut wanted_parts,
-        merging,
+        both_ways,
     )
     .await;
 
@@ -265,7 +265,7 @@ pub(crate) async fn ae_round_with_sketch<S: ShardOps>(
             &mut pull_keys,
             &mut pull_hashes,
             &mut undecodable_buckets,
-            merging,
+            both_ways,
         )
         .await
     {
@@ -287,7 +287,7 @@ pub(crate) async fn ae_round_with_sketch<S: ShardOps>(
                         &kv_to_tuples(peer_entries),
                         &mut push_keys,
                         &mut pull_keys,
-                        merging,
+                        both_ways,
                     )
                     .await;
                 }
@@ -337,21 +337,22 @@ pub(crate) async fn ae_round_with_sketch<S: ShardOps>(
     ok
 }
 
-/// Mirrors `cluster::anti_entropy::diff_bucket`: `merging` is
-/// `ShardOps::merges(shard)`, read once per round by [`ae_round_with_sketch`]
+/// Mirrors `cluster::anti_entropy::diff_bucket`: `both_ways` is
+/// `ShardOps::ae_exchanges_both(shard)`, read once per round by [`ae_round_with_sketch`]
 /// and threaded through every classification call in this file the same way
 /// `run_round_against` threads it through its own. `false` keeps the
 /// greater-version-only push/pull rule; `true` additionally queues the
 /// other direction too for a key present on both sides under different
-/// versions, so a merging resolver's two replicas exchange records in one
-/// round instead of needing a second round to carry a minted result back.
+/// versions, so the two replicas of a resolver that merges or reads values
+/// exchange records in one round instead of needing a second round to carry
+/// a minted result back.
 async fn diff_bucket<S: ShardOps>(
     shard: &S,
     bucket: u16,
     peer_entries: &[(Bytes, Hlc)],
     push_keys: &mut Vec<Bytes>,
     pull_keys: &mut Vec<Bytes>,
-    merging: bool,
+    both_ways: bool,
 ) {
     let peer_by_key: HashMap<Bytes, Hlc> = peer_entries.iter().cloned().collect();
     let mut local_keys = HashSet::with_capacity(peer_by_key.len());
@@ -364,10 +365,10 @@ async fn diff_bucket<S: ShardOps>(
         local_keys.insert(key.clone());
         match peer_by_key.get(&key) {
             Some(&peer_ver) if local_ver != peer_ver => {
-                if local_ver > peer_ver || merging {
+                if local_ver > peer_ver || both_ways {
                     push_keys.push(key.clone());
                 }
-                if local_ver < peer_ver || merging {
+                if local_ver < peer_ver || both_ways {
                     pull_keys.push(key.clone());
                 }
             }
@@ -385,14 +386,14 @@ async fn diff_bucket<S: ShardOps>(
 /// [`diff_bucket`]'s comparison, but over an already-fetched local entry
 /// list rather than a fresh `ShardOps::bucket_entries` call: the part path's
 /// counterpart, since `AePartReply::Listing`'s local side comes from one
-/// batched `ShardOps::entries_for_parts` call up front. `merging` is
+/// batched `ShardOps::entries_for_parts` call up front. `both_ways` is
 /// [`diff_bucket`]'s same flag.
 fn diff_part(
     local_entries: &[(Bytes, Hlc)],
     peer_entries: &[(Bytes, Hlc)],
     push_keys: &mut Vec<Bytes>,
     pull_keys: &mut Vec<Bytes>,
-    merging: bool,
+    both_ways: bool,
 ) {
     let peer_by_key: HashMap<&Bytes, Hlc> = peer_entries.iter().map(|(k, v)| (k, *v)).collect();
     let mut local_keys = HashSet::with_capacity(local_entries.len());
@@ -401,10 +402,10 @@ fn diff_part(
         local_keys.insert(key);
         match peer_by_key.get(key) {
             Some(&peer_ver) if *local_ver != peer_ver => {
-                if *local_ver > peer_ver || merging {
+                if *local_ver > peer_ver || both_ways {
                     push_keys.push(key.clone());
                 }
-                if *local_ver < peer_ver || merging {
+                if *local_ver < peer_ver || both_ways {
                     pull_keys.push(key.clone());
                 }
             }

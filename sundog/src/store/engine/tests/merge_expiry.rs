@@ -2,7 +2,9 @@
 
 use std::collections::BTreeSet;
 
-use super::super::merge::{Fold, Resolution, fold_sides, lapsed_before, resolve_conflict};
+use super::super::merge::{
+    Fold, Resolution, fold_sides, lapsed_before, resolve_conflict, tombstone_resolution,
+};
 use super::*;
 
 type SetEngine = Engine<u32, BTreeSet<String>>;
@@ -360,6 +362,7 @@ fn resolve_union(
         stored.map(AsRef::as_ref),
         stored_expires_at_ms,
         stored_absent,
+        false,
         ver,
         incoming,
     )
@@ -474,27 +477,92 @@ fn resolve_conflict_falls_to_the_winner_when_both_sides_are_dead() {
     assert!(matches!(older_incoming, Resolution::IncomingLoses));
 }
 
+/// A resolver whose `winner` prefers a value to a tombstone, and prefers the
+/// lower version when both sides are values; `merge` is never to run.
+struct PrefersValuesResolver;
+
+impl ConflictResolver for PrefersValuesResolver {
+    fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
+        match (a.value.is_some(), b.value.is_some()) {
+            (true, false) => Winner::A,
+            (false, true) => Winner::B,
+            _ => {
+                if a.ver <= b.ver {
+                    Winner::A
+                } else {
+                    Winner::B
+                }
+            }
+        }
+    }
+
+    fn merges(&self) -> bool {
+        true
+    }
+
+    fn merge(&self, _key: &[u8], _a: RecordView<'_>, _b: RecordView<'_>) -> Option<Merged> {
+        panic!("a collision with a tombstone never reaches merge")
+    }
+}
+
 #[test]
-fn resolve_conflict_leaves_a_tombstone_to_the_winner() {
+fn tombstone_resolution_is_the_higher_version_with_a_tie_keeping_the_stored_side() {
+    let (low, high) = (hlc(1_000, 1), hlc(2_000, 2));
+    for (stored_tombstone, incoming_tombstone) in [(true, false), (false, true), (true, true)] {
+        let newer = tombstone_resolution(low, high, stored_tombstone, incoming_tombstone);
+        assert!(matches!(newer, Some(Resolution::IncomingWins)));
+        let older = tombstone_resolution(high, low, stored_tombstone, incoming_tombstone);
+        assert!(matches!(older, Some(Resolution::IncomingLoses)));
+        let tie = tombstone_resolution(high, high, stored_tombstone, incoming_tombstone);
+        assert!(matches!(tie, Some(Resolution::IncomingLoses)));
+    }
+    assert!(
+        tombstone_resolution(low, high, false, false).is_none(),
+        "two values are the resolver's to decide"
+    );
+}
+
+#[test]
+fn resolve_conflict_settles_a_tombstone_by_version_whatever_the_resolver_prefers() {
     let stored = set_bytes(&["a"]);
-    let tombstone_incoming = resolve_union(
-        Some(&stored),
-        None,
-        false,
-        hlc(1_000, 1),
-        hlc(2_000, 2),
-        &Incoming::Tombstone,
-    );
-    assert!(matches!(tombstone_incoming, Resolution::IncomingWins));
-    let tombstone_stored = resolve_union(
-        None,
-        None,
-        false,
-        hlc(1_000, 1),
-        hlc(2_000, 2),
-        &incoming_put(&["b"], None),
-    );
-    assert!(matches!(tombstone_stored, Resolution::IncomingWins));
+    let value = incoming_put(&["b"], None);
+    let resolve = |stored_bytes: Option<&Bytes>,
+                   stored_tombstone: bool,
+                   sv: Hlc,
+                   ver: Hlc,
+                   incoming: &Incoming<BTreeSet<String>>| {
+        resolve_conflict(
+            &PrefersValuesResolver,
+            b"k",
+            sv,
+            stored_bytes.map(AsRef::as_ref),
+            None,
+            false,
+            stored_tombstone,
+            ver,
+            incoming,
+        )
+    };
+    let (low, high) = (hlc(1_000, 1), hlc(2_000, 2));
+    // A newer tombstone buries the value the resolver would keep, an older
+    // one cannot.
+    assert!(matches!(
+        resolve(Some(&stored), false, low, high, &Incoming::Tombstone),
+        Resolution::IncomingWins
+    ));
+    assert!(matches!(
+        resolve(Some(&stored), false, high, low, &Incoming::Tombstone),
+        Resolution::IncomingLoses
+    ));
+    // A value over a stored tombstone wins only when it is newer.
+    assert!(matches!(
+        resolve(None, true, low, high, &value),
+        Resolution::IncomingWins
+    ));
+    assert!(matches!(
+        resolve(None, true, high, low, &value),
+        Resolution::IncomingLoses
+    ));
 }
 
 #[test]
@@ -509,6 +577,7 @@ fn resolve_conflict_never_reads_stored_absence_for_a_resolver_that_does_not_merg
             Some(stored.as_ref()),
             None,
             stored_absent,
+            false,
             hlc(2_000, 2),
             &incoming,
         );
@@ -520,6 +589,7 @@ fn resolve_conflict_never_reads_stored_absence_for_a_resolver_that_does_not_merg
             Some(stored.as_ref()),
             None,
             stored_absent,
+            false,
             hlc(1_000, 2),
             &incoming,
         );

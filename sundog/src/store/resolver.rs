@@ -68,7 +68,19 @@ pub fn later_deadline(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 ///
 /// Convergence requires `winner` to be deterministic, antisymmetric
 /// (`winner(key, a, b) == A` iff `winner(key, b, a) == B`), and a strict
-/// total order over one key's distinct-version records. A resolver whose
+/// total order over one key's distinct-version records. The order need not
+/// follow versions: a resolver may prefer a record with a lower version.
+/// Anti-entropy exchanges both records of a version-mismatched key for every
+/// resolver that reads values ([`ConflictResolver::needs_value_bytes`] is
+/// `true`), so the replica that holds the winner at the lower version sends
+/// it, and each side's `winner` decides what it keeps; the adopting replica
+/// stores the winner under its own, lower, version. A resolver that returns
+/// `false` from `needs_value_bytes` promises that `winner` prefers the
+/// greater version, since only the greater side travels for it. A tombstone
+/// and a value never reach `winner`: the engine settles that pair by
+/// version alone for every resolver, the higher version winning and the
+/// stored side staying on a tie, so a resolver cannot revive a deleted
+/// key. A resolver whose
 /// [`ConflictResolver::merges`] is `true` additionally commits
 /// [`ConflictResolver::merge`] to the join-semilattice laws (commutative,
 /// associative across repeated pairwise folds, idempotent) over the merged
@@ -96,10 +108,19 @@ pub trait ConflictResolver: Send + Sync + 'static {
 
     /// Whether `winner` reads `RecordView::value`. Defaults to `true`. Override
     /// to `false` for a resolver that, like [`LwwResolver`], only compares
-    /// `ver`/`expires_at_ms`, so the versioned apply skips encoding both
-    /// records' values on every apply. Never override to `false` for a
-    /// resolver whose [`ConflictResolver::merges`] returns `true`: see the
-    /// trait docs.
+    /// `ver`, so the versioned apply skips encoding both records' values on
+    /// every apply. Never override to `false` for a resolver whose
+    /// [`ConflictResolver::merges`] returns `true`: see the trait docs.
+    ///
+    /// The answer selects anti-entropy's repair direction. Returning `false`
+    /// is a promise that `winner` prefers the greater version, so
+    /// anti-entropy repairs one way, the greater record travelling to the
+    /// replica that holds the lesser. A resolver that returns `false` yet
+    /// prefers a lower version, or compares only `expires_at_ms`, leaves
+    /// replicas apart after a lost replicate. Returning `false` from a
+    /// version-ordered resolver is also a bandwidth optimisation, since a
+    /// value-reading resolver has each mismatched key's two records both
+    /// travel.
     fn needs_value_bytes(&self) -> bool {
         true
     }
@@ -115,18 +136,15 @@ pub trait ConflictResolver: Send + Sync + 'static {
     /// folds in, any other resolver's as invalidations. Return `true` only
     /// for a resolver whose `merge` can return `Some`.
     ///
-    /// Anti-entropy reads the answer too. Its `diff_bucket`/`diff_decoded`
-    /// push only the greater of two differently-versioned records to the
-    /// lesser side by default, which costs a merging resolver two rounds per
-    /// divergent key: the lesser side merges and mints a version above both
-    /// inputs, and only the next round carries the fuller content back (see
-    /// `merge_version`'s doc for why the mint always dominates both inputs).
-    /// When `merges` is `true`, anti-entropy instead exchanges both records
-    /// on a version mismatch,
-    /// each side folding the other's record into its own, so both sides
-    /// mint (or adopt) the identical result in the same round: see
-    /// `merge_version`'s doc for why the mint arm is symmetric in its two
-    /// input stamps.
+    /// Anti-entropy reads the answer too. When `merges` or
+    /// [`ConflictResolver::needs_value_bytes`] is `true`, it exchanges both
+    /// records on a version mismatch, each side folding the other's record
+    /// into its own, so both sides mint (or adopt) the identical result in
+    /// the same round: see `merge_version`'s doc for why the mint arm is
+    /// symmetric in its two input stamps. A resolver with
+    /// `needs_value_bytes() == false` instead has only the greater record
+    /// travel, which costs a merging one two rounds per divergent key; that
+    /// pairing is a contract violation.
     fn merges(&self) -> bool {
         false
     }
@@ -193,6 +211,16 @@ pub trait ConflictResolver: Send + Sync + 'static {
     }
 }
 
+/// Whether anti-entropy sends both records of a version-mismatched key,
+/// rather than only the greater one to the replica holding the lesser, for a
+/// resolver with these answers: when it merges or reads values, because only
+/// such a resolver can prefer the lower version. `merges` without
+/// `needs_value_bytes` breaks [`ConflictResolver`]'s contract; the answer
+/// stays `true` so the replicas still converge.
+pub(crate) const fn exchanges_both_records(merges: bool, needs_value_bytes: bool) -> bool {
+    merges || needs_value_bytes
+}
+
 /// The default resolver: last-write-wins by [`Hlc`], ignoring value bytes and
 /// `expires_at_ms` entirely.
 #[derive(Debug, Clone, Copy, Default)]
@@ -210,7 +238,18 @@ impl ConflictResolver for LwwResolver {
 
 #[cfg(test)]
 mod tests {
-    use super::later_deadline;
+    use super::{exchanges_both_records, later_deadline};
+
+    #[test]
+    fn exchanges_both_records_is_the_or_of_merging_and_value_reading() {
+        assert!(!exchanges_both_records(false, false), "version-only");
+        assert!(exchanges_both_records(false, true), "reads values");
+        assert!(exchanges_both_records(true, true), "merges");
+        assert!(
+            exchanges_both_records(true, false),
+            "a merging resolver that declares no value reads still converges"
+        );
+    }
 
     #[test]
     fn later_deadline_takes_the_larger_of_two_set_deadlines() {

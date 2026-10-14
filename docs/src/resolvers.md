@@ -128,7 +128,7 @@ give merged values a lifetime as they give any other value one:
   period, such as one per day, with a TTL a little longer than the period,
   and start a fresh running total for each key.
 - **A delete is a tombstone.** `Cache::remove` writes a tombstone, and a
-  tombstone and a value settle by version, as under the default resolver.
+  tombstone and a value settle by version, as under every resolver.
   A writer's next write after the remove sends its whole running total
   again, so a remove does not reset a count; a new key does.
 
@@ -136,7 +136,8 @@ give merged values a lifetime as they give any other value one:
 
 - **Every write ships the whole value.** Replication is state-based: a
   write sends the merged value, not the change, and anti-entropy exchanges
-  both records of a mismatched key instead of one.
+  both records of a mismatched key instead of one. A custom resolver that
+  reads values pays the same, and `needs_value_bytes() == false` avoids it.
 - **Every write that meets a stored value decodes both, merges them and
   encodes the result.** `CacheBuilder::merge_coalesce_window` folds a key's
   consecutive `Cache::merge` and `Cache::merge_with_ttl` calls in memory and
@@ -165,7 +166,20 @@ under a new name.
 Implement `ConflictResolver`:
 
 - `winner` is deterministic and antisymmetric and puts every distinct
-  version of a key in one order.
+  version of a key in one order. It may prefer a record with a lower
+  version. Anti-entropy exchanges both records of a mismatched key for every
+  resolver that reads values, so a replica holding the winner at the lower
+  version sends it, each side's `winner` decides what it keeps, and the
+  adopting replica stores the winner under its own, lower, version.
+- A tombstone and a value settle by version, whatever `winner` prefers: the
+  higher version wins and a tie keeps the stored side. A resolver cannot
+  revive a deleted key or bury a newer value under an older tombstone.
+- `needs_value_bytes` returns `false` only for a resolver that compares
+  `ver` alone and prefers the greater version. It skips encoding the values
+  on every apply and keeps anti-entropy's one-way repair, the greater record
+  travelling to the replica that holds the lesser. A resolver that returns
+  `false` yet prefers a lower version leaves replicas apart after a lost
+  replicate.
 - `merges` returns `true`, and `merge` is commutative, associative and
   idempotent over a canonical encoding, so every node reaches the same
   bytes in any order. The `crdt` types build on `BTreeMap` and `BTreeSet`

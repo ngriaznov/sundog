@@ -74,7 +74,7 @@ fn diff_decoded_pushes_a_local_only_key() {
 }
 
 #[test]
-fn diff_decoded_queues_both_directions_for_a_both_sides_mismatch_when_merging() {
+fn diff_decoded_queues_both_directions_for_a_both_sides_mismatch_when_exchanging_both_ways() {
     let (key, hash) = entry(b"k1");
     let local_entries = vec![(key.clone(), hlc(10))];
     let decoded = Decoded {
@@ -92,19 +92,19 @@ fn diff_decoded_queues_both_directions_for_a_both_sides_mismatch_when_merging() 
     assert_eq!(
         push,
         vec![key],
-        "merging queues the push even though the peer's version is greater"
+        "both ways queues the push even though the peer's version is greater"
     );
     assert_eq!(
         pull,
         vec![hash],
-        "merging keeps the pull the non-merging rule already queues"
+        "both ways keeps the pull the one-way rule already queues"
     );
 }
 
 #[test]
-fn diff_decoded_leaves_a_one_sided_key_alone_regardless_of_merging() {
+fn diff_decoded_leaves_a_one_sided_key_alone_regardless_of_both_ways() {
     // Present only on this node's side of the peel: not a differing
-    // version present on both sides, so `merging` changes nothing.
+    // version present on both sides, so `both_ways` changes nothing.
     let (key, hash) = entry(b"k2");
     let local_entries = vec![(key.clone(), hlc(5))];
     let decoded = Decoded {
@@ -114,9 +114,9 @@ fn diff_decoded_leaves_a_one_sided_key_alone_regardless_of_merging() {
         }],
         only_right: Vec::new(),
     };
-    for merging in [false, true] {
+    for both_ways in [false, true] {
         let (mut push, mut pull) = (Vec::new(), Vec::new());
-        diff_decoded(&local_entries, &decoded, &mut push, &mut pull, merging);
+        diff_decoded(&local_entries, &decoded, &mut push, &mut pull, both_ways);
         assert_eq!(push, vec![key.clone()]);
         assert!(pull.is_empty(), "{pull:?}");
     }
@@ -169,15 +169,15 @@ fn a_sketch_of_an_unreproducible_shape_falls_back_to_a_full_listing() {
     assert_eq!(out.undecodable_buckets, vec![7]);
 }
 
-/// A merging bucket above the threshold that routes it to the sketch
+/// A both-ways bucket above the threshold that routes it to the sketch
 /// path (`ClusterConfig::ae_sketch_min_bucket`) converges in this one
 /// round: every one of its mismatched keys is a two-sided version
 /// mismatch, the shape `sketch.rs`'s own
 /// `two_sided_version_mismatches_decode_at_the_default_shape` pins as
 /// decodable at this element count, so the peel here succeeds with no
-/// fallback, and `merging` queues both directions for every key.
+/// fallback, and `both_ways` queues both directions for every key.
 #[test]
-fn a_merging_bucket_above_the_threshold_converges_through_the_sketch_path() {
+fn a_both_ways_bucket_above_the_threshold_converges_through_the_sketch_path() {
     const KEYS: u64 = 40;
     let local_entries: Vec<(Bytes, Hlc)> = (0..KEYS)
         .map(|i| bucket_entry(format!("k{i}").as_bytes(), 2 * i + 1))
@@ -204,7 +204,7 @@ fn a_merging_bucket_above_the_threshold_converges_through_the_sketch_path() {
     assert_eq!(
         plan.push_keys.len(),
         usize::try_from(KEYS).expect("KEYS is a small literal, always fits"),
-        "merging pushes every mismatched key, not only the greater-version side"
+        "both ways pushes every mismatched key, not only the greater-version side"
     );
     let (bucket, hashes) = plan
         .pull_hashes
@@ -214,7 +214,7 @@ fn a_merging_bucket_above_the_threshold_converges_through_the_sketch_path() {
     assert_eq!(
         hashes.len(),
         usize::try_from(KEYS).expect("KEYS is a small literal, always fits"),
-        "merging pulls every mismatched key's hash too, converging both directions in one round"
+        "both ways pulls every mismatched key's hash too, converging both directions in one round"
     );
 }
 
@@ -268,6 +268,45 @@ fn a_well_formed_part_sketch_decodes_into_hashes_to_pull() {
         "{:?}",
         out.undecodable_buckets
     );
+}
+
+/// The plan for a sketch whose peer holds `k1` at version 20 against this
+/// node's 10, classified at part scope when `part` and at bucket scope
+/// otherwise.
+fn mismatched_key_plan(part: bool, both_ways: bool) -> RepairPlan {
+    let local = [(Bytes::from_static(b"k1"), hlc(10))];
+    let mut remote = Iblt::new(240);
+    remote.insert(xxh3_64(b"k1"), hlc(20));
+    let cache = SmolStr::new("users");
+    let mut plan = RepairPlan::default();
+    if part {
+        handle_part_sketch_mismatch(&cache, 7, remote.into_cells(), &local, &mut plan, both_ways);
+    } else {
+        handle_sketch_mismatch(&cache, 7, remote.into_cells(), &local, &mut plan, both_ways);
+    }
+    plan
+}
+
+#[test]
+fn a_bucket_or_part_sketch_queues_both_directions_only_when_exchanging_both_ways() {
+    for part in [false, true] {
+        let one_way = mismatched_key_plan(part, false);
+        assert!(
+            one_way.push_keys.is_empty(),
+            "part {part}: the peer's version is greater: {:?}",
+            one_way.push_keys
+        );
+        assert_eq!(one_way.pull_hashes, vec![(7, vec![xxh3_64(b"k1")])]);
+
+        let both_ways = mismatched_key_plan(part, true);
+        assert_eq!(
+            both_ways.push_keys,
+            vec![Bytes::from_static(b"k1")],
+            "part {part}: the lower-version holder pushes its record too"
+        );
+        assert_eq!(both_ways.pull_hashes, vec![(7, vec![xxh3_64(b"k1")])]);
+        assert_eq!(both_ways.undecodable_buckets, Vec::<u16>::new());
+    }
 }
 
 #[test]
@@ -335,12 +374,39 @@ fn diff_decoded_pulls_a_remote_only_key_by_hash_alone() {
     assert_eq!(pull, vec![hash]);
 }
 
+#[test]
+fn classify_versions_exchanges_both_ways_only_when_asked() {
+    let (low, high) = (hlc(10), hlc(20));
+    // (local, peer, both_ways, expected (push, pull))
+    let table = [
+        (Some(high), Some(low), false, (true, false)),
+        (Some(high), Some(low), true, (true, true)),
+        (Some(low), Some(high), false, (false, true)),
+        (Some(low), Some(high), true, (true, true)),
+        (Some(low), Some(low), false, (false, false)),
+        (Some(low), Some(low), true, (false, false)),
+        (Some(low), None, false, (true, false)),
+        (Some(low), None, true, (true, false)),
+        (None, Some(low), false, (false, true)),
+        (None, Some(low), true, (false, true)),
+        (None, None, false, (false, false)),
+        (None, None, true, (false, false)),
+    ];
+    for (local, peer, both_ways, expected) in table {
+        assert_eq!(
+            classify_versions(local, peer, both_ways),
+            expected,
+            "local {local:?}, peer {peer:?}, both_ways {both_ways}"
+        );
+    }
+}
+
 fn bucket_entry(key: &[u8], wall_ms: u64) -> (Bytes, Hlc) {
     (Bytes::copy_from_slice(key), hlc(wall_ms))
 }
 
 #[test]
-fn diff_bucket_pushes_only_the_greater_local_version_when_not_merging() {
+fn diff_bucket_pushes_only_the_greater_local_version_when_not_exchanging_both_ways() {
     let local = vec![bucket_entry(b"k1", 20)];
     let peer = vec![bucket_entry(b"k1", 10)];
     let (mut push, mut pull) = (Vec::new(), Vec::new());
@@ -350,7 +416,7 @@ fn diff_bucket_pushes_only_the_greater_local_version_when_not_merging() {
 }
 
 #[test]
-fn diff_bucket_pulls_only_the_greater_peer_version_when_not_merging() {
+fn diff_bucket_pulls_only_the_greater_peer_version_when_not_exchanging_both_ways() {
     let local = vec![bucket_entry(b"k1", 10)];
     let peer = vec![bucket_entry(b"k1", 20)];
     let (mut push, mut pull) = (Vec::new(), Vec::new());
@@ -360,7 +426,7 @@ fn diff_bucket_pulls_only_the_greater_peer_version_when_not_merging() {
 }
 
 #[test]
-fn diff_bucket_queues_both_directions_for_a_mismatch_when_merging() {
+fn diff_bucket_queues_both_directions_for_a_mismatch_when_exchanging_both_ways() {
     let local = vec![bucket_entry(b"k1", 10)];
     let peer = vec![bucket_entry(b"k1", 20)];
     let (mut push, mut pull) = (Vec::new(), Vec::new());
@@ -368,34 +434,34 @@ fn diff_bucket_queues_both_directions_for_a_mismatch_when_merging() {
     assert_eq!(
         push,
         vec![Bytes::from_static(b"k1")],
-        "merging pushes this side's record even though the peer's version is greater"
+        "both ways pushes this side's record even though the peer's version is greater"
     );
     assert_eq!(
         pull,
         vec![Bytes::from_static(b"k1")],
-        "merging keeps the pull the non-merging rule already queues"
+        "both ways keeps the pull the one-way rule already queues"
     );
 }
 
 #[test]
-fn diff_bucket_agreeing_versions_queue_neither_direction_regardless_of_merging() {
+fn diff_bucket_agreeing_versions_queue_neither_direction_regardless_of_both_ways() {
     let local = vec![bucket_entry(b"k1", 10)];
     let peer = vec![bucket_entry(b"k1", 10)];
-    for merging in [false, true] {
+    for both_ways in [false, true] {
         let (mut push, mut pull) = (Vec::new(), Vec::new());
-        diff_bucket(&local, &peer, &mut push, &mut pull, merging);
+        diff_bucket(&local, &peer, &mut push, &mut pull, both_ways);
         assert!(push.is_empty(), "{push:?}");
         assert!(pull.is_empty(), "{pull:?}");
     }
 }
 
 #[test]
-fn diff_bucket_a_key_only_one_side_holds_is_unaffected_by_merging() {
+fn diff_bucket_a_key_only_one_side_holds_is_unaffected_by_both_ways() {
     let local_only = vec![bucket_entry(b"local-key", 1)];
     let peer_only = vec![bucket_entry(b"peer-key", 1)];
-    for merging in [false, true] {
+    for both_ways in [false, true] {
         let (mut push, mut pull) = (Vec::new(), Vec::new());
-        diff_bucket(&local_only, &peer_only, &mut push, &mut pull, merging);
+        diff_bucket(&local_only, &peer_only, &mut push, &mut pull, both_ways);
         assert_eq!(push, vec![Bytes::from_static(b"local-key")]);
         assert_eq!(pull, vec![Bytes::from_static(b"peer-key")]);
     }

@@ -267,6 +267,7 @@ where
             stored_encoded,
             stored_expires_at_ms,
             stored_absent,
+            prior_tombstone.is_some(),
             ver,
             incoming,
         ) {

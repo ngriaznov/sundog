@@ -67,6 +67,77 @@ async fn cache_opened_with_a_custom_resolver_keeps_the_longer_value_over_a_newer
 }
 
 #[tokio::test]
+async fn a_removed_key_stays_removed_under_a_resolver_that_prefers_a_longer_value() {
+    let cluster = solo_cluster("cluster-it-custom-resolver-remove").await;
+    let cache = cluster
+        .cache::<u32, Vec<u8>>("resolved")
+        .mode(Mode::Local)
+        .resolver(Arc::new(KeepsTheLongerValue))
+        .open()
+        .await
+        .expect("open succeeds");
+    let name = SmolStr::new("resolved");
+    let shard = cluster
+        .shards()
+        .read()
+        .expect("shard registry lock is never poisoned")
+        .get(&name)
+        .cloned()
+        .expect("shard is registered under the name it was opened with");
+    let record = |value: Option<&Vec<u8>>, ver: Hlc| WireRecord {
+        key: Bytes::from(postcard::to_stdvec(&1u32).expect("u32 key encodes")),
+        value: value.map(|v| Bytes::from(postcard::to_stdvec(v).expect("value encodes"))),
+        ver,
+        expires_at_ms: None,
+    };
+
+    cache.insert(1, vec![0u8; 3]).await.expect("insert");
+    cache.remove(&1).await.expect("remove");
+    assert_eq!(cache.get(&1).await, None);
+
+    // A longer value stamped before the removal arrives late: the resolver
+    // prefers it, but the tombstone is newer, so the key stays deleted.
+    let removed_at = crate::store::now_ms();
+    ShardOps::apply_remote(
+        shard.as_ref(),
+        record(
+            Some(&vec![0u8; 10]),
+            Hlc {
+                wall_ms: removed_at.saturating_sub(60_000),
+                logical: 0,
+                node: NodeId::from(9),
+            },
+        ),
+    )
+    .await;
+    assert_eq!(
+        cache.get(&1).await,
+        None,
+        "an older, longer value never resurrects a removed key"
+    );
+
+    // A remote tombstone newer than a longer live value deletes it.
+    cache.insert(2, vec![0u8; 10]).await.expect("insert");
+    let mut tombstone = record(
+        None,
+        Hlc {
+            wall_ms: crate::store::now_ms() + 1_000,
+            logical: 0,
+            node: NodeId::from(9),
+        },
+    );
+    tombstone.key = Bytes::from(postcard::to_stdvec(&2u32).expect("u32 key encodes"));
+    ShardOps::apply_remote(shard.as_ref(), tombstone).await;
+    assert_eq!(
+        cache.get(&2).await,
+        None,
+        "a newer tombstone deletes a longer value"
+    );
+
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
 async fn pn_counter_resolver_converges_a_three_node_cluster_to_the_exact_concurrent_total() {
     const INCREMENTS_PER_NODE: u64 = 5;
 

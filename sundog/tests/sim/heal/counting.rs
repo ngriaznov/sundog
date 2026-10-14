@@ -182,4 +182,8 @@ impl<S: ShardOps + 'static> ShardOps for CountingShard<S> {
     fn merges(&self) -> bool {
         self.inner.merges()
     }
+
+    fn ae_exchanges_both(&self) -> bool {
+        self.inner.ae_exchanges_both()
+    }
 }

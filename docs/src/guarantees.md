@@ -14,6 +14,16 @@ arrive in. Two nodes writing one key at nearly the same instant both
 succeed locally, and the older write disappears once the newer one
 reaches it. No error reports the loser.
 
+A custom `ConflictResolver` replaces that rule for two values. Its `winner`
+may prefer a record with a lower version, and replicas still converge on
+it: anti-entropy exchanges both records of a mismatched key whenever the
+resolver reads values, so the replica that holds the winner at the lower
+version sends it and the other adopts it. A tombstone and a value settle
+by version for every resolver, the higher version winning, so a deleted key
+stays deleted whatever a resolver prefers. A resolver that returns `false`
+from `needs_value_bytes` promises that it prefers the greater version, and
+anti-entropy repairs it one way.
+
 Keep node clocks synchronized with NTP or your platform's time service. A
 node whose clock runs ahead stamps its writes later than its peers' and
 wins their conflicts. `ClusterConfig::max_clock_skew`, one minute by

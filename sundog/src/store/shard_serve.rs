@@ -13,6 +13,7 @@ use serde::de::DeserializeOwned;
 
 #[cfg(feature = "spill")]
 use super::SpillRead;
+use super::resolver::exchanges_both_records;
 use super::shard_ops::MaskedDigest;
 use super::{
     BUCKET_COUNT, BucketDigest, BucketEntries, BucketLen, BucketPart, BucketPartDigests,
@@ -964,5 +965,9 @@ where
 
     fn merges(&self) -> bool {
         self.resolver.merges()
+    }
+
+    fn ae_exchanges_both(&self) -> bool {
+        exchanges_both_records(self.resolver.merges(), self.resolver.needs_value_bytes())
     }
 }

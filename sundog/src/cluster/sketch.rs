@@ -499,7 +499,7 @@ mod tests {
         );
     }
 
-    /// A merging resolver's mismatched key is never one-sided: it is
+    /// A both-ways resolver's mismatched key is never one-sided: it is
     /// present on both replicas at different versions, so it contributes
     /// *two* elements to the symmetric difference rather than one (see
     /// `cluster::anti_entropy`'s bidirectional-exchange doc). This pins

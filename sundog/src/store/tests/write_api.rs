@@ -209,19 +209,18 @@ async fn insert_many_queues_only_the_keys_that_landed() {
 }
 
 #[tokio::test]
-async fn remove_many_queues_only_the_keys_that_landed() {
+async fn remove_many_deletes_over_a_resolver_that_prefers_the_stored_value() {
+    // `AlwaysA` keeps whatever is stored for two values, but a tombstone and
+    // a value settle by version: every local tombstone is newer than what it
+    // meets, so it lands and reaches the fan-out queue.
     let s = shard::<u32, String>(1).with_resolver(Arc::new(AlwaysA));
     s.insert(1, "first".into()).await.expect("insert");
     let _ = s.fan_out.drain();
 
     s.remove_many([1, 3]).await.expect("remove_many");
 
-    assert_eq!(
-        applied_keys(s.fan_out.drain()),
-        vec![3],
-        "the rejected tombstone never reaches the fan-out queue"
-    );
-    assert_eq!(s.get(&1).await, Some("first".to_string()));
+    assert_eq!(applied_keys(s.fan_out.drain()), vec![1, 3]);
+    assert_eq!(s.get(&1).await, None);
 }
 
 #[tokio::test]

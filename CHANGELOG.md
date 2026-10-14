@@ -30,6 +30,23 @@ All notable changes to this project are documented in this file. Format follows
   hand-off the channel cannot take for another reason, a closed tier or a
   stopped flusher, counts as no eviction progress and ends the pass with the
   victim resident.
+- **Anti-entropy converges replicas under a custom resolver whose winner is
+  not the greater version.** A resolver that reads values (`needs_value_bytes`
+  left at `true`) has anti-entropy exchange both records of a
+  version-mismatched key, as a merging resolver already does. The replica
+  that holds the winner at the lower version sends it, and the other
+  replica adopts it, where the lower-version holder never offered it and the
+  other replica rejected it again every round. A resolver that returns
+  `false` from `needs_value_bytes`, like `LwwResolver`, keeps the one-way
+  repair and must prefer the greater version. This tightens the documented
+  contract for `needs_value_bytes() == false`. The defaulted
+  `ShardOps::ae_exchanges_both` carries the decision to the anti-entropy
+  round, and a wrapper around `ShardOps` forwards it beside `merges`.
+- **A tombstone and a value settle by version for every resolver.** The
+  higher version wins and a tie keeps the stored side, so a custom `winner`
+  that prefers values can no longer revive a deleted key or bury a newer
+  value under an older tombstone. `LwwResolver` and the `crdt` resolvers
+  already decided that pair by version.
 
 ## [0.6.7] – 2026-10-13
 

@@ -3,9 +3,10 @@
 //! 1,024 bucket digests; for each mismatch the peer answers with the bucket's
 //! entry listing, or an IBLT sketch for a large bucket. The initiator diffs,
 //! pushes what it has newer, and pulls what the peer has newer, so both sides
-//! converge in one round. When the shard's resolver merges
-//! (`ShardOps::merges` is `true`), a version-mismatched key
-//! is pushed *and* pulled instead of only in the greater side's direction, so
+//! converge in one round. When the shard's resolver merges or reads values
+//! (`ShardOps::ae_exchanges_both` is `true`), a version-mismatched key is
+//! pushed *and* pulled instead of only in the greater side's direction, so
+//! a replica holding the resolver's winner at the lower version sends it, and
 //! two replicas each holding half of a merge exchange records in this same
 //! round rather than needing a second round to carry the minted result back.
 //! Tombstones take part as records with no value.
@@ -165,10 +166,11 @@ pub enum RoundOutcome {
 /// One anti-entropy round against `peer`: exchanges digests, then diffs the
 /// mismatched buckets. A key this node has newer, or `peer` lacks, pushes
 /// via the normal `Replicate` path; a key `peer` has newer, or this node
-/// lacks, pulls and applies directly. When `shard`'s resolver reports
-/// [`ShardOps::merges`], a key present on both sides under different
-/// versions pushes *and* pulls, so two replicas each holding half of a
-/// merge converge in this one round rather than needing a second.
+/// lacks, pulls and applies directly. When `shard`'s resolver merges or reads
+/// values ([`ShardOps::ae_exchanges_both`]), a key present on both sides
+/// under different versions pushes *and* pulls, so a replica holding the
+/// winner at the lower version sends it, and two replicas each holding half
+/// of a merge converge in this one round rather than needing a second.
 ///
 /// A `Mode::Distributed` shard exchanges digests through
 /// `Mesh::ae_round_scoped`, or `Mesh::ae_round_masked` under a part view,
@@ -186,10 +188,10 @@ pub async fn run_round_against(
     cache: &SmolStr,
     peer: NodeId,
 ) -> RoundOutcome {
-    // Read once per round: a merging resolver has both sides exchange a
-    // mismatched key instead of only the greater version pushing to the
-    // lesser side. See `ShardOps::merges`.
-    let merging = shard.merges();
+    // Read once per round: a resolver that merges or reads values has both
+    // sides exchange a mismatched key instead of only the greater version
+    // pushing to the lesser side. See `ShardOps::ae_exchanges_both`.
+    let both_ways = shard.ae_exchanges_both();
     let (mismatched, in_scope) = match shard.ae_scoped_digests_for(peer).await {
         Some(scoped) => {
             // Only what `peer` co-owns, read under the view whose hash it
@@ -242,7 +244,7 @@ pub async fn run_round_against(
     }
 
     let repairs =
-        reconcile_mismatches(mesh, shard, cache, peer, mismatched, in_scope, merging).await;
+        reconcile_mismatches(mesh, shard, cache, peer, mismatched, in_scope, both_ways).await;
     if repairs.complete {
         RoundOutcome::Reconciled
     } else {
@@ -303,7 +305,7 @@ async fn reconcile_mismatches(
     peer: NodeId,
     mismatched: Vec<AeMismatch>,
     in_scope: Option<HashMap<u16, PartMask>>,
-    merging: bool,
+    both_ways: bool,
 ) -> Repairs {
     let (part_digest_mismatches, bucket_mismatches): (Vec<AeMismatch>, Vec<AeMismatch>) =
         mismatched
@@ -314,7 +316,7 @@ async fn reconcile_mismatches(
         in_scope,
         ..RepairPlan::default()
     };
-    classify_bucket_mismatches(shard, cache, bucket_mismatches, &mut plan, merging).await;
+    classify_bucket_mismatches(shard, cache, bucket_mismatches, &mut plan, both_ways).await;
     let mut complete = classify_part_digest_mismatches(
         mesh,
         shard,
@@ -322,7 +324,7 @@ async fn reconcile_mismatches(
         peer,
         part_digest_mismatches,
         &mut plan,
-        merging,
+        both_ways,
     )
     .await;
 
@@ -354,7 +356,7 @@ async fn reconcile_mismatches(
                         &key_versions_to_tuples(peer_entries),
                         &mut plan.push_keys,
                         &mut plan.pull_keys,
-                        merging,
+                        both_ways,
                     );
                 }
             }
@@ -375,7 +377,7 @@ async fn reconcile_mismatches(
         plan.push_keys,
         plan.pull_keys,
         plan.pull_hashes,
-        merging,
+        both_ways,
     )
     .await;
     Repairs {
@@ -470,7 +472,7 @@ pub(crate) async fn run_round_for_parts(
             .any(|part| wanted.contains(PartId::new(bucket, part)))
     });
     let covered = scoped.scope.coverage();
-    let merging = shard.merges();
+    let both_ways = shard.ae_exchanges_both();
     let mismatched = match scoped_exchange(mesh, cache, peer, scoped).await {
         Ok(AeRoundOutcome::Mismatches(mismatched)) => mismatched,
         Ok(AeRoundOutcome::Stale {
@@ -507,7 +509,7 @@ pub(crate) async fn run_round_for_parts(
         peer,
         mismatched,
         Some(in_scope),
-        merging,
+        both_ways,
     )
     .await;
     PartRoundOutcome {
@@ -585,12 +587,12 @@ impl RepairPlan {
 
 /// Whether a version mismatch pushes, pulls, or both, as `(push, pull)`:
 /// either side missing sends toward the side that holds it; both present
-/// sends the greater version's side, and `merging` additionally sends the
-/// other direction too.
-fn classify_versions(local: Option<Hlc>, peer: Option<Hlc>, merging: bool) -> (bool, bool) {
+/// sends the greater version's side, and `both_ways` (a resolver that merges
+/// or reads values) additionally sends the other direction too.
+fn classify_versions(local: Option<Hlc>, peer: Option<Hlc>, both_ways: bool) -> (bool, bool) {
     match (local, peer) {
         (Some(local), Some(peer)) if local != peer => {
-            (local > peer || merging, local < peer || merging)
+            (local > peer || both_ways, local < peer || both_ways)
         }
         (Some(_), Some(_)) | (None, None) => (false, false),
         (Some(_), None) => (true, false),
@@ -626,7 +628,7 @@ async fn classify_bucket_mismatches(
     cache: &SmolStr,
     mismatches: Vec<AeMismatch>,
     plan: &mut RepairPlan,
-    merging: bool,
+    both_ways: bool,
 ) {
     for chunk in chunk_mismatches(mismatches, CLASSIFY_BUCKET_CHUNK) {
         let local_entries = shard
@@ -645,13 +647,13 @@ async fn classify_bucket_mismatches(
                         &key_versions_to_tuples(peer_entries),
                         &mut plan.push_keys,
                         &mut plan.pull_keys,
-                        merging,
+                        both_ways,
                     );
                 }
                 AeMismatch::Sketch(bucket, cells) => {
                     let entries: &[(Bytes, Hlc)] =
                         local_by_bucket.get(&bucket).map_or(&[], Vec::as_slice);
-                    handle_sketch_mismatch(cache, bucket, cells, entries, plan, merging);
+                    handle_sketch_mismatch(cache, bucket, cells, entries, plan, both_ways);
                 }
                 AeMismatch::PartDigests(..) => {
                     unreachable!("invariant: reconcile_mismatches partitions this variant out")
@@ -686,11 +688,11 @@ async fn classify_part_digest_mismatches(
     peer: NodeId,
     mismatches: Vec<AeMismatch>,
     plan: &mut RepairPlan,
-    merging: bool,
+    both_ways: bool,
 ) -> bool {
     for chunk in chunk_mismatches(mismatches, CLASSIFY_BUCKET_CHUNK) {
         let ok =
-            classify_part_digest_mismatch_chunk(mesh, shard, cache, peer, chunk, plan, merging)
+            classify_part_digest_mismatch_chunk(mesh, shard, cache, peer, chunk, plan, both_ways)
                 .await;
         if !ok {
             return false;
@@ -713,7 +715,7 @@ async fn classify_part_digest_mismatch_chunk(
     peer: NodeId,
     mismatches: Vec<AeMismatch>,
     plan: &mut RepairPlan,
-    merging: bool,
+    both_ways: bool,
 ) -> bool {
     let buckets: Vec<u16> = mismatches.iter().map(AeMismatch::bucket).collect();
     let local_part_digests = shard.part_digests(buckets).await;
@@ -747,7 +749,7 @@ async fn classify_part_digest_mismatch_chunk(
         wanted_parts.iter().map(|p| (p.bucket, p.part)).collect();
     match mesh.ae_parts(peer, cache.clone(), wanted_parts_wire).await {
         Ok(replies) => {
-            classify_part_replies(shard, cache, replies, plan, merging).await;
+            classify_part_replies(shard, cache, replies, plan, both_ways).await;
             true
         }
         Err(error) => {
@@ -767,7 +769,7 @@ async fn classify_part_replies(
     cache: &SmolStr,
     replies: Vec<AePartReply>,
     plan: &mut RepairPlan,
-    merging: bool,
+    both_ways: bool,
 ) {
     if replies.is_empty() {
         return;
@@ -800,7 +802,7 @@ async fn classify_part_replies(
                     &key_versions_to_tuples(entries),
                     &mut slot.push_keys,
                     &mut slot.pull_keys,
-                    merging,
+                    both_ways,
                 );
                 metrics::counter!(
                     "sundog_ae_parts_total",
@@ -823,7 +825,7 @@ async fn classify_part_replies(
                 let entries: &[(Bytes, Hlc)] = local_by_part
                     .get(&(bucket, part))
                     .map_or(&[], Vec::as_slice);
-                handle_part_sketch_mismatch(cache, bucket, cells, entries, slot, merging);
+                handle_part_sketch_mismatch(cache, bucket, cells, entries, slot, both_ways);
             }
         }
     }
@@ -846,8 +848,9 @@ fn wire_record_len(cache_len: usize, record: &WireRecord) -> u64 {
 /// returns the total wire bytes moved (pushed plus pulled) and whether
 /// every pull was answered and every push reached `peer`'s outbox.
 ///
-/// Without `merging`, pushes go out first: the two sets are disjoint. With
-/// `merging`, a key both sides hold sits in both sets, so pulls run first
+/// Without `both_ways`, pushes go out first: the two sets are disjoint. With
+/// `both_ways` (a resolver that merges or reads values), a key both sides
+/// hold sits in both sets, so pulls run first
 /// and fold the peer's record in, and a key whose stored version is then
 /// exactly the version the peer sent is not pushed back: the peer already
 /// holds it.
@@ -863,10 +866,10 @@ async fn apply_repairs(
     push_keys: Vec<Bytes>,
     pull_keys: Vec<Bytes>,
     pull_hashes: Vec<(u16, Vec<u64>)>,
-    merging: bool,
+    both_ways: bool,
 ) -> Repairs {
     let mut tally = RepairTally::default();
-    let complete = if merging {
+    let complete = if both_ways {
         let (pulled, pulled_all) =
             pull_repairs(mesh, shard, cache, peer, pull_keys, pull_hashes, &mut tally).await;
         let pushed_all =
@@ -1012,7 +1015,7 @@ fn handle_sketch_mismatch(
     cells: Vec<Cell>,
     local_entries: &[(Bytes, Hlc)],
     plan: &mut RepairPlan,
-    merging: bool,
+    both_ways: bool,
 ) {
     if !peel_sketch_into(
         SketchScope::Bucket,
@@ -1021,7 +1024,7 @@ fn handle_sketch_mismatch(
         cells,
         local_entries,
         plan,
-        merging,
+        both_ways,
     ) {
         plan.mark_undecodable(bucket);
     }
@@ -1065,7 +1068,7 @@ fn peel_sketch_into(
     cells: Vec<Cell>,
     local_entries: &[(Bytes, Hlc)],
     plan: &mut RepairPlan,
-    merging: bool,
+    both_ways: bool,
 ) -> bool {
     // Sized from the received sketch's cell count, not this node's own
     // config, so the two sketches stay shape-compatible if configs drift. A
@@ -1094,7 +1097,7 @@ fn peel_sketch_into(
         &decoded,
         &mut plan.push_keys,
         &mut hashes,
-        merging,
+        both_ways,
     );
     plan.pull_by_hash(bucket, hashes);
     true
@@ -1129,7 +1132,7 @@ fn handle_part_sketch_mismatch(
     cells: Vec<Cell>,
     local_entries: &[(Bytes, Hlc)],
     plan: &mut RepairPlan,
-    merging: bool,
+    both_ways: bool,
 ) {
     if !peel_sketch_into(
         SketchScope::Part,
@@ -1138,7 +1141,7 @@ fn handle_part_sketch_mismatch(
         cells,
         local_entries,
         plan,
-        merging,
+        both_ways,
     ) {
         plan.mark_undecodable(bucket);
     }
@@ -1171,7 +1174,7 @@ fn diff_bucket(
     peer_entries: &[(Bytes, Hlc)],
     push_keys: &mut Vec<Bytes>,
     pull_keys: &mut Vec<Bytes>,
-    merging: bool,
+    both_ways: bool,
 ) {
     let peer_by_key: HashMap<&Bytes, Hlc> = peer_entries.iter().map(|(k, v)| (k, *v)).collect();
     let mut local_keys = HashSet::with_capacity(local_entries.len());
@@ -1179,7 +1182,7 @@ fn diff_bucket(
     for (key, local_ver) in local_entries {
         local_keys.insert(key);
         let (push, pull) =
-            classify_versions(Some(*local_ver), peer_by_key.get(key).copied(), merging);
+            classify_versions(Some(*local_ver), peer_by_key.get(key).copied(), both_ways);
         if push {
             push_keys.push(key.clone());
         }
@@ -1211,7 +1214,7 @@ pub fn diff_decoded(
     decoded: &Decoded,
     push_keys: &mut Vec<Bytes>,
     pull_hashes: &mut Vec<u64>,
-    merging: bool,
+    both_ways: bool,
 ) {
     let local_by_hash: HashMap<u64, &Bytes> = local_entries
         .iter()
@@ -1232,7 +1235,7 @@ pub fn diff_decoded(
         let (push, pull) = classify_versions(
             Some(elem.ver),
             remote_only.get(&elem.key_hash).copied(),
-            merging,
+            both_ways,
         );
         if push && let Some(&key) = local_by_hash.get(&elem.key_hash) {
             push_keys.push(key.clone());

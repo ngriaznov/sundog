@@ -232,6 +232,84 @@ async fn shard_merges_reflects_the_resolvers_merges_flag() {
     );
 }
 
+/// Prefers the greater version and declares `needs_value_bytes` `false`.
+#[derive(Debug, Clone, Copy)]
+struct GreaterVersionOnly;
+
+impl ConflictResolver for GreaterVersionOnly {
+    fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
+        if a.ver >= b.ver { Winner::A } else { Winner::B }
+    }
+
+    fn needs_value_bytes(&self) -> bool {
+        false
+    }
+}
+
+#[tokio::test]
+async fn shard_ae_exchanges_both_for_a_resolver_that_reads_values_only() {
+    let default_resolver = shard::<u32, Vec<u8>>(1);
+    assert!(
+        !ShardOps::ae_exchanges_both(&default_resolver),
+        "a shard with no resolver set repairs one way, like LwwResolver"
+    );
+
+    let reads_values = shard::<u32, Vec<u8>>(1).with_resolver(Arc::new(LongestValueWins));
+    assert!(
+        ShardOps::ae_exchanges_both(&reads_values),
+        "a resolver left at needs_value_bytes = true can prefer the lower version"
+    );
+    assert!(
+        !ShardOps::merges(&reads_values),
+        "reading values is not merging: compaction and the Invalidation wire stay off"
+    );
+
+    let merging = shard::<u32, Vec<u8>>(1).with_resolver(Arc::new(AlwaysMerge {
+        value: Bytes::from_static(b"x"),
+        expires_at_ms: None,
+    }));
+    assert!(ShardOps::ae_exchanges_both(&merging), "a merging resolver");
+
+    let version_only = shard::<u32, Vec<u8>>(1).with_resolver(Arc::new(GreaterVersionOnly));
+    assert!(
+        !ShardOps::ae_exchanges_both(&version_only),
+        "a resolver declaring needs_value_bytes = false keeps the one-way repair"
+    );
+}
+
+#[tokio::test]
+async fn a_tombstone_and_a_value_settle_by_version_for_a_resolver_preferring_values() {
+    let s = shard::<u32, Vec<u8>>(1).with_resolver(Arc::new(LongestValueWins));
+    let put = |len: usize, ver: Hlc| WireRecord {
+        key: key_bytes(&1u32),
+        value: Some(Bytes::from(
+            postcard::to_stdvec(&vec![0u8; len]).expect("encode"),
+        )),
+        ver,
+        expires_at_ms: None,
+    };
+    let tombstone = |ver: Hlc| WireRecord {
+        key: key_bytes(&1u32),
+        value: None,
+        ver,
+        expires_at_ms: None,
+    };
+
+    // A newer tombstone buries a longer value, which `LongestValueWins`
+    // would otherwise keep.
+    ShardOps::apply_remote(&s, put(10, hlc(100, 2))).await;
+    ShardOps::apply_remote(&s, tombstone(hlc(200, 3))).await;
+    assert_eq!(s.get(&1).await, None, "the newer tombstone wins");
+
+    // An older value cannot resurrect the key, however long it is.
+    ShardOps::apply_remote(&s, put(50, hlc(150, 2))).await;
+    assert_eq!(s.get(&1).await, None, "an older value never resurrects");
+
+    // A newer value does, however short it is.
+    ShardOps::apply_remote(&s, put(1, hlc(300, 2))).await;
+    assert_eq!(s.get(&1).await, Some(vec![0u8; 1]), "a newer value lands");
+}
+
 #[tokio::test]
 async fn custom_resolver_overrides_plain_hlc_order() {
     let s = shard::<u32, Vec<u8>>(1).with_resolver(Arc::new(LongestValueWins));

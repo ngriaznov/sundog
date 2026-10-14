@@ -22,7 +22,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use sundog::{Cache, Cluster, Mode, PrometheusHandle, SpillConfig};
+use sundog::{
+    Cache, Cluster, ConflictResolver, Mode, PrometheusHandle, RecordView, SpillConfig, Winner,
+};
 
 /// This binary's lazily-installed claim on the process-global Prometheus
 /// recorder slot. Mirrors `spill_bench.rs::metrics_handle`.
@@ -228,6 +230,105 @@ async fn replicated_two_node_spill_converges_and_settles_to_zero_repairs() {
     assert_eq!(
         before, after,
         "a steady state with nothing new to write settles to zero further repairs"
+    );
+
+    cache_a.close().await;
+    cache_b.close().await;
+    cluster_a.shutdown().await;
+    cluster_b.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Keeps the longer value: a deterministic antisymmetric order that does not
+/// follow versions.
+#[derive(Debug, Clone, Copy)]
+struct LongerValueWins;
+
+impl ConflictResolver for LongerValueWins {
+    fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
+        let len_a = a.value.map_or(0, <[u8]>::len);
+        let len_b = b.value.map_or(0, <[u8]>::len);
+        if len_b > len_a { Winner::B } else { Winner::A }
+    }
+}
+
+/// A resolver whose winner is held at the lower version, with the winner
+/// sitting on `a`'s disk: `b` took a shorter write at a higher version that
+/// `a` rejected, so only anti-entropy can carry the longer value back, and
+/// only if `a` reads its spilled record to push it.
+#[tokio::test]
+async fn anti_entropy_pushes_a_spilled_winner_held_at_the_lower_version() {
+    let cluster_a = Cluster::builder("it-spill-repl-winner")
+        .seeds(std::iter::empty())
+        .config(common::fast_config())
+        .build()
+        .await
+        .expect("node a builds");
+    let cluster_b = Cluster::builder("it-spill-repl-winner")
+        .seeds([cluster_a.local_gossip_addr()])
+        .config(common::fast_config())
+        .build()
+        .await
+        .expect("node b builds");
+    common::wait_for_peer_count(&cluster_a, 1, Duration::from_secs(15)).await;
+    common::wait_for_peer_count(&cluster_b, 1, Duration::from_secs(15)).await;
+
+    let dir = fresh_temp_dir("winner");
+    let cache_a = cluster_a
+        .cache::<u32, String>("orders")
+        .mode(Mode::Replicated)
+        .resolver(Arc::new(LongerValueWins))
+        .max_capacity(2)
+        .spill(SpillConfig::new(&dir, 1 << 20).region_bytes(4096))
+        .open()
+        .await
+        .expect("a opens with spill composing with Replicated's max_capacity");
+    let cache_b = cluster_b
+        .cache::<u32, String>("orders")
+        .mode(Mode::Replicated)
+        .resolver(Arc::new(LongerValueWins))
+        .open()
+        .await
+        .expect("b opens, unbounded and spill-free");
+
+    let long = |k: u32| format!("the-longer-value-{k}");
+    for k in 0..5u32 {
+        cache_a.insert(k, long(k)).await.expect("insert");
+    }
+    common::eventually(Duration::from_secs(10), || async {
+        for k in 0..5u32 {
+            if cache_b.get(&k).await.is_none() {
+                return false;
+            }
+        }
+        true
+    })
+    .await;
+    // a's tiny max_capacity spills at least one of the five under eviction.
+    common::eventually(Duration::from_secs(10), || async {
+        (0..5u32).any(|k| cache_a.get_sync(&k).is_none())
+    })
+    .await;
+    let spilled = (0..5u32)
+        .find(|k| cache_a.get_sync(k).is_none())
+        .expect("a spilled a key");
+
+    // b loses its copy without a tombstone and takes a shorter value at a
+    // higher version. a's resolver keeps the spilled longer value over it.
+    cache_b.invalidate_local(&spilled).await;
+    cache_b
+        .insert(spilled, "short".to_string())
+        .await
+        .expect("insert");
+
+    common::eventually(Duration::from_secs(15), || async {
+        cache_b.get(&spilled).await == Some(long(spilled))
+    })
+    .await;
+    assert_eq!(
+        cache_a.get(&spilled).await,
+        Some(long(spilled)),
+        "a keeps the winner it holds at the lower version"
     );
 
     cache_a.close().await;

@@ -21,9 +21,34 @@ async fn two_distributed_co_owners(
     Arc<dyn ShardOps>,
     Arc<dyn ShardOps>,
 ) {
+    two_distributed_co_owners_resolving(test_id, name, None).await
+}
+
+/// [`two_distributed_co_owners`] with both nodes opening the cache under
+/// `resolver` when one is given.
+async fn two_distributed_co_owners_resolving(
+    test_id: &str,
+    name: &SmolStr,
+    resolver: Option<Arc<dyn crate::store::ConflictResolver>>,
+) -> (
+    Cluster,
+    Cluster,
+    NodeId,
+    Arc<dyn ShardOps>,
+    Arc<dyn ShardOps>,
+) {
     use crate::cluster::test_support::{loopback_config, registered_shard, wait_for_peer_count};
     use crate::store::Mode;
 
+    let open = |cluster: &Cluster| {
+        let mut builder = cluster
+            .cache::<u32, String>(name.clone())
+            .mode(Mode::distributed());
+        if let Some(resolver) = &resolver {
+            builder = builder.resolver(Arc::clone(resolver));
+        }
+        builder.open()
+    };
     let b = Cluster::builder(format!("cluster-it-{test_id}"))
         .seeds(std::iter::empty())
         .config(loopback_config())
@@ -31,11 +56,7 @@ async fn two_distributed_co_owners(
         .await
         .expect("b builds");
     let node_b = b.node_id();
-    b.cache::<u32, String>(name.clone())
-        .mode(Mode::distributed())
-        .open()
-        .await
-        .expect("b opens alone, owning every bucket");
+    open(&b).await.expect("b opens alone, owning every bucket");
 
     let c = Cluster::builder(format!("cluster-it-{test_id}"))
         .seeds([b.local_gossip_addr()])
@@ -45,9 +66,7 @@ async fn two_distributed_co_owners(
         .expect("c builds");
     wait_for_peer_count(&b, 1).await;
     wait_for_peer_count(&c, 1).await;
-    c.cache::<u32, String>(name.clone())
-        .mode(Mode::distributed())
-        .open()
+    open(&c)
         .await
         .expect("c opens, co-owning every bucket alongside b");
 
@@ -323,4 +342,88 @@ async fn run_round_for_parts_treats_every_requested_bucket_as_still_diverged_whe
     assert_eq!(outcome.bytes_moved, 0);
 
     cluster.shutdown().await;
+}
+
+/// Keeps the longer value: a deterministic antisymmetric order that does not
+/// follow versions.
+#[derive(Debug, Clone, Copy)]
+struct LongerValueWins;
+
+impl crate::store::ConflictResolver for LongerValueWins {
+    fn winner(
+        &self,
+        _key: &[u8],
+        a: crate::store::RecordView<'_>,
+        b: crate::store::RecordView<'_>,
+    ) -> crate::store::Winner {
+        let len_a = a.value.map_or(0, <[u8]>::len);
+        let len_b = b.value.map_or(0, <[u8]>::len);
+        if len_b > len_a {
+            crate::store::Winner::B
+        } else {
+            crate::store::Winner::A
+        }
+    }
+}
+
+/// Pins that a part-scoped round sends the resolver's winner when it is held
+/// at the lower version, from either side: the pull a releasing owner drops
+/// is not needed, because the holder pushes.
+#[tokio::test]
+async fn run_round_for_parts_exchanges_both_records_for_a_value_reading_resolver() {
+    use crate::cluster::test_support::wait_until;
+
+    for (label, winner_holder_initiates) in [("winner-holder", true), ("loser-holder", false)] {
+        let name = SmolStr::new("scoped-round-winner");
+        let (b, c, node_b, shard_b, shard_c) = two_distributed_co_owners_resolving(
+            &format!("scoped-winner-{label}"),
+            &name,
+            Some(Arc::new(LongerValueWins)),
+        )
+        .await;
+        let (key, _) = keys_in_distinct_buckets(1)[0];
+        let part = part_of_u32(key);
+        let node_c = c.node_id();
+
+        // b holds the winner at the lower version, c the loser at the
+        // higher one; neither saw the other's write.
+        let (_, long) = encode_test_record(key, "the longer value", node_b);
+        shard_b.apply_remote(long).await;
+        let (_, mut short) = encode_test_record(key, "short", node_c);
+        short.ver.wall_ms = 2;
+        shard_c.apply_remote(short).await;
+
+        wait_until(
+            Duration::from_secs(10),
+            "the round runs once both views agree, and leaves the replicas equal",
+            async || {
+                let outcome = if winner_holder_initiates {
+                    run_round_for_parts(b.mesh(), &shard_b, &name, node_c, &[part]).await
+                } else {
+                    run_round_for_parts(c.mesh(), &shard_c, &name, node_b, &[part]).await
+                };
+                !outcome.failed && shard_b.digests().await == shard_c.digests().await
+            },
+        )
+        .await;
+        let key_bytes = crate::store::encode_key(&key).expect("u32 key encodes");
+        for (side, shard) in [("b", &shard_b), ("c", &shard_c)] {
+            let records = shard.records_for(vec![key_bytes.clone()]).await;
+            assert_eq!(
+                records.len(),
+                1,
+                "{label}: {side} holds the key after the round"
+            );
+            assert_eq!(
+                records[0].value,
+                Some(Bytes::from(
+                    postcard::to_stdvec("the longer value").expect("value encodes")
+                )),
+                "{label}: {side} holds the resolver's winner"
+            );
+        }
+
+        b.shutdown().await;
+        c.shutdown().await;
+    }
 }

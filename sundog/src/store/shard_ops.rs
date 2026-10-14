@@ -368,16 +368,29 @@ pub trait ShardOps: Send + Sync {
     }
 
     /// Whether this shard's [`ConflictResolver`] merges, forwarded straight
-    /// from [`ConflictResolver::merges`]. `cluster::anti_entropy` reads this once
-    /// per round and, when `true`, has `diff_bucket`/`diff_decoded` queue a
-    /// key present on both sides under different versions for both push and
-    /// pull instead of only pushing the greater side to the lesser one, so
-    /// two replicas each holding half of a merge exchange records in the
-    /// same round rather than needing a second round to carry the minted
-    /// result back. The pulls run first, and a key that lands at exactly the
-    /// peer's version is not pushed back. `false` for every shard without a
-    /// resolver set, since [`LwwResolver::merges`] is `false`.
+    /// from [`ConflictResolver::merges`]. Compaction and the `Invalidation`
+    /// wire read it; [`ShardOps::ae_exchanges_both`] carries the answer
+    /// anti-entropy reads. `false` for every shard without a resolver set,
+    /// since [`LwwResolver::merges`] is `false`.
     fn merges(&self) -> bool {
+        false
+    }
+
+    /// Whether anti-entropy sends both records of a key present on both
+    /// sides under different versions, as `exchanges_both_records` decides
+    /// from the shard's [`ConflictResolver`]: it is `true` when the resolver
+    /// merges or reads values (`needs_value_bytes`), the only resolvers that
+    /// can prefer the lower version. `cluster::anti_entropy` reads this once
+    /// per round and, when `true`, has `diff_bucket`/`diff_decoded` queue
+    /// such a key for both push and pull instead of only pushing the greater
+    /// side to the lesser one, so a replica holding the winner at the lower
+    /// version sends it, and two replicas each holding half of a merge
+    /// exchange records in the same round. The pulls run first, and a key
+    /// that lands at exactly the peer's version is not pushed back. `false`
+    /// for every shard without a resolver set. A wrapper around a
+    /// `ShardOps` forwards this beside [`ShardOps::merges`]; the default
+    /// would silently make the wrapped shard repair one way.
+    fn ae_exchanges_both(&self) -> bool {
         false
     }
 }

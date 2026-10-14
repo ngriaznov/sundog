@@ -1011,8 +1011,9 @@ proptest! {
 }
 
 /// One full pass of the bidirectional exchange anti-entropy's
-/// `merging = true` path applies (`cluster::anti_entropy`'s
-/// `diff_bucket`/`diff_decoded` with `merging` set), emulated the same way
+/// `both_ways = true` path applies for a resolver that merges or reads values
+/// (`cluster::anti_entropy`'s `diff_bucket`/`diff_decoded` with `both_ways`
+/// set), emulated the same way
 /// [`gossip_until_fixed_point`] emulates the unidirectional rule: for every
 /// unordered pair of `shards`, each side's *current* record for `key_bytes`
 /// is applied to the other, rather than only the greater version pushing to

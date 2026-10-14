@@ -112,6 +112,7 @@ fn fold_run<V: DeserializeOwned>(
             stored_encoded,
             stored_expires_at_ms,
             acc_absent,
+            matches!(acc_incoming, Incoming::Tombstone),
             ver,
             incoming,
         ) {

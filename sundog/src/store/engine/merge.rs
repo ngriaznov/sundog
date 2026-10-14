@@ -40,6 +40,27 @@ pub(super) fn lapsed_before(expires_at_ms: Option<u64>, other_ver: Hlc) -> bool 
     expires_at_ms.is_some_and(|deadline| deadline <= other_ver.wall_ms)
 }
 
+/// How a collision with a tombstone on either side settles: by version
+/// alone, whatever the resolver prefers. The higher version wins; a tie keeps
+/// the stored side. `None` when neither side is a tombstone, which the
+/// resolver decides. A resolver therefore never revives a deleted key or
+/// buries a newer value under an older tombstone, and every replica reaches
+/// the same answer for the same pair of records.
+pub(super) fn tombstone_resolution(
+    sv: Hlc,
+    ver: Hlc,
+    stored_tombstone: bool,
+    incoming_tombstone: bool,
+) -> Option<Resolution> {
+    (stored_tombstone || incoming_tombstone).then(|| {
+        if ver > sv {
+            Resolution::IncomingWins
+        } else {
+            Resolution::IncomingLoses
+        }
+    })
+}
+
 /// Which content a merging resolver's collision keeps, as [`fold_sides`]
 /// decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +101,9 @@ pub(crate) fn fold_sides(
 /// Consults `resolver` on `incoming` at `ver` against whatever is stored at
 /// `sv`. Returns [`Resolution::IncomingLoses`] on the equal-version fast
 /// path (an already-applied record seen again) without calling `resolver`.
+/// A collision with a tombstone on either side (`stored_tombstone` for the
+/// stored one) settles by version alone through [`tombstone_resolution`],
+/// without calling `resolver`.
 ///
 /// When [`ConflictResolver::merges`] is `true` and `incoming` is a put,
 /// [`fold_sides`] decides which content survives. [`Fold::Both`] runs
@@ -105,11 +129,20 @@ pub(super) fn resolve_conflict<V>(
     stored_encoded: Option<&[u8]>,
     stored_expires_at_ms: Option<u64>,
     stored_absent: bool,
+    stored_tombstone: bool,
     ver: Hlc,
     incoming: &Incoming<V>,
 ) -> Resolution {
     if sv == ver {
         return Resolution::IncomingLoses;
+    }
+    if let Some(resolution) = tombstone_resolution(
+        sv,
+        ver,
+        stored_tombstone,
+        matches!(incoming, Incoming::Tombstone),
+    ) {
+        return resolution;
     }
     let needs_value_bytes = resolver.needs_value_bytes();
     let stored_view = RecordView {
@@ -292,7 +325,8 @@ pub(super) fn mint_stamp(sv: Hlc, ver: Hlc, node: NodeId) -> Hlc {
 /// (outright loss, the engine-enforced tombstone/spill guard, a redelivered
 /// already-absorbed merge, or bytes that fail to decode as `V`) and
 /// `Some((ver, incoming))` otherwise: unchanged for an outright win, rebound
-/// for a merge. `stored_absent` is [`resolve_conflict`]'s.
+/// for a merge. `stored_absent` and `stored_tombstone` are
+/// [`resolve_conflict`]'s.
 #[allow(
     clippy::too_many_arguments,
     reason = "the two sides of a collision, each with its version, bytes and deadline, plus the resolver and key"
@@ -304,6 +338,7 @@ pub(super) fn resolve_and_rebind<V: DeserializeOwned>(
     stored_encoded: Option<&[u8]>,
     stored_expires_at_ms: Option<u64>,
     stored_absent: bool,
+    stored_tombstone: bool,
     ver: Hlc,
     incoming: Incoming<V>,
 ) -> Option<(Hlc, Incoming<V>)> {
@@ -314,6 +349,7 @@ pub(super) fn resolve_and_rebind<V: DeserializeOwned>(
         stored_encoded,
         stored_expires_at_ms,
         stored_absent,
+        stored_tombstone,
         ver,
         &incoming,
     ) {

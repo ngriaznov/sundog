@@ -1,8 +1,11 @@
 //! Tests for sketch-based anti-entropy repair through a running cluster.
 
 use super::*;
+use crate::cache::Cache;
+use crate::cluster::anti_entropy::{RoundOutcome, run_round_against};
 use crate::cluster::test_support::{registered_shard, scoped_subscriber};
 use crate::hlc::Hlc;
+use crate::store::{ConflictResolver, RecordView, Winner};
 use crate::wire::WireRecord;
 use bytes::Bytes;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -663,4 +666,416 @@ async fn run_round_against_ends_on_stale_without_pushing_or_pulling() {
 
     cluster_a.shutdown().await;
     cluster_b.shutdown().await;
+}
+
+// --- Resolvers whose winner is not the greater version ---
+
+/// Keeps the longer value: a deterministic antisymmetric order that does not
+/// follow versions, and a tombstone reads as the empty value.
+#[derive(Debug, Clone, Copy)]
+struct LongerValueWins;
+
+impl ConflictResolver for LongerValueWins {
+    fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
+        let len_a = a.value.map_or(0, <[u8]>::len);
+        let len_b = b.value.map_or(0, <[u8]>::len);
+        if len_b > len_a { Winner::B } else { Winner::A }
+    }
+}
+
+/// Prefers the greater version but leaves `needs_value_bytes` at its default
+/// `true`, so anti-entropy treats it as a value reader.
+#[derive(Debug, Clone, Copy)]
+struct GreaterVersionReadsValues;
+
+impl ConflictResolver for GreaterVersionReadsValues {
+    fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
+        if a.ver >= b.ver { Winner::A } else { Winner::B }
+    }
+}
+
+/// Prefers the greater version, declares `needs_value_bytes` `false`, and
+/// counts every collision it is asked to settle.
+#[derive(Debug, Clone)]
+struct CountingVersionOnly(Arc<AtomicUsize>);
+
+impl ConflictResolver for CountingVersionOnly {
+    fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        if a.ver >= b.ver { Winner::A } else { Winner::B }
+    }
+
+    fn needs_value_bytes(&self) -> bool {
+        false
+    }
+}
+
+const LONG_VALUE: &str = "the longer value, at the lower version";
+
+/// Two joined `Mode::Replicated` nodes with anti-entropy off, so only the
+/// rounds a test drives run, each opening cache `resolved` with its own
+/// resolver.
+struct ResolverPair {
+    cluster_a: Cluster,
+    cluster_b: Cluster,
+    cache_a: Cache<u32, String>,
+    cache_b: Cache<u32, String>,
+    name: SmolStr,
+    shard_a: Arc<dyn ShardOps>,
+    shard_b: Arc<dyn ShardOps>,
+}
+
+impl ResolverPair {
+    async fn open(
+        cluster_name: &str,
+        config: ClusterConfig,
+        resolver_a: Arc<dyn ConflictResolver>,
+        resolver_b: Arc<dyn ConflictResolver>,
+    ) -> Self {
+        let config = ClusterConfig {
+            ae_interval: Duration::from_hours(1),
+            tombstone_ttl: Duration::from_hours(24),
+            ..config
+        };
+        let (cluster_a, cluster_b) = two_node_cluster_with_config(cluster_name, config).await;
+        let open = |cluster: &Cluster, resolver: Arc<dyn ConflictResolver>| {
+            cluster
+                .cache::<u32, String>("resolved")
+                .mode(Mode::Replicated)
+                .resolver(resolver)
+                .open()
+        };
+        let cache_a = open(&cluster_a, resolver_a).await.expect("a opens");
+        let cache_b = open(&cluster_b, resolver_b).await.expect("b opens");
+        let name = SmolStr::new("resolved");
+        let shard_a = registered_shard(&cluster_a, &name);
+        let shard_b = registered_shard(&cluster_b, &name);
+        Self {
+            cluster_a,
+            cluster_b,
+            cache_a,
+            cache_b,
+            name,
+            shard_a,
+            shard_b,
+        }
+    }
+
+    async fn open_with(cluster_name: &str, resolver: impl ConflictResolver + Clone) -> Self {
+        Self::open(
+            cluster_name,
+            loopback_config(),
+            Arc::new(resolver.clone()),
+            Arc::new(resolver),
+        )
+        .await
+    }
+
+    /// Applies `value` (a tombstone for `None`) at `wall_ms` on one side
+    /// only, so the other side never sees it, as after a dropped replicate.
+    async fn apply(&self, on_a: bool, key: u32, value: Option<&str>, wall_ms: u64) {
+        let (shard, cluster) = if on_a {
+            (&self.shard_a, &self.cluster_a)
+        } else {
+            (&self.shard_b, &self.cluster_b)
+        };
+        shard
+            .apply_remote(test_record(key, value, wall_ms, cluster.node_id()))
+            .await;
+    }
+
+    /// One anti-entropy round, initiated by a when `from_a` and by b
+    /// otherwise.
+    async fn round(&self, from_a: bool) -> RoundOutcome {
+        if from_a {
+            run_round_against(
+                self.cluster_a.mesh(),
+                &self.shard_a,
+                &self.name,
+                self.cluster_b.node_id(),
+            )
+            .await
+        } else {
+            run_round_against(
+                self.cluster_b.mesh(),
+                &self.shard_b,
+                &self.name,
+                self.cluster_a.node_id(),
+            )
+            .await
+        }
+    }
+
+    /// Waits until both sides hold the same digests, which a push applied
+    /// asynchronously on the receiver reaches shortly after a round returns.
+    async fn wait_converged(&self, msg: &str) {
+        wait_until(Duration::from_secs(10), msg, async || {
+            self.shard_a.digests().await == self.shard_b.digests().await
+        })
+        .await;
+    }
+
+    async fn shutdown(self) {
+        self.cluster_a.shutdown().await;
+        self.cluster_b.shutdown().await;
+    }
+}
+
+/// A wire record for u32 `key`: a put of `value`, or a tombstone for `None`.
+fn test_record(key: u32, value: Option<&str>, wall_ms: u64, node: NodeId) -> WireRecord {
+    WireRecord {
+        key: Bytes::from(postcard::to_stdvec(&key).expect("key encodes")),
+        value: value.map(|v| Bytes::from(postcard::to_stdvec(v).expect("value encodes"))),
+        ver: Hlc {
+            wall_ms,
+            logical: 0,
+            node,
+        },
+        expires_at_ms: None,
+    }
+}
+
+#[tokio::test]
+async fn anti_entropy_converges_on_a_value_reading_resolvers_winner_held_at_the_lower_version() {
+    for (label, from_a) in [("a-initiates", true), ("b-initiates", false)] {
+        let pair =
+            ResolverPair::open_with(&format!("cluster-it-ae-winner-{label}"), LongerValueWins)
+                .await;
+        // Each side missed the other's write: no fan-out.
+        pair.apply(true, 1, Some(LONG_VALUE), 100).await;
+        pair.apply(false, 1, Some("short"), 200).await;
+        assert_eq!(pair.cache_a.get(&1).await.as_deref(), Some(LONG_VALUE));
+        assert_eq!(pair.cache_b.get(&1).await.as_deref(), Some("short"));
+
+        assert_eq!(
+            pair.round(from_a).await,
+            RoundOutcome::Reconciled,
+            "{label}"
+        );
+        pair.wait_converged(label).await;
+        assert_eq!(pair.cache_a.get(&1).await.as_deref(), Some(LONG_VALUE));
+        assert_eq!(
+            pair.cache_b.get(&1).await.as_deref(),
+            Some(LONG_VALUE),
+            "{label}: both replicas converge on the resolver's winner in one round"
+        );
+
+        // A converged pair has nothing left to move.
+        let digests = pair.shard_b.digests().await;
+        assert_eq!(
+            pair.round(from_a).await,
+            RoundOutcome::Reconciled,
+            "{label}"
+        );
+        assert_eq!(pair.shard_b.digests().await, digests, "{label}");
+        pair.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn anti_entropy_converges_on_a_value_reading_resolvers_winner_through_the_sketch_path() {
+    let config = ClusterConfig {
+        ae_sketch_min_bucket: 4,
+        ..loopback_config()
+    };
+    let keys = dense_bucket_keys(4096, config.ae_sketch_min_bucket + 1);
+    let target = keys[0];
+    let pair = ResolverPair::open(
+        "cluster-it-ae-winner-sketch",
+        config,
+        Arc::new(LongerValueWins),
+        Arc::new(LongerValueWins),
+    )
+    .await;
+    // The bucket agrees everywhere but the target key.
+    let writer = NodeId::from(9);
+    for &key in &keys[1..] {
+        let same = test_record(key, Some("same"), 50, writer);
+        pair.shard_a.apply_remote(same.clone()).await;
+        pair.shard_b.apply_remote(same).await;
+    }
+    pair.apply(true, target, Some(LONG_VALUE), 100).await;
+    pair.apply(false, target, Some("short"), 200).await;
+
+    let decoded = Arc::new(AtomicUsize::new(0));
+    let fallback = Arc::new(AtomicUsize::new(0));
+    let _guard = scoped_subscriber(AeSketchOutcomeSubscriber {
+        decoded: Arc::clone(&decoded),
+        fallback: Arc::clone(&fallback),
+    });
+    assert_eq!(pair.round(true).await, RoundOutcome::Reconciled);
+    pair.wait_converged("the sketch path settles the lower-version winner")
+        .await;
+    assert_eq!(pair.cache_b.get(&target).await.as_deref(), Some(LONG_VALUE));
+    assert_eq!(
+        (
+            decoded.load(Ordering::SeqCst),
+            fallback.load(Ordering::SeqCst)
+        ),
+        (1, 0),
+        "the one-key difference decodes from the sketch"
+    );
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn anti_entropy_converges_on_a_value_reading_resolvers_winner_through_the_listing_fallback() {
+    let config = ClusterConfig {
+        ae_sketch_min_bucket: 4,
+        // 2 cells per partition, too small to peel the difference below.
+        ae_sketch_cells: 6,
+        ..loopback_config()
+    };
+    let keys = keys_colliding_with_zero(30);
+    let pair = ResolverPair::open(
+        "cluster-it-ae-winner-fallback",
+        config,
+        Arc::new(LongerValueWins),
+        Arc::new(LongerValueWins),
+    )
+    .await;
+    // Thirty keys in one bucket, each held with the winner at the lower
+    // version on one side and the loser at the higher on the other.
+    for (i, &key) in keys.iter().enumerate() {
+        let a_holds_winner = i % 2 == 0;
+        pair.apply(a_holds_winner, key, Some(LONG_VALUE), 100).await;
+        pair.apply(!a_holds_winner, key, Some("short"), 200).await;
+    }
+
+    let decoded = Arc::new(AtomicUsize::new(0));
+    let fallback = Arc::new(AtomicUsize::new(0));
+    let _guard = scoped_subscriber(AeSketchOutcomeSubscriber {
+        decoded: Arc::clone(&decoded),
+        fallback: Arc::clone(&fallback),
+    });
+    assert_eq!(pair.round(true).await, RoundOutcome::Reconciled);
+    pair.wait_converged("the listing fallback settles every lower-version winner")
+        .await;
+    for &key in &keys {
+        assert_eq!(pair.cache_a.get(&key).await.as_deref(), Some(LONG_VALUE));
+        assert_eq!(pair.cache_b.get(&key).await.as_deref(), Some(LONG_VALUE));
+    }
+    assert!(
+        fallback.load(Ordering::SeqCst) > 0,
+        "the oversized difference reaches the listing fallback"
+    );
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_resolver_that_declares_needs_value_bytes_false_repairs_one_way() {
+    for (label, from_a) in [("a-initiates", true), ("b-initiates", false)] {
+        let greater_side_collisions = Arc::new(AtomicUsize::new(0));
+        let (resolver_a, resolver_b): (Arc<dyn ConflictResolver>, Arc<dyn ConflictResolver>) =
+            if from_a {
+                (
+                    Arc::new(CountingVersionOnly(Arc::clone(&greater_side_collisions))),
+                    Arc::new(CountingVersionOnly(Arc::default())),
+                )
+            } else {
+                (
+                    Arc::new(CountingVersionOnly(Arc::default())),
+                    Arc::new(CountingVersionOnly(Arc::clone(&greater_side_collisions))),
+                )
+            };
+        let pair = ResolverPair::open(
+            &format!("cluster-it-ae-one-way-{label}"),
+            loopback_config(),
+            resolver_a,
+            resolver_b,
+        )
+        .await;
+        // The initiator holds the greater version, so it only pushes.
+        pair.apply(from_a, 1, Some("greater"), 200).await;
+        pair.apply(!from_a, 1, Some("lesser"), 100).await;
+
+        assert_eq!(
+            pair.round(from_a).await,
+            RoundOutcome::Reconciled,
+            "{label}"
+        );
+        pair.wait_converged(label).await;
+        assert_eq!(pair.cache_a.get(&1).await.as_deref(), Some("greater"));
+        assert_eq!(pair.cache_b.get(&1).await.as_deref(), Some("greater"));
+        assert_eq!(
+            greater_side_collisions.load(Ordering::SeqCst),
+            0,
+            "{label}: the greater holder is never asked to take the lesser record"
+        );
+        pair.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn a_version_ordered_value_reading_resolver_still_converges_in_one_round() {
+    // The greater holder initiates: it pulls the lesser record (rejected)
+    // and pushes its own, which the lesser holder takes.
+    let pair =
+        ResolverPair::open_with("cluster-it-ae-reads-greater", GreaterVersionReadsValues).await;
+    pair.apply(true, 1, Some("greater"), 200).await;
+    pair.apply(false, 1, Some("lesser"), 100).await;
+    assert_eq!(pair.round(true).await, RoundOutcome::Reconciled);
+    pair.wait_converged("the greater record reaches the lesser holder")
+        .await;
+    assert_eq!(pair.cache_b.get(&1).await.as_deref(), Some("greater"));
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_newer_tombstone_beats_a_value_under_a_value_reading_resolver_whatever_the_initiator() {
+    for (label, from_a) in [("a-initiates", true), ("b-initiates", false)] {
+        let pair = ResolverPair::open_with(
+            &format!("cluster-it-ae-tombstone-newer-{label}"),
+            GreaterVersionReadsValues,
+        )
+        .await;
+        pair.apply(true, 1, Some("value"), 100).await;
+        pair.apply(false, 1, None, 200).await;
+
+        assert_eq!(
+            pair.round(from_a).await,
+            RoundOutcome::Reconciled,
+            "{label}"
+        );
+        pair.wait_converged(label).await;
+        assert_eq!(pair.cache_a.get(&1).await, None, "{label}: no resurrection");
+        assert_eq!(pair.cache_b.get(&1).await, None, "{label}");
+        pair.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn a_tombstone_and_a_value_settle_by_version_even_for_a_resolver_preferring_values() {
+    for (label, from_a) in [("a-initiates", true), ("b-initiates", false)] {
+        // `LongerValueWins` ranks a tombstone below every value, yet the
+        // newer tombstone still wins and the deleted key stays deleted.
+        let pair = ResolverPair::open_with(
+            &format!("cluster-it-ae-tombstone-longer-{label}"),
+            LongerValueWins,
+        )
+        .await;
+        pair.apply(true, 1, Some(LONG_VALUE), 100).await;
+        pair.apply(false, 1, None, 200).await;
+        assert_eq!(
+            pair.round(from_a).await,
+            RoundOutcome::Reconciled,
+            "{label}"
+        );
+        pair.wait_converged(label).await;
+        assert_eq!(pair.cache_a.get(&1).await, None, "{label}: tombstone@200");
+        assert_eq!(pair.cache_b.get(&1).await, None, "{label}");
+
+        // A value newer than the tombstone wins on both replicas.
+        pair.apply(true, 2, Some("short"), 300).await;
+        pair.apply(false, 2, None, 250).await;
+        assert_eq!(
+            pair.round(from_a).await,
+            RoundOutcome::Reconciled,
+            "{label}"
+        );
+        pair.wait_converged(label).await;
+        assert_eq!(pair.cache_a.get(&2).await.as_deref(), Some("short"));
+        assert_eq!(pair.cache_b.get(&2).await.as_deref(), Some("short"));
+        pair.shutdown().await;
+    }
 }
