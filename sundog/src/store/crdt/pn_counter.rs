@@ -16,7 +16,12 @@
 //! entry; stage two, once quiet and retired long enough, folds it into a
 //! bounded `folded_p`/`folded_n` accumulator and leaves a `folded_at`
 //! receipt so [`PnCounter::merge`] can tell an already-folded writer from
-//! mere silence about one. `PnCounter::prune_receipts` drops a receipt
+//! mere silence about one. The folded total is one scalar per replica, so two
+//! replicas' totals merge exactly only when one replica's folded writers
+//! include the other's: the replicas of a `Replicated` or `Distributed` part
+//! hold the same writers and fold nested sets, while an `Invalidation` cache,
+//! whose nodes hold different writers, never folds (stage one only).
+//! `PnCounter::prune_receipts` drops a receipt
 //! `receipt_ttl_ms` after the fold, however long after the retirement the
 //! fold happens, and one stamped that far ahead of the clock, under the same
 //! trust boundary `tombstone_max_ttl` accepts for a long-gone member.
@@ -63,6 +68,10 @@ pub struct PnCounter {
     /// `folded_p` together, since a writer's contribution must be counted
     /// exactly once; it instead takes whichever side's bound already
     /// accounts for at least as much, deciding that via [`Self::folded_at`].
+    /// That is exact while one side's folded writers include the other's,
+    /// which holds for the replicas of one part; two folds of disjoint
+    /// writer sets keep only the larger total, so a cache whose nodes hold
+    /// different writers never folds.
     folded_p: u64,
     folded_n: u64,
     /// A per-writer receipt: the wall-clock instant this replica folds `w`
@@ -131,9 +140,11 @@ impl PnCounter {
     /// each writer's max `p`/`n` (over both sides' retired and still-live
     /// slots) and minimum `since_ms`, which keeps the cross-stale-retirement
     /// case exact. Stage two drops a writer from `retired` once either
-    /// side holds a `folded_at` receipt for it, crediting its bound into that side's
-    /// `folded_p`/`folded_n` first; the merged bound is the greater of the
-    /// two, never their sum. `p`/`n` are the pointwise maximum of both
+    /// side holds a `folded_at` receipt for it, crediting its bound into that
+    /// side's `folded_p`/`folded_n` first; the merged bound is the greater of
+    /// the two, never their sum, which is exact when one side's folded
+    /// writers include the other's and loses the smaller total when two folds
+    /// cover disjoint writers. `p`/`n` are the pointwise maximum of both
     /// sides, excluding every writer now `retired`.
     ///
     /// `merge_is_commutative_for_any_shape` and

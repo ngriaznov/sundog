@@ -27,6 +27,17 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **An `Invalidation` cache no longer folds a retired `PnCounter` writer into
+  its folded total.** A fold keeps one scalar per replica and a merge takes the
+  larger of two, which is exact only when one replica's folded writers include
+  the other's. The nodes of an `Invalidation` cache hold different writers, so
+  two nodes could fold disjoint sets while cut off and keep only the larger
+  total, losing the other for good. The sweep still retires a dead writer in
+  every mode, which keeps its exact total, and folds it in `Replicated`,
+  `Distributed` and `Local` caches, whose replicas of a part fold nested sets;
+  an `Invalidation` cache keeps one small retired entry for every dead writer.
+  `OrSet`, which has no folded total, follows the same rule.
+
 - **A fold receipt lives from the fold, not from the retirement.** `PnCounter`
   and `OrSet` stamp the receipt that stage two leaves with the fold instant,
   never lowering a stamp the writer already has. A fold that membership churn

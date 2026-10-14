@@ -346,6 +346,7 @@ mod tests {
     use crate::store::crdt::{PnCounter, PnCounterResolver};
     use crate::wire;
 
+    mod stage_two;
     mod unobserved;
 
     // -----------------------------------------------------------------

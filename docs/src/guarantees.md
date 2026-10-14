@@ -86,30 +86,40 @@ window, and a read does not see a fold still pending inside its window.
 Each writer owns a slot in a merged value. A background sweep retires the
 slot of a writer whose node has been absent longer than
 `ClusterConfig::crdt_retire_after`, 24 hours by default, or has restarted
-under a new incarnation, and folds it away once the retirement has aged
-past twice that bound with every peer quiet. A node this node never saw as a
-member counts as absent from the later of this node's start and the sweep's
-first sight of its writer, so the slots that earlier deploys left retire once
-this node has run for the bound; a fleet that replaces every node faster than
-that bound lowers `crdt_retire_after`, or merged values keep a slot for every
-deploy ([Tuning](tuning.md)). A writer the sweep meets for the first time waits
-a full bound before it retires, so a live node that gossip has not shown yet
-is a peer by then and never retires. The sweep reads
-resident records only, so a spilled record keeps its slots until it is read
-back. Each fold leaves a receipt that
-every merge honors for three times `crdt_retire_after` past the fold, longer
-when the sweep period is more than half that bound. The lifetime starts at
-the fold, which waits for a quiet cache and trails the retirement by at least
-twice the bound, so a receipt lives about five bounds past its retirement at
-the defaults, however long churn delays the fold. Replicas fold at their own
-sweeps and stamp the receipt with that instant, so their records differ by
-the stamps until one anti-entropy exchange merges them, the later stamp
-winning. A receipt stamped more than its lifetime ahead of a replica's clock
-expires there instead of outliving the others. A replica cut
-off from before the fold until after the receipt expires, still holding the
-slot every other replica has folded, counts that writer's contribution
-twice when it reconnects. Like `tombstone_max_ttl` for deletes, below, the
-bound trusts that a replica gone this long no longer holds the state.
+under a new incarnation. A node this node never saw as a member counts as
+absent from the later of this node's start and the sweep's first sight of its
+writer, so the slots that earlier deploys left retire once this node has run
+for the bound; a fleet that replaces every node faster than that bound lowers
+`crdt_retire_after`, or merged values keep a slot for every deploy
+([Tuning](tuning.md)). A writer the sweep meets for the first time waits a
+full bound before it retires, so a live node that gossip has not shown yet is
+a peer by then and never retires. The sweep reads resident records only, so a
+spilled record keeps its slots until it is read back.
+
+A `Replicated` or `Distributed` cache folds a retirement away once it has
+aged past twice that bound with every peer quiet. Each fold leaves a receipt
+that every merge honors for three times `crdt_retire_after` past the fold,
+longer when the sweep period is more than half that bound. The lifetime
+starts at the fold, which waits for a quiet cache and trails the retirement by
+at least twice the bound, so a receipt lives about five bounds past its
+retirement at the defaults, however long churn delays the fold. Replicas fold
+at their own sweeps and stamp the receipt with that instant, so their records
+differ by the stamps until one anti-entropy exchange merges them, the later
+stamp winning. A receipt stamped more than its lifetime ahead of a replica's
+clock expires there instead of outliving the others. The replicas of a part
+hold the same writers, so they fold nested sets of writers and the merge of
+their folded totals is exact; anti-entropy keeps it so, except for a replica
+cut off from before the fold until after the receipt expires, which still
+holds the slot every other replica has folded and counts that writer's
+contribution twice when it reconnects. Like `tombstone_max_ttl` for deletes,
+below, the bound trusts that a replica gone this long no longer holds the
+state.
+
+An `Invalidation` cache retires a dead writer but never folds it. The nodes
+of such a cache hold different writers, each the ones it saw, so two nodes can
+fold disjoint sets, and merging their folded totals would keep the larger and
+lose the smaller. A merged value there keeps one retired entry, a few bytes,
+for every dead writer it has seen, and stays exact.
 
 ## Deletes
 

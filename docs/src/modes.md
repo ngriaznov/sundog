@@ -35,7 +35,9 @@ into its copy, so no node loses the contribution only it held. A peer that
 does not hold the key ignores the record and stores nothing, which keeps
 each node's cache to its own working set. A removal drops the copy on
 every peer, and a peer on a release before protocol 8 gets the bare
-invalidation for every write. [Choosing a resolver](resolvers.md) has the
+invalidation for every write. A merged value keeps one retired entry for
+every writer that has died, since nodes here hold different writers and the
+sweep does not fold them. [Choosing a resolver](resolvers.md) has the
 detail.
 
 This is the mode for a large or expensive dataset: each node holds only

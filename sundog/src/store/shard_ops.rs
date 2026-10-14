@@ -255,7 +255,10 @@ pub trait ShardOps: Send + Sync {
     /// `now_ms`, `retire`, `quiet`, and `bounds` are exactly
     /// [`ConflictResolver::compact`]'s own parameters, threaded straight
     /// through; this method's job is the shard-level plumbing, never the
-    /// retirement decision, which stays the resolver's call.
+    /// retirement decision, which stays the resolver's call. A shard in
+    /// [`crate::store::Mode::Invalidation`] retires a dead writer but never folds it,
+    /// whatever `quiet` says: its nodes hold different writers, which a
+    /// fold's merged total cannot add up.
     ///
     /// Returns every writer the scan found eligible for retirement,
     /// deduplicated across the batch, and how many records were

@@ -853,3 +853,110 @@ async fn an_or_set_late_fold_leaves_a_receipt_the_merge_apply_keeps() {
         );
     }
 }
+
+/// Only `Invalidation` declines to fold: nodes there hold different
+/// writers, so two nodes' folds can be of disjoint writer sets, which the
+/// folded totals' merge cannot add up.
+#[test]
+fn only_an_invalidation_cache_declines_to_fold_retired_writers() {
+    assert!(Mode::Local.folds_retired_writers());
+    assert!(!Mode::Invalidation.folds_retired_writers());
+    assert!(Mode::Replicated.folds_retired_writers());
+    assert!(Mode::distributed().folds_retired_writers());
+}
+
+fn shard_in<V>(mode: Mode, node: u64) -> Shard<u32, V>
+where
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    Shard::new(
+        SmolStr::new("test"),
+        mode,
+        NodeId::from(node),
+        10_000,
+        None,
+        None,
+    )
+}
+
+/// The sweep retires a dead writer in every mode, and folds it into the
+/// bounded total in every mode but `Invalidation`, whatever `quiet` the
+/// caller passes: the retired entry stays, exact per writer, past twice the
+/// bound.
+#[tokio::test]
+async fn an_invalidation_counter_keeps_a_retired_entry_unfolded_past_twice_the_bound() {
+    let bounds = CompactionBounds::three_bounds(1_000);
+    let dead = writer(9);
+    let alive = writer(99);
+    let retire = move |w: crdt::WriterId| w == dead;
+    for (mode, folds) in [
+        (Mode::Invalidation, false),
+        (Mode::Replicated, true),
+        (Mode::distributed(), true),
+        (Mode::Local, true),
+    ] {
+        let s = shard_in::<PnCounter>(mode, 1).with_resolver(Arc::new(PnCounterResolver));
+        s.merge(1, PnCounter::local_delta(dead, 3))
+            .await
+            .expect("merge");
+        s.merge(1, PnCounter::local_delta(alive, 4))
+            .await
+            .expect("merge");
+        let retired =
+            ShardOps::compact_pass(&s, 1_000, &retire, Quiescence::Settled, bounds, 100).await;
+        assert_eq!(
+            retired.retired,
+            vec![dead],
+            "{mode:?} retires the dead writer"
+        );
+        assert_eq!(retired.compacted, 1, "{mode:?}");
+        let retired_bytes = s.get(&1).await.expect("resident").encode().expect("encode");
+
+        // Far past twice the bound, with every peer quiet.
+        let later =
+            ShardOps::compact_pass(&s, 100_000, &retire, Quiescence::Settled, bounds, 100).await;
+        let bytes = s.get(&1).await.expect("resident").encode().expect("encode");
+        assert_eq!(s.get(&1).await.map(|c| c.value()), Some(7), "{mode:?}");
+        if folds {
+            assert_eq!(later.compacted, 1, "{mode:?} folds the retired writer");
+            assert_ne!(bytes, retired_bytes, "{mode:?}");
+        } else {
+            assert_eq!(
+                later.compacted, 0,
+                "{mode:?} leaves the retired entry alone"
+            );
+            assert_eq!(bytes, retired_bytes, "{mode:?}");
+        }
+    }
+}
+
+/// The same for `OrSet`: an `Invalidation` cache keeps the retirement.
+#[tokio::test]
+async fn an_invalidation_or_set_keeps_a_retirement_unfolded_past_twice_the_bound() {
+    let bounds = CompactionBounds::three_bounds(1_000);
+    let dead = writer(9);
+    let retire = move |w: crdt::WriterId| w == dead;
+    for (mode, folds) in [(Mode::Invalidation, false), (Mode::Replicated, true)] {
+        let s = shard_in::<OrSet<String>>(mode, 1)
+            .with_resolver(Arc::new(OrSetResolver::<String>::new()));
+        s.merge(1, OrSet::add(dead, 0, "x".to_string()))
+            .await
+            .expect("add");
+        let retired =
+            ShardOps::compact_pass(&s, 1_000, &retire, Quiescence::Settled, bounds, 100).await;
+        assert_eq!(retired.retired, vec![dead], "{mode:?}");
+        let retired_bytes = s.get(&1).await.expect("resident").encode().expect("encode");
+
+        let later =
+            ShardOps::compact_pass(&s, 100_000, &retire, Quiescence::Settled, bounds, 100).await;
+        let bytes = s.get(&1).await.expect("resident").encode().expect("encode");
+        assert!(
+            s.get(&1)
+                .await
+                .expect("resident")
+                .contains(&"x".to_string())
+        );
+        assert_eq!(later.compacted, usize::from(folds), "{mode:?}");
+        assert_eq!(bytes == retired_bytes, !folds, "{mode:?}");
+    }
+}

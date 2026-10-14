@@ -64,6 +64,20 @@ impl Mode {
         matches!(self, Self::Replicated | Self::Distributed { .. })
     }
 
+    /// Whether the CRDT sweep's stage two folds a retired writer into the
+    /// bounded total in this mode. A fold keeps one total per replica and
+    /// merges two replicas' totals by taking the larger, which is exact only
+    /// while one replica's folded writers include the other's. `Replicated`
+    /// and `Distributed` hold every writer on every replica of a part and
+    /// repair them through anti-entropy, so folds nest. `Invalidation` nodes
+    /// hold different writers, each only the ones it saw, so two nodes can
+    /// fold disjoint sets and the larger total would drop the smaller; its
+    /// sweep retires a dead writer, which keeps its exact total per writer,
+    /// and never folds it. `Local` has no other node.
+    pub(crate) const fn folds_retired_writers(self) -> bool {
+        !matches!(self, Self::Invalidation)
+    }
+
     /// The wire token gossiped for this mode under a `cache:<name>` chitchat
     /// key. A stable string, not a `Debug`/`Display` impl, so renaming a
     /// variant never changes the wire.

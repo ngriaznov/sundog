@@ -121,6 +121,12 @@ pub struct ClusterConfig {
     /// has run for this long, and values stay bounded once any node runs
     /// that long. A fleet that replaces every node faster than this lowers
     /// it, or merged values keep a slot for every deploy.
+    ///
+    /// A `Replicated` or `Distributed` cache folds a retirement into a
+    /// bounded total once it has aged past twice this bound. An
+    /// `Invalidation` cache retires but never folds, since its nodes hold
+    /// different writers, so there a value keeps one small retired entry for
+    /// every dead writer.
     pub crdt_retire_after: Duration,
     /// How many resident CRDT records one `compact_pass` call examines
     /// before yielding to the executor. A tick keeps calling until the

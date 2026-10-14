@@ -151,17 +151,20 @@ give merged values a lifetime as they give any other value one:
 - **The value grows with its writers.** Each writer, one run of one node,
   owns a slot, so every restart adds one. The slots of writers whose node is
   gone longer than `ClusterConfig::crdt_retire_after`, 24 hours by default,
-  or has restarted, retire and later fold into one total. A node this node
-  never saw counts as gone from the later of this node's start and the
-  sweep's first sight of its writer, so the slots of earlier deploys retire
-  once this node has run for the bound. A fleet that replaces every node
-  faster than that bound lowers `crdt_retire_after`, or the value keeps a
-  slot for every deploy. A replica cut off
-  while that happens can count a folded writer twice;
-  [Guarantees](guarantees.md#values-that-merge) has the bound. Folding an
-  `OrSet` drops only its bookkeeping, never an add. An `OrSet` writer, once
-  retired, adds nothing new; its node adds again after a restart, under a
-  new writer id.
+  or has restarted, retire. A node this node never saw counts as gone from
+  the later of this node's start and the sweep's first sight of its writer,
+  so the slots of earlier deploys retire once this node has run for the
+  bound. A fleet that replaces every node faster than that bound lowers
+  `crdt_retire_after`, or the value keeps a slot for every deploy. In a
+  `Replicated` or `Distributed` cache a retirement later folds into one total,
+  exact while replicas fold nested sets of writers, which anti-entropy keeps
+  true except for a replica cut off across the fold;
+  [Guarantees](guarantees.md#values-that-merge) has the bound. In an
+  `Invalidation` cache nodes hold different writers, so a retirement never
+  folds: the value keeps one small retired entry for every dead writer and
+  stays exact. Folding an `OrSet` drops only its bookkeeping, never an add.
+  An `OrSet` writer, once retired, adds nothing new; its node adds again
+  after a restart, under a new writer id.
 
 ## Every node needs the same resolver
 

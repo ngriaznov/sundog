@@ -862,6 +862,17 @@ where
                 }
             });
         }
+        // Stage two folds retired writers into a per-replica total that a
+        // merge combines by taking the larger, exact only when one
+        // replica's folded writers include the other's. An `Invalidation`
+        // node holds only the writers it saw, so its sweep retires a dead
+        // writer and leaves the exact per-writer entry unfolded, whatever
+        // the cache's quiet flag says.
+        let quiet = if self.mode.folds_retired_writers() {
+            quiet
+        } else {
+            Quiescence::Churning
+        };
         // `Engine::compact` takes `retire` as `&dyn Fn`, not `FnMut`, so
         // recording which writers it accepted (as opposed to every writer
         // merely passed to it) goes through interior mutability
