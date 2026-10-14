@@ -165,6 +165,8 @@ where
             skew_wake: Notify::new(),
             skew_drop_warned: AtomicBool::new(false),
             spill_close: Arc::new(tokio::sync::Mutex::new(false)),
+            #[cfg(all(test, feature = "spill"))]
+            spill_checkpoint_panic: AtomicBool::new(false),
             resolver: Arc::new(LwwResolver),
             raw_resolver: Arc::new(LwwResolver),
             crdt_bounds: ClusterConfig::default().crdt_compaction_bounds(),

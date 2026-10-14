@@ -281,11 +281,13 @@ impl SpillTier {
         self.inner.flush_queue_bytes.saturating_sub(available)
     }
 
-    /// Test-only: blocks [`flusher_loop`] before it pulls its next job off
-    /// the channel, so a job's bytes stay counted in `queued_bytes` (and,
+    /// Test-only: parks [`flusher_loop`] at the top of its loop, before its
+    /// next receive, so a job's bytes stay counted in `queued_bytes` (and,
     /// upstream, a hand-off's weight stays in
     /// `crate::store::engine::Engine::pending_spill_weight`) for as long as
-    /// the test needs. [`SpillTier::resume_flusher`] undoes this.
+    /// the test needs. A flusher already blocked in the receive takes the job
+    /// that wakes it, flushes it, and parks after.
+    /// [`SpillTier::resume_flusher`] undoes this.
     #[cfg(all(test, not(feature = "sim")))]
     pub(crate) fn pause_flusher(&self) {
         self.inner.flusher_paused.store(true, Ordering::Release);

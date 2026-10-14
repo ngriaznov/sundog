@@ -799,3 +799,37 @@ async fn a_close_dropped_in_a_blocking_stage_is_not_checkpointed_twice() {
     cluster.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A close whose checkpoint task ends early, here by a panic before its
+/// first stage, leaves the tier open; the close of a clone after it runs the
+/// checkpoint, and the cache reopens warm.
+#[tokio::test]
+async fn a_close_whose_checkpoint_task_panics_is_run_by_the_next_close() {
+    let dir = fresh_spill_dir("panicked-close");
+    let cluster = solo_cluster_for("cache-it-spill-panicked-close").await;
+    let first = open_warm(&cluster, &dir).await;
+    first.insert(1, "one".to_string()).await.expect("insert");
+    let other = first.clone();
+    first.shard.debug_panic_next_spill_checkpoint();
+
+    first.close().await;
+    assert!(
+        !other.shard.spill_tier_closed(),
+        "the panicked checkpoint closed nothing"
+    );
+    assert_eq!(other.shard.debug_spill_checkpoint_runs(), 0);
+
+    other.clone().close().await;
+    assert!(other.shard.spill_tier_closed());
+    assert_eq!(
+        other.shard.debug_spill_checkpoint_runs(),
+        1,
+        "the next close ran one checkpoint"
+    );
+
+    let second = open_warm(&cluster, &dir).await;
+    assert_eq!(second.get(&1).await, Some("one".to_string()));
+    second.close().await;
+    cluster.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

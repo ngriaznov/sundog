@@ -5,6 +5,8 @@
 use std::collections::HashSet;
 use std::hash::Hash;
 use std::sync::Arc;
+#[cfg(all(test, feature = "spill"))]
+use std::sync::atomic::Ordering;
 #[cfg(all(feature = "spill", not(feature = "sim"), test))]
 use std::time::Duration;
 
@@ -393,7 +395,11 @@ where
             let name = self.name.clone();
             let engine = Arc::clone(&self.engine);
             let now = self.now_ms();
+            #[cfg(test)]
+            let inject_panic = self.spill_checkpoint_panic.swap(false, Ordering::AcqRel);
             let checkpoint = tokio::spawn(async move {
+                #[cfg(test)]
+                assert!(!inject_panic, "injected checkpoint task panic");
                 checkpoint_and_close_spill(name, engine, tier, now).await;
                 *gate = true;
             });
@@ -428,9 +434,13 @@ where
             .expect("the flusher drains its queue")
     }
 
-    /// Test-only: parks the spill tier's flusher before its next job, so a
+    /// Test-only: parks the spill tier's flusher at the top of its loop, so a
     /// checkpointed close joining it waits until
-    /// [`Shard::debug_resume_spill_flusher`].
+    /// [`Shard::debug_resume_spill_flusher`]. A flusher already blocked
+    /// waiting for a job does not see the pause until that wait returns: it
+    /// takes the job it is waiting for, flushes it, then parks. A test queues
+    /// at least one eviction job before the close; with none queued, the
+    /// close ends the wait, the flusher exits, and the join does not block.
     ///
     /// # Panics
     ///
@@ -441,6 +451,13 @@ where
             .spill()
             .expect("a spill tier is attached")
             .pause_flusher();
+    }
+
+    /// Test-only: makes the next checkpointed close's task panic before it
+    /// starts any stage, once, so a test sees a close whose task ends early.
+    #[cfg(all(feature = "spill", test, not(feature = "sim")))]
+    pub(crate) fn debug_panic_next_spill_checkpoint(&self) {
+        self.spill_checkpoint_panic.store(true, Ordering::Release);
     }
 
     /// Test-only: undoes [`Shard::debug_pause_spill_flusher`].

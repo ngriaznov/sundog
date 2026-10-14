@@ -1286,27 +1286,76 @@ async fn overlapping_checkpointed_closes_checkpoint_once() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A close dropped before it finishes, such as a caller's timeout, leaves the
-/// tier open and nothing claimed: the next close runs the whole checkpoint.
-#[cfg(feature = "spill")]
+/// A close dropped at its first wait, such as a caller's timeout, leaves its
+/// checkpoint running on its own task: the next close waits for that run, the
+/// tier ends closed, and exactly one checkpoint ran between the two calls.
+#[cfg(all(feature = "spill", not(feature = "sim")))]
 #[tokio::test]
-async fn a_checkpointed_close_dropped_mid_way_is_run_by_the_next_call() {
+async fn a_checkpointed_close_dropped_at_its_first_wait_is_waited_for_by_the_next_call() {
+    use metrics_util::debugging::DebuggingRecorder;
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
     let (shard, dir) = shard_with_one_entry_and_a_warm_tier("dropped").await;
     {
         let mut closing = std::pin::pin!(shard.close_spill_checkpointed());
         assert!(
             futures::poll!(closing.as_mut()).is_pending(),
-            "the checkpoint waits on a blocking task"
+            "the first close waits on its checkpoint task"
         );
     }
-    assert!(
-        !shard.spill_tier_closed(),
-        "a close dropped at its first wait closed nothing"
-    );
 
     shard.close_spill_checkpointed().await;
 
     assert!(shard.spill_tier_closed());
+    assert_eq!(
+        shard.debug_spill_checkpoint_runs(),
+        1,
+        "the next close waited for the checkpoint under way and started no second one"
+    );
+    assert_eq!(
+        snapshot_stage_total(&snapshotter),
+        1,
+        "one snapshot of the one entry"
+    );
+    let _ = snapshot_file(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A checkpoint task that ends early, here by a panic before its first
+/// stage, leaves the close undone: the call that awaited it returns with the
+/// tier open, and the next close runs the whole checkpoint.
+#[cfg(all(feature = "spill", not(feature = "sim")))]
+#[tokio::test]
+async fn a_checkpointed_close_whose_task_panics_is_run_by_the_next_call() {
+    use metrics_util::debugging::DebuggingRecorder;
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let (shard, dir) = shard_with_one_entry_and_a_warm_tier("panicked").await;
+    shard.debug_panic_next_spill_checkpoint();
+
+    shard.close_spill_checkpointed().await;
+
+    assert!(
+        !shard.spill_tier_closed(),
+        "a checkpoint task that panicked closed nothing"
+    );
+    assert_eq!(shard.debug_spill_checkpoint_runs(), 0);
+    assert_eq!(snapshot_stage_total(&snapshotter), 0);
+
+    shard.close_spill_checkpointed().await;
+
+    assert!(
+        shard.spill_tier_closed(),
+        "the next close ran the checkpoint"
+    );
+    assert_eq!(shard.debug_spill_checkpoint_runs(), 1);
+    assert_eq!(
+        snapshot_stage_total(&snapshotter),
+        1,
+        "one snapshot of the one entry"
+    );
     let _ = snapshot_file(&dir);
     let _ = std::fs::remove_dir_all(&dir);
 }

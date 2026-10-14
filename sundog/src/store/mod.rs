@@ -515,6 +515,10 @@ where
     /// task running it, so later and concurrent closers, and one that
     /// follows a dropped first caller, wait for that run and find it done.
     spill_close: Arc<tokio::sync::Mutex<bool>>,
+    /// Test-only: makes the next checkpointed close's task panic before it
+    /// starts, so a test sees the close left undone and the next one run it.
+    #[cfg(all(test, feature = "spill"))]
+    spill_checkpoint_panic: AtomicBool,
     /// The resolver every decision runs through: `raw_resolver` wrapped in
     /// a [`SettlingResolver`] carrying `crdt_retire_after_ms` and this
     /// shard's clock, rebuilt whenever any of the three changes.
