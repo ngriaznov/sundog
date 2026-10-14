@@ -210,11 +210,12 @@ pub struct DistributedRead {
 #[non_exhaustive]
 pub enum LocalRecord {
     /// No entry and no tombstone: never written here, swept after
-    /// expiring in a `Local` or `Invalidation` cache, or released with its
-    /// part.
+    /// expiring in a `Local` or `Invalidation` cache or under a merging
+    /// resolver, or released with its part.
     Absent,
     /// A tombstone: the key was deleted, or, in a `Replicated` or
-    /// `Distributed` cache, its entry expired and was swept.
+    /// `Distributed` cache whose resolver does not merge, its entry expired
+    /// and was swept.
     #[non_exhaustive]
     Tombstone {
         /// The delete's version, or the expired entry's.

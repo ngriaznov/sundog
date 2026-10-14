@@ -136,8 +136,8 @@ its copy of every part it owned, and a delete made meanwhile reaches only
 this side. A graceful leave is not an absence: the leaver hands its parts
 off and keeps nothing.
 
-The tombstone an expired entry leaves in `Replicated` and `Distributed` is
-kept by the same rules, counted from the entry's expiry instead of from the
+The tombstone an expired entry leaves in `Replicated` and `Distributed`
+under a non-merging resolver is kept by the same rules, counted from the entry's expiry instead of from the
 delete. `sundog_tombstones{cache}` reports how many a node holds.
 
 A member gone longer than `tombstone_max_ttl` returns after the tombstone
@@ -190,9 +190,9 @@ as a longer value that anti-entropy delivered first. That record is the
 resolver's winner, so the write sends it as a record, not as a departed
 invalidation.
 
-In `Replicated` and `Distributed`, the sweep that removes an expired entry
-keeps a tombstone at the entry's version. A replica that missed the
-overwrite cannot bring the overwritten value back, whether or not the sweep
+In `Replicated` and `Distributed` under a non-merging resolver, the sweep
+that removes an expired entry keeps a tombstone at the entry's version. A
+replica that missed the overwrite cannot bring the overwritten value back, whether or not the sweep
 had run when the older copy arrived, and anti-entropy removes that copy from
 the replica that still holds it. The tombstone counts its retention from the
 entry's expiry, so every replica that learns of it, by sweeping or from a
@@ -209,8 +209,8 @@ before its own clock reaches the expiry.
 
 A `Distributed` owner of a part it has not yet verified declines a peer's
 fetch for a key it holds nothing for, and the peer asks the next owner. An
-owner that swept an expired entry holds its tombstone, so it answers that
-fetch with a miss instead.
+owner that swept an expired entry under a non-merging resolver holds its
+tombstone, so it answers that fetch with a miss instead.
 
 A cache with a merging resolver keeps no tombstone: it reads an expired side
 as absent on every node, swept or not, so a write older than the expired

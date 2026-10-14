@@ -8,8 +8,8 @@ All notable changes to this project are documented in this file. Format follows
 ### Added
 
 - **`sundog_tombstones{cache}`** gauge: the tombstones a node holds for a
-  cache, its deletes and, in a `Replicated` or `Distributed` cache, its swept
-  expired entries, refreshed every five seconds with `sundog_cache_entries`.
+  cache, its deletes and, in a `Replicated` or `Distributed` cache whose
+  resolver does not merge, its swept expired entries, refreshed every five seconds with `sundog_cache_entries`.
 - **`sundog_clock_skew_held{cache}`, `sundog_clock_skew_held_bytes{cache}`
   and `sundog_clock_skew_hold_dropped_total{cache, reason}`**: the forwarded
   writes an owner holds for clock skew, the memory they take, and the ones it
@@ -153,13 +153,14 @@ All notable changes to this project are documented in this file. Format follows
   peer on release 8 reads the record as an ordinary delete. A sweep no longer
   changes a bucket's digest, and a `Distributed` owner of a cold part now
   answers a peer's fetch for a swept key with a miss, as for a deleted one,
-  where it declined. Each expired entry costs a tombstone for the retention,
-  and while a member is absent for up to `tombstone_max_ttl`: a TTL-heavy
-  cache holds that many tombstones, outside `max_capacity` and the memory
-  ceiling, so size for the expiry rate times the retention. `LocalRecord`
-  reports a swept key as `Tombstone` in these modes. `Local`, `Invalidation`
-  and merging caches keep nothing, as before: a merging cache already reads an
-  expired side as absent on every node.
+  where it declined. Each expired entry of such a cache costs a tombstone for
+  the retention, and while a member is absent for up to `tombstone_max_ttl`: a
+  TTL-heavy cache holds that many tombstones, outside `max_capacity` and the
+  memory ceiling, so size for the expiry rate times the retention.
+  `LocalRecord` reports a swept key as `Tombstone` in these caches. `Local`,
+  `Invalidation` and merging caches keep nothing, as before, and report it as
+  `Absent`: a merging cache already reads an expired side as absent on every
+  node.
 - **A merge waiting in its coalesce window no longer outlives a remove, a
   clear or a newer tombstone.** `Cache::remove`, `remove_sync`, `remove_many`
   and `clear` discard a fold still pending for the key, `clear` covers keys

@@ -787,7 +787,8 @@ where
     /// The number of live entries in this node's local copy; nodes may
     /// legitimately hold different subsets or briefly disagree under lag.
     /// Sweeps expired entries first; in a `Replicated` or `Distributed`
-    /// cache each leaves a tombstone, which is not counted.
+    /// cache whose resolver does not merge each leaves a tombstone, which is
+    /// not counted.
     pub async fn entry_count(&self) -> u64 {
         self.shard.entry_count().await
     }
