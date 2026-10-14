@@ -1,6 +1,7 @@
 //! Tests for snapshot serialization, `install_new` and warm `reopen`.
 
 use super::*;
+use crate::store::spill::open::max_snapshot_version;
 
 // --- Checkpoint snapshot serialization, no fsync ---
 
@@ -609,4 +610,166 @@ fn reopen_drops_an_already_expired_record() {
     assert_eq!(fresh_sink.install_new_count(), 0);
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+// --- The greatest replayed version ---
+
+fn snapshot_entry_at(ver: Hlc) -> SnapshotEntry {
+    SnapshotEntry {
+        key: Bytes::from_static(b"k"),
+        ver,
+        expires_at_ms: None,
+        loc: SpillLoc {
+            region: 0,
+            offset: 0,
+            len: 16,
+            generation: 0,
+        },
+    }
+}
+
+#[test]
+fn max_snapshot_version_is_the_greatest_stamp_by_wall_logical_then_node() {
+    assert_eq!(max_snapshot_version(&[]), None, "no entries");
+    let only = hlc(5, 3);
+    assert_eq!(
+        max_snapshot_version(&[snapshot_entry_at(only)]),
+        Some(only),
+        "a single entry"
+    );
+
+    let by_wall = [hlc(9, 0), hlc(5, u32::MAX)];
+    assert_eq!(
+        max_snapshot_version(&by_wall.map(snapshot_entry_at)),
+        Some(hlc(9, 0)),
+        "wall time dominates the logical counter"
+    );
+    let by_logical = [hlc(5, 2), hlc(5, 7), hlc(5, 4)];
+    assert_eq!(
+        max_snapshot_version(&by_logical.map(snapshot_entry_at)),
+        Some(hlc(5, 7)),
+        "the logical counter breaks a wall tie"
+    );
+    let low_node = Hlc {
+        node: NodeId::from(1u64),
+        ..hlc(5, 7)
+    };
+    let high_node = Hlc {
+        node: NodeId::from(9u64),
+        ..hlc(5, 7)
+    };
+    assert_eq!(
+        max_snapshot_version(&[low_node, high_node].map(snapshot_entry_at)),
+        Some(high_node),
+        "the node breaks a wall and logical tie"
+    );
+    assert_eq!(
+        max_snapshot_version(&[high_node, low_node].map(snapshot_entry_at)),
+        Some(high_node),
+        "the order of the entries does not matter"
+    );
+}
+
+/// Flushes the records `(key, ver)` and writes a snapshot of them with
+/// `expires_at_ms`, returning the config to reopen against.
+fn closed_tier_with(
+    tag: &str,
+    records: &[(&'static str, Hlc)],
+    expires_at_ms: Option<u64>,
+) -> (SpillConfig, PathBuf) {
+    let dir = temp_dir(tag);
+    let cfg = SpillConfig::new(&dir, 1 << 20)
+        .region_bytes(4096)
+        .warm_reopen(true);
+    let tier = SpillTier::open(&cfg, "cache-a").unwrap();
+    let cache_dir = dir.join("cache-a");
+    let sink = Arc::new(RecordingSink::default());
+    flush_batch(
+        &tier.inner,
+        &*sink,
+        records
+            .iter()
+            .map(|(key, ver)| job(key, b"1", *ver))
+            .collect(),
+    );
+    tier.close();
+    let region_count = region_count_for(1 << 20, 4096);
+    write_snapshot_for_test(&cache_dir, &sink, 4096, region_count, 1_000, expires_at_ms);
+    (cfg, dir)
+}
+
+#[test]
+fn reopen_reports_the_greatest_replayed_version() {
+    let (cfg, dir) = closed_tier_with(
+        "reopen-max-ver",
+        &[("a", hlc(1, 0)), ("b", hlc(9, 2))],
+        None,
+    );
+
+    let fresh_sink = RecordingSink::default();
+    let outcome = SpillTier::reopen(&cfg, "cache-a", &fresh_sink, 1_500, 600_000, |_| true)
+        .expect("reopen against a cleanly closed tier succeeds");
+
+    assert!(outcome.warm);
+    assert_eq!(outcome.max_ver, Some(hlc(9, 2)));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reopen_reports_the_version_of_a_record_it_drops_as_expired() {
+    let (cfg, dir) = closed_tier_with("reopen-max-ver-expired", &[("k", hlc(7, 1))], Some(999));
+
+    let fresh_sink = RecordingSink::default();
+    let outcome = SpillTier::reopen(&cfg, "cache-a", &fresh_sink, 1_500, 600_000, |_| true)
+        .expect("reopen against a cleanly closed tier succeeds");
+
+    assert_eq!(outcome.records_installed, 0, "the record is dropped");
+    assert_eq!(
+        outcome.max_ver,
+        Some(hlc(7, 1)),
+        "its stamp is still this node's history"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reopen_reports_the_version_of_a_record_it_drops_as_unowned() {
+    let (cfg, dir) = closed_tier_with("reopen-max-ver-unowned", &[("k", hlc(7, 1))], None);
+
+    let fresh_sink = RecordingSink::default();
+    let outcome = SpillTier::reopen(&cfg, "cache-a", &fresh_sink, 1_500, 600_000, |_| false)
+        .expect("reopen against a cleanly closed tier succeeds");
+
+    assert_eq!(outcome.records_installed, 0, "the record is dropped");
+    assert_eq!(outcome.max_ver, Some(hlc(7, 1)));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_cold_fallback_reports_no_replayed_version() {
+    let dir = temp_dir("reopen-max-ver-cold");
+    let cfg = SpillConfig::new(&dir, 1 << 20)
+        .region_bytes(4096)
+        .warm_reopen(true);
+    let _tier = SpillTier::open(&cfg, "cache-a").unwrap();
+
+    let fresh_sink = RecordingSink::default();
+    let outcome = SpillTier::reopen(&cfg, "cache-a", &fresh_sink, 1_500, 600_000, |_| true)
+        .expect("the cold fallback still succeeds");
+
+    assert!(!outcome.warm);
+    assert_eq!(outcome.max_ver, None, "no_snapshot");
+    let _ = fs::remove_dir_all(&dir);
+
+    let disabled_dir = temp_dir("reopen-max-ver-disabled");
+    let disabled = SpillConfig::new(&disabled_dir, 1 << 20).region_bytes(4096);
+    let _tier = SpillTier::open(&disabled, "cache-a").unwrap();
+    let outcome = SpillTier::reopen(&disabled, "cache-a", &fresh_sink, 1_500, 600_000, |_| true)
+        .expect("the cold fallback still succeeds");
+    assert_eq!(outcome.reason, Some("disabled"));
+    assert_eq!(outcome.max_ver, None, "disabled");
+    let _ = fs::remove_dir_all(&disabled_dir);
 }

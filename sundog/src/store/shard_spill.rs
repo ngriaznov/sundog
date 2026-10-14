@@ -117,6 +117,12 @@ where
     /// Returns [`AttachSpillOutcome::warm_parts`], the subset it replayed.
     /// A warm-reloaded part still counts as cold per
     /// [`ShardOps::is_cold_part`] until the caller clears it.
+    ///
+    /// A warm reopen advances this shard's clock past the greatest version it
+    /// replayed, so a later local write or remove stamps after every
+    /// replayed entry, even when the system clock restarted behind those
+    /// stamps. Nothing stamps on the shard before this returns: the cache is
+    /// not advertised and no handle to it exists yet.
     /// # Errors
     ///
     /// Returns the underlying [`std::io::Error`] if the tier's directory or
@@ -141,6 +147,7 @@ where
             self.tombstone_ttl_ms,
             owned,
         )?;
+        self.seed_clock_from_replay(outcome.max_ver);
         if outcome.warm {
             tracing::info!(
                 cache = %self.name,

@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use parking_lot::Mutex;
 use tokio::sync::Semaphore;
 
+use crate::hlc::Hlc;
+
 use super::record::{
     decode_record_with_key, pread_exact, region_file_name, remove_stale_region_files,
 };
@@ -172,6 +174,8 @@ impl SpillTier {
     /// is past `now_ms`, and otherwise installed via
     /// [`SpillSink::install_new`]. The snapshot is deleted on success, so
     /// a second open with no intervening clean close is cold.
+    /// [`ReopenOutcome::max_ver`] reports the greatest version the snapshot
+    /// recorded, which the caller folds into its clock.
     ///
     /// # Errors
     ///
@@ -253,6 +257,7 @@ impl SpillTier {
             );
         };
 
+        let max_ver = max_snapshot_version(&snapshot_entries);
         let InstalledRecords {
             reverse_index_by_region,
             used_bytes_by_region,
@@ -331,6 +336,7 @@ impl SpillTier {
             dropped_expired,
             dropped_bad,
             refused_present,
+            max_ver,
         })
     }
 
@@ -357,6 +363,7 @@ impl SpillTier {
             dropped_expired: 0,
             dropped_bad,
             refused_present: 0,
+            max_ver: None,
         })
     }
 }
@@ -392,6 +399,19 @@ pub(crate) struct ReopenOutcome {
     /// Entries [`SpillSink::install_new`] refused because the key was
     /// already present, live or tombstoned.
     pub(crate) refused_present: u64,
+    /// The greatest version the snapshot recorded across every validated
+    /// entry, including ones the replay then dropped as expired or unowned:
+    /// those stamps are this node's own history. `None` for a cold
+    /// fallback or an empty snapshot. The caller folds it into its clock so
+    /// a later local stamp exceeds every replayed version.
+    pub(crate) max_ver: Option<Hlc>,
+}
+
+/// The greatest version among `entries`, by wall time, then logical
+/// counter, then node: what a clock must pass for every later stamp to
+/// outrank every replayed entry. `None` for no entries.
+pub(super) fn max_snapshot_version(entries: &[SnapshotEntry]) -> Option<Hlc> {
+    entries.iter().map(|entry| entry.ver).max()
 }
 
 /// Opens every region file `0..region_count` in `dir` for continued

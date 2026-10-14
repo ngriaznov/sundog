@@ -878,3 +878,205 @@ fn attach_spill_twice_with_no_close_between_falls_back_cold_with_reason_no_snaps
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// How far ahead of the real clock the first life of a warm-reopen test stamps.
+#[cfg(feature = "spill")]
+const WARM_CLOCK_LEAD_MS: u64 = 60_000;
+
+/// A spill config for the warm-reopen clock tests, under a directory unique to `tag`.
+#[cfg(feature = "spill")]
+fn warm_clock_config(tag: &str, warm: bool) -> (spill::SpillConfig, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "sundog-warm-hlc-{tag}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id(),
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let cfg = spill::SpillConfig::new(&dir, 1 << 20)
+        .region_bytes(4096)
+        .warm_reopen(warm);
+    (cfg, dir)
+}
+
+/// Shard 1 stamps key 42 a minute ahead of the real clock and closes
+/// checkpointed; the returned shard 2 reopens `cfg`'s directory on the real
+/// clock, a minute behind the replayed stamp. The returned version is the one
+/// shard 1 stamped.
+#[cfg(feature = "spill")]
+async fn warm_reopened_shard_on_a_clock_behind_its_replayed_stamp(
+    cfg: &spill::SpillConfig,
+) -> (Shard<u32, String>, Hlc) {
+    let node = NodeId::from(401u64);
+    let name = SmolStr::new("warm-hlc");
+
+    let shard1 = Shard::<u32, String>::new(name.clone(), Mode::Local, node, 1 << 20, None, None)
+        .with_clock(Arc::new(|| crate::store::now_ms() + WARM_CLOCK_LEAD_MS));
+    shard1.attach_spill(cfg).expect("cold open");
+    shard1.insert(42, "old".to_string()).await.expect("insert");
+    let replayed = ShardOps::records_for(&shard1, vec![key_bytes(&42u32)]).await[0].ver;
+    shard1.close_spill_checkpointed().await;
+
+    let shard2 = Shard::<u32, String>::new(name, Mode::Local, node, 1 << 20, None, None);
+    let outcome = shard2.attach_spill(cfg).expect("reopen");
+    assert_eq!(outcome.warm_parts.len(), 1, "the reopen is warm");
+    assert_eq!(
+        shard2.get(&42).await,
+        Some("old".to_string()),
+        "the replayed entry is readable"
+    );
+    (shard2, replayed)
+}
+
+#[cfg(feature = "spill")]
+#[tokio::test]
+async fn a_local_insert_after_a_warm_reopen_stamps_past_the_replayed_version() {
+    let (cfg, dir) = warm_clock_config("insert", true);
+    let (shard2, _) = warm_reopened_shard_on_a_clock_behind_its_replayed_stamp(&cfg).await;
+    shard2.insert(42, "new".to_string()).await.expect("insert");
+    assert_eq!(
+        shard2.get(&42).await,
+        Some("new".to_string()),
+        "a local write after a warm reopen stamps after the replayed version"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(feature = "spill")]
+#[tokio::test]
+async fn a_local_remove_after_a_warm_reopen_outvotes_the_replayed_version() {
+    let (cfg, dir) = warm_clock_config("remove", true);
+    let (shard2, _) = warm_reopened_shard_on_a_clock_behind_its_replayed_stamp(&cfg).await;
+    shard2.remove(&42).await.expect("remove");
+    assert_eq!(
+        shard2.get(&42).await,
+        None,
+        "a local remove after a warm reopen outvotes the replayed version"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(feature = "spill")]
+#[tokio::test]
+async fn a_warm_reopen_seeds_the_clock_so_every_later_stamp_exceeds_the_replayed_one() {
+    let (cfg, dir) = warm_clock_config("seed", true);
+    let (shard2, replayed) = warm_reopened_shard_on_a_clock_behind_its_replayed_stamp(&cfg).await;
+    shard2
+        .insert(7, "other".to_string())
+        .await
+        .expect("insert a key the snapshot did not hold");
+    let stamped = ShardOps::records_for(&shard2, vec![key_bytes(&7u32)]).await[0].ver;
+    assert!(
+        stamped > replayed,
+        "a write to a key outside the snapshot stamps past the replayed version: \
+         {stamped:?} vs {replayed:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(feature = "spill")]
+#[tokio::test]
+async fn a_merge_after_a_warm_reopen_stamps_past_the_replayed_version() {
+    use crate::store::crdt::{PnCounter, PnCounterResolver};
+
+    let (cfg, dir) = warm_clock_config("merge", true);
+    let node = NodeId::from(402u64);
+    let name = SmolStr::new("warm-hlc-merge");
+    let writer_a = crdt::WriterId::new(NodeId::from(11), 1);
+    let writer_b = crdt::WriterId::new(NodeId::from(22), 1);
+
+    let shard1 = Shard::<u32, PnCounter>::new(name.clone(), Mode::Local, node, 1 << 20, None, None)
+        .with_resolver(Arc::new(PnCounterResolver))
+        .with_clock(Arc::new(|| crate::store::now_ms() + WARM_CLOCK_LEAD_MS));
+    shard1.attach_spill(&cfg).expect("cold open");
+    shard1
+        .merge(1, PnCounter::local_delta(writer_a, 3))
+        .await
+        .expect("merge");
+    let replayed = ShardOps::records_for(&shard1, vec![key_bytes(&1u32)]).await[0].ver;
+    shard1.close_spill_checkpointed().await;
+
+    let shard2 = Shard::<u32, PnCounter>::new(name, Mode::Local, node, 1 << 20, None, None)
+        .with_resolver(Arc::new(PnCounterResolver));
+    let outcome = shard2.attach_spill(&cfg).expect("reopen");
+    assert_eq!(outcome.warm_parts.len(), 1, "the reopen is warm");
+
+    shard2
+        .merge(1, PnCounter::local_delta(writer_b, 4))
+        .await
+        .expect("merge after the reopen");
+    assert_eq!(
+        shard2.get(&1).await.map(|c| c.value()),
+        Some(7),
+        "the merge folds into the replayed counter"
+    );
+    let merged = ShardOps::records_for(&shard2, vec![key_bytes(&1u32)]).await[0].ver;
+    assert!(merged > replayed, "{merged:?} vs {replayed:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(feature = "spill")]
+#[tokio::test]
+async fn a_cold_open_leaves_the_clock_at_physical_time() {
+    // The first life's stamps lead the real clock, but warm reopen is off, so
+    // the second life replays nothing and stamps at the real clock.
+    let (cfg, dir) = warm_clock_config("cold", false);
+    let node = NodeId::from(403u64);
+    let name = SmolStr::new("warm-hlc-cold");
+    let shard1 = Shard::<u32, String>::new(name.clone(), Mode::Local, node, 1 << 20, None, None)
+        .with_clock(Arc::new(|| crate::store::now_ms() + WARM_CLOCK_LEAD_MS));
+    shard1.attach_spill(&cfg).expect("cold open");
+    shard1.insert(42, "old".to_string()).await.expect("insert");
+    shard1.close_spill_checkpointed().await;
+
+    let shard2 = Shard::<u32, String>::new(name, Mode::Local, node, 1 << 20, None, None);
+    let outcome = shard2.attach_spill(&cfg).expect("cold open");
+    assert!(outcome.warm_parts.is_empty(), "warm reopen is off");
+    let before = crate::store::now_ms();
+    shard2.insert(42, "new".to_string()).await.expect("insert");
+    let stamped = ShardOps::records_for(&shard2, vec![key_bytes(&42u32)]).await[0].ver;
+    assert!(
+        stamped.wall_ms < before + WARM_CLOCK_LEAD_MS / 2,
+        "a cold open seeds nothing: {} vs {before}",
+        stamped.wall_ms
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(feature = "spill")]
+#[test]
+fn seed_clock_from_replay_flags_only_a_replayed_stamp_ahead_of_max_clock_skew() {
+    let now = crate::store::now_ms();
+    let shard = Shard::<u32, String>::new(
+        SmolStr::new("warm-hlc-seed"),
+        Mode::Local,
+        NodeId::from(404u64),
+        1 << 20,
+        None,
+        None,
+    )
+    .with_max_clock_skew(Some(Duration::from_secs(1)))
+    .with_clock(Arc::new(move || now));
+    let at = |wall_ms: u64| Hlc {
+        wall_ms,
+        logical: 0,
+        node: NodeId::from(404u64),
+    };
+
+    assert!(!shard.seed_clock_from_replay(None), "nothing replayed");
+    assert!(
+        !shard.seed_clock_from_replay(Some(at(now - 10_000))),
+        "a stamp behind the clock leaves no lead"
+    );
+    assert!(
+        !shard.seed_clock_from_replay(Some(at(now + 1_000))),
+        "a lead of exactly max_clock_skew is within it"
+    );
+    assert!(
+        shard.seed_clock_from_replay(Some(at(now + 1_001))),
+        "a lead past max_clock_skew is flagged"
+    );
+    assert!(
+        shard.stamp_local() > at(now + 1_001),
+        "the seeded clock stamps past the replayed version"
+    );
+}

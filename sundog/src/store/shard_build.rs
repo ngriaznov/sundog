@@ -573,6 +573,38 @@ where
             .observe(self.now_ms(), derived);
     }
 
+    /// Folds the greatest version a warm reopen replayed into this shard's
+    /// clock with no skew bound, so every later local stamp exceeds it: the
+    /// stamps were written here, and a bound would re-create the lost
+    /// write. Returns whether the clock now runs ahead of the system clock by
+    /// more than `max_clock_skew`, which it warns about once: the node's
+    /// writes stay ordered at the replayed stamp, and peers may refuse them
+    /// until the system clock catches up.
+    #[cfg(feature = "spill")]
+    pub(super) fn seed_clock_from_replay(&self, max_ver: Option<Hlc>) -> bool {
+        let Some(ver) = max_ver else {
+            return false;
+        };
+        self.observe_derived(ver);
+        let lead_ms = self
+            .clock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .lead_ms(self.now_ms());
+        let jumped = clock_jumped(lead_ms, self.max_clock_skew_ms);
+        if jumped {
+            tracing::warn!(
+                cache = %self.name,
+                ahead_ms = lead_ms,
+                "a warm reopen replayed a stamp further ahead of this node's clock than \
+                 max_clock_skew: the system clock restarted behind it. Writes stay ordered \
+                 at the replayed stamp until the clock catches up, and peers may refuse them \
+                 as stamped ahead until then"
+            );
+        }
+        jumped
+    }
+
     /// The absolute expiry a write stamped `stamp_wall_ms` carries: the
     /// per-write `ttl` if given, else the shard's configured default, else
     /// none. Only this stamp is per-cache; everything downstream reads each

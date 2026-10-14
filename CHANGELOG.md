@@ -13,6 +13,12 @@ All notable changes to this project are documented in this file. Format follows
   longer reads as idle past `tti`: the read hits, the sweep keeps it, a
   merging resolver folds it and eviction ranks it hottest, in every mode with
   a capacity. A `tti` longer than about 48.7 days is capped at that.
+- **A warm reopen resumes the node's clock past the stamps it replays.** A
+  write or delete made after a restart from a spill snapshot stamps after
+  every replayed entry. A clock that restarts behind a replayed stamp no
+  longer ranks the new write below the old entry, which returned `Ok`,
+  changed nothing and left a deleted key readable. A replayed stamp that
+  leads the system clock by more than `max_clock_skew` logs a warning.
 
 ## [0.6.7] – 2026-10-13
 

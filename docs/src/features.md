@@ -67,6 +67,12 @@ against the same directory replays the snapshot instead of starting empty,
 reading no values into RAM. A replayed bucket answers `fetch` only after a
 live co-owner confirms it, or after the warm-up finds no co-owner to ask.
 
+A warm reopen advances the node's clock past the greatest version it
+replays, so a write or delete made after the restart stamps after every
+replayed entry and wins over it, even when the system clock restarted behind
+those stamps. If a replayed stamp leads the system clock by more than
+`max_clock_skew`, the node logs a warning once.
+
 The snapshot holds no tombstones and no expired entries. A crash leaves no
 snapshot, a successful warm reopen deletes the one it replayed, so a second
 open with no clean close between is cold, and a node down longer than

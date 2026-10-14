@@ -24,6 +24,13 @@ refused write stays on the node that made it and reaches the others through
 anti-entropy once their clocks catch up with its stamp.
 `sundog_clock_skew_rejected_total{cache}` counts refusals.
 
+A restart that replays a spill snapshot resumes the node's clock at or past
+the replayed stamps, so a clock that steps back across a restart does not
+make the node's new writes and deletes lose to its own old entries. Until
+the system clock catches up, the node's writes stay ordered at the replayed
+stamp, and peers may refuse them under `max_clock_skew` like any write
+stamped ahead.
+
 ### Values that merge
 
 A value that combines, a counter or a set, does not have to lose writes. A

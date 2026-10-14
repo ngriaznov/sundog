@@ -509,3 +509,117 @@ async fn merging_into_a_spilled_counter_folds_instead_of_dropping_a_side() {
     cache.close().await;
     cluster.shutdown().await;
 }
+
+/// A cache in `mode` stamps key 42 a minute ahead of the system clock and
+/// closes checkpointed; its successor on a fresh cluster, built without that
+/// clock, reopens the same spill directory warm and so trails the replayed
+/// stamp. Returns the successor, its cluster and the directory.
+#[cfg(not(feature = "sim"))]
+async fn cache_reopened_warm_behind_its_replayed_stamps(
+    mode: Mode,
+    label: &'static str,
+) -> (Cluster, Cache<u32, String>, std::path::PathBuf) {
+    let dir = fresh_spill_dir(label);
+    let spill = || {
+        SpillConfig::new(&dir, 1 << 20)
+            .region_bytes(4096)
+            .warm_reopen(true)
+    };
+    let cluster = Cluster::builder(label)
+        .seeds(std::iter::empty())
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("build succeeds");
+    let first = cluster
+        .cache::<u32, String>("warm-clock")
+        .mode(mode)
+        .clock(Arc::new(|| now_ms() + 60_000))
+        .spill(spill())
+        .open()
+        .await
+        .expect("opens");
+    first.insert(42, "old".to_string()).await.expect("insert");
+    first.close().await;
+    cluster.shutdown().await;
+
+    let cluster = Cluster::builder(label)
+        .seeds(std::iter::empty())
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("build succeeds");
+    let second = cluster
+        .cache::<u32, String>("warm-clock")
+        .mode(mode)
+        .spill(spill())
+        .open()
+        .await
+        .expect("reopens");
+    assert_eq!(
+        second.get(&42).await,
+        Some("old".to_string()),
+        "the replay is warm: the old entry is readable"
+    );
+    (cluster, second, dir)
+}
+
+#[cfg(not(feature = "sim"))]
+#[tokio::test]
+async fn a_local_cache_reopened_warm_behind_its_replayed_stamps_accepts_a_new_write() {
+    let (cluster, cache, dir) = cache_reopened_warm_behind_its_replayed_stamps(
+        Mode::Local,
+        "cache-it-warm-clock-local-write",
+    )
+    .await;
+    cache.insert(42, "new".to_string()).await.expect("insert");
+    assert_eq!(cache.get(&42).await, Some("new".to_string()));
+    cache.close().await;
+    cluster.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(not(feature = "sim"))]
+#[tokio::test]
+async fn a_local_cache_reopened_warm_behind_its_replayed_stamps_honours_a_remove() {
+    let (cluster, cache, dir) = cache_reopened_warm_behind_its_replayed_stamps(
+        Mode::Local,
+        "cache-it-warm-clock-local-remove",
+    )
+    .await;
+    cache.remove(&42).await.expect("remove");
+    assert_eq!(cache.get(&42).await, None);
+    cache.close().await;
+    cluster.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(not(feature = "sim"))]
+#[tokio::test]
+async fn an_invalidation_cache_reopened_warm_behind_its_replayed_stamps_accepts_a_new_write() {
+    let (cluster, cache, dir) = cache_reopened_warm_behind_its_replayed_stamps(
+        Mode::Invalidation,
+        "cache-it-warm-clock-inval-write",
+    )
+    .await;
+    cache.insert(42, "new".to_string()).await.expect("insert");
+    assert_eq!(cache.get(&42).await, Some("new".to_string()));
+    cache.close().await;
+    cluster.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(not(feature = "sim"))]
+#[tokio::test]
+async fn an_invalidation_cache_reopened_warm_behind_its_replayed_stamps_honours_a_remove() {
+    let (cluster, cache, dir) = cache_reopened_warm_behind_its_replayed_stamps(
+        Mode::Invalidation,
+        "cache-it-warm-clock-inval-remove",
+    )
+    .await;
+    cache.remove(&42).await.expect("remove");
+    assert_eq!(cache.get(&42).await, None);
+    cache.close().await;
+    cluster.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
