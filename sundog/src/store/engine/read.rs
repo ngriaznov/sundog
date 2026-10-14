@@ -225,7 +225,7 @@ where
                 key: Bytes::copy_from_slice(key_bytes),
                 value: None,
                 ver: t.ver,
-                expires_at_ms: None,
+                expires_at_ms: t.expired_at_ms,
             });
         }
         let live = stripe

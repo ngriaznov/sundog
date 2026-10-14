@@ -547,11 +547,11 @@ fn resolve_conflict_settles_a_tombstone_by_version_whatever_the_resolver_prefers
     // A newer tombstone buries the value the resolver would keep, an older
     // one cannot.
     assert!(matches!(
-        resolve(Some(&stored), false, low, high, &Incoming::Tombstone),
+        resolve(Some(&stored), false, low, high, &Incoming::DELETE),
         Resolution::IncomingWins
     ));
     assert!(matches!(
-        resolve(Some(&stored), false, high, low, &Incoming::Tombstone),
+        resolve(Some(&stored), false, high, low, &Incoming::DELETE),
         Resolution::IncomingLoses
     ));
     // A value over a stored tombstone wins only when it is newer.

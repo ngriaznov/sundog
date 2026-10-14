@@ -83,6 +83,25 @@ fn apply_direct<K, V>(
 
 #[test]
 fn digest_matches_full_recompute_after_random_ops_including_sweeps_and_evictions() {
+    digest_matches_full_recompute_after_random_ops(None);
+}
+
+/// The same mix with every sweep leaving the tombstone of an expired entry
+/// for 1s/10s: the digest, the live count and the weight stay exact as
+/// entries turn into tombstones and the collection drops them.
+#[test]
+fn digest_matches_full_recompute_after_random_ops_with_expiry_tombstoning_sweeps() {
+    digest_matches_full_recompute_after_random_ops(Some(
+        crate::store::engine::TombstoneRetention {
+            ttl_ms: 1_000,
+            max_ttl_ms: 10_000,
+        },
+    ));
+}
+
+fn digest_matches_full_recompute_after_random_ops(
+    retention: Option<crate::store::engine::TombstoneRetention>,
+) {
     use rand::{RngExt as _, SeedableRng as _, rngs::StdRng};
 
     let weigher: Weigher<u32, u64> = Box::new(|_k, _v| 1);
@@ -130,11 +149,11 @@ fn digest_matches_full_recompute_after_random_ops_including_sweeps_and_evictions
                         key_bytes: kb,
                     },
                     ver,
-                    Incoming::Tombstone,
+                    Incoming::DELETE,
                     now,
                 );
             }
-            2 => engine.sweep(now),
+            2 => engine.sweep(now, retention),
             _ => engine.gc_tombstones(false, now),
         }
         assert_eq!(
@@ -255,7 +274,7 @@ fn resident_bytes_counts_each_entry_overhead_plus_its_heap_record() {
                 key_bytes: kb,
             },
             hlc(wall_ms, 1),
-            Incoming::Tombstone,
+            Incoming::DELETE,
             wall_ms,
         );
     }
@@ -305,9 +324,9 @@ fn resident_bytes_matches_a_full_recount_after_random_ops_including_sweeps_and_e
             }
             1 => {
                 let ver = clock.now(now);
-                apply_direct(&engine, bucket, entry, ver, Incoming::Tombstone, now);
+                apply_direct(&engine, bucket, entry, ver, Incoming::DELETE, now);
             }
-            2 => engine.sweep(now),
+            2 => engine.sweep(now, None),
             _ => engine.gc_tombstones(false, now),
         }
         assert_eq!(

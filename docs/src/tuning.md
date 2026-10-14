@@ -48,8 +48,8 @@ Cache-level settings, `mode`, `max_capacity`, `max_resident_bytes`, `ttl`,
 
 | Field | Default | Change it when |
 |---|---|---|
-| `tombstone_ttl` | 10 min | tombstones cost too much memory, or a lagging peer needs longer to see a delete; keep it at least 3 × `ae_interval` |
-| `tombstone_max_ttl` | 24 h | entries have no TTL and a member can be absent longer than this |
+| `tombstone_ttl` | 10 min | tombstones cost too much memory, deletes and, in the replicated modes, expired entries alike, or a lagging peer needs longer to see a delete; keep it at least 3 × `ae_interval` |
+| `tombstone_max_ttl` | 24 h | entries have no TTL and a member can be absent longer than this; lower it if a day of expired entries as tombstones does not fit in memory |
 
 ## Distributed caches
 

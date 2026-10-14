@@ -69,8 +69,19 @@ node's own share, not the cluster total.
 
 A removed key keeps a tombstone for `tombstone_ttl`, 10 minutes by default,
 and for up to `tombstone_max_ttl` while a member is absent, in a
-`Distributed` cache a member that shares a part with this node. A workload that removes many keys holds their tombstones for that
-long. Budget for the removal rate times the retention.
+`Distributed` cache a member that shares a part with this node. In a
+`Replicated` or `Distributed` cache whose resolver does not merge, an entry
+that expires keeps one too, counted from its expiry: the sweep turns the
+entry into a tombstone at its version, which holds the key and its version
+but no value. A workload that removes or expires many keys holds their
+tombstones for that long. Budget for the removal rate plus the expiry rate,
+times the retention. A TTL-heavy cache at the default holds ten minutes of
+expiries as tombstones, and while a member is absent, whether down, flapping
+or partitioned, up to `tombstone_max_ttl`: at the default 24 hours, a full day
+of expiries. Tombstones sit outside `max_capacity` and the memory ceiling.
+`sundog_tombstones{cache}` counts the ones this node holds; alert on it
+before an absent member makes it grow, and lower `tombstone_max_ttl` if a day
+of expiries does not fit.
 
 ## Allocator
 

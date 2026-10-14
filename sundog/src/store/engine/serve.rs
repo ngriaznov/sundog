@@ -195,7 +195,7 @@ where
                 key: key_bytes.clone(),
                 value: None,
                 ver: t.ver,
-                expires_at_ms: None,
+                expires_at_ms: t.expired_at_ms,
             }));
         }
         out

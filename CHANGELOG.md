@@ -5,6 +5,12 @@ All notable changes to this project are documented in this file. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`sundog_tombstones{cache}`** gauge: the tombstones a node holds for a
+  cache, its deletes and, in a `Replicated` or `Distributed` cache, its swept
+  expired entries, refreshed every five seconds with `sundog_cache_entries`.
+
 ### Changed
 
 - **The wire protocol is 9** (`wire::PROTOCOL_AE_LISTING_CHUNKS`). A reply to
@@ -15,6 +21,30 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **A swept expired entry keeps out the value it overwrote.** In a
+  `Replicated` or `Distributed` cache whose resolver does not merge, the sweep
+  turns an entry that reached its deadline into a tombstone at the entry's
+  version. A replica that missed the overwrite can no longer bring the older
+  value back through a write or anti-entropy, whether or not a sweep had run
+  when the older copy arrived, and anti-entropy removes that copy from the
+  replica that still holds it. The same holds for a lifetime shortened with
+  `expire`: a cut-off peer's longer-lived copy is deleted instead of bringing
+  the entry back. The tombstone counts its `tombstone_ttl` (and, while a member
+  is absent, `tombstone_max_ttl`) from the entry's expiry, so every replica
+  collects it at the same instant, and a tombstone that arrives already past
+  that retention, holding nothing it displaces, is dropped instead of being
+  handed back and forth between replicas that collected it and replicas that
+  have not. The expiry travels as the tombstone record's `expires_at_ms`; a
+  peer on release 8 reads the record as an ordinary delete. A sweep no longer
+  changes a bucket's digest, and a `Distributed` owner of a cold part now
+  answers a peer's fetch for a swept key with a miss, as for a deleted one,
+  where it declined. Each expired entry costs a tombstone for the retention,
+  and while a member is absent for up to `tombstone_max_ttl`: a TTL-heavy
+  cache holds that many tombstones, outside `max_capacity` and the memory
+  ceiling, so size for the expiry rate times the retention. `LocalRecord`
+  reports a swept key as `Tombstone` in these modes. `Local`, `Invalidation`
+  and merging caches keep nothing, as before: a merging cache already reads an
+  expired side as absent on every node.
 - **A merge waiting in its coalesce window no longer outlives a remove, a
   clear or a newer tombstone.** `Cache::remove`, `remove_sync`, `remove_many`
   and `clear` discard a fold still pending for the key, `clear` covers keys

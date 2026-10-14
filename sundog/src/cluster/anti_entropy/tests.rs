@@ -10,6 +10,7 @@ mod parts;
 #[cfg(not(feature = "sim"))]
 mod repair;
 mod rules;
+mod tombstone_drain;
 
 /// A postcard-encoded `(key, value)` pair and the `WireRecord`
 /// `apply_remote` takes. Real-transport only.

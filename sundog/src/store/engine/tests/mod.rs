@@ -87,6 +87,7 @@ fn test_ctx<'a, K, V>(
         spill: None,
         tombstone_ttl_ms,
         tombstone_max_ttl_ms,
+        deferring: false,
         now_ms,
         held_only: false,
     }
@@ -130,6 +131,26 @@ where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
+    tombstone_of(engine, key, key_bytes, ver, None, now_ms, false)
+}
+
+/// [`tombstone`] for the tombstone of an entry that expired at
+/// `expired_at_ms` (`Some`) or a delete (`None`), landing while collection
+/// is deferred for an absent member when `deferring`. Retentions are 60 s
+/// and 600 s.
+fn tombstone_of<K, V>(
+    engine: &Engine<K, V>,
+    key: K,
+    key_bytes: Bytes,
+    ver: Hlc,
+    expired_at_ms: Option<u64>,
+    now_ms: u64,
+    deferring: bool,
+) -> ApplyOutcome<K, V>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
     let hash = hash_key_bytes(key_bytes.as_ref());
     let bucket = stripe_index_from_hash(hash);
     let resolver = LwwResolver;
@@ -156,6 +177,7 @@ where
         spill: engine.spill().map(Arc::as_ref),
         tombstone_ttl_ms: 60_000,
         tombstone_max_ttl_ms: 600_000,
+        deferring,
         now_ms,
         held_only: false,
     };
@@ -168,7 +190,7 @@ where
             key_bytes,
         },
         ver,
-        Incoming::Tombstone,
+        Incoming::Tombstone { expired_at_ms },
     )
     .0
 }
@@ -220,6 +242,7 @@ where
         spill: engine.spill().map(Arc::as_ref),
         tombstone_ttl_ms: 60_000,
         tombstone_max_ttl_ms: 600_000,
+        deferring: false,
         now_ms,
         held_only: false,
     };
@@ -370,6 +393,7 @@ mod apply;
 mod entry;
 mod evict;
 mod expiry;
+mod expiry_tombstone;
 mod held_only;
 mod housekeeping;
 mod inflight;

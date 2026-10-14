@@ -715,18 +715,18 @@ const LONG_VALUE: &str = "the longer value, at the lower version";
 /// Two joined `Mode::Replicated` nodes with anti-entropy off, so only the
 /// rounds a test drives run, each opening cache `resolved` with its own
 /// resolver.
-struct ResolverPair {
-    cluster_a: Cluster,
-    cluster_b: Cluster,
-    cache_a: Cache<u32, String>,
-    cache_b: Cache<u32, String>,
-    name: SmolStr,
-    shard_a: Arc<dyn ShardOps>,
-    shard_b: Arc<dyn ShardOps>,
+pub(super) struct ResolverPair {
+    pub(super) cluster_a: Cluster,
+    pub(super) cluster_b: Cluster,
+    pub(super) cache_a: Cache<u32, String>,
+    pub(super) cache_b: Cache<u32, String>,
+    pub(super) name: SmolStr,
+    pub(super) shard_a: Arc<dyn ShardOps>,
+    pub(super) shard_b: Arc<dyn ShardOps>,
 }
 
 impl ResolverPair {
-    async fn open(
+    pub(super) async fn open(
         cluster_name: &str,
         config: ClusterConfig,
         resolver_a: Arc<dyn ConflictResolver>,
@@ -761,7 +761,10 @@ impl ResolverPair {
         }
     }
 
-    async fn open_with(cluster_name: &str, resolver: impl ConflictResolver + Clone) -> Self {
+    pub(super) async fn open_with(
+        cluster_name: &str,
+        resolver: impl ConflictResolver + Clone,
+    ) -> Self {
         Self::open(
             cluster_name,
             loopback_config(),
@@ -773,7 +776,7 @@ impl ResolverPair {
 
     /// Applies `value` (a tombstone for `None`) at `wall_ms` on one side
     /// only, so the other side never sees it, as after a dropped replicate.
-    async fn apply(&self, on_a: bool, key: u32, value: Option<&str>, wall_ms: u64) {
+    pub(super) async fn apply(&self, on_a: bool, key: u32, value: Option<&str>, wall_ms: u64) {
         let (shard, cluster) = if on_a {
             (&self.shard_a, &self.cluster_a)
         } else {
@@ -786,7 +789,7 @@ impl ResolverPair {
 
     /// One anti-entropy round, initiated by a when `from_a` and by b
     /// otherwise.
-    async fn round(&self, from_a: bool) -> RoundOutcome {
+    pub(super) async fn round(&self, from_a: bool) -> RoundOutcome {
         if from_a {
             run_round_against(
                 self.cluster_a.mesh(),
@@ -808,21 +811,21 @@ impl ResolverPair {
 
     /// Waits until both sides hold the same digests, which a push applied
     /// asynchronously on the receiver reaches shortly after a round returns.
-    async fn wait_converged(&self, msg: &str) {
+    pub(super) async fn wait_converged(&self, msg: &str) {
         wait_until(Duration::from_secs(10), msg, async || {
             self.shard_a.digests().await == self.shard_b.digests().await
         })
         .await;
     }
 
-    async fn shutdown(self) {
+    pub(super) async fn shutdown(self) {
         self.cluster_a.shutdown().await;
         self.cluster_b.shutdown().await;
     }
 }
 
 /// A wire record for u32 `key`: a put of `value`, or a tombstone for `None`.
-fn test_record(key: u32, value: Option<&str>, wall_ms: u64, node: NodeId) -> WireRecord {
+pub(super) fn test_record(key: u32, value: Option<&str>, wall_ms: u64, node: NodeId) -> WireRecord {
     WireRecord {
         key: Bytes::from(postcard::to_stdvec(&key).expect("key encodes")),
         value: value.map(|v| Bytes::from(postcard::to_stdvec(v).expect("value encodes"))),

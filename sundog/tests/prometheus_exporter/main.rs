@@ -19,9 +19,10 @@ mod spill;
 mod support;
 
 use crate::pins::{
-    clock_skew_pin_metrics, count_hits_and_misses, fan_out_wait_timeout_pin_metrics,
-    loader_calls_pin_metric, memory_ceiling_pin_metrics, read_durations_pin_metrics,
-    refresh_hints_pin_metric, refresh_outcomes_pin_metrics,
+    TOMBSTONE_PIN_COUNT, clock_skew_pin_metrics, count_hits_and_misses,
+    fan_out_wait_timeout_pin_metrics, loader_calls_pin_metric, memory_ceiling_pin_metrics,
+    read_durations_pin_metrics, refresh_hints_pin_metric, refresh_outcomes_pin_metrics,
+    tombstone_pin_metrics,
 };
 use crate::seeds::{
     seed_crdt_compaction_metrics, seed_distributed_metrics, seed_part_mismatch,
@@ -81,6 +82,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     );
     assert!(ceiling_pin_bytes > 0.0);
     loader_calls_pin_metric(&cluster).await;
+    let tombstone_node = tombstone_pin_metrics().await;
     refresh_outcomes_pin_metrics(&cluster).await;
     refresh_hints_pin_metric(&cluster, &peer).await;
     #[cfg(feature = "spill")]
@@ -123,6 +125,8 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
                 == Some(ceiling_pin_bytes)
             && scraped_metric_value(&body, "sundog_ae_sketch_total", &[("outcome", "decoded")])
                 .is_some()
+            && scraped_metric_value(&body, "sundog_tombstones", &[("cache", "tombstone-pin")])
+                == Some(TOMBSTONE_PIN_COUNT)
             && (cfg!(not(feature = "spill"))
                 || scraped_metric_value(
                     &body,
@@ -136,7 +140,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         assert!(
             tokio::time::Instant::now() < deadline,
             "metrics endpoint never served sundog_open_caches, sundog_live_peers, \
-             sundog_cache_entries, sundog_cache_bytes, a decoded sundog_ae_sketch_total, and (feature = \"spill\") \
+             sundog_cache_entries, sundog_cache_bytes, sundog_tombstones, a decoded sundog_ae_sketch_total, and (feature = \"spill\") \
              sundog_spill_writes_total within the bound"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -181,6 +185,20 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     assert!(
         scraped_metric_value(&body, "sundog_cache_entries", &[("cache", "counted")]).is_some(),
         "expected a sundog_cache_entries line for the 'counted' cache; got body:\n{body}"
+    );
+
+    // sundog_tombstones: pinned by tombstone_pin_metrics, two deletes and one
+    // swept expired entry (the wait above), beside two live entries that
+    // `sundog_cache_entries` counts.
+    assert_eq!(
+        scraped_metric_value(&body, "sundog_cache_entries", &[("cache", "tombstone-pin")]),
+        Some(2.0),
+        "expected two live entries on the 'tombstone-pin' cache; got body:\n{body}"
+    );
+    assert_eq!(
+        scraped_metric_value(&body, "sundog_tombstones", &[("cache", "counted")]),
+        Some(0.0),
+        "a cache that deleted nothing holds no tombstone; got body:\n{body}"
     );
 
     // An uncapped cache counts no bytes, so it exports neither series.
@@ -728,6 +746,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     );
 
     peer.shutdown().await;
+    tombstone_node.shutdown().await;
     cluster.shutdown().await;
     #[cfg(feature = "spill")]
     for dir in &spill_dirs {

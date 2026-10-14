@@ -87,11 +87,11 @@ fn fold_run<V: DeserializeOwned>(
                 expires_at_ms,
                 ..
             } => (Some(encoded.as_ref()), *expires_at_ms),
-            Incoming::Tombstone => (None, None),
+            Incoming::Tombstone { .. } => (None, None),
         };
         let incoming_expires_at_ms = match incoming {
             Incoming::Put { expires_at_ms, .. } => *expires_at_ms,
-            Incoming::Tombstone => None,
+            Incoming::Tombstone { .. } => None,
         };
         if carries_stored
             && fold_sides(
@@ -112,7 +112,7 @@ fn fold_run<V: DeserializeOwned>(
             stored_encoded,
             stored_expires_at_ms,
             acc_absent,
-            matches!(acc_incoming, Incoming::Tombstone),
+            matches!(acc_incoming, Incoming::Tombstone { .. }),
             ver,
             incoming,
         ) {
@@ -163,7 +163,7 @@ pub(super) fn group_prefold_runs<K, V>(entries: &[BatchEntry<K, V>]) -> Vec<Vec<
         for idx in indices {
             match &entries[idx].4 {
                 Incoming::Put { .. } => current.push(idx),
-                Incoming::Tombstone => {
+                Incoming::Tombstone { .. } => {
                     if !current.is_empty() {
                         runs.push(std::mem::take(&mut current));
                     }

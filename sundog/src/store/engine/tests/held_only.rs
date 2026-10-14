@@ -39,13 +39,7 @@ fn set_entry(
 /// A batch entry removing `key` at `ver`.
 fn removal_entry(key: u32, ver: Hlc) -> BatchEntry<u32, BTreeSet<String>> {
     let kb = key_bytes(key);
-    (
-        hash_key_bytes(kb.as_ref()),
-        key,
-        kb,
-        ver,
-        Incoming::Tombstone,
-    )
+    (hash_key_bytes(kb.as_ref()), key, kb, ver, Incoming::DELETE)
 }
 
 /// Applies `entries` to `engine` under `scope` and the union resolver.

@@ -257,7 +257,7 @@ fn reaches_deadline_is_true_for_a_put_whose_deadline_has_passed() {
     assert!(reaches_deadline(&put(Some(10)), 11));
     assert!(!reaches_deadline(&put(Some(10)), 9));
     assert!(!reaches_deadline(&put(None), u64::MAX));
-    assert!(!reaches_deadline::<u32>(&Incoming::Tombstone, u64::MAX));
+    assert!(!reaches_deadline::<u32>(&Incoming::DELETE, u64::MAX));
 }
 
 #[test]
@@ -452,7 +452,7 @@ fn prefold_never_folds_a_run_across_a_tombstone() {
         vec![
             put_entry(k, hlc(1, 1), "a"),
             put_entry(k, hlc(2, 1), "b"),
-            (hash, k, kb.clone(), hlc(3, 1), Incoming::Tombstone),
+            (hash, k, kb.clone(), hlc(3, 1), Incoming::DELETE),
             put_entry(k, hlc(4, 1), "c"),
         ]
     };

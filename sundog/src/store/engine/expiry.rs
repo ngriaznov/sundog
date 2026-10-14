@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use bytes::Bytes;
 
 use crate::explain::Lapse;
+use crate::store::Mode;
 
 use super::Live;
 
@@ -166,4 +167,143 @@ pub(super) fn lapse_cause(expires_at_ms: Option<u64>, now_ms: u64) -> Lapse {
     } else {
         Lapse::Idle
     }
+}
+
+/// How long [`Engine::sweep`](super::Engine::sweep) keeps the tombstone of an
+/// entry it removes for having expired: the same two retentions a delete's
+/// tombstone gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TombstoneRetention {
+    pub(crate) ttl_ms: u64,
+    pub(crate) max_ttl_ms: u64,
+}
+
+/// What a sweep does with one live entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SweepFate {
+    /// The entry is readable: it stays.
+    Keep,
+    /// The entry is removed and leaves nothing behind.
+    Drop,
+    /// The entry is removed and leaves a tombstone at its version, so an
+    /// older copy of the key cannot come back after it.
+    Tombstone,
+}
+
+/// A sweep's verdict on an entry. `absent` is what [`absent_at`] says;
+/// `tombstones_expired` is whether this sweep leaves a tombstone for an
+/// entry that expired. Only an expiry deadline that has passed leaves one:
+/// idleness is local to a node, and a tombstone would delete the key on its
+/// peers. The verdict reads the expiry alone, never the idle clock, so an
+/// entry both expired and idle still leaves one. Pure; unit tested directly.
+pub(super) fn sweep_fate(
+    absent: bool,
+    expires_at_ms: Option<u64>,
+    now_ms: u64,
+    tombstones_expired: bool,
+) -> SweepFate {
+    if !absent {
+        SweepFate::Keep
+    } else if tombstones_expired && expires_at_ms.is_some_and(|exp| now_ms >= exp) {
+        SweepFate::Tombstone
+    } else {
+        SweepFate::Drop
+    }
+}
+
+/// The two GC deadlines a tombstone landing at `now_ms` is kept under, as
+/// `(ttl_deadline_ms, max_deadline_ms)`. A delete (`expired_at_ms` `None`)
+/// counts its retentions from `now_ms`. The tombstone of an expired entry
+/// counts them from the expiry, `expired_at_ms`, capped at `now_ms` so a
+/// stamp from a skewed clock never extends the hold: every replica that
+/// learns of it derives the same deadlines, whenever it learns. Saturating.
+/// Pure; unit tested directly.
+pub(super) fn tombstone_deadlines(
+    expired_at_ms: Option<u64>,
+    now_ms: u64,
+    ttl_ms: u64,
+    max_ttl_ms: u64,
+) -> (u64, u64) {
+    let anchor = expired_at_ms.map_or(now_ms, |expired| expired.min(now_ms));
+    (
+        anchor.saturating_add(ttl_ms),
+        anchor.saturating_add(max_ttl_ms),
+    )
+}
+
+/// The deadlines of the tombstone a sweep at `now_ms` leaves for an entry
+/// that expired at `expired_at_ms`: [`tombstone_deadlines`], and never
+/// earlier than `now_ms`, so the tombstone outlives the sweep that made it
+/// even when the sweep runs long after the expiry. Pure; unit tested
+/// directly.
+pub(super) fn swept_tombstone_deadlines(
+    expired_at_ms: u64,
+    now_ms: u64,
+    retention: TombstoneRetention,
+) -> (u64, u64) {
+    let (ttl, max) = tombstone_deadlines(
+        Some(expired_at_ms),
+        now_ms,
+        retention.ttl_ms,
+        retention.max_ttl_ms,
+    );
+    (ttl.max(now_ms), max.max(now_ms))
+}
+
+/// Whether a tombstone with these deadlines is already past the retention
+/// the next collection would apply at `now_ms`: its `ttl_deadline_ms`, or,
+/// while collection is deferred for an absent member (`deferring`), its
+/// `max_deadline_ms`. Pure; unit tested directly.
+pub(super) fn tombstone_lapsed(
+    ttl_deadline_ms: u64,
+    max_deadline_ms: u64,
+    now_ms: u64,
+    deferring: bool,
+) -> bool {
+    now_ms
+        >= if deferring {
+            max_deadline_ms
+        } else {
+            ttl_deadline_ms
+        }
+}
+
+/// Whether [`apply_locked`](super::apply::apply_locked) drops a tombstone
+/// that arrives over the wire instead of storing it. Only the tombstone of
+/// an expired entry (`expired_at_ms` `Some`) can be dropped, and only when
+/// the key holds nothing it would displace (`displaces` `false`) and the
+/// tombstone has already lapsed. A replica that collected such a tombstone
+/// would otherwise take it back from a peer that has not collected yet,
+/// with fresh deadlines, and the peers would hand it back and forth for
+/// good. Pure; unit tested directly.
+pub(super) fn drops_lapsed_expiry_tombstone(
+    expired_at_ms: Option<u64>,
+    displaces: bool,
+    deadlines: (u64, u64),
+    now_ms: u64,
+    deferring: bool,
+) -> bool {
+    expired_at_ms.is_some()
+        && !displaces
+        && tombstone_lapsed(deadlines.0, deadlines.1, now_ms, deferring)
+}
+
+/// The retention a shard's sweep leaves the tombstone of an expired entry
+/// under, or `None` when it leaves none: in a mode that runs no
+/// anti-entropy ([`Mode::tombstones_expired_entries`]), or under a resolver
+/// that merges. A merging cache already reads an expired stored side as
+/// absent on every node, swept or not, so a write older than the expired
+/// value starts a new value there rather than being an overwritten value
+/// coming back; a tombstone would make that depend on whether the receiving
+/// node has swept. Pure; unit tested directly.
+pub(crate) fn expiry_tombstone_retention(
+    mode: Mode,
+    resolver_merges: bool,
+    tombstone_ttl_ms: u64,
+    tombstone_max_ttl_ms: u64,
+) -> Option<TombstoneRetention> {
+    (mode.tombstones_expired_entries() && !resolver_merges).then_some(TombstoneRetention {
+        ttl_ms: tombstone_ttl_ms,
+        max_ttl_ms: tombstone_max_ttl_ms,
+    })
 }

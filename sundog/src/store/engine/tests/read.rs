@@ -71,7 +71,7 @@ fn inspect_reports_absent_tombstone_live_and_lapsed() {
         "an expiry equal to now has passed"
     );
 
-    engine.sweep(now);
+    engine.sweep(now, None);
     assert_eq!(
         inspect(4, now),
         LocalRecord::Absent,
@@ -310,7 +310,7 @@ fn written_record_for_returns_a_lapsed_entry_that_record_for_hides() {
 fn written_record_for_returns_nothing_once_a_sweep_has_reclaimed_the_entry() {
     let now = 2_000;
     let (engine, _) = engine_with_every_record(now);
-    engine.sweep(now);
+    engine.sweep(now, None);
     assert_eq!(engine.written_record_for(key_bytes(4).as_ref(), now), None);
 }
 

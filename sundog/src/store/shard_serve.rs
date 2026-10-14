@@ -520,7 +520,9 @@ where
                             encoded: value_bytes,
                         }
                     }
-                    None => Incoming::Tombstone,
+                    None => Incoming::Tombstone {
+                        expired_at_ms: rec.expires_at_ms,
+                    },
                 };
                 decoded.push((hash, key, rec.key, rec.ver, incoming, origin));
             }
@@ -802,7 +804,7 @@ where
 
     fn run_pending_tasks(&self) -> BoxFuture<'_, ()> {
         let now = self.now_ms();
-        self.engine.sweep(now);
+        self.engine.sweep(now, self.expiry_tombstones());
         Box::pin(async move {})
     }
 

@@ -110,11 +110,11 @@ use self::apply::apply_locked;
 pub(crate) use self::checkpoint::CheckpointFinalizeCounts;
 #[cfg(doc)]
 use self::evict::VictimOutcome;
-pub(crate) use self::expiry::Lapsed;
 #[cfg(doc)]
 use self::expiry::encode_expiry;
 #[cfg(doc)]
 use self::expiry::{LONG_TTL, decode_expiry, idle_elapsed_ms};
+pub(crate) use self::expiry::{Lapsed, TombstoneRetention, expiry_tombstone_retention};
 use self::expiry::{absent_at, absent_under, clamp_tti_ms, touch_stamp};
 pub(crate) use self::housekeeping::{CompactCandidate, CompactReplace, CompactScan};
 pub(crate) use self::inflight::{FillOutcome, FreshLoad, JoinOutcome};
@@ -607,6 +607,11 @@ pub(crate) struct Engine<K, V> {
     /// `evict_cursor` this is a rotation pointer, not a PRNG state, so a
     /// zero seed is fine.
     compact_cursor: AtomicU64,
+    /// What the last [`Engine::gc_tombstones`] call was told about member
+    /// absence. A tombstone that arrives already past the retention that
+    /// call applies is dropped rather than stored; see
+    /// [`expiry::drops_lapsed_expiry_tombstone`].
+    gc_deferring: AtomicBool,
     #[cfg(test)]
     eviction_lock_acquisitions: AtomicU64,
     /// Test-only: how many stripe read locks [`Engine::compact`] has taken
@@ -665,6 +670,7 @@ where
             pending_spill_weight: AtomicU64::new(0),
             prefold_enabled: AtomicBool::new(true),
             compact_cursor: AtomicU64::new(0),
+            gc_deferring: AtomicBool::new(false),
             #[cfg(test)]
             eviction_lock_acquisitions: AtomicU64::new(0),
             #[cfg(test)]
@@ -816,6 +822,16 @@ where
     /// The number of live entries across every stripe.
     pub(crate) fn live_entry_count(&self) -> u64 {
         self.live_count.load(Ordering::Relaxed)
+    }
+
+    /// The number of tombstones across every stripe, counted under each
+    /// stripe's read lock in turn. A tombstone is not a live entry, so
+    /// [`Engine::live_entry_count`], the weight and the capacity ignore it.
+    pub(crate) fn tombstone_count(&self) -> u64 {
+        self.stripes
+            .iter()
+            .map(|s| u64::try_from(s.read().tombstones.len()).unwrap_or(u64::MAX))
+            .fold(0u64, u64::saturating_add)
     }
 
     /// Turns resident byte counting on, for an engine that holds no

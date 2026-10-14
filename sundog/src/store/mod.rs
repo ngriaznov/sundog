@@ -157,15 +157,26 @@ pub(crate) fn bucket_of(key_bytes: &[u8]) -> u16 {
     PartId::of_key(key_bytes).bucket()
 }
 
-/// A tombstone: the version of the delete that created it, and its two GC
-/// deadlines. `ttl_deadline_ms` is when it becomes eligible for ordinary
-/// collection; `max_deadline_ms` is the hard cap past which it collects
-/// regardless of member absence. See [`ShardOps::gc_tombstones`].
+/// A tombstone: the version it stands for, the two GC deadlines it is kept
+/// under, and, for one an expired entry left, the expiry it was anchored on.
+/// `ttl_deadline_ms` is when it becomes eligible for ordinary collection;
+/// `max_deadline_ms` is the hard cap past which it collects regardless of
+/// member absence. See [`ShardOps::gc_tombstones`].
+///
+/// A delete makes a tombstone at the delete's version with deadlines a
+/// retention past the moment it lands. In a replicated mode the sweep also
+/// makes one for an entry that reached its deadline, at that entry's version
+/// (`expired_at_ms` is `Some`), with deadlines a retention past the expiry,
+/// so every replica that learns of it, by sweeping or by anti-entropy,
+/// collects it at the same instant. See [`ShardOps::run_pending_tasks`].
 #[derive(Debug, Clone, Copy)]
 struct Tombstone {
     ver: Hlc,
     ttl_deadline_ms: u64,
     max_deadline_ms: u64,
+    /// The expiry an expired entry's tombstone is anchored on, carried on
+    /// the wire as the record's `expires_at_ms`; `None` for a delete.
+    expired_at_ms: Option<u64>,
 }
 
 /// What a versioned write carries into `Shard::apply`: a live value, or a
@@ -182,7 +193,16 @@ enum Incoming<V> {
         /// decoding to a structurally equal `value`.
         encoded: Bytes,
     },
-    Tombstone,
+    /// A deletion marker. `expired_at_ms` is `Some` for the tombstone of an
+    /// entry that expired, whose retention counts from that expiry.
+    Tombstone { expired_at_ms: Option<u64> },
+}
+
+impl<V> Incoming<V> {
+    /// A delete's marker: kept for a retention from the moment it lands.
+    const DELETE: Self = Self::Tombstone {
+        expired_at_ms: None,
+    };
 }
 
 /// The lifespan a re-arm gives an entry, from now.

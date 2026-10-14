@@ -65,10 +65,17 @@ pub struct ClusterConfig {
     /// resurrect the entry via anti-entropy on return. A `Mode::Distributed`
     /// cache counts only a member that shares a part with this node once it
     /// is eligible again.
+    ///
+    /// In a `Mode::Replicated` or `Mode::Distributed` cache whose resolver
+    /// does not merge, the sweep also leaves a tombstone for an entry it
+    /// removes for having expired, kept for this retention counted from the
+    /// entry's expiry. `sundog_tombstones{cache}` counts the tombstones a
+    /// node holds.
     pub tombstone_ttl: Duration,
     /// Hard cap on tombstone retention regardless of any member's absence.
     /// Bounds [`tombstone_ttl`](Self::tombstone_ttl)'s deferral against a
-    /// member that never comes back.
+    /// member that never comes back. While a member is absent, a cache holds
+    /// one tombstone per entry that expired in the last `tombstone_max_ttl`.
     pub tombstone_max_ttl: Duration,
     /// How far ahead of this node's clock a remote write's version stamp
     /// may be. A replicated write, invalidation, anti-entropy repair or

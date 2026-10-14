@@ -178,7 +178,11 @@ pub struct WireRecord {
     pub value: Option<Bytes>,
     /// The write's HLC version stamp.
     pub ver: Hlc,
-    /// Absolute expiry in epoch milliseconds, or `None` for no TTL.
+    /// Absolute expiry in epoch milliseconds, or `None` for no TTL. On a
+    /// tombstone, `Some` marks the tombstone of an entry that expired and
+    /// holds the expiry, which the receiver counts its retention from; a
+    /// delete's tombstone carries `None`. A peer that predates this reading
+    /// ignores the field on a tombstone.
     pub expires_at_ms: Option<u64>,
 }
 

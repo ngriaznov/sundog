@@ -90,6 +90,8 @@ pub struct Model {
     hlc_clock: HlcClock,
     tombstone_ttl_ms: u64,
     tombstone_max_ttl_ms: u64,
+    /// What the last [`Model::gc`] was told about member absence.
+    gc_deferring: bool,
     /// `Some` only for [`new_shard_and_model_with_ownership`]'s pair: the
     /// same view attached to the paired `Shard`, so [`Model::owns`] answers
     /// exactly what that shard's own inbound/write guards would. `None`
@@ -110,6 +112,7 @@ impl Model {
             hlc_clock: HlcClock::new(node),
             tombstone_ttl_ms,
             tombstone_max_ttl_ms,
+            gc_deferring: false,
             ownership: None,
         }
     }
@@ -180,18 +183,34 @@ impl Model {
     }
 
     /// A versioned tombstone write under the same version rule as
-    /// [`Model::apply`], its two GC deadlines stamped from the clock.
-    pub fn remove(&mut self, key: u8, ver: Hlc) {
+    /// [`Model::apply`], its two GC deadlines stamped from the clock. A
+    /// delete counts them from now. The tombstone of an expired entry
+    /// (`expired_at_ms` `Some`) counts them from that expiry, capped at now,
+    /// and is dropped on arrival when it displaces nothing and its
+    /// retention has already lapsed: the `ttl` deadline, or the `max` one
+    /// while the last [`Model::gc`] deferred.
+    pub fn remove(&mut self, key: u8, ver: Hlc, expired_at_ms: Option<u64>) {
         if self.incoming_loses(key, ver) {
             return;
         }
         let now = self.now_ms();
+        let anchor = expired_at_ms.map_or(now, |expired| expired.min(now));
+        let ttl_deadline_ms = anchor.saturating_add(self.tombstone_ttl_ms);
+        let max_deadline_ms = anchor.saturating_add(self.tombstone_max_ttl_ms);
+        let horizon = if self.gc_deferring {
+            max_deadline_ms
+        } else {
+            ttl_deadline_ms
+        };
+        if expired_at_ms.is_some() && self.stored_ver(key).is_none() && now >= horizon {
+            return;
+        }
         self.entries.insert(
             key,
             ModelEntry::Tombstone {
                 ver,
-                ttl_deadline_ms: now.saturating_add(self.tombstone_ttl_ms),
-                max_deadline_ms: now.saturating_add(self.tombstone_max_ttl_ms),
+                ttl_deadline_ms,
+                max_deadline_ms,
             },
         );
     }
@@ -224,6 +243,7 @@ impl Model {
     /// `tombstone_ttl`, and past `tombstone_max_ttl` while any member is
     /// absent.
     pub fn gc(&mut self, any_member_absent: bool) {
+        self.gc_deferring = any_member_absent;
         let now = self.now_ms();
         self.entries.retain(|_, entry| match entry {
             ModelEntry::Tombstone {
@@ -240,13 +260,28 @@ impl Model {
     }
 
     /// [`super::engine::Engine::sweep`]'s rule: a live entry past its own
-    /// `expires_at_ms` is dropped outright, with no tombstone left behind.
+    /// `expires_at_ms` is replaced by a tombstone at its version, anchored
+    /// on that expiry: its deadlines count a retention from the expiry and
+    /// are never earlier than now.
     pub fn sweep(&mut self) {
         let now = self.now_ms();
-        self.entries.retain(|_, entry| match entry {
-            ModelEntry::Live { expires_at_ms, .. } => expires_at_ms.is_none_or(|exp| now < exp),
-            ModelEntry::Tombstone { .. } => true,
-        });
+        let (ttl, max) = (self.tombstone_ttl_ms, self.tombstone_max_ttl_ms);
+        for entry in self.entries.values_mut() {
+            if let ModelEntry::Live {
+                ver,
+                expires_at_ms: Some(expired_at_ms),
+                ..
+            } = *entry
+                && now >= expired_at_ms
+            {
+                let anchor = expired_at_ms.min(now);
+                *entry = ModelEntry::Tombstone {
+                    ver,
+                    ttl_deadline_ms: anchor.saturating_add(ttl).max(now),
+                    max_deadline_ms: anchor.saturating_add(max).max(now),
+                };
+            }
+        }
     }
 
     /// What a read of `key` sees now: `None` for an absent key, a
@@ -467,7 +502,11 @@ fn apply_remote_to_model(model: &mut Model, record: &RemoteRecord, now_ms: u64) 
             v,
             remote_expiry(now_ms, record.expires_offset_ms),
         ),
-        None => model.remove(record.key, ver),
+        None => model.remove(
+            record.key,
+            ver,
+            remote_expiry(now_ms, record.expires_offset_ms),
+        ),
     }
 }
 
@@ -491,7 +530,7 @@ fn apply_op(op: &Op, shard: &Shard<u8, u8>, model: &mut Model) {
         Op::LocalRemove { key } => {
             let ver = model.stamp_local();
             let _ = futures::executor::block_on(shard.remove(key));
-            model.remove(*key, ver);
+            model.remove(*key, ver, None);
         }
         Op::RemoteApply {
             key,
@@ -628,6 +667,103 @@ pub fn run(ops: &[Op], shard: &Shard<u8, u8>, model: &mut Model) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn model() -> Model {
+        Model::new(NodeId::from(1), 1_000, 10_000)
+    }
+
+    fn ver(wall_ms: u64) -> Hlc {
+        Hlc {
+            wall_ms,
+            logical: 0,
+            node: NodeId::from(2),
+        }
+    }
+
+    fn held(model: &Model, key: u8) -> Option<Hlc> {
+        model
+            .entries()
+            .into_iter()
+            .find_map(|(bytes, v)| (bytes == key_bytes(key)).then_some(v))
+    }
+
+    #[test]
+    fn sweep_replaces_an_expired_entry_with_a_tombstone_that_keeps_its_version() {
+        let mut model = model();
+        model.apply(1, ver(5), 7, Some(START_CLOCK_MS + 100));
+        model.advance_clock(200);
+        model.sweep();
+
+        assert_eq!(model.visible(1), None);
+        assert_eq!(
+            held(&model, 1),
+            Some(ver(5)),
+            "listed at the entry's version"
+        );
+        model.apply(1, ver(4), 9, None);
+        assert_eq!(model.visible(1), None, "an older write stays out");
+        model.apply(1, ver(6), 9, None);
+        assert_eq!(model.visible(1), Some(9), "a newer one lands");
+    }
+
+    #[test]
+    fn a_swept_tombstone_is_collected_a_retention_after_the_expiry() {
+        let mut model = model();
+        model.apply(1, ver(5), 7, Some(START_CLOCK_MS + 100));
+        model.advance_clock(200);
+        model.sweep();
+
+        model.advance_clock(899);
+        model.gc(false);
+        assert!(held(&model, 1).is_some(), "kept until the retention ends");
+        model.advance_clock(1);
+        model.gc(true);
+        assert!(held(&model, 1).is_some(), "an absent member defers it");
+        model.advance_clock(9_000);
+        model.gc(true);
+        assert_eq!(held(&model, 1), None, "the cap collects it");
+    }
+
+    #[test]
+    fn a_late_sweep_keeps_the_tombstone_to_the_sweep() {
+        let mut model = model();
+        model.apply(1, ver(5), 7, Some(START_CLOCK_MS + 100));
+        model.advance_clock(50_000);
+        model.sweep();
+        assert!(held(&model, 1).is_some());
+        model.gc(false);
+        assert_eq!(held(&model, 1), None, "collectible at the sweep instant");
+    }
+
+    #[test]
+    fn a_lapsed_expiry_tombstone_stores_nothing_unless_it_displaces_something() {
+        let mut model = model();
+        let long_ago = Some(START_CLOCK_MS - 5_000);
+        model.remove(1, ver(5), long_ago);
+        assert_eq!(held(&model, 1), None, "nothing to displace, already lapsed");
+
+        model.apply(2, ver(4), 1, None);
+        model.remove(2, ver(5), long_ago);
+        assert_eq!(model.visible(2), None, "it deletes the older copy");
+        assert_eq!(held(&model, 2), Some(ver(5)), "and stays until collected");
+
+        model.remove(3, ver(5), None);
+        assert_eq!(held(&model, 3), Some(ver(5)), "a delete is always stored");
+    }
+
+    #[test]
+    fn a_deferring_collection_keeps_a_lapsed_expiry_tombstone_to_its_cap() {
+        let mut model = model();
+        model.gc(true);
+        model.remove(1, ver(5), Some(START_CLOCK_MS - 20_000));
+        assert_eq!(held(&model, 1), None, "past its cap too");
+        model.remove(1, ver(5), Some(START_CLOCK_MS - 2_000));
+        assert_eq!(
+            held(&model, 1),
+            Some(ver(5)),
+            "within its cap, past its ttl"
+        );
+    }
 
     #[test]
     fn part_of_is_the_part_a_model_key_hashes_into_inside_its_bucket() {

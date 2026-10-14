@@ -1099,11 +1099,12 @@ pub(crate) async fn tombstone_gc_task(
     }
 }
 
-/// Publishes `sundog_cache_entries{cache}` for one opened cache, and
-/// `sundog_cache_bytes{cache}` for one with a memory ceiling: set
-/// immediately, then refreshed every 5 seconds from [`Shard::entry_count`]
-/// and [`Shard::resident_bytes`] for as long as the cache stays open. The
-/// count is only advisory until pending housekeeping flushes.
+/// Publishes `sundog_cache_entries{cache}` and `sundog_tombstones{cache}` for
+/// one opened cache, and `sundog_cache_bytes{cache}` for one with a memory
+/// ceiling: set immediately, then refreshed every 5 seconds from
+/// [`Shard::entry_count`], [`Shard::tombstone_count`] and
+/// [`Shard::resident_bytes`] for as long as the cache stays open. The counts
+/// are only advisory until pending housekeeping flushes.
 pub(crate) async fn cache_entries_gauge_task<K, V>(
     shard: Arc<Shard<K, V>>,
     name: SmolStr,
@@ -1113,6 +1114,7 @@ pub(crate) async fn cache_entries_gauge_task<K, V>(
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
     let gauge = metrics::gauge!("sundog_cache_entries", "cache" => name.to_string());
+    let tombstone_gauge = metrics::gauge!("sundog_tombstones", "cache" => name.to_string());
     let bytes_gauge = shard
         .resident_bytes()
         .is_some()
@@ -1122,7 +1124,10 @@ pub(crate) async fn cache_entries_gauge_task<K, V>(
             gauge.set(resident_bytes_f64(bytes));
         }
     };
+    // The sweep inside `entry_count` runs first, so the tombstones it leaves
+    // are counted in the same pass.
     gauge.set(entry_count_f64(shard.entry_count().await));
+    tombstone_gauge.set(entry_count_f64(shard.tombstone_count()));
     publish_bytes();
 
     let mut ticker = tokio::time::interval(Duration::from_secs(5));
@@ -1132,6 +1137,7 @@ pub(crate) async fn cache_entries_gauge_task<K, V>(
             return;
         }
         gauge.set(entry_count_f64(shard.entry_count().await));
+        tombstone_gauge.set(entry_count_f64(shard.tombstone_count()));
         publish_bytes();
     }
 }

@@ -1,10 +1,13 @@
 //! Scripted cache traffic whose exact metric values the exporter test pins.
 
 use smol_str::SmolStr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use sundog::store::{Shard, ShardOps};
 use sundog::{Cluster, Mode, NodeId};
+
+use crate::support::node_config;
 
 /// A known hit/miss sequence on a `Mode::Local` cache of its own, exact
 /// rather than shared with `users`' traffic: 2 inserts, 3 hit gets, 2 miss
@@ -137,6 +140,48 @@ pub(crate) async fn memory_ceiling_pin_metrics(cluster: &Cluster) -> u64 {
     capped
         .resident_bytes()
         .expect("a capped cache counts its bytes")
+}
+
+/// How many tombstones [`tombstone_pin_metrics`] leaves: two deletes and one
+/// swept expired entry.
+pub(crate) const TOMBSTONE_PIN_COUNT: f64 = 3.0;
+
+/// Drives `sundog_tombstones{cache}` on a `Mode::Replicated` cache of a node
+/// of its own, which keeps tombstones for an hour where the shared nodes'
+/// two seconds would collect them mid-test: two removes and one entry that
+/// expires and is swept leave three tombstones, and the live entries beside
+/// them leave none. Returns the node, which must stay up until the gauge is
+/// scraped.
+pub(crate) async fn tombstone_pin_metrics() -> Cluster {
+    let node = Cluster::builder("it-prometheus-tombstones")
+        .seeds(std::iter::empty())
+        .config(
+            node_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).with(|c| {
+                c.tombstone_ttl = Duration::from_hours(1);
+            }),
+        )
+        .build()
+        .await
+        .expect("node builds");
+    let cache = node
+        .cache::<u32, String>("tombstone-pin")
+        .mode(Mode::Replicated)
+        .open()
+        .await
+        .expect("cache opens");
+    for key in 1..=4 {
+        cache.insert(key, "v".into()).await.expect("insert");
+    }
+    cache.remove(&1).await.expect("remove");
+    cache.remove(&2).await.expect("remove");
+    cache
+        .insert_with_ttl(5, "short".into(), Duration::from_millis(30))
+        .await
+        .expect("insert with ttl");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The count sweeps first, so the expired entry becomes a tombstone.
+    assert_eq!(cache.entry_count().await, 2);
+    node
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -3,6 +3,7 @@
 use super::test_support::{loopback_config, wait_for_peer_count, wait_until};
 use super::*;
 
+mod ae_expiry;
 mod ae_repair;
 mod background;
 mod builder;

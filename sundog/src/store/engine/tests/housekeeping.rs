@@ -8,7 +8,7 @@ fn sweep_removes_expired_entries_and_corrects_the_digest() {
     let _ = put(&engine, 1, key_bytes(1), "a".into(), hlc(1, 1), Some(50), 0);
     let _ = put(&engine, 2, key_bytes(2), "b".into(), hlc(1, 1), None, 0);
 
-    engine.sweep(100);
+    engine.sweep(100, None);
     assert_eq!(engine.get(&1, 100), None);
     assert_eq!(engine.get(&2, 100), Some("b".to_string()));
     assert_eq!(engine.digests(), engine.recompute_digests_paired());
@@ -77,7 +77,7 @@ fn sweep_of_an_expired_long_ttl_entry_clears_its_side_table_row() {
             .contains_key(kb.as_ref())
     );
 
-    engine.sweep(deadline + 1);
+    engine.sweep(deadline + 1, None);
 
     assert_eq!(engine.get(&1, deadline + 1), None, "swept: reads as absent");
     assert!(
@@ -120,7 +120,7 @@ fn sweep_of_a_tti_idle_long_ttl_entry_clears_its_side_table_row() {
     assert_eq!(entries_before, 1);
 
     // Idle past the 100ms TTI, nowhere near `deadline`.
-    engine.sweep(500);
+    engine.sweep(500, None);
 
     let (entries_after, _) = engine.debug_totals();
     assert_eq!(entries_after, 0, "sweep evicts the tti-idle entry");
@@ -147,7 +147,7 @@ fn next_expiry_ms_skip_logic_leaves_stripes_with_nothing_due_untouched() {
     assert_eq!(engine.stripe_lock(bucket).read().next_expiry_ms, 10_000);
 
     // Sweeping well before the deadline does not touch this stripe.
-    engine.sweep(1);
+    engine.sweep(1, None);
     assert_eq!(engine.get(&key, 1), Some("a".to_string()));
     assert_eq!(engine.stripe_lock(bucket).read().next_expiry_ms, 10_000);
 }

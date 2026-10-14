@@ -415,9 +415,40 @@ async fn an_evicted_write_is_departed_with_its_queued_version() {
 }
 
 #[tokio::test]
-async fn a_lapsed_write_swept_before_the_drain_is_departed() {
+async fn a_lapsed_write_swept_before_the_drain_ships_its_tombstone() {
     let clock = clock_at(T0);
     let a = replicated(&clock);
+    a.insert_with_ttl(1, "a".into(), Duration::from_millis(50))
+        .await
+        .expect("insert");
+    let writes = drained(&a);
+    clock.store(T0 + 100, Ordering::SeqCst);
+    ShardOps::run_pending_tasks(&a).await;
+
+    let fan = a.fan_out_records(&writes).await;
+
+    assert!(
+        fan.departed.is_empty(),
+        "a replicated sweep keeps the write's version as a tombstone, which ships"
+    );
+    assert_eq!(fan.records.len(), 1);
+    assert_eq!(key_of(&fan.records[0]), 1);
+    assert!(
+        fan.records[0].value.is_none(),
+        "a tombstone carries no value"
+    );
+    assert_eq!(fan.records[0].ver, writes[0].1);
+    assert_eq!(
+        fan.records[0].expires_at_ms,
+        Some(T0 + 50),
+        "it carries the expiry its retention counts from"
+    );
+}
+
+#[tokio::test]
+async fn a_lapsed_write_swept_before_the_drain_is_departed_where_a_sweep_keeps_nothing() {
+    let clock = clock_at(T0);
+    let a = clocked(Mode::Invalidation, u64::MAX, None, &clock);
     a.insert_with_ttl(1, "a".into(), Duration::from_millis(50))
         .await
         .expect("insert");

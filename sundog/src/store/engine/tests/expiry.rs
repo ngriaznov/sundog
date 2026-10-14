@@ -585,7 +585,7 @@ fn a_sweep_sampled_before_a_touch_keeps_the_touched_entry() {
     let engine = engine_u32_string(u64::MAX, Some(Duration::from_millis(100)));
     let _ = put(&engine, 1, key_bytes(1), "a".into(), hlc(1, 1), None, 1_000);
     assert_eq!(engine.get(&1, 1_001), Some("a".to_string()));
-    engine.sweep(999);
+    engine.sweep(999, None);
     assert_eq!(
         engine.live_entry_count(),
         1,

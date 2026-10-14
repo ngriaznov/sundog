@@ -1281,7 +1281,7 @@ fn tombstone_over_a_spilled_key_removes_it_and_corrects_weight_and_live_count() 
                 key_bytes: kb.clone(),
             },
             hlc(2, 1),
-            Incoming::Tombstone,
+            Incoming::DELETE,
         );
         assert!(matches!(outcome, ApplyOutcome::Tombstoned { .. }));
         assert!(
@@ -1351,7 +1351,7 @@ fn sweep_removes_an_expired_spilled_key_and_corrects_the_digest() {
     engine.debug_insert_spilled(&kb, hlc(1, 1), Some(50), loc(0, 0, 4, 0), 0);
     assert_eq!(engine.debug_spill_entries_count(), 1);
 
-    engine.sweep(100);
+    engine.sweep(100, None);
     assert_eq!(engine.get(&key, 100), None);
     let (live_count, weight) = engine.debug_totals();
     assert_eq!((live_count, weight), (0, 0));
@@ -1361,6 +1361,61 @@ fn sweep_removes_an_expired_spilled_key_and_corrects_the_digest() {
         0,
         "an expiry sweep of a spilled key must decrement sundog_spill_entries"
     );
+}
+
+#[test]
+fn sweeping_an_expired_spilled_key_with_retention_leaves_a_tombstone_and_decrements_spill_entries()
+{
+    let engine = engine_u32_string(u64::MAX, None);
+    let key = 1u32;
+    let kb = key_bytes(key);
+    let hash = hash_key_bytes(kb.as_ref());
+    let bucket = stripe_index_from_hash(hash);
+    engine.debug_insert_spilled(&kb, hlc(1, 1), Some(50), loc(0, 0, 4, 0), 0);
+    let before = engine.digests();
+
+    engine.sweep(
+        100,
+        Some(crate::store::engine::TombstoneRetention {
+            ttl_ms: 60_000,
+            max_ttl_ms: 600_000,
+        }),
+    );
+
+    assert_eq!(engine.get(&key, 100), None);
+    assert_eq!(engine.debug_totals(), (0, 0));
+    assert_eq!(
+        engine.debug_spill_entries_count(),
+        0,
+        "the swept spilled entry leaves sundog_spill_entries"
+    );
+    assert_eq!(engine.tombstone_count(), 1);
+    assert_eq!(
+        engine.digests(),
+        before,
+        "the tombstone keeps the fingerprint"
+    );
+    assert_eq!(engine.digests(), engine.recompute_digests_paired());
+    assert_eq!(
+        engine.inspect(kb.as_ref(), 100),
+        LocalRecord::Tombstone { version: hlc(1, 1) }
+    );
+
+    let inserted = SpillSink::install_new(
+        &engine,
+        bucket,
+        &kb,
+        hash,
+        hlc(1, 1),
+        None,
+        loc(0, 0, 4, 0),
+        1,
+    );
+    assert!(
+        !inserted,
+        "a hand-off still pending for the swept key is refused by its tombstone"
+    );
+    assert_eq!(engine.debug_totals(), (0, 0));
 }
 
 #[test]

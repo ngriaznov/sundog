@@ -2,6 +2,7 @@
 
 mod builder;
 mod distributed_fetch;
+mod expiry_tombstone;
 mod explain_probes;
 mod explain_reads;
 mod fan_out_departed;

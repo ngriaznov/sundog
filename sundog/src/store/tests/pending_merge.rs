@@ -352,7 +352,10 @@ async fn the_pending_count_is_zero_after_every_way_a_fold_leaves() {
     assert_eq!(s.pending_merge_count(), 0, "a flush of everything");
 
     s.merge(9, 1).await.expect("merge");
-    ShardOps::invalidate(&s, key_bytes(&9u32), hlc(ahead_ms(), 2)).await;
+    // Past the clock the remote tombstone above moved: stamped in the same
+    // millisecond it would carry an older logical counter than the fold's
+    // and lose to it.
+    ShardOps::invalidate(&s, key_bytes(&9u32), hlc(ahead_ms() + 1_000, 2)).await;
     assert_eq!(
         s.pending_merge_count(),
         0,

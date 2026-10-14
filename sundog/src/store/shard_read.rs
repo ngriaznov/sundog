@@ -219,13 +219,27 @@ where
 
     /// The number of live entries this node currently holds. Runs the engine's
     /// sweep first, so completed TTL/TTI expiries are reflected rather than
-    /// estimated. Sampled periodically by
+    /// estimated. In a `Replicated` or `Distributed` shard whose resolver
+    /// does not merge, that sweep turns an entry that expired into a
+    /// tombstone at its version, so an older copy of the key cannot come back
+    /// after it; an entry that went idle, and every sweep in another mode or
+    /// under a merging resolver, leaves nothing. Sampled periodically by
     /// `cluster::cache_entries_gauge_task` to publish
     /// `sundog_cache_entries{cache}`.
     pub async fn entry_count(&self) -> u64 {
         let now = self.now_ms();
-        self.engine.sweep(now);
+        self.engine.sweep(now, self.expiry_tombstones());
         self.engine.live_entry_count()
+    }
+
+    /// The number of tombstones this node holds: the deletes it keeps for
+    /// `tombstone_ttl`, and in a `Replicated` or `Distributed` cache with a
+    /// resolver that picks a side, the expired entries its sweep turned into
+    /// tombstones. Sampled periodically by `cluster::cache_entries_gauge_task`
+    /// to publish `sundog_tombstones{cache}`. A full pass over the stripes.
+    #[must_use]
+    pub(crate) fn tombstone_count(&self) -> u64 {
+        self.engine.tombstone_count()
     }
 
     /// A weakly consistent, point-in-time snapshot of this node's local live

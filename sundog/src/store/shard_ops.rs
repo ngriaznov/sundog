@@ -217,14 +217,19 @@ pub trait ShardOps: Send + Sync {
     /// versioned [`ShardOps::apply_remote`] path as live traffic.
     fn snapshot_chunks(&self) -> BoxStream<'static, Vec<WireRecord>>;
 
-    /// Garbage-collects tombstones older than `tombstone_ttl`. While
-    /// `any_member_absent`, a tombstone past `tombstone_ttl` but not
-    /// `tombstone_max_ttl` is left in place instead.
+    /// Garbage-collects tombstones older than `tombstone_ttl`: a delete's,
+    /// counted from the delete, and an expired entry's, counted from its
+    /// expiry. While `any_member_absent`, a tombstone past `tombstone_ttl`
+    /// but not `tombstone_max_ttl` is left in place instead. A tombstone that
+    /// arrives from a peer already past the retention this call applies is
+    /// dropped on arrival when it displaces nothing.
     fn gc_tombstones(&self, any_member_absent: bool) -> BoxFuture<'_, ()>;
 
     /// Runs `engine::Engine::sweep`, since the engine has no free-running sweep
     /// of its own. Called periodically by `tombstone_gc_task`, independent
-    /// of read/write traffic.
+    /// of read/write traffic. In a `Replicated` or `Distributed` shard whose
+    /// resolver does not merge, an entry the sweep removes for having expired
+    /// leaves a tombstone at its version.
     fn run_pending_tasks(&self) -> BoxFuture<'_, ()>;
 
     /// Runs one rate-limited pass of the CRDT writer-retirement sweep over

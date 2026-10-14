@@ -55,6 +55,15 @@ impl Mode {
         }
     }
 
+    /// Whether a sweep of this mode leaves a tombstone for an entry that
+    /// expired. `Replicated` and `Distributed` run anti-entropy, so an
+    /// expired entry removed with no trace would let a replica that missed
+    /// the overwrite bring the overwritten value back; `Local` and
+    /// `Invalidation` run none and keep nothing.
+    pub(crate) const fn tombstones_expired_entries(self) -> bool {
+        matches!(self, Self::Replicated | Self::Distributed { .. })
+    }
+
     /// The wire token gossiped for this mode under a `cache:<name>` chitchat
     /// key. A stable string, not a `Debug`/`Display` impl, so renaming a
     /// variant never changes the wire.

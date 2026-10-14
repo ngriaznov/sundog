@@ -212,6 +212,19 @@ where
         self
     }
 
+    /// What a sweep of this shard leaves behind for an entry that expired:
+    /// the retention of its tombstone, or `None` for nothing. See
+    /// [`expiry_tombstone_retention`]. Read at call time, so a retention
+    /// set after construction applies.
+    pub(super) fn expiry_tombstones(&self) -> Option<super::engine::TombstoneRetention> {
+        super::engine::expiry_tombstone_retention(
+            self.mode,
+            self.resolver.merges(),
+            self.tombstone_ttl_ms,
+            self.tombstone_max_ttl_ms,
+        )
+    }
+
     /// Overrides how far ahead of this node's clock a remote stamp may be
     /// ([`ClusterConfig::max_clock_skew`]); `None` accepts any stamp.
     #[must_use]

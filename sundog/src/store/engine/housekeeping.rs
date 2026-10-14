@@ -9,12 +9,16 @@ use serde::de::DeserializeOwned;
 
 use crate::hlc::Hlc;
 use crate::store::{
-    BUCKET_COUNT, CompactionBounds, ConflictResolver, Quiescence, crdt, entry_fingerprint,
+    BUCKET_COUNT, CompactionBounds, ConflictResolver, Quiescence, Tombstone, crdt,
+    entry_fingerprint,
 };
 
 #[cfg(all(doc, feature = "spill"))]
 use super::EntryState;
-use super::expiry::{LONG_TTL, decode_expiry, encode_expiry};
+use super::expiry::{
+    LONG_TTL, SweepFate, TombstoneRetention, decode_expiry, encode_expiry, sweep_fate,
+    swept_tombstone_deadlines,
+};
 use super::keys::{
     digest_slot, hash_key_bytes, hasher_for, part_index_from_hash, stripe_index_from_hash,
 };
@@ -73,7 +77,14 @@ where
     /// Drops tombstones past `tombstone_ttl`, or past the hard cap
     /// `tombstone_max_ttl` while `any_member_absent`, correcting the
     /// digest.
+    ///
+    /// Remembers `any_member_absent` for [`Engine::apply_many`]: while
+    /// collection is deferred, a tombstone that arrives lapsed past its
+    /// `ttl_deadline_ms` but not its `max_deadline_ms` is still worth
+    /// keeping.
     pub(crate) fn gc_tombstones(&self, any_member_absent: bool, now_ms: u64) {
+        self.gc_deferring
+            .store(any_member_absent, Ordering::Relaxed);
         for (idx, stripe_lock) in self.stripes.iter().enumerate() {
             let mut stripe = stripe_lock.write();
             stripe.tombstones.retain(|key_bytes, t| {
@@ -94,7 +105,17 @@ where
     /// `next_expiry_ms` is due, or every stripe if TTI is configured,
     /// removes expired/idle live entries, corrects the digest and total
     /// weight, and recomputes `next_expiry_ms` exactly.
-    pub(crate) fn sweep(&self, now_ms: u64) {
+    ///
+    /// With `expiry_tombstones` set, an entry removed for having passed its
+    /// expiry leaves a tombstone at its own version, anchored on that
+    /// expiry (see [`sweep_fate`]): a replica that missed the entry's
+    /// overwrite cannot bring the overwritten value back after the sweep
+    /// any more than before it. The tombstone has the live entry's
+    /// fingerprint, so the digest does not change here and
+    /// [`Engine::gc_tombstones`] drops it from the digest when it collects.
+    /// Without it, and for an entry that went idle, the removal leaves no
+    /// trace.
+    pub(crate) fn sweep(&self, now_ms: u64, expiry_tombstones: Option<TombstoneRetention>) {
         for (idx, stripe_lock) in self.stripes.iter().enumerate() {
             let due = stripe_lock.read().next_expiry_ms <= now_ms;
             if !due && self.tti_ms.is_none() {
@@ -109,32 +130,59 @@ where
             let mut removed_spilled = 0usize;
             let mut new_next = u64::MAX;
             let mut cleared_long_ttl: Vec<Bytes> = Vec::new();
+            let mut expired: Vec<(Bytes, Hlc, u64)> = Vec::new();
             stripe.live.retain(hasher_for, |live| {
                 let key_bytes = record_key(&live.record);
-                if self.is_absent(live, key_bytes, &stripe.long_ttl, now_ms) {
+                let expires_at_ms =
+                    decode_expiry(live.wall_ms, live.expiry, key_bytes, &stripe.long_ttl);
+                let absent = self.is_absent(live, key_bytes, &stripe.long_ttl, now_ms);
+                let fate = sweep_fate(absent, expires_at_ms, now_ms, expiry_tombstones.is_some());
+                if fate == SweepFate::Keep {
+                    if let Some(exp) = expires_at_ms {
+                        new_next = new_next.min(exp);
+                    }
+                    return true;
+                }
+                if let (SweepFate::Tombstone, Some(lapsed_at)) = (fate, expires_at_ms) {
+                    // The tombstone carries the fingerprint on: no digest
+                    // change here.
+                    expired.push((record_key_bytes(&live.record), live.ver(), lapsed_at));
+                } else {
                     let part = part_index_from_hash(hash_key_bytes(key_bytes));
                     self.digest[digest_slot(idx, part)]
                         .fetch_xor(entry_fingerprint(key_bytes, live.ver()), Ordering::Relaxed);
-                    removed_weight += u64::from(live.weight);
-                    removed_count += 1;
-                    if is_spilled(live) {
-                        removed_spilled += 1;
-                    }
-                    if live.expiry == LONG_TTL {
-                        cleared_long_ttl.push(Bytes::copy_from_slice(key_bytes));
-                    }
-                    false
-                } else {
-                    if let Some(exp) =
-                        decode_expiry(live.wall_ms, live.expiry, key_bytes, &stripe.long_ttl)
-                    {
-                        new_next = new_next.min(exp);
-                    }
-                    true
                 }
+                removed_weight += u64::from(live.weight);
+                removed_count += 1;
+                if is_spilled(live) {
+                    removed_spilled += 1;
+                }
+                if live.expiry == LONG_TTL {
+                    cleared_long_ttl.push(Bytes::copy_from_slice(key_bytes));
+                }
+                false
             });
             for key_bytes in &cleared_long_ttl {
                 stripe.long_ttl.remove(key_bytes.as_ref());
+            }
+            if let Some(retention) = expiry_tombstones {
+                for (key_bytes, ver, lapsed_at) in expired {
+                    let (ttl_deadline_ms, max_deadline_ms) =
+                        swept_tombstone_deadlines(lapsed_at, now_ms, retention);
+                    let prior = stripe.tombstones.insert(
+                        key_bytes,
+                        Tombstone {
+                            ver,
+                            ttl_deadline_ms,
+                            max_deadline_ms,
+                            expired_at_ms: Some(lapsed_at),
+                        },
+                    );
+                    debug_assert!(
+                        prior.is_none(),
+                        "a key is never live and tombstoned at once, so the digest would count it twice"
+                    );
+                }
             }
             stripe.next_expiry_ms = new_next;
             drop(guard);

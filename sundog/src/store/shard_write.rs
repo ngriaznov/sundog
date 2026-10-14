@@ -236,7 +236,7 @@ where
                 }
                 rec
             }
-            Incoming::Tombstone => {
+            Incoming::Tombstone { .. } => {
                 let rec = WireRecord {
                     key: key_bytes,
                     value: None,
@@ -529,7 +529,7 @@ where
                     Incoming::Put { encoded, .. } => {
                         u64::from(tier.admit_charge(key_bytes.len(), encoded.len()))
                     }
-                    Incoming::Tombstone => 0,
+                    Incoming::Tombstone { .. } => 0,
                 })
                 .sum();
             let reserved = u32::try_from(reserved).unwrap_or(u32::MAX);
@@ -723,7 +723,7 @@ where
         self.discard_pending_merge(key, key_bytes.as_ref());
         let ver = self.stamp_local();
         if !self.owns_key(key_bytes.as_ref()) {
-            let rec = self.forward_write(key.clone(), key_bytes, Incoming::Tombstone, ver);
+            let rec = self.forward_write(key.clone(), key_bytes, Incoming::DELETE, ver);
             if !self.fan_out.push(FanOutItem::Forward(rec)) {
                 return Err(self.closed());
             }
@@ -731,13 +731,7 @@ where
                 .increment(1);
             return Ok(());
         }
-        self.apply(
-            key.clone(),
-            key_bytes,
-            ver,
-            Incoming::Tombstone,
-            Origin::Local,
-        );
+        self.apply(key.clone(), key_bytes, ver, Incoming::DELETE, Origin::Local);
         Ok(())
     }
 
@@ -764,13 +758,13 @@ where
         let (owned_prepared, forwarded_prepared) = self.partition_owned(prepared, |e| e.0);
         self.wait_for_fan_out_room().await;
         if !self.forward_prepared(forwarded_prepared, |(_, key, key_bytes, ver)| {
-            (key, key_bytes, ver, Incoming::Tombstone)
+            (key, key_bytes, ver, Incoming::DELETE)
         }) {
             return Err(self.closed());
         }
 
         self.apply_grouped(owned_prepared, |(hash, key, key_bytes, ver)| {
-            (hash, key, key_bytes, ver, Incoming::Tombstone)
+            (hash, key, key_bytes, ver, Incoming::DELETE)
         })
         .await;
         Ok(())

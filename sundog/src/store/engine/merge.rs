@@ -140,7 +140,7 @@ pub(super) fn resolve_conflict<V>(
         sv,
         ver,
         stored_tombstone,
-        matches!(incoming, Incoming::Tombstone),
+        matches!(incoming, Incoming::Tombstone { .. }),
     ) {
         return resolution;
     }
@@ -156,7 +156,7 @@ pub(super) fn resolve_conflict<V>(
             expires_at_ms,
             ..
         } => (Some(encoded), *expires_at_ms),
-        Incoming::Tombstone => (None, None),
+        Incoming::Tombstone { .. } => (None, None),
     };
     let incoming_view = RecordView {
         value: incoming_encoded

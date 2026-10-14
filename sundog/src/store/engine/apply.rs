@@ -20,7 +20,9 @@ use crate::store::{ConflictResolver, Incoming, Tombstone, Weigher, entry_fingerp
 
 #[cfg(feature = "spill")]
 use super::EntryState;
-use super::expiry::{absent_at, decode_expiry, encode_expiry};
+use super::expiry::{
+    absent_at, decode_expiry, drops_lapsed_expiry_tombstone, encode_expiry, tombstone_deadlines,
+};
 use super::keys::{digest_slot, hasher_for, part_index_from_hash, stripe_index_from_hash};
 use super::merge::resolve_and_rebind;
 #[cfg(doc)]
@@ -139,6 +141,9 @@ pub(crate) struct ApplyCtx<'a, K, V> {
     pub(super) spill: Option<&'a SpillTier>,
     pub(super) tombstone_ttl_ms: u64,
     pub(super) tombstone_max_ttl_ms: u64,
+    /// Whether tombstone collection is deferred for an absent member; see
+    /// [`Engine::gc_tombstones`].
+    pub(super) deferring: bool,
     pub(super) now_ms: u64,
     /// Applies a write only as a fold into a visible live entry; see
     /// [`ApplyScope::HeldOnly`].
@@ -279,6 +284,10 @@ where
         }
     }
 
+    if drops_on_arrival(ctx, &incoming, stored_ver.is_some()) {
+        return (ApplyOutcome::Rejected, false);
+    }
+
     let had_live = prior_tombstone.is_none() && stored_ver.is_some();
     let was_visible = stored_live.as_ref().is_some_and(|s| s.visible);
     let new_fp = entry_fingerprint(key_bytes.as_ref(), ver);
@@ -320,8 +329,37 @@ where
             had_live,
             was_visible,
         ),
-        Incoming::Tombstone => apply_tombstone(stripe, ctx, entry, ver, had_live),
+        Incoming::Tombstone { expired_at_ms } => {
+            apply_tombstone(stripe, ctx, entry, ver, expired_at_ms, had_live)
+        }
     }
+}
+
+/// Whether `incoming` is a tombstone of an expired entry that arrives already
+/// past the retention the next collection applies and would displace nothing
+/// (`displaces` `false`), so [`apply_locked`] stores nothing for it; see
+/// [`drops_lapsed_expiry_tombstone`].
+fn drops_on_arrival<K, V>(
+    ctx: &ApplyCtx<'_, K, V>,
+    incoming: &Incoming<V>,
+    displaces: bool,
+) -> bool {
+    let Incoming::Tombstone { expired_at_ms } = *incoming else {
+        return false;
+    };
+    let deadlines = tombstone_deadlines(
+        expired_at_ms,
+        ctx.now_ms,
+        ctx.tombstone_ttl_ms,
+        ctx.tombstone_max_ttl_ms,
+    );
+    drops_lapsed_expiry_tombstone(
+        expired_at_ms,
+        displaces,
+        deadlines,
+        ctx.now_ms,
+        ctx.deferring,
+    )
 }
 
 /// The held-only gate of [`apply_locked`]: whether the write at `ver` is
@@ -441,6 +479,7 @@ fn apply_tombstone<K, V>(
     ctx: &ApplyCtx<'_, K, V>,
     entry: EntryKey<K>,
     ver: Hlc,
+    expired_at_ms: Option<u64>,
     had_live: bool,
 ) -> (ApplyOutcome<K, V>, bool)
 where
@@ -458,12 +497,19 @@ where
         ctx.live_count.fetch_sub(1, Ordering::Relaxed);
         displaced_spilled = removed.was_spilled;
     }
+    let (ttl_deadline_ms, max_deadline_ms) = tombstone_deadlines(
+        expired_at_ms,
+        ctx.now_ms,
+        ctx.tombstone_ttl_ms,
+        ctx.tombstone_max_ttl_ms,
+    );
     stripe.tombstones.insert(
         key_bytes,
         Tombstone {
             ver,
-            ttl_deadline_ms: ctx.now_ms.saturating_add(ctx.tombstone_ttl_ms),
-            max_deadline_ms: ctx.now_ms.saturating_add(ctx.tombstone_max_ttl_ms),
+            ttl_deadline_ms,
+            max_deadline_ms,
+            expired_at_ms,
         },
     );
     (
@@ -660,6 +706,7 @@ where
                     spill: self.spill().map(Arc::as_ref),
                     tombstone_ttl_ms,
                     tombstone_max_ttl_ms,
+                    deferring: self.gc_deferring.load(Ordering::Relaxed),
                     now_ms,
                     held_only,
                 };
@@ -740,6 +787,7 @@ where
                 spill: self.spill().map(Arc::as_ref),
                 tombstone_ttl_ms,
                 tombstone_max_ttl_ms,
+                deferring: self.gc_deferring.load(Ordering::Relaxed),
                 now_ms,
                 held_only: false,
             };

@@ -558,3 +558,56 @@ async fn a_clock_stepped_back_does_not_idle_out_a_just_read_entry() {
     );
     assert_eq!(shard.get(&1).await, Some("v".into()), "still readable");
 }
+
+/// The headline guarantee: an expired overwrite that the sweep removed still
+/// rejects the older value it overwrote, as it did before the sweep.
+#[tokio::test]
+async fn a_swept_expired_overwrite_still_rejects_the_value_it_overwrote() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let clock = Arc::new(AtomicU64::new(1_000_000));
+    let s = clocked_shard(1, None, &clock);
+    let hlc = |wall_ms: u64| Hlc {
+        wall_ms,
+        logical: 0,
+        node: NodeId::from(2),
+    };
+    ShardOps::apply_remote(&s, wire_record(1, "old", hlc(1_000))).await;
+    let mut v2 = wire_record(1, "new", hlc(2_000));
+    v2.expires_at_ms = Some(1_000_100);
+    ShardOps::apply_remote(&s, v2).await;
+    assert_eq!(s.get(&1).await, Some("new".into()));
+
+    clock.store(1_000_200, Ordering::SeqCst);
+    assert_eq!(s.get(&1).await, None, "the overwrite expired");
+
+    // Control: before any sweep the expired overwrite still outranks the old value.
+    ShardOps::apply_remote(&s, wire_record(1, "old", hlc(1_000))).await;
+    assert_eq!(
+        s.get(&1).await,
+        None,
+        "control: the old value stays rejected"
+    );
+
+    ShardOps::run_pending_tasks(&s).await;
+    assert_eq!(
+        s.local_record(&key_bytes(&1u32)).1,
+        LocalRecord::Tombstone {
+            version: hlc(2_000)
+        },
+        "the sweep keeps the expired overwrite's version as a tombstone"
+    );
+    ShardOps::apply_remote(&s, wire_record(1, "old", hlc(1_000))).await;
+    assert_eq!(
+        s.get(&1).await,
+        None,
+        "a swept expired overwrite does not bring back the value it overwrote"
+    );
+
+    ShardOps::apply_remote(&s, wire_record(1, "newer", hlc(3_000))).await;
+    assert_eq!(
+        s.get(&1).await,
+        Some("newer".into()),
+        "a write newer than the expired overwrite still lands"
+    );
+}
