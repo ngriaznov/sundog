@@ -561,6 +561,26 @@ mod sockets {
         panic!("a free port in 20000..30000");
     }
 
+    /// Binds `addr` again once the listener that held it is dropped. The port
+    /// is one [`low_port_listener`] returned: below every ephemeral range, so
+    /// the OS hands it to no socket bound to port 0 while it is free. A
+    /// listener another test process picked from the same range can still hold
+    /// it for a moment, so the bind retries every 10 ms for up to 5 s.
+    async fn rebind(addr: std::net::SocketAddr) -> TcpListener {
+        const RETRY_EVERY: Duration = Duration::from_millis(10);
+        const GIVE_UP_AFTER: Duration = Duration::from_secs(5);
+        let started = Instant::now();
+        loop {
+            match TcpListener::bind(addr).await {
+                Ok(listener) => return listener,
+                Err(err) if started.elapsed() >= GIVE_UP_AFTER => {
+                    panic!("{addr} was not free again within {GIVE_UP_AFTER:?}: {err}");
+                }
+                Err(_) => tokio::time::sleep(RETRY_EVERY).await,
+            }
+        }
+    }
+
     impl Writer {
         async fn start() -> Self {
             let listener = TcpListener::bind("127.0.0.1:0")
@@ -768,6 +788,26 @@ mod sockets {
     }
 
     #[tokio::test]
+    async fn rebind_waits_for_a_port_that_frees_within_its_bound() {
+        let held = low_port_listener().await;
+        let addr = held.local_addr().expect("addr");
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            drop(held);
+        });
+        let started = Instant::now();
+
+        let again = rebind(addr).await;
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "the first binds were refused while the listener held the port"
+        );
+        assert_eq!(again.local_addr().expect("addr"), addr);
+        release.await.expect("the release task ends");
+    }
+
+    #[tokio::test]
     async fn run_peer_writer_marks_dirty_only_after_the_redial_succeeds() {
         let listener = low_port_listener().await;
         let addr = listener.local_addr().expect("addr");
@@ -792,11 +832,7 @@ mod sockets {
             "a mark set while the peer is unreachable would be spent on a failed round"
         );
 
-        // The port lies below every ephemeral range, so nothing else is
-        // handed it while it is free.
-        let listener = TcpListener::bind(addr)
-            .await
-            .expect("a port below the ephemeral ranges is free again");
+        let listener = rebind(addr).await;
         let writer = Writer {
             listener,
             replicate_tx,

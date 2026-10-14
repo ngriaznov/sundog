@@ -532,13 +532,13 @@ pub(in crate::net) struct PeerTarget {
 /// most 1 MiB), which a peer that closed the link may not have received (see
 /// [`drive_connection`]). The peer is marked dirty once the redial succeeds,
 /// when a connection that carried frames ended or frames were held, so the
-/// next anti-entropy round targets it; a mark the spacing defers is set on
-/// the connection itself once the spacing has passed, however long that
-/// connection lives. That repairs `Replicated` and
-/// owner-to-owner loss. A `Distributed` non-owner's forwarded write has no
-/// other copy, and a partition that never delivers a FIN can still lose it.
-/// Dials are at least [`RECONNECT_BACKOFF`] apart, and the dirty marks at
-/// least `DIRTY_MARK_SPACING`. Two connections per pair of peers is normal.
+/// next anti-entropy round targets it. That repairs `Replicated` and
+/// owner-to-owner loss. A mark the spacing defers is set on the connection
+/// itself when the spacing ends, however long that connection lives. A
+/// `Distributed` non-owner's forwarded write has no other copy, and a
+/// partition that never delivers a FIN can still lose it. Dials are at least
+/// [`RECONNECT_BACKOFF`] apart, and the dirty marks at least
+/// `DIRTY_MARK_SPACING`. Two connections per pair of peers is normal.
 pub(in crate::net) async fn run_peer_writer(
     target: PeerTarget,
     invalidate: Arc<DropOldestQueue<OutFrame>>,
