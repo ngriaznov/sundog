@@ -678,4 +678,6 @@ pub(crate) mod read_cases;
 pub(crate) mod test_support;
 
 #[cfg(test)]
+mod prop_regressions;
+#[cfg(test)]
 mod prop_tests;

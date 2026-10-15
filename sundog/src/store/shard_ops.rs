@@ -232,11 +232,11 @@ pub trait ShardOps: Send + Sync {
 
     /// Garbage-collects tombstones older than `tombstone_ttl`: a delete's,
     /// counted from the delete, and an expired entry's, counted from its
-    /// expiry. While `any_member_absent`, a tombstone past `tombstone_ttl`
-    /// but not `tombstone_max_ttl` is left in place instead. A tombstone that
-    /// arrives from a peer already past the retention this call applies is
-    /// dropped on arrival when it displaces nothing.
-    fn gc_tombstones(&self, any_member_absent: bool) -> BoxFuture<'_, ()>;
+    /// expiry. While `defer`, a tombstone past `tombstone_ttl` but not
+    /// `tombstone_max_ttl` is left in place instead. A tombstone of an
+    /// expired entry that arrives from a peer already past the retention
+    /// this call applies is dropped on arrival, whatever the key holds.
+    fn gc_tombstones(&self, defer: bool) -> BoxFuture<'_, ()>;
 
     /// Runs `engine::Engine::sweep`, since the engine has no free-running sweep
     /// of its own. Called periodically by `tombstone_gc_task`, independent

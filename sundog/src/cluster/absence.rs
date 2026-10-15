@@ -230,9 +230,11 @@ impl AbsenceTracker {
     }
 }
 
-/// Whether `tombstone_gc_task` defers a tombstone past `tombstone_ttl` this
-/// tick: [`defers_for`] over the members [`AbsenceTracker::holding_gc`]
-/// names, absent up to `hard_cap` or back for less than `settle`.
+/// Whether the members absent or only just back make `tombstone_gc_task`
+/// defer a tombstone past `tombstone_ttl` this tick: [`defers_for`] over the
+/// members [`AbsenceTracker::holding_gc`] names, absent up to `hard_cap` or
+/// back for less than `settle`. The task also defers while the cache is new;
+/// see `gc_defers` in the parent module.
 pub(crate) fn should_defer_gc(
     mode: Mode,
     tracker: &AbsenceTracker,

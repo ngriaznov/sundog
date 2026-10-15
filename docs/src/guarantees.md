@@ -149,7 +149,11 @@ counts an absent member that shares a part with this node once it is
 eligible again: its ownership view drops the member, yet the member keeps
 its copy of every part it owned, and a delete made meanwhile reaches only
 this side. A graceful leave is not an absence: the leaver hands its parts
-off and keeps nothing.
+off and keeps nothing. A `Replicated` or `Distributed` cache also defers
+collection for the first `tombstone_ttl` after it opens, whoever is absent:
+a node that reopened warm can hold a copy that a peer's tombstone has to
+delete, and a node that just started has no memory of which members were
+away.
 
 The tombstone an expired entry leaves in `Replicated` and `Distributed` under
 a non-merging resolver is kept by the same rules, counted from the entry's
@@ -219,8 +223,13 @@ not the sweep had run when the older copy arrived, and anti-entropy removes
 that copy from the replica that still holds it. The tombstone counts its
 retention from the entry's expiry, so every replica that learns of it, by
 sweeping or from a peer, collects it at the same instant: `tombstone_ttl`, and
-up to `tombstone_max_ttl` while a member is absent, as for a delete. A replica
-that already collected it does not take it back from one that has not.
+up to `tombstone_max_ttl` while collection defers, as for a delete. A
+tombstone that arrives already past that retention is ignored, whatever the
+node holds for the key: it deletes nothing and is not stored. A replica that
+collected it never takes it back from one that has not, and the same records
+applied in any order leave the same state. Within its first `tombstone_ttl` a
+cache defers collection, so a tombstone past `tombstone_ttl` but not
+`tombstone_max_ttl` is kept there and removes an older copy the node holds.
 Shortening a lifetime takes the same path: once the shortened entry expires
 and is swept, a node cut off for the whole lifetime loses its longer-lived
 copy to anti-entropy instead of bringing the entry back. After the retention

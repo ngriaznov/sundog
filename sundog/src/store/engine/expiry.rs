@@ -252,8 +252,8 @@ pub(super) fn swept_tombstone_deadlines(
 
 /// Whether a tombstone with these deadlines is already past the retention
 /// the next collection would apply at `now_ms`: its `ttl_deadline_ms`, or,
-/// while collection is deferred for an absent member (`deferring`), its
-/// `max_deadline_ms`. Pure; unit tested directly.
+/// while collection is deferred (`deferring`), its `max_deadline_ms`. Pure;
+/// unit tested directly.
 pub(super) fn tombstone_lapsed(
     ttl_deadline_ms: u64,
     max_deadline_ms: u64,
@@ -271,21 +271,20 @@ pub(super) fn tombstone_lapsed(
 /// Whether [`apply_locked`](super::apply::apply_locked) drops a tombstone
 /// that arrives over the wire instead of storing it. Only the tombstone of
 /// an expired entry (`expired_at_ms` `Some`) can be dropped, and only when
-/// the key holds nothing it would displace (`displaces` `false`) and the
-/// tombstone has already lapsed. A replica that collected such a tombstone
-/// would otherwise take it back from a peer that has not collected yet,
-/// with fresh deadlines, and the peers would hand it back and forth for
-/// good. Pure; unit tested directly.
+/// it has already lapsed. Whatever the key holds does not matter: the
+/// outcome depends on the tombstone and the clock alone, never on which
+/// record reached the node first, so replicas that receive the same records
+/// in any order store the same ones. A replica that collected such a
+/// tombstone would otherwise take it back from a peer that has not
+/// collected yet, with fresh deadlines, and the peers would hand it back
+/// and forth for good. Pure; unit tested directly.
 pub(super) fn drops_lapsed_expiry_tombstone(
     expired_at_ms: Option<u64>,
-    displaces: bool,
     deadlines: (u64, u64),
     now_ms: u64,
     deferring: bool,
 ) -> bool {
-    expired_at_ms.is_some()
-        && !displaces
-        && tombstone_lapsed(deadlines.0, deadlines.1, now_ms, deferring)
+    expired_at_ms.is_some() && tombstone_lapsed(deadlines.0, deadlines.1, now_ms, deferring)
 }
 
 /// The retention a shard's sweep leaves the tombstone of an expired entry

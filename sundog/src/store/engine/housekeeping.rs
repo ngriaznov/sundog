@@ -74,23 +74,21 @@ where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    /// Drops tombstones past `tombstone_ttl`, or past the hard cap
-    /// `tombstone_max_ttl` while `any_member_absent`, correcting the
-    /// digest.
+    /// Drops tombstones past `tombstone_ttl`, or, while `defer`, past the
+    /// hard cap `tombstone_max_ttl`, correcting the digest.
     ///
-    /// Remembers `any_member_absent` for [`Engine::apply_many`]: while
-    /// collection is deferred, a tombstone that arrives lapsed past its
-    /// `ttl_deadline_ms` but not its `max_deadline_ms` is still worth
-    /// keeping.
-    pub(crate) fn gc_tombstones(&self, any_member_absent: bool, now_ms: u64) {
-        self.gc_deferring
-            .store(any_member_absent, Ordering::Relaxed);
+    /// Remembers `defer` for [`Engine::apply_many`]: while collection is
+    /// deferred, a tombstone that arrives lapsed past its `ttl_deadline_ms`
+    /// but not its `max_deadline_ms` is still worth keeping, and one that
+    /// arrives past its `max_deadline_ms` is dropped.
+    pub(crate) fn gc_tombstones(&self, defer: bool, now_ms: u64) {
+        self.gc_deferring.store(defer, Ordering::Relaxed);
         for (idx, stripe_lock) in self.stripes.iter().enumerate() {
             let mut stripe = stripe_lock.write();
             stripe.tombstones.retain(|key_bytes, t| {
                 let past_ttl = now_ms >= t.ttl_deadline_ms;
                 let past_max = now_ms >= t.max_deadline_ms;
-                let collect = past_ttl && (!any_member_absent || past_max);
+                let collect = past_ttl && (!defer || past_max);
                 if collect {
                     let part = part_index_from_hash(hash_key_bytes(key_bytes));
                     self.digest[digest_slot(idx, part)]

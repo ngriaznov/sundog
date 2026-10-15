@@ -607,9 +607,10 @@ pub(crate) struct Engine<K, V> {
     /// `evict_cursor` this is a rotation pointer, not a PRNG state, so a
     /// zero seed is fine.
     compact_cursor: AtomicU64,
-    /// What the last [`Engine::gc_tombstones`] call was told about member
-    /// absence. A tombstone that arrives already past the retention that
-    /// call applies is dropped rather than stored; see
+    /// What the last [`Engine::gc_tombstones`] call was told about whether
+    /// collection defers, or what [`Engine::starting_gc_deferred`] set before
+    /// the first call. A tombstone that arrives already past the retention
+    /// that call applies is dropped rather than stored; see
     /// [`expiry::drops_lapsed_expiry_tombstone`].
     gc_deferring: AtomicBool,
     #[cfg(test)]
@@ -832,6 +833,24 @@ where
             .iter()
             .map(|s| u64::try_from(s.read().tombstones.len()).unwrap_or(u64::MAX))
             .fold(0u64, u64::saturating_add)
+    }
+
+    /// Starts this engine with tombstone collection counted as deferring
+    /// (`deferred`), until the first [`Engine::gc_tombstones`] call says
+    /// otherwise: a tombstone that arrives before that call is judged
+    /// against its `tombstone_max_ttl` deadline, not its `tombstone_ttl`
+    /// one. An engine built by [`Engine::new`] starts not deferring.
+    #[must_use]
+    pub(crate) fn starting_gc_deferred(mut self, deferred: bool) -> Self {
+        *self.gc_deferring.get_mut() = deferred;
+        self
+    }
+
+    /// Whether tombstone collection currently counts as deferring; see
+    /// [`Engine::starting_gc_deferred`] and [`Engine::gc_tombstones`].
+    #[cfg(test)]
+    pub(crate) fn gc_deferring(&self) -> bool {
+        self.gc_deferring.load(Ordering::Relaxed)
     }
 
     /// Turns resident byte counting on, for an engine that holds no

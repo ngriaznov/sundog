@@ -822,9 +822,9 @@ where
         Box::pin(stream::once(fut).flat_map(stream::iter))
     }
 
-    fn gc_tombstones(&self, any_member_absent: bool) -> BoxFuture<'_, ()> {
+    fn gc_tombstones(&self, defer: bool) -> BoxFuture<'_, ()> {
         let now = self.now_ms();
-        self.engine.gc_tombstones(any_member_absent, now);
+        self.engine.gc_tombstones(defer, now);
         Box::pin(async move {})
     }
 

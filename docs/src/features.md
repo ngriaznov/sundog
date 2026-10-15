@@ -102,7 +102,10 @@ The snapshot holds no tombstones and no expired entries. A crash leaves no
 snapshot, a successful warm reopen deletes the one it replayed, so a second
 open with no clean close between is cold, and a node down longer than
 `tombstone_ttl` opens cold regardless, since a peer may already have
-collected a tombstone that would outvote a stale replayed entry.
+collected a tombstone that would outvote a stale replayed entry. A node
+defers tombstone collection for its first `tombstone_ttl` after it opens, so a
+tombstone from a peer that is past `tombstone_ttl` but not `tombstone_max_ttl`
+still removes an older replayed entry.
 `sundog_spill_reopen_total{outcome, reason}` records which path each open
 took.
 

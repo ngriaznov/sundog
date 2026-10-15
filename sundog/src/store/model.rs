@@ -90,7 +90,9 @@ pub struct Model {
     hlc_clock: HlcClock,
     tombstone_ttl_ms: u64,
     tombstone_max_ttl_ms: u64,
-    /// What the last [`Model::gc`] was told about member absence.
+    /// What the last [`Model::gc`] was told about whether collection
+    /// defers; `true` until the first one, as a new `Replicated` or
+    /// `Distributed` shard starts.
     gc_deferring: bool,
     /// `Some` only for [`new_shard_and_model_with_ownership`]'s pair: the
     /// same view attached to the paired `Shard`, so [`Model::owns`] answers
@@ -104,6 +106,8 @@ pub struct Model {
 impl Model {
     /// Builds an empty model with its clock at [`START_CLOCK_MS`] and its
     /// [`HlcClock`] seeded with `node`, the same node the shard stamps with.
+    /// The model starts with collection deferring, as the `Replicated` and
+    /// `Distributed` shards it pairs with do, until the first [`Model::gc`].
     #[must_use]
     pub fn new(node: NodeId, tombstone_ttl_ms: u64, tombstone_max_ttl_ms: u64) -> Self {
         Self {
@@ -112,7 +116,7 @@ impl Model {
             hlc_clock: HlcClock::new(node),
             tombstone_ttl_ms,
             tombstone_max_ttl_ms,
-            gc_deferring: false,
+            gc_deferring: true,
             ownership: None,
         }
     }
@@ -186,9 +190,9 @@ impl Model {
     /// [`Model::apply`], its two GC deadlines stamped from the clock. A
     /// delete counts them from now. The tombstone of an expired entry
     /// (`expired_at_ms` `Some`) counts them from that expiry, capped at now,
-    /// and is dropped on arrival when it displaces nothing and its
-    /// retention has already lapsed: the `ttl` deadline, or the `max` one
-    /// while the last [`Model::gc`] deferred.
+    /// and is dropped on arrival, whatever the key holds, when its retention
+    /// has already lapsed: the `ttl` deadline, or the `max` one while the
+    /// last [`Model::gc`] deferred.
     pub fn remove(&mut self, key: u8, ver: Hlc, expired_at_ms: Option<u64>) {
         if self.incoming_loses(key, ver) {
             return;
@@ -202,7 +206,7 @@ impl Model {
         } else {
             ttl_deadline_ms
         };
-        if expired_at_ms.is_some() && self.stored_ver(key).is_none() && now >= horizon {
+        if expired_at_ms.is_some() && now >= horizon {
             return;
         }
         self.entries.insert(
@@ -240,10 +244,9 @@ impl Model {
     }
 
     /// [`super::ShardOps::gc_tombstones`]'s rule: drops tombstones past
-    /// `tombstone_ttl`, and past `tombstone_max_ttl` while any member is
-    /// absent.
-    pub fn gc(&mut self, any_member_absent: bool) {
-        self.gc_deferring = any_member_absent;
+    /// `tombstone_ttl`, and, while `defer`, past `tombstone_max_ttl` instead.
+    pub fn gc(&mut self, defer: bool) {
+        self.gc_deferring = defer;
         let now = self.now_ms();
         self.entries.retain(|_, entry| match entry {
             ModelEntry::Tombstone {
@@ -253,7 +256,7 @@ impl Model {
             } => {
                 let past_ttl = now >= *ttl_deadline_ms;
                 let past_max = now >= *max_deadline_ms;
-                !(past_ttl && (!any_member_absent || past_max))
+                !(past_ttl && (!defer || past_max))
             }
             ModelEntry::Live { .. } => true,
         });
@@ -736,19 +739,24 @@ mod tests {
     }
 
     #[test]
-    fn a_lapsed_expiry_tombstone_stores_nothing_unless_it_displaces_something() {
+    fn a_lapsed_expiry_tombstone_stores_nothing_whatever_the_key_holds() {
         let mut model = model();
+        model.gc(false);
         let long_ago = Some(START_CLOCK_MS - 5_000);
         model.remove(1, ver(5), long_ago);
-        assert_eq!(held(&model, 1), None, "nothing to displace, already lapsed");
+        assert_eq!(held(&model, 1), None, "nothing held, already lapsed");
 
         model.apply(2, ver(4), 1, None);
         model.remove(2, ver(5), long_ago);
-        assert_eq!(model.visible(2), None, "it deletes the older copy");
-        assert_eq!(held(&model, 2), Some(ver(5)), "and stays until collected");
+        assert_eq!(model.visible(2), Some(1), "the older copy stays");
+        assert_eq!(held(&model, 2), Some(ver(4)), "and nothing replaces it");
 
-        model.remove(3, ver(5), None);
-        assert_eq!(held(&model, 3), Some(ver(5)), "a delete is always stored");
+        model.remove(3, ver(3), None);
+        model.remove(3, ver(5), long_ago);
+        assert_eq!(held(&model, 3), Some(ver(3)), "an older tombstone stays");
+
+        model.remove(4, ver(5), None);
+        assert_eq!(held(&model, 4), Some(ver(5)), "a delete is always stored");
     }
 
     #[test]
@@ -763,6 +771,31 @@ mod tests {
             Some(ver(5)),
             "within its cap, past its ttl"
         );
+
+        model.apply(2, ver(4), 1, None);
+        model.remove(2, ver(5), Some(START_CLOCK_MS - 2_000));
+        assert_eq!(model.visible(2), None, "it deletes the older copy");
+        assert_eq!(held(&model, 2), Some(ver(5)));
+    }
+
+    #[test]
+    fn a_new_model_defers_collection_until_its_first_gc() {
+        let mut model = model();
+        let past_its_ttl = Some(START_CLOCK_MS - 2_000);
+        model.apply(1, ver(4), 1, None);
+        model.remove(1, ver(5), past_its_ttl);
+        assert_eq!(
+            model.visible(1),
+            None,
+            "a new model keeps it, as a new shard"
+        );
+        assert_eq!(held(&model, 1), Some(ver(5)));
+
+        model.gc(false);
+        assert_eq!(held(&model, 1), None, "the collection ends the deferral");
+        model.apply(2, ver(4), 1, None);
+        model.remove(2, ver(5), past_its_ttl);
+        assert_eq!(model.visible(2), Some(1), "and the next one is dropped");
     }
 
     #[test]

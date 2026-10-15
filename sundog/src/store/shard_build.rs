@@ -128,7 +128,10 @@ where
     ///
     /// Tombstone GC uses [`ClusterConfig::default`]'s `tombstone_ttl` until
     /// overridden via [`Shard::with_tombstone_ttl`]; `Shard::new` takes no
-    /// `ClusterConfig` itself.
+    /// `ClusterConfig` itself. A shard in a mode that defers tombstone
+    /// collection (`Replicated` and `Distributed`) starts with collection
+    /// deferred, until its first [`ShardOps::gc_tombstones`] call says
+    /// otherwise.
     #[must_use]
     pub fn new(
         name: SmolStr,
@@ -138,7 +141,10 @@ where
         ttl: Option<Duration>,
         tti: Option<Duration>,
     ) -> Self {
-        let engine = Arc::new(Engine::new(max_capacity, tti, None, None));
+        let engine = Arc::new(
+            Engine::new(max_capacity, tti, None, None)
+                .starting_gc_deferred(mode.defers_tombstone_gc()),
+        );
         let hits = metrics::counter!("sundog_cache_hits_total", "cache" => name.to_string());
         let misses = metrics::counter!("sundog_cache_misses_total", "cache" => name.to_string());
         let read_durations = read_timing::ReadDurations::new(&name);
@@ -471,14 +477,17 @@ where
     /// A fresh engine from this shard's capacity, TTI, weigher, capacity
     /// hint, ceiling and the current engine's pre-fold flag: the rebuild
     /// every engine-shaping builder shares, so each carries the others'
-    /// settings forward. Counts resident bytes only under a ceiling.
+    /// settings forward. Counts resident bytes only under a ceiling. The
+    /// engine starts with tombstone collection deferred in a mode that
+    /// defers it ([`Mode::defers_tombstone_gc`]).
     fn build_engine(&self) -> Arc<Engine<K, V>> {
         let engine = Engine::new(
             self.max_capacity,
             self.tti,
             self.weigher.clone().map(boxed_weigher),
             self.capacity_hint,
-        );
+        )
+        .starting_gc_deferred(self.mode.defers_tombstone_gc());
         engine.set_prefold_enabled(self.engine.prefold_enabled());
         Arc::new(if self.max_resident_bytes == u64::MAX {
             engine

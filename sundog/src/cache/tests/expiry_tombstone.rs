@@ -2,7 +2,10 @@
 //! tombstone at the entry's version in the replicated modes, nothing in
 //! `Local` and `Invalidation`.
 //!
-//! The cache reads a clock the test moves, so no test waits out a TTL.
+//! The cache reads a clock the test moves, so no test waits out a TTL. A
+//! cache defers collection for its first `tombstone_ttl` after it opens, so
+//! the tombstone of an expired entry that reaches it already past that
+//! retention is kept, and dropped once the window ends.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -20,8 +23,17 @@ async fn open(
     mode: Mode,
     clock: &Arc<AtomicU64>,
 ) -> (Cluster, Cache<u32, String>) {
+    open_with(name, mode, clock, loopback_config()).await
+}
+
+async fn open_with(
+    name: &'static str,
+    mode: Mode,
+    clock: &Arc<AtomicU64>,
+    config: ClusterConfig,
+) -> (Cluster, Cache<u32, String>) {
     let cluster = Cluster::builder(name)
-        .config(loopback_config())
+        .config(config)
         .seeds(std::iter::empty())
         .build()
         .await
@@ -134,4 +146,122 @@ async fn a_local_or_invalidation_cache_keeps_nothing_of_an_entry_its_sweep_remov
         );
         cluster.shutdown().await;
     }
+}
+
+/// Key `key` holding an older copy, then the tombstone of an entry that
+/// expired `expired_ago` before the cache's clock reading arriving from a
+/// peer: whether the cache still holds the older copy.
+async fn holds_the_older_copy_after_the_expiry_tombstone(
+    cache: &Cache<u32, String>,
+    clock: &Arc<AtomicU64>,
+    key: u32,
+    expired_ago: Duration,
+) -> bool {
+    let node = NodeId::from(77);
+    let mut old = test_record(key, "old", node);
+    old.ver.wall_ms = 1_000;
+    let expired_at = clock
+        .load(Ordering::SeqCst)
+        .saturating_sub(u64::try_from(expired_ago.as_millis()).expect("fits"));
+    let tombstone = WireRecord {
+        key: old.key.clone(),
+        value: None,
+        ver: crate::hlc::Hlc {
+            wall_ms: 2_000,
+            logical: 0,
+            node,
+        },
+        expires_at_ms: Some(expired_at),
+    };
+    ShardOps::apply_remote(cache.shard.as_ref(), old).await;
+    ShardOps::apply_remote(cache.shard.as_ref(), tombstone).await;
+    cache.get(&key).await.is_some()
+}
+
+#[tokio::test]
+async fn a_newly_opened_cache_keeps_an_expiry_tombstone_lapsed_by_ttl_and_deletes_its_older_copy() {
+    for (name, mode) in [
+        (
+            "cache-it-expiry-tombstone-start-replicated",
+            Mode::Replicated,
+        ),
+        (
+            "cache-it-expiry-tombstone-start-distributed",
+            Mode::distributed(),
+        ),
+    ] {
+        let clock = manual_clock();
+        let config = ClusterConfig {
+            tombstone_ttl: Duration::from_mins(10),
+            ..loopback_config()
+        };
+        let (cluster, cache) = open_with(name, mode, &clock, config).await;
+
+        // Past the 10 min ttl by a minute, far inside the 24 h cap.
+        let held = holds_the_older_copy_after_the_expiry_tombstone(
+            &cache,
+            &clock,
+            KEY,
+            Duration::from_mins(11),
+        )
+        .await;
+
+        assert!(!held, "{mode:?}: the older copy is deleted");
+        assert!(
+            matches!(
+                cache.explain(&KEY).await.expect("explains").local,
+                LocalRecord::Tombstone { .. }
+            ),
+            "{mode:?}: the tombstone is kept"
+        );
+        let past_the_cap = Duration::from_hours(25);
+        assert!(
+            holds_the_older_copy_after_the_expiry_tombstone(&cache, &clock, KEY + 1, past_the_cap)
+                .await,
+            "{mode:?}: one lapsed past its cap is dropped"
+        );
+        cluster.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn a_cache_drops_a_lapsed_expiry_tombstone_once_its_first_tombstone_ttl_has_passed() {
+    let clock = manual_clock();
+    let config = ClusterConfig {
+        tombstone_ttl: Duration::from_secs(1),
+        ..loopback_config()
+    };
+    let (cluster, cache) = open_with(
+        "cache-it-expiry-tombstone-after-start",
+        Mode::Replicated,
+        &clock,
+        config,
+    )
+    .await;
+
+    // The gc task's first collection after the ttl lifts the deferral, at the
+    // latest a period (a second) after it.
+    let lifted = tokio::time::timeout(Duration::from_secs(15), async {
+        for key in 0u32.. {
+            if holds_the_older_copy_after_the_expiry_tombstone(
+                &cache,
+                &clock,
+                key,
+                Duration::from_secs(5),
+            )
+            .await
+            {
+                return key;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        unreachable!("the loop returns or the timeout fires")
+    })
+    .await
+    .expect("the deferral ends within a few ticks of the tombstone ttl");
+    assert!(
+        cache.get(&lifted).await.is_some(),
+        "the older copy stays under a lapsed tombstone"
+    );
+    cluster.shutdown().await;
 }

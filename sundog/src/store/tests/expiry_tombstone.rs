@@ -471,3 +471,183 @@ async fn a_cold_distributed_owner_answers_a_fetch_for_a_swept_expired_key_with_a
         "the swept entry's tombstone is held: a definitive miss"
     );
 }
+
+/// Key `key` holding an older copy, then the tombstone of an entry that
+/// expired at [`EXPIRES_AT_MS`] arriving from a peer: whether the older copy
+/// survives it.
+async fn the_older_copy_survives_the_expiry_tombstone(s: &Shard<u32, String>, key: u32) -> bool {
+    ShardOps::apply_remote(s, wire_record(key, "old", writer(1_000))).await;
+    let mut tombstone = wire_record(key, "", writer(2_000));
+    tombstone.value = None;
+    tombstone.expires_at_ms = Some(EXPIRES_AT_MS);
+    ShardOps::apply_remote(s, tombstone).await;
+    s.get(&key).await.is_some()
+}
+
+/// Past the tombstone's `tombstone_ttl` deadline, within its cap.
+const PAST_TTL: u64 = EXPIRES_AT_MS + 120_000;
+/// Past the tombstone's `tombstone_max_ttl` deadline too.
+const PAST_CAP: u64 = EXPIRES_AT_MS + 700_000;
+
+#[tokio::test]
+async fn a_new_shard_keeps_an_expiry_tombstone_lapsed_by_ttl_until_a_collection_ends_the_deferral()
+{
+    let clock = manual_clock();
+    let s = clocked::<String>(Mode::Replicated, &clock);
+    clock.store(PAST_TTL, Ordering::SeqCst);
+
+    assert!(
+        !the_older_copy_survives_the_expiry_tombstone(&s, 1).await,
+        "a node that may hold a copy from before it went down takes the tombstone"
+    );
+    assert_eq!(s.tombstone_count(), 1);
+    assert_digest_matches_full_recompute(&s).await;
+
+    ShardOps::gc_tombstones(&s, false).await;
+    assert_eq!(s.tombstone_count(), 0, "the first collection takes it");
+    assert!(
+        the_older_copy_survives_the_expiry_tombstone(&s, 2).await,
+        "once collection stops deferring, a lapsed tombstone is a no-op"
+    );
+    assert_eq!(s.tombstone_count(), 0);
+    assert_digest_matches_full_recompute(&s).await;
+}
+
+#[tokio::test]
+async fn a_deferred_collection_keeps_a_tombstone_lapsed_by_ttl_until_one_that_does_not_defer() {
+    let clock = manual_clock();
+    let s = clocked::<String>(Mode::Replicated, &clock);
+    clock.store(PAST_TTL, Ordering::SeqCst);
+
+    ShardOps::gc_tombstones(&s, true).await;
+
+    assert!(!the_older_copy_survives_the_expiry_tombstone(&s, 1).await);
+    ShardOps::gc_tombstones(&s, false).await;
+    assert!(the_older_copy_survives_the_expiry_tombstone(&s, 2).await);
+}
+
+#[tokio::test]
+async fn a_new_shard_drops_an_expiry_tombstone_lapsed_past_its_cap_whatever_it_holds() {
+    let clock = manual_clock();
+    let s = clocked::<String>(Mode::Replicated, &clock);
+    clock.store(PAST_CAP, Ordering::SeqCst);
+
+    assert!(the_older_copy_survives_the_expiry_tombstone(&s, 1).await);
+    assert_eq!(s.tombstone_count(), 0);
+    ShardOps::apply_remote_batch(
+        &s,
+        vec![{
+            let mut tombstone = wire_record(3, "", writer(2_000));
+            tombstone.value = None;
+            tombstone.expires_at_ms = Some(EXPIRES_AT_MS);
+            tombstone
+        }],
+    )
+    .await;
+    assert_eq!(s.tombstone_count(), 0, "nor does it store one over nothing");
+}
+
+#[tokio::test]
+async fn a_lapsed_expiry_tombstone_converges_in_either_order_with_the_older_copy() {
+    for (clock_ms, kept) in [(PAST_TTL, true), (PAST_CAP, false)] {
+        let mut states = Vec::new();
+        for tombstone_first in [true, false] {
+            let clock = manual_clock();
+            let s = clocked::<String>(Mode::Replicated, &clock);
+            clock.store(clock_ms, Ordering::SeqCst);
+            let old = wire_record(1, "old", writer(1_000));
+            let mut tombstone = wire_record(1, "", writer(2_000));
+            tombstone.value = None;
+            tombstone.expires_at_ms = Some(EXPIRES_AT_MS);
+            let batch = if tombstone_first {
+                vec![tombstone, old]
+            } else {
+                vec![old, tombstone]
+            };
+            ShardOps::apply_remote_batch(&s, batch).await;
+            assert_eq!(s.tombstone_count(), u64::from(kept), "clock {clock_ms}");
+            states.push((s.get(&1).await, ShardOps::digests(&s).await));
+        }
+        assert_eq!(states[0], states[1], "clock {clock_ms}");
+    }
+}
+
+#[tokio::test]
+async fn a_new_distributed_shard_defers_collection_too() {
+    let owners = NonZeroU8::new(2).expect("nonzero");
+    let node = NodeId::from(1);
+    let clock = manual_clock();
+    let (tracker, tx) =
+        OwnershipTracker::seed(node, &[], &HashMap::new(), &SmolStr::new("test"), owners);
+    let view = Arc::new(OwnershipView::compute(
+        node,
+        vec![node, NodeId::from(2)],
+        owners,
+    ));
+    tx.send(Arc::clone(&view)).expect("receiver alive");
+    let reader = Arc::clone(&clock);
+    let s = Shard::<u32, String>::new(
+        SmolStr::new("test"),
+        Mode::Distributed { owners },
+        node,
+        u64::MAX,
+        None,
+        None,
+    )
+    .with_tombstone_ttl(TOMBSTONE_TTL)
+    .with_tombstone_max_ttl(TOMBSTONE_MAX_TTL)
+    .with_clock(Arc::new(move || reader.load(Ordering::SeqCst)))
+    .with_ownership(tracker, Arc::new(ResidencySet::new()));
+    let owned: Vec<u32> = (0..10_000u32)
+        .filter(|key| view.owns(PartId::of_key(&key_bytes(key))))
+        .take(2)
+        .collect();
+    clock.store(PAST_TTL, Ordering::SeqCst);
+
+    assert!(!the_older_copy_survives_the_expiry_tombstone(&s, owned[0]).await);
+    ShardOps::gc_tombstones(&s, false).await;
+    assert!(the_older_copy_survives_the_expiry_tombstone(&s, owned[1]).await);
+}
+
+#[tokio::test]
+async fn only_a_replicated_or_distributed_shard_starts_deferred() {
+    let owners = NonZeroU8::new(2).expect("nonzero");
+    let clock = manual_clock();
+    for (mode, deferred) in [
+        (Mode::Local, false),
+        (Mode::Invalidation, false),
+        (Mode::Replicated, true),
+        (Mode::Distributed { owners }, true),
+    ] {
+        let s = clocked::<String>(mode, &clock);
+        assert_eq!(s.engine.gc_deferring(), deferred, "{mode:?}");
+    }
+
+    let s = clocked::<String>(Mode::Local, &clock);
+    clock.store(PAST_TTL, Ordering::SeqCst);
+    assert!(
+        the_older_copy_survives_the_expiry_tombstone(&s, 1).await,
+        "a lapsed tombstone is dropped at once"
+    );
+    assert_eq!(s.tombstone_count(), 0);
+}
+
+#[tokio::test]
+async fn every_engine_rebuild_keeps_the_start_deferral() {
+    let clock = manual_clock();
+    let shards = [
+        clocked::<String>(Mode::Replicated, &clock).with_capacity_hint(16),
+        clocked::<String>(Mode::Replicated, &clock).with_weigher(|_, _| 1),
+        clocked::<String>(Mode::Replicated, &clock).with_max_resident_bytes(1 << 30),
+    ];
+    clock.store(PAST_TTL, Ordering::SeqCst);
+    for (index, s) in shards.iter().enumerate() {
+        assert!(s.engine.gc_deferring(), "rebuild {index}");
+        assert!(
+            !the_older_copy_survives_the_expiry_tombstone(s, 1).await,
+            "rebuild {index}"
+        );
+    }
+    let local = clocked::<String>(Mode::Local, &clock).with_capacity_hint(16);
+    assert!(!local.engine.gc_deferring(), "a rebuilt Local engine");
+}

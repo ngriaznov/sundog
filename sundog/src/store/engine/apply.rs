@@ -141,7 +141,7 @@ pub(crate) struct ApplyCtx<'a, K, V> {
     pub(super) spill: Option<&'a SpillTier>,
     pub(super) tombstone_ttl_ms: u64,
     pub(super) tombstone_max_ttl_ms: u64,
-    /// Whether tombstone collection is deferred for an absent member; see
+    /// Whether tombstone collection is deferred; see
     /// [`Engine::gc_tombstones`].
     pub(super) deferring: bool,
     pub(super) now_ms: u64,
@@ -284,7 +284,7 @@ where
         }
     }
 
-    if drops_on_arrival(ctx, &incoming, stored_ver.is_some()) {
+    if drops_on_arrival(ctx, &incoming) {
         return (ApplyOutcome::Rejected, false);
     }
 
@@ -336,14 +336,10 @@ where
 }
 
 /// Whether `incoming` is a tombstone of an expired entry that arrives already
-/// past the retention the next collection applies and would displace nothing
-/// (`displaces` `false`), so [`apply_locked`] stores nothing for it; see
+/// past the retention the next collection applies, so [`apply_locked`] stores
+/// nothing for it whatever the key holds; see
 /// [`drops_lapsed_expiry_tombstone`].
-fn drops_on_arrival<K, V>(
-    ctx: &ApplyCtx<'_, K, V>,
-    incoming: &Incoming<V>,
-    displaces: bool,
-) -> bool {
+fn drops_on_arrival<K, V>(ctx: &ApplyCtx<'_, K, V>, incoming: &Incoming<V>) -> bool {
     let Incoming::Tombstone { expired_at_ms } = *incoming else {
         return false;
     };
@@ -353,13 +349,7 @@ fn drops_on_arrival<K, V>(
         ctx.tombstone_ttl_ms,
         ctx.tombstone_max_ttl_ms,
     );
-    drops_lapsed_expiry_tombstone(
-        expired_at_ms,
-        displaces,
-        deadlines,
-        ctx.now_ms,
-        ctx.deferring,
-    )
+    drops_lapsed_expiry_tombstone(expired_at_ms, deadlines, ctx.now_ms, ctx.deferring)
 }
 
 /// The held-only gate of [`apply_locked`]: whether the write at `ver` is

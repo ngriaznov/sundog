@@ -64,7 +64,10 @@ pub struct ClusterConfig {
     /// `tombstone_ttl` once the member is back, so that member can't
     /// resurrect the entry via anti-entropy on return. A `Mode::Distributed`
     /// cache counts only a member that shares a part with this node once it
-    /// is eligible again.
+    /// is eligible again. A `Mode::Replicated` or `Mode::Distributed` cache
+    /// also defers collection for the first `tombstone_ttl` after it opens,
+    /// whoever is absent, since a node that just opened can hold a copy a
+    /// peer's tombstone has to delete.
     ///
     /// In a `Mode::Replicated` or `Mode::Distributed` cache whose resolver
     /// does not merge, the sweep also leaves a tombstone for an entry it

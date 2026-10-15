@@ -89,8 +89,9 @@ expired entries, whose retention counts from the expiry, at the same
 instants. A tombstone that one replica has collected and another still holds
 is offered again by each anti-entropy round, and the receiver drops it. That
 window is the clock skew between the two nodes, and in one case longer: a
-node that defers collection for an absent member keeps its tombstones while
-the other does not, which lasts until the deferral ends.
+node that defers collection, for an absent member or for its first
+`tombstone_ttl` after opening, keeps its tombstones while the other does not,
+which lasts until the deferral ends.
 
 ## Allocator
 

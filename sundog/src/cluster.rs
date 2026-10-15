@@ -1107,6 +1107,19 @@ fn until_next_grid_tick(now_ms: u64, period: Duration) -> Duration {
     Duration::from_millis(period_ms - now_ms % period_ms)
 }
 
+/// Whether `tombstone_gc_task` defers tombstone collection this tick, given
+/// `absent_defers`, what [`absence::should_defer_gc`] says of the members
+/// absent or only just back. A cache in a mode that defers at all
+/// ([`Mode::defers_tombstone_gc`]) also defers while it has run for less than
+/// `settle`, the `tombstone_ttl`, whoever is absent: a node that just opened
+/// may hold a copy from before it went down, or have no memory of which
+/// members were absent, and a tombstone a peer has held past its `ttl` still
+/// has to reach it. `uptime` counts from when the gc task started. `Local` and
+/// `Invalidation` never defer. Pure; unit tested directly.
+fn gc_defers(mode: Mode, absent_defers: bool, uptime: Duration, settle: Duration) -> bool {
+    mode.defers_tombstone_gc() && (absent_defers || uptime < settle)
+}
+
 /// Periodically garbage-collects one shard's expired tombstones and flushes
 /// pending housekeeping via `ShardOps::run_pending_tasks`, once on start and
 /// then at every multiple of a quarter of `tombstone_ttl` on the wall clock,
@@ -1118,13 +1131,17 @@ fn until_next_grid_tick(now_ms: u64, period: Duration) -> Duration {
 /// which anti-entropy would offer again each round, lasts as long as the
 /// clock skew between them, not up to a whole period.
 /// `mode` and `absence` decide each tick whether collection past
-/// `tombstone_ttl` defers via [`absence::should_defer_gc`]: a
-/// `Mode::Replicated` tombstone survives up to `tombstone_max_ttl` while any
-/// recently known member is absent, and for another `tombstone_ttl` once it
-/// is back; `Mode::Distributed` narrows that to a member that co-owns a
-/// part with this node when it is eligible again. `now_ms` reads the wall
-/// clock in epoch milliseconds that places the grid; the cache's tasks pass
-/// [`crate::store::now_ms`].
+/// `tombstone_ttl` defers via [`gc_defers`]: a `Mode::Replicated` tombstone
+/// survives up to `tombstone_max_ttl` while any recently known member is
+/// absent ([`absence::should_defer_gc`]), and for another `tombstone_ttl`
+/// once it is back; `Mode::Distributed` narrows that to a member that
+/// co-owns a part with this node when it is eligible again. Either mode also
+/// defers for the first `tombstone_ttl` after the task starts. The shard
+/// itself starts deferring when it is built, so the records that arrive
+/// before the first tick, state transfer among them, meet the same rule.
+/// `now_ms` reads the wall clock in epoch milliseconds that places the grid;
+/// the cache's tasks pass [`crate::store::now_ms`]. The uptime comes from
+/// the tokio clock.
 pub(crate) async fn tombstone_gc_task(
     shard: Arc<dyn ShardOps>,
     mode: Mode,
@@ -1135,19 +1152,21 @@ pub(crate) async fn tombstone_gc_task(
     cancel: CancellationToken,
 ) {
     let period = (tombstone_ttl / 4).max(Duration::from_secs(1));
+    let started = tokio::time::Instant::now();
     loop {
         if cancel.is_cancelled() {
             return;
         }
         shard.run_pending_tasks().await;
         let view = shard.ownership_view();
-        let defer = absence::should_defer_gc(
+        let absent_defers = absence::should_defer_gc(
             mode,
             &absence,
             tombstone_max_ttl,
             tombstone_ttl,
             view.as_deref(),
         );
+        let defer = gc_defers(mode, absent_defers, started.elapsed(), tombstone_ttl);
         shard.gc_tombstones(defer).await;
         let wait = until_next_grid_tick(now_ms(), period);
         if cancel

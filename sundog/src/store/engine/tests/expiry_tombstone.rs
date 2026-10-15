@@ -140,36 +140,20 @@ fn tombstone_lapsed_reads_the_ttl_deadline_or_the_cap_while_deferring() {
 }
 
 #[test]
-fn drops_lapsed_expiry_tombstone_only_drops_a_lapsed_one_that_displaces_nothing() {
+fn drops_lapsed_expiry_tombstone_drops_exactly_a_lapsed_one() {
     let lapsed = (100, 1_000);
-    assert!(drops_lapsed_expiry_tombstone(
-        Some(40),
-        false,
-        lapsed,
-        200,
-        false
-    ));
+    assert!(drops_lapsed_expiry_tombstone(Some(40), lapsed, 200, false));
     assert!(
-        !drops_lapsed_expiry_tombstone(Some(40), true, lapsed, 200, false),
-        "it still removes the entry it displaces"
-    );
-    assert!(
-        !drops_lapsed_expiry_tombstone(Some(40), false, lapsed, 99, false),
+        !drops_lapsed_expiry_tombstone(Some(40), lapsed, 99, false),
         "a tombstone within its retention is kept"
     );
     assert!(
-        !drops_lapsed_expiry_tombstone(Some(40), false, lapsed, 200, true),
+        !drops_lapsed_expiry_tombstone(Some(40), lapsed, 200, true),
         "collection is deferred, so the cap is the horizon"
     );
-    assert!(drops_lapsed_expiry_tombstone(
-        Some(40),
-        false,
-        lapsed,
-        1_000,
-        true
-    ));
+    assert!(drops_lapsed_expiry_tombstone(Some(40), lapsed, 1_000, true));
     assert!(
-        !drops_lapsed_expiry_tombstone(None, false, lapsed, 5_000, false),
+        !drops_lapsed_expiry_tombstone(None, lapsed, 5_000, false),
         "a delete's deadlines count from its arrival and it is never dropped"
     );
 }
@@ -201,6 +185,15 @@ fn only_the_replicated_modes_tombstone_an_expired_entry() {
     assert!(!Mode::Invalidation.tombstones_expired_entries());
     assert!(Mode::Replicated.tombstones_expired_entries());
     assert!(Mode::Distributed { owners }.tombstones_expired_entries());
+}
+
+#[test]
+fn only_the_replicated_modes_defer_tombstone_collection() {
+    let owners = std::num::NonZeroU8::new(3).expect("nonzero");
+    assert!(!Mode::Local.defers_tombstone_gc());
+    assert!(!Mode::Invalidation.defers_tombstone_gc());
+    assert!(Mode::Replicated.defers_tombstone_gc());
+    assert!(Mode::Distributed { owners }.defers_tombstone_gc());
 }
 
 #[test]
@@ -482,7 +475,41 @@ fn a_lapsed_expiry_tombstone_for_a_key_holding_nothing_is_dropped() {
 }
 
 #[test]
-fn a_lapsed_expiry_tombstone_still_removes_the_older_entry_it_displaces() {
+fn a_lapsed_expiry_tombstone_leaves_the_older_entry_it_would_displace() {
+    let engine = engine_u32_string(u64::MAX, None);
+    let _ = put(
+        &engine,
+        1,
+        key_bytes(1),
+        "old".into(),
+        hlc(500, 2),
+        None,
+        1_000,
+    );
+    let digests = engine.digests();
+
+    let outcome = tombstone_of(
+        &engine,
+        1,
+        key_bytes(1),
+        hlc(1_000, 1),
+        Some(1_500),
+        70_000,
+        false,
+    );
+
+    assert!(
+        matches!(outcome, ApplyOutcome::Rejected),
+        "the outcome does not depend on what the key holds"
+    );
+    assert_eq!(engine.get(&1, 70_000), Some("old".into()));
+    assert_eq!(engine.tombstone_count(), 0);
+    assert_eq!(engine.digests(), digests);
+    assert_eq!(engine.digests(), engine.recompute_digests_paired());
+}
+
+#[test]
+fn a_lapsed_expiry_tombstone_within_its_cap_removes_the_older_entry_while_deferring() {
     let engine = engine_u32_string(u64::MAX, None);
     let _ = put(
         &engine,
@@ -501,7 +528,7 @@ fn a_lapsed_expiry_tombstone_still_removes_the_older_entry_it_displaces() {
         hlc(1_000, 1),
         Some(1_500),
         70_000,
-        false,
+        true,
     );
 
     assert!(matches!(outcome, ApplyOutcome::Tombstoned { .. }));
@@ -510,7 +537,7 @@ fn a_lapsed_expiry_tombstone_still_removes_the_older_entry_it_displaces() {
     let t = tombstone_state(&engine, 1).expect("kept until the next collection");
     assert!(
         tombstone_lapsed(t.ttl_deadline_ms, t.max_deadline_ms, 70_000, false),
-        "already collectible"
+        "already collectible once collection stops deferring"
     );
     engine.gc_tombstones(false, 70_000);
     assert_eq!(engine.tombstone_count(), 0);
@@ -518,7 +545,35 @@ fn a_lapsed_expiry_tombstone_still_removes_the_older_entry_it_displaces() {
 }
 
 #[test]
-fn a_lapsed_expiry_tombstone_replaces_an_older_tombstone() {
+fn a_lapsed_expiry_tombstone_past_its_cap_leaves_the_older_entry_even_while_deferring() {
+    let engine = engine_u32_string(u64::MAX, None);
+    let _ = put(
+        &engine,
+        1,
+        key_bytes(1),
+        "old".into(),
+        hlc(500, 2),
+        None,
+        1_000,
+    );
+
+    let outcome = tombstone_of(
+        &engine,
+        1,
+        key_bytes(1),
+        hlc(1_000, 1),
+        Some(1_500),
+        601_500,
+        true,
+    );
+
+    assert!(matches!(outcome, ApplyOutcome::Rejected));
+    assert_eq!(engine.get(&1, 601_500), Some("old".into()));
+    assert_eq!(engine.tombstone_count(), 0);
+}
+
+#[test]
+fn a_lapsed_expiry_tombstone_leaves_an_older_tombstone() {
     let engine = engine_u32_string(u64::MAX, None);
     let _ = tombstone(&engine, 1, key_bytes(1), hlc(500, 2), 69_000);
 
@@ -530,6 +585,30 @@ fn a_lapsed_expiry_tombstone_replaces_an_older_tombstone() {
         Some(1_500),
         70_000,
         false,
+    );
+
+    assert!(matches!(outcome, ApplyOutcome::Rejected));
+    assert_eq!(
+        tombstone_state(&engine, 1).map(|t| t.ver),
+        Some(hlc(500, 2)),
+        "the older tombstone stays until its own collection"
+    );
+    assert_eq!(engine.digests(), engine.recompute_digests_paired());
+}
+
+#[test]
+fn a_lapsed_expiry_tombstone_within_its_cap_replaces_an_older_tombstone_while_deferring() {
+    let engine = engine_u32_string(u64::MAX, None);
+    let _ = tombstone(&engine, 1, key_bytes(1), hlc(500, 2), 69_000);
+
+    let outcome = tombstone_of(
+        &engine,
+        1,
+        key_bytes(1),
+        hlc(1_000, 1),
+        Some(1_500),
+        70_000,
+        true,
     );
 
     assert!(matches!(outcome, ApplyOutcome::Tombstoned { .. }));
@@ -571,13 +650,14 @@ fn a_deferring_collection_keeps_an_expiry_tombstone_past_its_ttl_deadline() {
     assert_eq!((t.ttl_deadline_ms, t.max_deadline_ms), (61_500, 601_500));
 }
 
-#[test]
-fn collection_tells_the_apply_path_whether_it_is_deferring() {
-    let engine = engine_u32_string(u64::MAX, None);
-    let apply = |engine: &Engine<u32, String>, key: u32| {
-        let kb = key_bytes(key);
-        let hash = hash_key_bytes(kb.as_ref());
-        engine.apply_many(
+/// `engine.apply_many` of the tombstone of an entry that expired at 1,500,
+/// version `hlc(1_000, 1)`, for `key`, at 70,000: past its 60 s `ttl`
+/// deadline, within its 600 s cap.
+fn apply_expiry_tombstone(engine: &Engine<u32, String>, key: u32) -> ApplyOutcome<u32, String> {
+    let kb = key_bytes(key);
+    let hash = hash_key_bytes(kb.as_ref());
+    engine
+        .apply_many(
             stripe_index_from_hash(hash),
             vec![(
                 hash,
@@ -593,17 +673,91 @@ fn collection_tells_the_apply_path_whether_it_is_deferring() {
             600_000,
             70_000,
         )
-    };
+        .remove(0)
+}
+
+#[test]
+fn collection_tells_the_apply_path_whether_it_is_deferring() {
+    let engine = engine_u32_string(u64::MAX, None);
 
     engine.gc_tombstones(false, 70_000);
-    assert!(matches!(apply(&engine, 1)[0], ApplyOutcome::Rejected));
+    assert!(matches!(
+        apply_expiry_tombstone(&engine, 1),
+        ApplyOutcome::Rejected
+    ));
     engine.gc_tombstones(true, 70_000);
     assert!(
-        matches!(apply(&engine, 2)[0], ApplyOutcome::Tombstoned { .. }),
-        "an absent member holds the tombstone to its cap"
+        matches!(
+            apply_expiry_tombstone(&engine, 2),
+            ApplyOutcome::Tombstoned { .. }
+        ),
+        "a deferred collection holds the tombstone to its cap"
     );
     engine.gc_tombstones(false, 70_000);
-    assert!(matches!(apply(&engine, 3)[0], ApplyOutcome::Rejected));
+    assert!(matches!(
+        apply_expiry_tombstone(&engine, 3),
+        ApplyOutcome::Rejected
+    ));
+}
+
+#[test]
+fn an_engine_built_to_start_deferred_judges_arrivals_against_the_cap_until_a_collection() {
+    let old = |engine: &Engine<u32, String>| {
+        let _ = put(
+            engine,
+            1,
+            key_bytes(1),
+            "old".into(),
+            hlc(500, 2),
+            None,
+            1_000,
+        );
+    };
+
+    let plain = engine_u32_string(u64::MAX, None);
+    old(&plain);
+    assert!(matches!(
+        apply_expiry_tombstone(&plain, 1),
+        ApplyOutcome::Rejected
+    ));
+    assert_eq!(
+        plain.get(&1, 70_000),
+        Some("old".into()),
+        "an engine not told to defer drops it"
+    );
+
+    let settling = engine_u32_string(u64::MAX, None).starting_gc_deferred(true);
+    old(&settling);
+    assert!(
+        matches!(
+            apply_expiry_tombstone(&settling, 1),
+            ApplyOutcome::Tombstoned { .. }
+        ),
+        "before any collection it keeps a tombstone lapsed by ttl alone"
+    );
+    assert_eq!(
+        settling.get(&1, 70_000),
+        None,
+        "and so deletes the old copy"
+    );
+
+    settling.gc_tombstones(false, 70_000);
+    assert_eq!(settling.tombstone_count(), 0);
+    let _ = put(
+        &settling,
+        2,
+        key_bytes(2),
+        "old".into(),
+        hlc(500, 2),
+        None,
+        1_000,
+    );
+    assert!(
+        matches!(apply_expiry_tombstone(&settling, 2), ApplyOutcome::Rejected),
+        "the first collection ends the deferral"
+    );
+    assert_eq!(settling.get(&2, 70_000), Some("old".into()));
+    assert_eq!(settling.digests(), settling.recompute_digests_paired());
 }
 
 #[test]

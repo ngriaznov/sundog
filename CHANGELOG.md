@@ -160,20 +160,24 @@ All notable changes to this project are documented in this file. Format follows
   member is absent, `tombstone_max_ttl`) from the entry's expiry, and every
   node collects on a wall-clock grid of a quarter of `tombstone_ttl`, so every
   replica collects it at the same instant, give or take their clock skew. A
-  tombstone that arrives already past that retention, holding nothing it
-  displaces, is dropped instead of being handed back and forth between
-  replicas that collected it and replicas that have not. The expiry travels as
-  the tombstone record's `expires_at_ms`; a peer on protocol 8 reads the
-  record as an ordinary delete. A sweep leaves a bucket's digest unchanged,
-  and a `Distributed` owner of a cold part answers a peer's fetch for a swept
-  key with a miss, as for a deleted one, instead of declining. Each expired
-  entry of such a cache costs a tombstone for the retention, and while a
-  member is absent for up to `tombstone_max_ttl`: a TTL-heavy cache holds that
-  many tombstones, outside `max_capacity` and the memory ceiling, so size for
-  the expiry rate times the retention. `LocalRecord` reports a swept key as
-  `Tombstone` in these caches. `Local`, `Invalidation` and merging caches keep
-  nothing, and report it as `Absent`: a merging cache already reads an expired
-  side as absent on every node.
+  tombstone that arrives already past that retention is ignored whatever the
+  node holds for the key, so replicas that receive the same records in any
+  order hold the same ones, and a replica that collected it never takes it back
+  from one that has not. A cache defers collection for its first
+  `tombstone_ttl` after it opens, whoever is absent, so a node that just opened
+  keeps a tombstone that is past `tombstone_ttl` but not `tombstone_max_ttl`
+  and deletes its older copy. The expiry travels as the tombstone record's
+  `expires_at_ms`; a peer on protocol 8 reads the record as an ordinary delete.
+  A sweep leaves a bucket's digest unchanged, and a `Distributed` owner of a
+  cold part answers a peer's fetch for a swept key with a miss, as for a
+  deleted one, instead of declining. Each expired entry of such a cache costs a
+  tombstone for the retention, and while a member is absent for up to
+  `tombstone_max_ttl`: a TTL-heavy cache holds that many tombstones, outside
+  `max_capacity` and the memory ceiling, so size for the expiry rate times the
+  retention. `LocalRecord` reports a swept key as `Tombstone` in these caches.
+  `Local`, `Invalidation` and merging caches keep nothing, and report it as
+  `Absent`: a merging cache already reads an expired side as absent on every
+  node.
 - **A merge waiting in its coalesce window no longer outlives a remove, a
   clear or a newer tombstone.** `Cache::remove`, `remove_sync`, `remove_many`
   and `clear` discard a fold still pending for the key, `clear` covers keys

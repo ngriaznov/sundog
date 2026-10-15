@@ -25,19 +25,65 @@ const KEYSPACE: u8 = 8;
 /// Upper bound on gossip rounds the fixed-point loop may take before the
 /// test treats non-convergence as a failure of the merge rule itself.
 const MAX_GOSSIP_ROUNDS: usize = 20;
+/// The wall clock reading of the first generated write; each later one is a
+/// millisecond after the one before.
+const RECORDS_START_MS: u64 = 1_700_000_000_000;
+/// The fixed clock [`permutation_convergence`]'s replicas read: an hour after
+/// every generated write.
+const NOW_MS: u64 = RECORDS_START_MS + 3_600_000;
+/// The tombstone retention [`permutation_convergence`]'s replicas count.
+const TOMBSTONE_TTL_MS: u64 = 600_000;
+/// The cap on that retention.
+const TOMBSTONE_MAX_TTL_MS: u64 = 86_400_000;
+
+/// How long before [`NOW_MS`] the entry behind a generated expiry tombstone
+/// expired, which decides whether the tombstone arrives inside its retention
+/// or already lapsed.
+#[derive(Debug, Clone, Copy)]
+enum ExpiredAgo {
+    /// Inside `tombstone_ttl`: kept whatever the node does about collection.
+    Within,
+    /// Past `tombstone_ttl`, inside `tombstone_max_ttl`: kept while the
+    /// node defers collection, dropped once it does not.
+    PastTtl,
+    /// Past `tombstone_max_ttl`: dropped whatever the node does.
+    PastCap,
+}
+
+impl ExpiredAgo {
+    fn expires_at_ms(self) -> u64 {
+        NOW_MS
+            - match self {
+                Self::Within => TOMBSTONE_TTL_MS / 2,
+                Self::PastTtl => TOMBSTONE_TTL_MS + 1_000,
+                Self::PastCap => TOMBSTONE_MAX_TTL_MS + 1_000,
+            }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 enum OpKind {
     Put(u8, u16),
     Remove(u8),
+    /// The tombstone of an entry that expired, as a sweep leaves it.
+    Expire(u8, ExpiredAgo),
 }
 
 fn op_strategy() -> impl Strategy<Value = (u8, OpKind)> {
     (
         0..NUM_NODES,
         prop_oneof![
-            (0..KEYSPACE, any::<u16>()).prop_map(|(k, v)| OpKind::Put(k, v)),
-            (0..KEYSPACE).prop_map(OpKind::Remove),
+            3 => (0..KEYSPACE, any::<u16>()).prop_map(|(k, v)| OpKind::Put(k, v)),
+            1 => (0..KEYSPACE).prop_map(OpKind::Remove),
+            2 => (
+                0..KEYSPACE,
+                prop_oneof![
+                    Just(ExpiredAgo::Within),
+                    Just(ExpiredAgo::PastTtl),
+                    Just(ExpiredAgo::PastCap),
+                ],
+            )
+                .prop_map(|(k, ago)| OpKind::Expire(k, ago)),
         ],
     )
 }
@@ -49,7 +95,7 @@ fn build_records(ops: &[(u8, OpKind)]) -> Vec<WireRecord> {
     let mut clocks: Vec<HlcClock> = (0..NUM_NODES)
         .map(|i| HlcClock::new(NodeId::from(u64::from(i) + 1)))
         .collect();
-    let mut physical_ms: u64 = 1_700_000_000_000;
+    let mut physical_ms: u64 = RECORDS_START_MS;
 
     ops.iter()
         .map(|(origin, op)| {
@@ -60,7 +106,7 @@ fn build_records(ops: &[(u8, OpKind)]) -> Vec<WireRecord> {
             clocks[gossip_idx].observe(physical_ms, ver);
 
             let key = match op {
-                OpKind::Put(k, _) | OpKind::Remove(k) => *k,
+                OpKind::Put(k, _) | OpKind::Remove(k) | OpKind::Expire(k, _) => *k,
             };
             let key_bytes = Bytes::from(postcard::to_stdvec(&key).expect("u8 key encodes"));
             match op {
@@ -77,6 +123,12 @@ fn build_records(ops: &[(u8, OpKind)]) -> Vec<WireRecord> {
                     value: None,
                     ver,
                     expires_at_ms: None,
+                },
+                OpKind::Expire(_, ago) => WireRecord {
+                    key: key_bytes,
+                    value: None,
+                    ver,
+                    expires_at_ms: Some(ago.expires_at_ms()),
                 },
             }
         })
@@ -176,14 +228,20 @@ fn current_thread_runtime() -> tokio::runtime::Runtime {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(24))]
 
-    /// The permutation-convergence property: the same multiset of writes and
-    /// removes, applied to several shards under independent permutation and
-    /// duplication and alternating [`apply_mixed`] with [`apply_concurrent`],
-    /// converges to byte-identical state everywhere.
+    /// The permutation-convergence property: the same multiset of writes,
+    /// removes and expiry tombstones, applied to several shards under
+    /// independent permutation and duplication and alternating
+    /// [`apply_mixed`] with [`apply_concurrent`], converges to
+    /// byte-identical state everywhere. An expiry tombstone arrives inside
+    /// its retention, lapsed past `tombstone_ttl` only or lapsed past
+    /// `tombstone_max_ttl`, alongside older values of the same key, and the
+    /// replicas either still defer collection, as a new shard does, or have
+    /// run a collection that does not (`settled`).
     #[test]
     fn permutation_convergence(
         ops in proptest::collection::vec(op_strategy(), 4..40),
         seeds in proptest::collection::vec(any::<u64>(), NUM_REPLICAS),
+        settled in any::<bool>(),
     ) {
         let records = build_records(&ops);
         let rt = current_thread_runtime();
@@ -191,14 +249,22 @@ proptest! {
         rt.block_on(async {
             let mut states = Vec::with_capacity(seeds.len());
             for &seed in &seeds {
-                let shard = Arc::new(Shard::<u8, u16>::new(
-                    SmolStr::new("perm-conv"),
-                    Mode::Replicated,
-                    NodeId::from(1000),
-                    10_000,
-                    None,
-                    None,
-                ));
+                let shard = Arc::new(
+                    Shard::<u8, u16>::new(
+                        SmolStr::new("perm-conv"),
+                        Mode::Replicated,
+                        NodeId::from(1000),
+                        10_000,
+                        None,
+                        None,
+                    )
+                    .with_tombstone_ttl(Duration::from_millis(TOMBSTONE_TTL_MS))
+                    .with_tombstone_max_ttl(Duration::from_millis(TOMBSTONE_MAX_TTL_MS))
+                    .with_clock(Arc::new(|| NOW_MS)),
+                );
+                if settled {
+                    ShardOps::gc_tombstones(shard.as_ref(), false).await;
+                }
                 let permuted = shuffled_with_duplicates(&records, seed);
                 if seed % 2 == 0 {
                     apply_mixed(&shard, permuted, seed).await;
@@ -364,7 +430,7 @@ proptest! {
             let mut remote_clocks: Vec<HlcClock> = (0u8..3)
                 .map(|i| HlcClock::new(NodeId::from(u64::from(i) + 1)))
                 .collect();
-            let mut physical_ms: u64 = 1_700_000_000_000;
+            let mut physical_ms: u64 = RECORDS_START_MS;
 
             for op in &ops {
                 match *op {
@@ -623,7 +689,7 @@ fn build_pn_counter_records(deltas: &[u64]) -> Vec<WireRecord> {
     let mut clocks: Vec<HlcClock> = (0..deltas.len())
         .map(|i| HlcClock::new(NodeId::from(u64::try_from(i).expect("small") + 1)))
         .collect();
-    let mut physical_ms: u64 = 1_700_000_000_000;
+    let mut physical_ms: u64 = RECORDS_START_MS;
     let key_bytes = Bytes::from(postcard::to_stdvec(&0u8).expect("u8 key encodes"));
 
     deltas

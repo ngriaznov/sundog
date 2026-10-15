@@ -64,6 +64,15 @@ impl Mode {
         matches!(self, Self::Replicated | Self::Distributed { .. })
     }
 
+    /// Whether tombstone collection can defer in this mode, for an absent
+    /// member or while the cache settles after it opens. `Replicated` and
+    /// `Distributed` run anti-entropy, which can hand a peer a copy a
+    /// collected tombstone would have deleted; `Local` and `Invalidation`
+    /// run none and never defer.
+    pub(crate) const fn defers_tombstone_gc(self) -> bool {
+        matches!(self, Self::Replicated | Self::Distributed { .. })
+    }
+
     /// Whether the CRDT sweep's stage two folds a retired writer into the
     /// bounded total in this mode. A fold keeps one total per replica and
     /// merges two replicas' totals by taking the larger, which is exact only
