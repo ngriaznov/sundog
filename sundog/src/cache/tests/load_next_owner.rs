@@ -72,10 +72,13 @@ impl LoadingNode {
 /// Three loading nodes, the first the requester. Returns once the first
 /// advertises a loader on both others.
 async fn three_loading_nodes(name: &'static str) -> [LoadingNode; 3] {
+    // Every node stays up: a failure detector that drops a node too busy to
+    // gossip moves the views and cools the parts the tests wait on, and a
+    // part a node loses keeps its cold mark.
     let build = |seed: Option<SocketAddr>| async move {
         Cluster::builder(name)
             .seeds(seed)
-            .config(loopback_config())
+            .config(loopback_config().with(|c| c.phi_threshold = 1_000.0))
             .build()
             .await
             .expect("node builds")
@@ -92,19 +95,40 @@ async fn three_loading_nodes(name: &'static str) -> [LoadingNode; 3] {
     wait_for_peer_count(&a.cluster, 2).await;
     wait_for_peer_count(&b.cluster, 2).await;
     wait_until(
-        Duration::from_secs(15),
+        CONVERGE,
         "the requester sees a loader on both peers",
         async || a.cache.loader_peers().len() == 2,
     )
     .await;
-    [a, b, c]
+    // The loader adverts and the cache-mode adverts a view is built from are
+    // separate gossip keys, so seeing both loaders says nothing about the
+    // view.
+    let nodes = [a, b, c];
+    wait_until(
+        CONVERGE,
+        "every node's ownership view ranks every node",
+        async || {
+            nodes.iter().all(|node| {
+                node.cache
+                    .shard
+                    .ownership_view()
+                    .is_some_and(|view| view.eligible().len() == nodes.len())
+            })
+        },
+    )
+    .await;
+    nodes
 }
 
 /// Waits until every node ranks each of `keys`' owners as the first does and
-/// has the key's part warm, so no owner declines of its own accord.
+/// each owner has the key's part warm and verified, so no owner declines of
+/// its own accord. A node that does not own the part is not waited on: it
+/// keeps the cold mark an earlier view left on a part it has since lost, until
+/// a view owns the part again (see `ResidencySet::mark_serving`), and it is
+/// never asked to serve the key.
 async fn wait_until_settled(nodes: &[LoadingNode; 3], keys: &[u32]) {
     wait_until(
-        Duration::from_secs(20),
+        CONVERGE,
         "owners agree and hold their parts warm",
         async || {
             keys.iter().all(|key| {
@@ -112,8 +136,9 @@ async fn wait_until_settled(nodes: &[LoadingNode; 3], keys: &[u32]) {
                 let owners = nodes[0].cache.owners_of(key);
                 nodes.iter().all(|node| {
                     node.cache.owners_of(key) == owners
-                        && !node.cache.shard.is_cold_part(part)
-                        && !node.cache.shard.is_unverified_part(part)
+                        && (!owners.contains(&node.id())
+                            || (!node.cache.shard.is_cold_part(part)
+                                && !node.cache.shard.is_unverified_part(part)))
                 })
             })
         },
@@ -123,7 +148,7 @@ async fn wait_until_settled(nodes: &[LoadingNode; 3], keys: &[u32]) {
 
 /// Polls the first node's view until `pick` finds keys in it.
 async fn wait_for_keys<T>(a: &LoadingNode, pick: impl Fn(&Cache<u32, String>) -> Option<T>) -> T {
-    tokio::time::timeout(Duration::from_secs(15), async {
+    tokio::time::timeout(CONVERGE, async {
         loop {
             if let Some(found) = pick(&a.cache) {
                 return found;
