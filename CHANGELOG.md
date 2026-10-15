@@ -27,6 +27,10 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **`sundog_ae_repaired_total` counts each repair chunk as it moves.** An
+  anti-entropy round adds every batch of records it pushes or pulls to the
+  counter when the batch moves, so a scrape during a long round sees the
+  records the round has already sent.
 - **An `Invalidation` cache no longer folds a retired `PnCounter` writer into
   its folded total.** A fold keeps one scalar per replica and a merge takes
   the larger of two, which is exact only when one replica's folded writers

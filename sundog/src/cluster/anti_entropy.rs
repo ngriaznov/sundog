@@ -844,7 +844,8 @@ fn wire_record_len(cache_len: usize, record: &WireRecord) -> u64 {
 }
 
 /// Applies a round's classified push/pull/hash-pull sets against `peer`, in
-/// [`REPAIR_BATCH`] chunks, emits `sundog_ae_repaired_total{cache}`, and
+/// [`REPAIR_BATCH`] chunks, counts each chunk under
+/// `sundog_ae_repaired_total{cache}` as it moves ([`RepairTally::add`]), and
 /// returns the total wire bytes moved (pushed plus pulled) and whether
 /// every pull was answered and every push reached `peer`'s outbox.
 ///
@@ -891,10 +892,6 @@ async fn apply_repairs(
         pushed_all && pulled_all
     };
 
-    if tally.repaired > 0 {
-        metrics::counter!("sundog_ae_repaired_total", "cache" => cache.to_string())
-            .increment(tally.repaired);
-    }
     tracing::debug!(
         repaired = tally.repaired,
         bytes_moved = tally.bytes_moved,
@@ -914,7 +911,15 @@ struct RepairTally {
 }
 
 impl RepairTally {
+    /// Counts one chunk of `records` moved for `cache`, and adds it to
+    /// `sundog_ae_repaired_total{cache}` at once, not at the end of the
+    /// round, so the counter keeps up with the bytes a long round has
+    /// already sent.
     fn add(&mut self, cache: &SmolStr, records: &[WireRecord]) {
+        if !records.is_empty() {
+            metrics::counter!("sundog_ae_repaired_total", "cache" => cache.to_string())
+                .increment(records.len() as u64);
+        }
         self.repaired += records.len() as u64;
         self.bytes_moved += records
             .iter()

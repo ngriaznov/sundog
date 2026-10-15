@@ -36,7 +36,7 @@ addresses once it forms, under `cluster formed`.
 | `sundog_ceiling_refusals_total{cache, kind}` | a cache with a `max_resident_bytes` ceiling: local writes refused (`write`) and fills returned uncached (`fill`) |
 | `sundog_fan_out_backlog{cache}` | written keys not yet sent to peers |
 | `sundog_fan_out_wait_timeouts_total{cache}` | writes that waited out `fan_out_wait_timeout` for backlog room and proceeded over capacity |
-| `sundog_ae_repaired_total{cache}` | entries anti-entropy repaired |
+| `sundog_ae_repaired_total{cache}` | entries anti-entropy repaired, counted per batch as each moves |
 | `sundog_ae_sketch_total{cache, outcome}` | sketch reconciliations of large buckets, `decoded` or `fallback`; a `fallback` lists the whole bucket, in several frames of about 2 MiB when it is large |
 | `sundog_ae_parts_total{cache, outcome}` | part-level reconciliations, `listing`, `sketch` or `fallback` |
 | `sundog_state_transfer_records_total{cache}` | records a joining node pulled from its donor |

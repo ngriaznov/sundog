@@ -249,3 +249,57 @@ fn chunk_mismatches_splits_into_bounded_chunks_preserving_order() {
         );
     }
 }
+
+/// Each chunk a round moves reaches `sundog_ae_repaired_total` when it is
+/// counted, before the round ends, so a reader of the counter mid-round sees
+/// every record the round has already sent.
+#[test]
+fn a_repair_tally_counts_each_chunk_as_it_moves() {
+    use metrics_util::MetricKind;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let repaired = || {
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(key, ..)| {
+                key.kind() == MetricKind::Counter && key.key().name() == "sundog_ae_repaired_total"
+            })
+            .map_or(0, |(.., value)| match value {
+                DebugValue::Counter(n) => n,
+                other => panic!("a counter, not {other:?}"),
+            })
+    };
+    let cache = SmolStr::new("it");
+    let chunk = |from: u8, n: u8| -> Vec<WireRecord> {
+        (from..from + n)
+            .map(|k| WireRecord {
+                key: Bytes::from(vec![k]),
+                value: Some(Bytes::from_static(b"v")),
+                ver: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    node: NodeId::from(1),
+                },
+                expires_at_ms: None,
+            })
+            .collect()
+    };
+    let mut tally = RepairTally::default();
+
+    tally.add(&cache, &chunk(0, 3));
+    assert_eq!(
+        repaired(),
+        3,
+        "the first chunk counts before the round ends"
+    );
+    tally.add(&cache, &[]);
+    tally.add(&cache, &chunk(3, 2));
+    // A snapshot drains the counter, so this one reads the second chunk only.
+    assert_eq!(repaired(), 2, "the second chunk counts its own records");
+    assert_eq!(tally.repaired, 5);
+}
