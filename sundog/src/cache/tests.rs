@@ -10,6 +10,7 @@ mod fan_out_departed;
 mod forwarding;
 mod forwarding_skew;
 mod lifecycle;
+mod load_next_owner;
 mod loading;
 mod merge_expiry;
 mod nonowner_fill;

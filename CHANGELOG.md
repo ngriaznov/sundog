@@ -148,7 +148,11 @@ All notable changes to this project are documented in this file. Format follows
   as documented and a later remove or write can no longer leave a stale value
   behind. The fill is not sent to the owners either. A non-owner runs the
   loader on every `get_or_load`; `load` gathers a key's loads on an owner that
-  has a loader. A refresh-ahead reload skips an entry a node holds only
+  has a loader. A load an owner declines, as one does while it is still pulling
+  a part it gained, or cannot take goes to the key's next owner with a loader,
+  which stores the value and sends it to the other owners, and only a key no
+  owner takes is loaded on the non-owner, which answers without keeping a
+  copy. A refresh-ahead reload skips an entry a node holds only
   through disown grace, and a read after the node regains the part asks for
   the reload again. A non-owner at the memory ceiling no longer counts
   `sundog_ceiling_refusals_total{kind="fill"}`.

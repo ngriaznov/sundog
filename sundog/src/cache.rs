@@ -873,9 +873,14 @@ where
     /// like a [`Cache::get_or_load`] fill; a key the source lacks is not
     /// cached, so the next read asks again. In [`Mode::Distributed`] the
     /// load runs on the first owner of the key's part that has a loader and
-    /// is warm for it; a node that owns nothing of the part answers with the
-    /// value and keeps no copy, also when the load runs here because no
-    /// owner can load or an owner declined or could not be reached.
+    /// is warm for it. An owner that declines or cannot be reached passes
+    /// the key to the next owner with a loader, and only a key no owner
+    /// takes loads on this node. A node that owns nothing of the part
+    /// answers with the value and keeps no copy; an owner that loads stores
+    /// it and fans it out to the other owners. An owner that declines never
+    /// ran its loader. A request that failed after the owner received it can
+    /// have run it, so such a key can load on that owner and again on the
+    /// next node.
     ///
     /// # Errors
     ///

@@ -379,26 +379,112 @@ fn load_target_in_distributed_takes_the_first_owner_that_can_load() {
     let part = PartId::from_raw(7);
     let both: HashSet<NodeId> = [a, b].into_iter().collect();
     let mode = Mode::distributed();
+    let none = HashSet::new();
     assert_eq!(
-        load_target(mode, part, me, &[a, b], &both),
+        load_target(mode, part, me, &[a, b], &both, &none),
         LoadTarget::Peer(a)
     );
     assert_eq!(
-        load_target(mode, part, me, &[a, b], &[b].into_iter().collect()),
+        load_target(mode, part, me, &[a, b], &[b].into_iter().collect(), &none),
         LoadTarget::Peer(b),
         "an owner with no loader is skipped"
     );
     assert_eq!(
-        load_target(mode, part, me, &[me, a], &both),
+        load_target(mode, part, me, &[me, a], &both, &none),
         LoadTarget::Here,
         "this node, as the first owner, loads its own keys"
     );
     assert_eq!(
-        load_target(mode, part, me, &[a, b], &HashSet::new()),
+        load_target(mode, part, me, &[a, b], &HashSet::new(), &none),
         LoadTarget::Here,
         "with no owner able to load, this node loads"
     );
-    assert_eq!(load_target(mode, part, me, &[], &both), LoadTarget::Here);
+    assert_eq!(
+        load_target(mode, part, me, &[], &both, &none),
+        LoadTarget::Here
+    );
+}
+
+#[test]
+fn load_target_in_distributed_skips_the_owners_already_tried() {
+    let me = NodeId::from(1);
+    let (a, b, c) = (NodeId::from(2), NodeId::from(3), NodeId::from(4));
+    let part = PartId::from_raw(7);
+    let capable: HashSet<NodeId> = [a, b, c].into_iter().collect();
+    let mode = Mode::distributed();
+    let tried = |nodes: &[NodeId]| nodes.iter().copied().collect::<HashSet<_>>();
+    assert_eq!(
+        load_target(mode, part, me, &[a, b], &capable, &tried(&[a])),
+        LoadTarget::Peer(b),
+        "the next owner takes what the first declined"
+    );
+    assert_eq!(
+        load_target(mode, part, me, &[a, b, c], &capable, &tried(&[a, b])),
+        LoadTarget::Peer(c),
+        "every owner already tried is skipped"
+    );
+    assert_eq!(
+        load_target(mode, part, me, &[a, b, c], &capable, &tried(&[b])),
+        LoadTarget::Peer(a),
+        "rank order holds, a later owner's refusal does not move the pick"
+    );
+    assert_eq!(
+        load_target(mode, part, me, &[a, me, b], &capable, &tried(&[a])),
+        LoadTarget::Here,
+        "this node, as the next owner, loads its own keys"
+    );
+    assert_eq!(
+        load_target(mode, part, me, &[a, b], &capable, &tried(&[a, b])),
+        LoadTarget::Here,
+        "with every owner tried, this node loads"
+    );
+    assert_eq!(
+        load_target(
+            mode,
+            part,
+            me,
+            &[a, b, c],
+            &[a, c].into_iter().collect(),
+            &tried(&[a])
+        ),
+        LoadTarget::Peer(c),
+        "an owner with no loader is skipped after the declined one"
+    );
+    assert_eq!(
+        load_target(mode, part, me, &[], &capable, &tried(&[a])),
+        LoadTarget::Here,
+        "a part with no owners loads here"
+    );
+}
+
+#[test]
+fn load_target_elsewhere_moves_to_this_node_once_the_winner_is_tried() {
+    let nodes: Vec<NodeId> = (1..=5).map(NodeId::from).collect();
+    let me = nodes[0];
+    let capable: HashSet<NodeId> = nodes[1..].iter().copied().collect();
+    let mut peers_seen = 0;
+    for raw in [0u16, 1, 99, 4_000, 65_535] {
+        let part = PartId::from_raw(raw);
+        let LoadTarget::Peer(winner) =
+            load_target(Mode::Invalidation, part, me, &[], &capable, &HashSet::new())
+        else {
+            continue;
+        };
+        peers_seen += 1;
+        assert_eq!(
+            load_target(
+                Mode::Invalidation,
+                part,
+                me,
+                &[],
+                &capable,
+                &[winner].into_iter().collect()
+            ),
+            LoadTarget::Here,
+            "part {raw}: a winner that declined leaves the key to this node"
+        );
+    }
+    assert!(peers_seen > 0, "some part gathers on a peer");
 }
 
 #[test]
@@ -410,7 +496,7 @@ fn load_target_elsewhere_is_one_rendezvous_winner_every_node_agrees_on() {
             .iter()
             .map(|&me| {
                 let capable: HashSet<NodeId> = nodes.iter().copied().filter(|&n| n != me).collect();
-                match load_target(Mode::Invalidation, part, me, &[], &capable) {
+                match load_target(Mode::Invalidation, part, me, &[], &capable, &HashSet::new()) {
                     LoadTarget::Here => me,
                     LoadTarget::Peer(peer) => peer,
                 }
@@ -429,6 +515,7 @@ fn load_target_elsewhere_is_one_rendezvous_winner_every_node_agrees_on() {
             PartId::from_raw(3),
             me,
             &[],
+            &HashSet::new(),
             &HashSet::new()
         ),
         LoadTarget::Here,
@@ -437,7 +524,14 @@ fn load_target_elsewhere_is_one_rendezvous_winner_every_node_agrees_on() {
     let spread: HashSet<NodeId> = (0..64u16)
         .map(|raw| {
             let capable: HashSet<NodeId> = nodes[1..].iter().copied().collect();
-            match load_target(Mode::Invalidation, PartId::from_raw(raw), me, &[], &capable) {
+            match load_target(
+                Mode::Invalidation,
+                PartId::from_raw(raw),
+                me,
+                &[],
+                &capable,
+                &HashSet::new(),
+            ) {
                 LoadTarget::Here => me,
                 LoadTarget::Peer(peer) => peer,
             }

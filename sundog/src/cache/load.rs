@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::Arc;
 
+use futures::future::BoxFuture;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use smol_str::SmolStr;
@@ -14,7 +15,7 @@ use super::Cache;
 #[cfg(doc)]
 use super::CacheBuilder;
 use crate::cluster::Cluster;
-use crate::error::RemoteLoaderError;
+use crate::error::{CodecError, RemoteLoaderError};
 use crate::net::LoadOutcome;
 use crate::node::NodeId;
 use crate::store::{LoadError, Mode, PartId, RefreshRequest, Shard, ShardOps, Sourced, encode_key};
@@ -55,11 +56,14 @@ pub(super) enum LoadTarget {
 }
 
 /// The node `part`'s loads gather on, among this node `me` and the peers in
-/// `capable` that can load for this cache. In `Mode::Distributed`, the
-/// first of the part's `owners`, in rank order, that is `me` or capable,
-/// and `me` when none is. In every other mode, the rendezvous winner for
-/// `part` among `me` and `capable`, ties to the lower [`NodeId`], so every
-/// node that agrees on who can load picks the same one. Pure; unit tested
+/// `capable` that can load for this cache, leaving out the peers in `tried`,
+/// the ones that already declined or could not be reached for this key. In
+/// `Mode::Distributed`, the first of the part's `owners`, in rank order, that
+/// is `me` or a capable peer not in `tried`, and `me` when none is. In every
+/// other mode, the rendezvous winner for `part` among `me` and `capable`,
+/// ties to the lower [`NodeId`], so every node that agrees on who can load
+/// picks the same one; once that winner has declined or failed, `me`, as
+/// those modes keep what each node loads for itself. Pure; unit tested
 /// directly.
 pub(super) fn load_target(
     mode: Mode,
@@ -67,13 +71,15 @@ pub(super) fn load_target(
     me: NodeId,
     owners: &[NodeId],
     capable: &HashSet<NodeId>,
+    tried: &HashSet<NodeId>,
 ) -> LoadTarget {
     let chosen = match mode {
         Mode::Distributed { .. } => owners
             .iter()
             .copied()
-            .find(|&node| node == me || capable.contains(&node))
+            .find(|&node| node == me || (capable.contains(&node) && !tried.contains(&node)))
             .unwrap_or(me),
+        _ if !tried.is_empty() => me,
         _ => capable
             .iter()
             .copied()
@@ -92,6 +98,41 @@ pub(super) fn load_target(
         LoadTarget::Peer(chosen)
     }
 }
+
+/// A key a load routes: its encoding, and the peers that declined it or could
+/// not be reached for it, which [`load_target`] skips.
+pub(super) struct Routed<K> {
+    key: K,
+    key_bytes: bytes::Bytes,
+    tried: HashSet<NodeId>,
+}
+
+impl<K> Routed<K> {
+    /// A key no peer has been asked for yet.
+    pub(super) fn new(key: K, key_bytes: bytes::Bytes) -> Self {
+        Self {
+            key,
+            key_bytes,
+            tried: HashSet::new(),
+        }
+    }
+}
+
+/// What asking a peer to load a batch of keys came to.
+pub(super) enum Asked<K, V> {
+    /// The peer loaded them, or answered that its loader failed.
+    Answered(Sourced<K, V>),
+    /// The peer declined or could not be reached; the keys, with the peer
+    /// marked tried, go to the next node [`load_target`] picks.
+    Passed(Vec<Routed<K>>),
+}
+
+/// How a load request reaches a peer: the keys' encodings in, the peer's
+/// outcome out. [`Cache::route_load`] sends it over the mesh.
+pub(super) type AskLoad<'a> = dyn Fn(NodeId, Vec<bytes::Bytes>) -> BoxFuture<'a, Result<LoadOutcome, CodecError>>
+    + Send
+    + Sync
+    + 'a;
 
 /// The most refresh requests [`refresh_task`] takes off its queue at once.
 const REFRESH_BURST: usize = 1_024;
@@ -138,7 +179,7 @@ pub(super) async fn refresh_task<K, V>(
             } else {
                 let part = PartId::of_key(&request.key_bytes);
                 let owners = view.as_ref().map_or(&[][..], |view| view.owners_of(part));
-                load_target(mode, part, me, owners, &capable)
+                load_target(mode, part, me, owners, &capable, &HashSet::new())
             };
             match target {
                 LoadTarget::Peer(peer)
@@ -171,77 +212,106 @@ where
     /// The source [`Cache::load`] reads a miss from in `Mode::Invalidation`
     /// and `Mode::Distributed`: each key goes to the node its loads gather
     /// on, per [`load_target`], one request per node, and this node's own
-    /// keys to its loader, all at once. A peer that declines or cannot be
-    /// reached has its keys loaded here instead, and so does a key no owner
-    /// can load; a `Mode::Distributed` node that does not own such a key
-    /// answers with the value and keeps no copy. A peer whose loader fails
-    /// fails the batch with [`RemoteLoaderError`].
+    /// keys to its loader, all at once.
+    ///
+    /// In `Mode::Distributed`, a key whose owner declines or cannot be
+    /// reached goes to the next owner of its part that is this node or has a
+    /// loader, skipping every owner already tried, and so on down the
+    /// owners; only a key no owner takes is loaded here. An owner that loads
+    /// stores the value and fans it out to the other owners; a node that
+    /// owns nothing of the key answers with the value and keeps no copy.
+    /// In `Mode::Invalidation` a key whose peer declines or cannot be reached
+    /// is loaded here. A peer that declines never ran its loader, so a
+    /// declined key loads once. A request that fails after the peer received
+    /// it can have run the peer's loader, which the requester cannot tell
+    /// from one that never arrived, so such a key can load on that peer and
+    /// again on the next node. A peer whose loader fails fails the batch with
+    /// [`RemoteLoaderError`].
     pub(super) async fn route_load(&self, keys: Vec<K>) -> Result<Sourced<K, V>, LoadError> {
+        let name = SmolStr::new(self.shard.name());
+        self.route_load_via(keys, &|peer, request| {
+            let name = name.clone();
+            Box::pin(async move { self.cluster.mesh().load(peer, name, request).await })
+        })
+        .await
+    }
+
+    /// [`Cache::route_load`] with the requests to peers sent through `ask`.
+    pub(super) async fn route_load_via(
+        &self,
+        keys: Vec<K>,
+        ask: &AskLoad<'_>,
+    ) -> Result<Sourced<K, V>, LoadError> {
         let mode = self.shard.mode();
         let me = self.cluster.node_id();
         let capable = self.loader_peers();
         let view = self.shard.ownership_view();
         let mut here = Vec::new();
-        let mut remote: HashMap<NodeId, Vec<(K, bytes::Bytes)>> = HashMap::new();
+        let mut pending = Vec::new();
         for key in keys {
-            let Ok(key_bytes) = encode_key(&key) else {
-                here.push(key);
-                continue;
-            };
-            let part = PartId::of_key(&key_bytes);
-            let owners = view.as_ref().map_or(&[][..], |view| view.owners_of(part));
-            match load_target(mode, part, me, owners, &capable) {
-                LoadTarget::Here => here.push(key),
-                LoadTarget::Peer(peer) => remote.entry(peer).or_default().push((key, key_bytes)),
+            match encode_key(&key) {
+                Ok(key_bytes) => pending.push(Routed::new(key, key_bytes)),
+                Err(_) => here.push(key),
             }
         }
-        let local = async {
-            if here.is_empty() {
-                Ok(HashMap::new())
-            } else {
-                self.shard.call_loader(here).await
-            }
-        };
-        let remotes = futures::future::join_all(
-            remote
-                .into_iter()
-                .map(|(peer, keys)| self.load_on(peer, keys)),
-        );
-        let (local, remotes) = tokio::join!(local, remotes);
         let mut sourced = Sourced {
-            store: local?,
+            store: HashMap::new(),
             answer: HashMap::new(),
         };
-        for answer in remotes {
-            let answer = answer?;
-            sourced.store.extend(answer.store);
-            sourced.answer.extend(answer.answer);
+        loop {
+            let mut remote: HashMap<NodeId, Vec<Routed<K>>> = HashMap::new();
+            for routed in std::mem::take(&mut pending) {
+                let part = PartId::of_key(&routed.key_bytes);
+                let owners = view.as_ref().map_or(&[][..], |view| view.owners_of(part));
+                match load_target(mode, part, me, owners, &capable, &routed.tried) {
+                    LoadTarget::Here => here.push(routed.key),
+                    LoadTarget::Peer(peer) => remote.entry(peer).or_default().push(routed),
+                }
+            }
+            let local = async {
+                let here = std::mem::take(&mut here);
+                if here.is_empty() {
+                    Ok(HashMap::new())
+                } else {
+                    self.shard.call_loader(here).await
+                }
+            };
+            let remotes = futures::future::join_all(
+                remote
+                    .into_iter()
+                    .map(|(peer, keys)| self.load_on(peer, keys, ask)),
+            );
+            let (local, remotes) = tokio::join!(local, remotes);
+            sourced.store.extend(local?);
+            for asked in remotes {
+                match asked? {
+                    Asked::Answered(answer) => {
+                        sourced.store.extend(answer.store);
+                        sourced.answer.extend(answer.answer);
+                    }
+                    Asked::Passed(passed) => pending.extend(passed),
+                }
+            }
+            if pending.is_empty() {
+                return Ok(sourced);
+            }
         }
-        Ok(sourced)
     }
 
-    /// Asks `peer` to load `keys`. A record it stores comes back to be
-    /// stored here too in `Mode::Invalidation`, where each node caches its
-    /// own working set, and only answered with in `Mode::Distributed`,
-    /// where `peer` owns the key and this node does not. Keys loaded here
-    /// because `peer` declined or could not be reached come back to store;
-    /// the shard stores them only where it owns them, so a `Mode::Distributed`
-    /// non-owner answers with them and keeps no copy.
+    /// Asks `peer`, through `ask`, to load `keys`. A record it stores comes
+    /// back to be stored here too in `Mode::Invalidation`, where each node
+    /// caches its own working set, and only answered with in
+    /// `Mode::Distributed`, where `peer` owns the key and this node may not.
+    /// A peer that declines or cannot be reached is marked tried on each key,
+    /// and the keys come back as [`Asked::Passed`] for the next node.
     pub(super) async fn load_on(
         &self,
         peer: NodeId,
-        keys: Vec<(K, bytes::Bytes)>,
-    ) -> Result<Sourced<K, V>, LoadError> {
-        let request = keys
-            .iter()
-            .map(|(_, key_bytes)| key_bytes.clone())
-            .collect();
-        let outcome = self
-            .cluster
-            .mesh()
-            .load(peer, SmolStr::new(self.shard.name()), request)
-            .await;
-        let (found, uncached) = match outcome {
+        keys: Vec<Routed<K>>,
+        ask: &AskLoad<'_>,
+    ) -> Result<Asked<K, V>, LoadError> {
+        let request = keys.iter().map(|routed| routed.key_bytes.clone()).collect();
+        let (found, uncached) = match ask(peer, request).await {
             Ok(LoadOutcome::Loaded { found, uncached }) => (found, uncached),
             Ok(LoadOutcome::Failed(message)) => {
                 return Err(Box::new(RemoteLoaderError {
@@ -250,16 +320,19 @@ where
                 }));
             }
             Ok(LoadOutcome::Declined) | Err(_) => {
-                let keys = keys.into_iter().map(|(key, _)| key).collect();
-                return Ok(Sourced {
-                    store: self.shard.call_loader(keys).await?,
-                    answer: HashMap::new(),
-                });
+                let passed = keys
+                    .into_iter()
+                    .map(|mut routed| {
+                        routed.tried.insert(peer);
+                        routed
+                    })
+                    .collect();
+                return Ok(Asked::Passed(passed));
             }
         };
         let mut by_bytes: HashMap<bytes::Bytes, K> = keys
             .into_iter()
-            .map(|(key, key_bytes)| (key_bytes, key))
+            .map(|routed| (routed.key_bytes, routed.key))
             .collect();
         let mut sourced = Sourced {
             store: HashMap::new(),
@@ -283,7 +356,7 @@ where
                 sourced.answer.insert(key, value);
             }
         }
-        Ok(sourced)
+        Ok(Asked::Answered(sourced))
     }
 
     /// [`loader_peers`] for this cache.

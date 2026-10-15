@@ -135,39 +135,6 @@ async fn load_many_on_a_distributed_non_owner_keeps_no_copy() {
     c.shutdown().await;
 }
 
-/// The `Declined | Err` arm of `load_on`: a peer that cannot be reached has
-/// its keys loaded here and handed back to store.
-#[tokio::test]
-async fn a_load_an_unreachable_owner_leaves_to_a_distributed_non_owner_keeps_no_copy() {
-    let ((a, cache_a), b, c, key, calls) =
-        three_nodes_loading_on_the_first("nonowner-fill-unreachable").await;
-    let ghost = NodeId::from(u64::MAX);
-    let owner = &cache_a;
-    let found = cache_a
-        .shard
-        .load_many_from([key], &|keys| {
-            Box::pin(async move {
-                let keys = keys
-                    .into_iter()
-                    .map(|key| (key, encode_key(&key).expect("u32 encodes")))
-                    .collect();
-                owner.load_on(ghost, keys).await
-            })
-        })
-        .await
-        .expect("the load falls back to this node's loader");
-    assert_eq!(found, HashMap::from([(key, format!("v{key}"))]));
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "the loader ran here");
-    assert_eq!(
-        cache_a.get(&key).await,
-        None,
-        "a non-owner keeps no copy of what it loaded for an owner it could not reach"
-    );
-    a.shutdown().await;
-    b.shutdown().await;
-    c.shutdown().await;
-}
-
 #[tokio::test]
 async fn a_removed_key_is_not_served_from_a_distributed_non_owners_fill() {
     let ((a, cache_a), (b, cache_b), (c, cache_c), key) = three_node_distributed_with_a(

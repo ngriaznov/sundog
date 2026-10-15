@@ -291,8 +291,14 @@ async fn a_failing_remote_loader_answers_with_a_remote_loader_error() {
     let key = (0..10_000u32)
         .find(|key| {
             let part = PartId::of_key(&encode_key(key).expect("u32 encodes"));
-            load_target(Mode::Invalidation, part, a.node_id(), &[], &capable)
-                == LoadTarget::Peer(failing)
+            load_target(
+                Mode::Invalidation,
+                part,
+                a.node_id(),
+                &[],
+                &capable,
+                &HashSet::new(),
+            ) == LoadTarget::Peer(failing)
         })
         .expect("a key whose loads gather on the failing node");
     let err = cache_a
@@ -451,6 +457,7 @@ async fn refresh_ahead_reloads_a_replicated_key_once_on_its_refresher() {
         a.node_id(),
         &[],
         &[b.node_id()].into_iter().collect(),
+        &HashSet::new(),
     ) {
         LoadTarget::Here => a.node_id(),
         LoadTarget::Peer(peer) => peer,
