@@ -282,8 +282,16 @@ async fn distributed_cache_opened_before_any_peer_is_known_pulls_its_buckets_onc
 }
 
 /// Polls until every key in `0..total` is held by exactly the two
-/// owners every node's view agrees on, or panics after 30 seconds with
-/// a histogram of keys by holder count.
+/// owners every node's view agrees on, and both owners hold the key's
+/// part warm and verified, or panics after 30 seconds with a histogram
+/// of keys by holder count.
+///
+/// Holding the value is not enough for a read to be served. An owner
+/// whose part is unverified declines a peer's fetch even for a record it
+/// holds, and one whose part is cold declines a record it lacks, so the
+/// wait covers the marks as well. Only the owners count: a node that is
+/// not an owner of the part keeps whatever mark an earlier view left on it
+/// (see `ResidencySet::mark_serving`), and it serves nothing of that part.
 async fn wait_until_settled_on_agreed_owners(nodes: &[(NodeId, &Cache<u32, String>)], total: u32) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -291,11 +299,17 @@ async fn wait_until_settled_on_agreed_owners(nodes: &[(NodeId, &Cache<u32, Strin
         let mut settled = 0u32;
         for key in 0..total {
             let expected = format!("v{key}");
+            let part = part_of(key);
             let mut owners: Vec<Vec<NodeId>> = Vec::new();
             let mut holders: Vec<NodeId> = Vec::new();
+            let mut owners_warm = true;
             for (node, cache) in nodes {
                 let mut view_owners = cache.owners_of(&key);
                 view_owners.sort_unstable();
+                if view_owners.contains(node) {
+                    owners_warm &=
+                        !cache.shard.is_cold_part(part) && !cache.shard.is_unverified_part(part);
+                }
                 owners.push(view_owners);
                 if cache.get(&key).await.as_deref() == Some(expected.as_str()) {
                     holders.push(*node);
@@ -306,6 +320,7 @@ async fn wait_until_settled_on_agreed_owners(nodes: &[(NodeId, &Cache<u32, Strin
             if owners.iter().all(|o| *o == owners[0])
                 && owners[0].len() == 2
                 && holders == owners[0]
+                && owners_warm
             {
                 settled += 1;
             }
@@ -329,9 +344,22 @@ async fn two_nodes_joining_at_once_lose_no_bucket_the_origin_releases() {
     // other joiner finds nothing there. `a`'s release hands those
     // buckets off before dropping them.
     let name = "distributed-double-join";
+    // Every node stays up and answers: the three share this test's one
+    // runtime, whose ownership-view and rebalance planning over 65,536
+    // parts in a debug build holds it for hundreds of milliseconds at a
+    // time, longer on a busy runner. A fetch then outlasts the default
+    // 750ms fetch timeout, and a failure detector that drops a node too busy
+    // to gossip fails a fetch to it at once ("not a known mesh member") and
+    // moves the views.
+    let config = || {
+        loopback_config().with(|c| {
+            c.fetch_timeout = Duration::from_secs(5);
+            c.phi_threshold = 1_000.0;
+        })
+    };
     let a = Cluster::builder(name)
         .seeds(std::iter::empty())
-        .config(loopback_config())
+        .config(config())
         .build()
         .await
         .expect("node a builds");
@@ -351,13 +379,13 @@ async fn two_nodes_joining_at_once_lose_no_bucket_the_origin_releases() {
     let seed = a.local_gossip_addr();
     let b = Cluster::builder(name)
         .seeds([seed])
-        .config(loopback_config())
+        .config(config())
         .build()
         .await
         .expect("node b builds");
     let c = Cluster::builder(name)
         .seeds([seed])
-        .config(loopback_config())
+        .config(config())
         .build()
         .await
         .expect("node c builds");
