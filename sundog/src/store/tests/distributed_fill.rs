@@ -9,7 +9,7 @@ use tokio::sync::Notify;
 use super::*;
 use crate::net::LoadServe;
 use crate::store::Loader;
-use crate::store::fan_out::{FillRoute, fill_route};
+use crate::store::fan_out::{FillRoute, ReadThroughRoute, fill_route, read_through_route};
 use crate::store::refresh::RefreshRequest;
 
 /// What publishes a further view to a test shard.
@@ -557,4 +557,223 @@ fn fill_route_installs_only_an_owned_fill_under_the_ceiling() {
             "a non-owner stores nothing, at the ceiling or not, and refuses nothing"
         );
     }
+}
+
+#[test]
+fn read_through_route_asks_the_owners_only_for_a_distributed_non_owner() {
+    let modes = [
+        Mode::Local,
+        Mode::Invalidation,
+        Mode::Replicated,
+        Mode::distributed(),
+    ];
+    for mode in modes {
+        for owns in [false, true] {
+            let want = if matches!(mode, Mode::Distributed { .. }) && !owns {
+                ReadThroughRoute::OwnersFirst
+            } else {
+                ReadThroughRoute::Local
+            };
+            assert_eq!(read_through_route(mode, owns), want, "{mode:?} owns={owns}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_read_through_route_follows_the_shards_current_view() {
+    let (s, view, tx, _calls) = loading_shard();
+    let owned = find_key_by_ownership(&view, true);
+    let foreign = find_key_by_ownership(&view, false);
+    assert_eq!(
+        s.read_through_route_of(&owned).expect("encodes"),
+        ReadThroughRoute::Local
+    );
+    assert_eq!(
+        s.read_through_route_of(&foreign).expect("encodes"),
+        ReadThroughRoute::OwnersFirst
+    );
+
+    let crowded = crowded_view();
+    let moved = key_moved_away(&view, &crowded);
+    tx.send(crowded).expect("the tracker holds a receiver");
+    assert_eq!(
+        s.read_through_route_of(&moved).expect("encodes"),
+        ReadThroughRoute::OwnersFirst,
+        "a part the view moved away asks the owners"
+    );
+
+    let replicated = shard::<u32, String>(1);
+    assert_eq!(
+        replicated.read_through_route_of(&7).expect("encodes"),
+        ReadThroughRoute::Local,
+        "a shard with no ownership view loads on a miss"
+    );
+}
+
+#[tokio::test]
+async fn get_or_load_via_on_a_non_owner_answers_with_the_asked_value_and_stores_nothing() {
+    let (s, view, _tx, _calls) = loading_shard();
+    let key = find_key_by_ownership(&view, false);
+    let mut events = s.events();
+    let ran = AtomicUsize::new(0);
+
+    let got = s
+        .get_or_load_via(
+            &key,
+            async |_: &u32| Ok(Some("asked".to_string())),
+            async |_: &u32| {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Infallible>("loaded".to_string())
+            },
+        )
+        .await
+        .expect("answers");
+
+    assert_eq!(got, "asked");
+    assert_eq!(ran.load(Ordering::SeqCst), 0, "the loader does not run");
+    assert_eq!(s.get(&key).await, None, "a non-owner keeps no copy");
+    assert!(s.fan_out_queue().drain().is_empty(), "nothing is sent");
+    assert!(
+        matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ),
+        "a value stored nowhere emits no event"
+    );
+}
+
+#[tokio::test]
+async fn get_or_load_via_on_an_owner_stores_the_asked_value_and_fans_it_out() {
+    let (s, view, _tx, _calls) = loading_shard();
+    let key = find_key_by_ownership(&view, true);
+    let ran = AtomicUsize::new(0);
+
+    let got = s
+        .get_or_load_via(
+            &key,
+            async |_: &u32| Ok(Some("asked".to_string())),
+            async |_: &u32| {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Infallible>("loaded".to_string())
+            },
+        )
+        .await
+        .expect("answers");
+
+    assert_eq!(got, "asked");
+    assert_eq!(ran.load(Ordering::SeqCst), 0);
+    assert_eq!(s.get(&key).await, Some("asked".to_string()));
+    assert_eq!(applied_keys(s.fan_out_queue().drain()), vec![key]);
+}
+
+#[tokio::test]
+async fn get_or_load_via_runs_the_loader_when_the_ask_has_no_value() {
+    let (s, view, _tx, _calls) = loading_shard();
+    let key = find_key_by_ownership(&view, false);
+
+    let got = s
+        .get_or_load_via(&key, async |_: &u32| Ok(None), filled("loaded"))
+        .await
+        .expect("answers");
+
+    assert_eq!(got, "loaded");
+    assert_eq!(s.get(&key).await, None);
+}
+
+#[tokio::test]
+async fn get_or_load_via_returns_the_asks_error_and_a_joined_call_takes_the_fill_over() {
+    let (s, view, _tx, _calls) = loading_shard();
+    let key = find_key_by_ownership(&view, false);
+    let release = Notify::new();
+    let first = s.get_or_load_via(
+        &key,
+        async |_: &u32| {
+            release.notified().await;
+            Err(CacheError::NoLoader {
+                cache: SmolStr::new("asked"),
+            })
+        },
+        filled("first"),
+    );
+    let waiter = async {
+        let joined = s.get_or_load_via(
+            &key,
+            async |_: &u32| Ok(Some("second".to_string())),
+            filled("loaded"),
+        );
+        let release_later = async {
+            tokio::task::yield_now().await;
+            release.notify_one();
+        };
+        tokio::join!(joined, release_later).0
+    };
+    let (first, joined) = tokio::join!(first, waiter);
+
+    assert!(
+        matches!(first, Err(CacheError::NoLoader { .. })),
+        "the ask's own error answers the call that ran it: {first:?}"
+    );
+    assert_eq!(
+        joined.expect("the joined call answers"),
+        "second",
+        "it takes the fill over and asks for itself"
+    );
+    assert_eq!(s.get(&key).await, None);
+}
+
+#[tokio::test]
+async fn concurrent_get_or_load_via_calls_share_one_ask() {
+    let (s, view, _tx, _calls) = loading_shard();
+    let key = find_key_by_ownership(&view, false);
+    let asks = AtomicUsize::new(0);
+    let loads = AtomicUsize::new(0);
+    let release = Notify::new();
+    let calls = (0..8).map(|_| {
+        s.get_or_load_via(
+            &key,
+            async |_: &u32| {
+                asks.fetch_add(1, Ordering::SeqCst);
+                release.notified().await;
+                Ok(None)
+            },
+            async |_: &u32| {
+                loads.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Infallible>("loaded".to_string())
+            },
+        )
+    });
+    let release_later = async {
+        tokio::task::yield_now().await;
+        release.notify_one();
+    };
+    let (answers, ()) = tokio::join!(futures::future::join_all(calls), release_later);
+
+    for answer in answers {
+        assert_eq!(answer.expect("answers"), "loaded");
+    }
+    assert_eq!(asks.load(Ordering::SeqCst), 1);
+    assert_eq!(loads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_dropped_ask_frees_the_in_flight_fill() {
+    let (s, view, _tx, _calls) = loading_shard();
+    let key = find_key_by_ownership(&view, false);
+    tokio::select! {
+        biased;
+        _ = s.get_or_load_via(
+            &key,
+            async |_: &u32| {
+                std::future::pending::<()>().await;
+                Ok(None)
+            },
+            filled("never"),
+        ) => unreachable!("the ask never returns"),
+        () = tokio::task::yield_now() => {}
+    }
+    let loaded = tokio::time::timeout(Duration::from_secs(5), s.get_or_load(&key, filled("after")))
+        .await
+        .expect("the dropped ask left nothing in flight")
+        .expect("loads");
+    assert_eq!(loaded, "after");
 }

@@ -16,7 +16,7 @@ use crate::explain::{OwnerProbe, Reads};
 use crate::net::FetchOutcome;
 use crate::node::NodeId;
 use crate::ownership::OwnershipView;
-use crate::store::{PartId, ShardOps, encode_key, now_ms};
+use crate::store::{PartId, ReadThroughRoute, ShardOps, encode_key, now_ms};
 use crate::wire::WireRecord;
 use crate::{explain, verdict};
 
@@ -77,6 +77,19 @@ pub(super) fn record_fetch_outcome(
     }
 }
 
+/// What the owners' answer to a non-owner's read-through decides: a value
+/// answers the call, a miss and an owner set that cannot answer
+/// ([`CacheError::FetchUnavailable`]) both leave the loader to run, and
+/// any other error ends the call. Pure; unit tested directly.
+pub(super) fn owners_answer<V>(
+    fetched: Result<Option<V>, CacheError>,
+) -> Result<Option<V>, CacheError> {
+    match fetched {
+        Err(CacheError::FetchUnavailable { .. }) => Ok(None),
+        other => other,
+    }
+}
+
 /// Decodes a [`Cache::fetch`] reply's record into its value, re-checking
 /// expiry client-side (defense in depth against the responder's own expiry
 /// sweep lagging) and treating a tombstone or undecodable value as a miss.
@@ -110,6 +123,32 @@ where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
+    /// [`Shard::get_or_load`](crate::store::Shard::get_or_load) for `key`
+    /// where a `Mode::Distributed` node that does not own the key's part
+    /// asks the key's owners, as [`Cache::fetch`] does, before it runs
+    /// `loader`. The ask runs inside the shard's single-flight, so
+    /// concurrent calls for one key share one fetch and at most one
+    /// `loader` call; a value an owner returns ends the fill as a loaded
+    /// value does and is stored nowhere on this node.
+    pub(super) async fn read_through<F, E>(&self, key: &K, loader: F) -> Result<V, CacheError>
+    where
+        F: AsyncFnOnce(&K) -> Result<V, E>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        match self.shard.read_through_route_of(key)? {
+            ReadThroughRoute::Local => self.shard.get_or_load(key, loader).await,
+            ReadThroughRoute::OwnersFirst => {
+                self.shard
+                    .get_or_load_via(
+                        key,
+                        async |key: &K| owners_answer(self.fetch(key).await),
+                        loader,
+                    )
+                    .await
+            }
+        }
+    }
+
     /// [`Cache::fetch`] inside its `sundog.fetch` span. Every field is
     /// recorded on `span` itself, so a span the subscriber disables records
     /// nothing and never writes to the caller's span.

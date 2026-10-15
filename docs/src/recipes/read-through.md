@@ -82,8 +82,14 @@ owners keep it, and a node that owns nothing of the key keeps no copy, as with
 there, and a `load` that runs on the node itself because no owner has a loader
 or none took the key. The node answers with the value, stores it nowhere and
 sends it to no one, and a later `get` there is `None`. A non-owner's
-`get_or_load` therefore runs its loader on every call, where `load` gathers
-the key's loads on an owner and queries the source once. An owner that loads a
+`get_or_load` and `get_or_insert_with` first ask the key's owners, as `fetch`
+does, and run the loader only when the owners hold no value or none can
+answer. Concurrent calls on the node share one owner fetch and at most one
+loader call. A key no owner stores runs the loader on every non-owner call
+until an owner stores it, through its own read-through, a `load` or a write,
+and `load` gathers the key's loads on an owner and queries the source once. A
+non-owner that still holds the key through the grace after it lost the part
+answers from that copy and asks no one. An owner that loads a
 key stores it and sends it to the other owners. An owner that declines runs no
 loader, so the key loads once. A request that fails after the owner received
 it can have run the owner's loader, so a key can then load on that owner and

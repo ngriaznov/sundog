@@ -28,7 +28,7 @@ addresses once it forms, under `cluster formed`.
 | Metric | Meaning |
 |---|---|
 | `sundog_cache_hits_total{cache}` | reads answered from this node's copy |
-| `sundog_cache_misses_total{cache}` | reads that found no entry on this node, one per loader run for `get_or_load` |
+| `sundog_cache_misses_total{cache}` | reads that found no entry on this node, one per `get_or_load` fill, whether its loader or, on a `Distributed` non-owner, an owner supplies the value |
 | `sundog_read_duration_seconds{cache, outcome}` | histogram of `get` and `get_sync` durations, `hit` or `miss`, about one read in 256 per thread |
 | `sundog_cache_entries{cache}` | live entries on this node |
 | `sundog_tombstones{cache}` | tombstones this node holds: its deletes and, in a `Replicated` or `Distributed` cache whose resolver does not merge, its swept expired entries, until they are collected |

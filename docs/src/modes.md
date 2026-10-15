@@ -96,7 +96,9 @@ dropped and counted in `sundog_backlog_dropped_total`. When the node is not an
 owner of those records, its pass-through copy was the only one, and
 anti-entropy cannot repair it. `get` reads this node's copy and returns `None`
 off a non-owner, and a read-through fill does not change that: `get_or_load`
-and `load` on a non-owner answer with the loaded value and keep no copy.
+and `load` on a non-owner answer and keep no copy. `get_or_load` and
+`get_or_insert_with` there ask the owners as `fetch` does and run their loader
+only when the owners hold no value or none can answer.
 `fetch` is the network-aware read: it answers locally when this node owns the
 part and otherwise asks the owners in order, returning `Ok(None)` for a real
 miss or `CacheError::FetchUnavailable` when no owner answers within

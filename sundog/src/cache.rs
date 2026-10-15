@@ -826,12 +826,18 @@ where
     /// loads afresh.
     ///
     /// In [`Mode::Distributed`] a node that does not own the key's part
-    /// answers with the loaded value and keeps no copy, so a later `get` of
-    /// it there is `None` and a later remove or write elsewhere leaves no
-    /// stale value behind. Each such call runs `loader`: a non-owner has no
-    /// copy to hit. [`Cache::load`] runs the load on an owner that has a
-    /// loader, and is the way to read through with one source query per
-    /// key.
+    /// keeps no copy of what it reads through. It asks the key's owners
+    /// first, as [`Cache::fetch`] does, and an owner's value answers the
+    /// call without running `loader`. Only when the owners hold no value
+    /// for the key, or none can answer (every owner is unreachable, times
+    /// out or declines), does `loader` run, and its value answers the call
+    /// and is stored nowhere. Concurrent calls for one key on this node
+    /// share one owner fetch and at most one `loader` call. A key no owner
+    /// stores therefore runs `loader` on every such call, until an owner
+    /// stores it: through its own read-through, [`Cache::load`], which
+    /// runs the load on an owner that has a loader and is the way to read
+    /// through with one source query per key, or a write. A node that
+    /// still holds the key answers from its own copy and asks nobody.
     ///
     /// # Errors
     ///
@@ -844,12 +850,13 @@ where
         F: AsyncFnOnce(&K) -> Result<V, E>,
         E: std::error::Error + Send + Sync + 'static,
     {
-        self.shard.get_or_load(key, loader).await
+        self.read_through(key, loader).await
     }
 
     /// [`Cache::get_or_load`] for a loader that never fails; `Result` remains
     /// only for [`CacheError::Codec`]. A [`Mode::Distributed`] non-owner
-    /// answers with `make`'s value and keeps no copy, as `get_or_load`
+    /// asks the key's owners before it calls `make`, answers with `make`'s
+    /// value only when they hold none, and keeps no copy, as `get_or_load`
     /// does.
     ///
     /// # Errors
@@ -860,7 +867,10 @@ where
         key: &K,
         make: impl AsyncFnOnce(&K) -> V,
     ) -> Result<V, CacheError> {
-        self.shard.get_or_insert_with(key, make).await
+        self.read_through(key, async move |key: &K| {
+            Ok::<V, std::convert::Infallible>(make(key).await)
+        })
+        .await
     }
 
     /// Reads `key` through the loader registered with

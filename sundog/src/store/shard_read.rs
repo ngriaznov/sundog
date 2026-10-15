@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::engine::JoinOutcome;
-use super::fan_out::{FillRoute, fill_fans_out, fill_route};
+use super::fan_out::{FillRoute, ReadThroughRoute, fill_fans_out, fill_route, read_through_route};
 use super::{
     Event, FanOutItem, Origin, PartId, Shard, SharedLoaderFailure, encode_key, engine, read_timing,
 };
@@ -287,7 +287,8 @@ where
     /// it nowhere: it sends nothing to the owners, emits no event and
     /// counts no refusal. A non-owner holds no copy for a hit, so every
     /// call there runs `loader`; callers joined to a run in flight share
-    /// its value.
+    /// its value. [`Cache::get_or_load`](crate::Cache::get_or_load) on a
+    /// non-owner asks the owners before it runs its loader.
     ///
     /// An invalidation for `key` that lands while `loader` runs, from a peer
     /// or [`Shard::invalidate_local`], means the loader may have read the
@@ -305,6 +306,54 @@ where
     /// `Shard::insert` relies on the same bound to encode any `V`.
     pub async fn get_or_load<F, E>(&self, key: &K, loader: F) -> Result<V, CacheError>
     where
+        F: AsyncFnOnce(&K) -> Result<V, E>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        self.get_or_load_via(key, async |_: &K| Ok(None), loader)
+            .await
+    }
+
+    /// Whether a read-through of `key` asks the key's owners before it runs
+    /// a loader, by [`read_through_route`] under this shard's current view.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::Codec`] if `key` fails to postcard-encode.
+    pub(crate) fn read_through_route_of(&self, key: &K) -> Result<ReadThroughRoute, CacheError> {
+        // A shard with no ownership view owns every key, so it needs no key
+        // encoding to say so.
+        let owns = self.ownership.is_none() || self.owns_key(&encode_key(key)?);
+        Ok(read_through_route(self.mode, owns))
+    }
+
+    /// [`Shard::get_or_load`] with `ask_first` run by the call that wins the
+    /// key's fill, after the spilled-key check and before `loader`. An
+    /// `Ok(Some(value))` is the fill's value: `loader` does not run, and
+    /// the value ends the fill as a loader's value would, stored or
+    /// returned uncached per [`fill_route`] and counted as the call's one
+    /// miss. `Ok(None)` runs `loader`. An `Err` ends the call with it and
+    /// frees the fill, so a call joined to it takes the fill over; nothing
+    /// is stored. The step runs once per fill, so concurrent calls for one
+    /// key share one `ask_first` and at most one `loader`. The version the
+    /// fill stores under is stamped before `ask_first` runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::Loader`] if `loader` fails and `ask_first`'s
+    /// error if it fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a value `ask_first` or `loader` returned fails to
+    /// postcard-encode.
+    pub(crate) async fn get_or_load_via<P, F, E>(
+        &self,
+        key: &K,
+        ask_first: P,
+        loader: F,
+    ) -> Result<V, CacheError>
+    where
+        P: AsyncFnOnce(&K) -> Result<Option<V>, CacheError>,
         F: AsyncFnOnce(&K) -> Result<V, E>,
         E: std::error::Error + Send + Sync + 'static,
     {
@@ -368,10 +417,17 @@ where
                         guard.complete();
                         return Ok(value);
                     }
-                    // Stamped before the loader runs, so a write or removal
-                    // that lands during the load is newer than the fill and
-                    // keeps its place.
+                    // Stamped before the first step runs, so a write or
+                    // removal that lands during the load is newer than the
+                    // fill and keeps its place.
                     let ver = self.stamp_local();
+                    // An error drops `guard` uncompleted, which frees the
+                    // fill for a joined call to take over.
+                    if let Some(value) = ask_first(key).await? {
+                        self.finish_fill(key, &key_bytes, hash, ver, &inflight, value.clone());
+                        guard.complete();
+                        return Ok(value);
+                    }
                     return match loader(key).await {
                         Ok(value) => {
                             self.finish_fill(key, &key_bytes, hash, ver, &inflight, value.clone());

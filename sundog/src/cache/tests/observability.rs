@@ -248,7 +248,7 @@ async fn a_disabled_fetch_span_records_nothing_on_the_callers_span() {
 
 /// Per `(name, cache, outcome)` metric, a counter's value or a
 /// histogram's sample count, drained from `snapshotter`.
-fn drained(
+pub(super) fn drained(
     snapshotter: &metrics_util::debugging::Snapshotter,
 ) -> std::collections::BTreeMap<(String, String, String), u64> {
     use metrics_util::debugging::DebugValue;
@@ -280,7 +280,7 @@ fn drained(
 
 /// [`drained`]'s map: per `(name, cache, outcome)`, a counter's value or a
 /// histogram's sample count.
-type Series = std::collections::BTreeMap<(String, String, String), u64>;
+pub(super) type Series = std::collections::BTreeMap<(String, String, String), u64>;
 
 /// The series a read moves: hit and miss counts, sampled read timings,
 /// fetch counts and timings, and loader calls.
@@ -295,7 +295,7 @@ const READ_SERIES: [&str; 6] = [
 
 /// [`drained`] restricted to [`READ_SERIES`]. A call drains every series,
 /// so each reports what ran since the one before.
-fn read_series(snapshotter: &metrics_util::debugging::Snapshotter) -> Series {
+pub(super) fn read_series(snapshotter: &metrics_util::debugging::Snapshotter) -> Series {
     drained(snapshotter)
         .into_iter()
         .filter(|((name, ..), _)| READ_SERIES.contains(&name.as_str()))
@@ -304,7 +304,7 @@ fn read_series(snapshotter: &metrics_util::debugging::Snapshotter) -> Series {
 
 /// The value of the series `name` of `cache` under `outcome` in `series`,
 /// 0 when it has none.
-fn series_count(series: &Series, name: &str, cache: &str, outcome: &str) -> u64 {
+pub(super) fn series_count(series: &Series, name: &str, cache: &str, outcome: &str) -> u64 {
     series
         .get(&(name.to_owned(), cache.to_owned(), outcome.to_owned()))
         .copied()

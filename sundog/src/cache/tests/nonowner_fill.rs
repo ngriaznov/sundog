@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use super::nonowner_read_through::settled_trio_with;
 use super::*;
 
 /// Three `Mode::distributed()` nodes of `name`, only the first with a
@@ -58,8 +59,8 @@ async fn three_nodes_loading_on_the_first(
 
 #[tokio::test]
 async fn get_or_load_on_a_distributed_non_owner_keeps_no_copy() {
-    let ((a, cache_a), (b, _cache_b), (c, _cache_c), key) =
-        three_node_distributed("nonowner-fill-get-or-load", "prices").await;
+    let trio = settled_trio_with("nonowner-fill-get-or-load", loopback_config()).await;
+    let (key, cache_a) = (trio.key, trio.non_owner());
     let loaded = cache_a
         .get_or_load(&key, async |_: &u32| {
             Ok::<_, SourceDown>("filled".to_string())
@@ -74,24 +75,20 @@ async fn get_or_load_on_a_distributed_non_owner_keeps_no_copy() {
     );
     assert!(!cache_a.contains_key(&key).await);
     assert!(cache_a.keys().is_empty(), "no key is held");
-    a.shutdown().await;
-    b.shutdown().await;
-    c.shutdown().await;
+    trio.shut_down().await;
 }
 
 #[tokio::test]
 async fn get_or_insert_with_on_a_distributed_non_owner_keeps_no_copy() {
-    let ((a, cache_a), (b, _cache_b), (c, _cache_c), key) =
-        three_node_distributed("nonowner-fill-insert-with", "prices").await;
+    let trio = settled_trio_with("nonowner-fill-insert-with", loopback_config()).await;
+    let (key, cache_a) = (trio.key, trio.non_owner());
     let made = cache_a
         .get_or_insert_with(&key, async |_: &u32| "made".to_string())
         .await
         .expect("get_or_insert_with");
     assert_eq!(made, "made");
     assert_eq!(cache_a.get(&key).await, None);
-    a.shutdown().await;
-    b.shutdown().await;
-    c.shutdown().await;
+    trio.shut_down().await;
 }
 
 #[tokio::test]
@@ -137,39 +134,29 @@ async fn load_many_on_a_distributed_non_owner_keeps_no_copy() {
 
 #[tokio::test]
 async fn a_removed_key_is_not_served_from_a_distributed_non_owners_fill() {
-    let ((a, cache_a), (b, cache_b), (c, cache_c), key) = three_node_distributed_with_a(
+    let trio = settled_trio_with(
         "nonowner-fill-stale",
-        "prices",
-        loopback_config().with(|c| {
-            c.ae_interval = Duration::from_secs(30);
-            c.tombstone_ttl = Duration::from_secs(300);
-        }),
+        loopback_config().with(|c| c.tombstone_ttl = Duration::from_secs(300)),
     )
     .await;
-    cache_b
-        .insert(key, "owned".to_string())
-        .await
-        .expect("insert");
-    wait_until(
-        Duration::from_secs(10),
-        "an owner holds the written value",
-        async || cache_b.get(&key).await.is_some() || cache_c.get(&key).await.is_some(),
-    )
-    .await;
+    let (key, cache_a) = (trio.key, trio.non_owner());
+    let owners = trio.owners();
+    trio.hold_at_the_owners("owned").await;
     let ran = AtomicUsize::new(0);
-    let filled = cache_a
+    let served = cache_a
         .get_or_load(&key, async |_: &u32| {
             ran.fetch_add(1, Ordering::SeqCst);
             Ok::<_, SourceDown>("filled".to_string())
         })
         .await
         .expect("get_or_load");
-    assert_eq!(filled, "filled");
+    assert_eq!(served, "owned", "an owner holds the key, so no loader runs");
+    assert_eq!(ran.load(Ordering::SeqCst), 0);
     assert_eq!(cache_a.get(&key).await, None);
 
-    cache_b.remove(&key).await.expect("remove");
+    owners[0].remove(&key).await.expect("remove");
     wait_until(Duration::from_secs(10), "owners drop the key", async || {
-        cache_b.get(&key).await.is_none() && cache_c.get(&key).await.is_none()
+        owners[0].get(&key).await.is_none() && owners[1].get(&key).await.is_none()
     })
     .await;
     assert_eq!(
@@ -184,13 +171,11 @@ async fn a_removed_key_is_not_served_from_a_distributed_non_owners_fill() {
         })
         .await
         .expect("get_or_load");
-    assert_eq!(reloaded, "reloaded");
     assert_eq!(
-        ran.load(Ordering::SeqCst),
-        2,
-        "a non-owner has no copy, so each call reads the source"
+        reloaded, "reloaded",
+        "the owners dropped the key, so the loader runs"
     );
-    a.shutdown().await;
-    b.shutdown().await;
-    c.shutdown().await;
+    assert_eq!(ran.load(Ordering::SeqCst), 1);
+    assert_eq!(cache_a.get(&key).await, None);
+    trio.shut_down().await;
 }

@@ -358,6 +358,30 @@ pub(super) const fn fill_route(owns: bool, at_ceiling: bool) -> FillRoute {
     }
 }
 
+/// Where a read-through of a key looks before it runs a loader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadThroughRoute {
+    /// The loader runs on a miss here.
+    Local,
+    /// The key's owners are asked first, and the loader runs only when
+    /// they hold no value for the key or cannot be reached.
+    OwnersFirst,
+}
+
+/// Where a read-through of a key in `mode` looks on a node that `owns`
+/// the key's part or not. Only a `Mode::Distributed` node that does not own
+/// the part asks its owners first: it stores no fill (see [`fill_route`]),
+/// so a loader it ran would repeat work an owner may already have done.
+/// Every owner, and every other mode, loads on a miss. Pure; unit tested
+/// directly.
+pub(super) const fn read_through_route(mode: Mode, owns: bool) -> ReadThroughRoute {
+    if matches!(mode, Mode::Distributed { .. }) && !owns {
+        ReadThroughRoute::OwnersFirst
+    } else {
+        ReadThroughRoute::Local
+    }
+}
+
 /// Whether the records a drain sends carry values: every mode but an
 /// `Invalidation` cache whose resolver does not merge, which sends peers a
 /// bare invalidation. Pure; unit tested directly.
