@@ -231,8 +231,8 @@ pub trait ShardOps: Send + Sync {
     fn snapshot_chunks(&self) -> BoxStream<'static, Vec<WireRecord>>;
 
     /// Garbage-collects tombstones older than `tombstone_ttl`: a delete's,
-    /// counted from the delete, and an expired entry's, counted from its
-    /// expiry. While `defer`, a tombstone past `tombstone_ttl` but not
+    /// counted from when this node receives or makes it, and an expired
+    /// entry's, counted from its expiry. While `defer`, a tombstone past `tombstone_ttl` but not
     /// `tombstone_max_ttl` is left in place instead. A tombstone of an
     /// expired entry that arrives from a peer already past the retention
     /// this call applies is dropped on arrival, whatever the key holds.

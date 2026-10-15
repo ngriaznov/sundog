@@ -408,7 +408,7 @@ async fn wait_for_local_record(
 ) {
     let key_bytes = encode_key(&key).expect("u32 encodes");
     wait_until(
-        Duration::from_secs(10),
+        CONVERGE,
         "every cache stores the key as wanted",
         async || {
             caches

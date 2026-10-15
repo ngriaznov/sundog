@@ -746,7 +746,14 @@ async fn concurrent_get_or_load_via_calls_share_one_ask() {
         tokio::task::yield_now().await;
         release.notify_one();
     };
-    let (answers, ()) = tokio::join!(futures::future::join_all(calls), release_later);
+    let (answers, ()) = tokio::join!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            futures::future::join_all(calls)
+        ),
+        release_later
+    );
+    let answers = answers.expect("one ask serves every joined call");
 
     for answer in answers {
         assert_eq!(answer.expect("answers"), "loaded");

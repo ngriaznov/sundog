@@ -855,9 +855,9 @@ where
 
     /// [`Cache::get_or_load`] for a loader that never fails; `Result` remains
     /// only for [`CacheError::Codec`]. A [`Mode::Distributed`] non-owner
-    /// asks the key's owners before it calls `make`, answers with `make`'s
-    /// value only when they hold none, and keeps no copy, as `get_or_load`
-    /// does.
+    /// asks the key's owners before it calls `make`. `make` runs only when
+    /// they hold no value for the key or none can answer; its value answers
+    /// the call and is stored nowhere, as `get_or_load` does.
     ///
     /// # Errors
     ///

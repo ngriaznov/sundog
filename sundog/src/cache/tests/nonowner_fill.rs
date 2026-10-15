@@ -155,7 +155,7 @@ async fn a_removed_key_is_not_served_from_a_distributed_non_owners_fill() {
     assert_eq!(cache_a.get(&key).await, None);
 
     owners[0].remove(&key).await.expect("remove");
-    wait_until(Duration::from_secs(10), "owners drop the key", async || {
+    wait_until(CONVERGE, "owners drop the key", async || {
         owners[0].get(&key).await.is_none() && owners[1].get(&key).await.is_none()
     })
     .await;

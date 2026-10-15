@@ -330,8 +330,11 @@ async fn get_or_load_on_a_non_owner_loads_when_every_owner_is_down() {
 
 #[tokio::test]
 async fn get_or_load_on_a_non_owner_fails_with_the_loader_error_when_the_owners_miss() {
+    let (recorder, snapshotter) = debugging_recorder();
+    let _guard = metrics::set_default_local_recorder(&recorder);
     let trio = settled_trio("nonowner-rt-loader-error").await;
     let (key, cache_a) = (trio.key, trio.non_owner());
+    let _ = read_series(&snapshotter);
 
     let err = cache_a
         .get_or_load(&key, async |_: &u32| Err::<String, _>(SourceDown))
@@ -342,6 +345,13 @@ async fn get_or_load_on_a_non_owner_fails_with_the_loader_error_when_the_owners_
         matches!(err, CacheError::Loader(_)),
         "a loader failure after the owners missed is the loader's: {err:?}"
     );
+    let series = read_series(&snapshotter);
+    assert_eq!(
+        series_count(&series, "sundog_fetch_total", trio.name, "miss"),
+        1,
+        "the loader ran after the owners were asked"
+    );
+    assert_eq!(trio.fetches(&series), 1, "one call asks the owners once");
     trio.shut_down().await;
 }
 
@@ -368,9 +378,12 @@ async fn get_or_insert_with_on_a_non_owner_answers_with_an_owners_value_and_runs
 
 #[tokio::test]
 async fn get_or_insert_with_on_a_non_owner_makes_the_value_when_the_owners_miss() {
+    let (recorder, snapshotter) = debugging_recorder();
+    let _guard = metrics::set_default_local_recorder(&recorder);
     let trio = settled_trio("nonowner-rt-insert-miss").await;
     let (key, cache_a) = (trio.key, trio.non_owner());
     let makes = AtomicUsize::new(0);
+    let _ = read_series(&snapshotter);
 
     for call in 1..=2usize {
         let got = cache_a
@@ -384,6 +397,12 @@ async fn get_or_insert_with_on_a_non_owner_makes_the_value_when_the_owners_miss(
         assert_eq!(makes.load(Ordering::SeqCst), call, "each call makes");
     }
 
+    let series = read_series(&snapshotter);
+    assert_eq!(
+        series_count(&series, "sundog_fetch_total", trio.name, "miss"),
+        2
+    );
+    assert_eq!(trio.fetches(&series), 2, "each call asks the owners once");
     assert_eq!(cache_a.get(&key).await, None, "the non-owner keeps no copy");
     for owner in trio.owners() {
         assert_eq!(owner.get(&key).await, None, "the owners still lack the key");
