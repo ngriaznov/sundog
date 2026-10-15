@@ -1127,9 +1127,12 @@ fn gc_defers(mode: Mode, absent_defers: bool, uptime: Duration, settle: Duration
 /// grid every node shares ([`until_next_grid_tick`]), not on a phase counted
 /// from when the node started: replicas collect the tombstone of an expired
 /// entry, whose deadline is anchored on the expiry, at the same instants,
-/// and a tombstone that one replica has collected and another still holds,
-/// which anti-entropy would offer again each round, lasts as long as the
-/// clock skew between them, not up to a whole period.
+/// and one that a replica has collected and another still holds, which
+/// anti-entropy offers again each round and the collector drops on arrival,
+/// lasts as long as the clock skew between them, not up to a whole period.
+/// A delete's tombstone counts its deadline from its receipt, so replicas
+/// collect it at different ticks, and a collector takes it back from a
+/// replica that still holds it, with fresh deadlines.
 /// `mode` and `absence` decide each tick whether collection past
 /// `tombstone_ttl` defers via [`gc_defers`]: a `Mode::Replicated` tombstone
 /// survives up to `tombstone_max_ttl` while any recently known member is
