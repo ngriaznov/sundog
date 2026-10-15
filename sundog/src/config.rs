@@ -69,6 +69,14 @@ pub struct ClusterConfig {
     /// whoever is absent, since a node that just opened can hold a copy a
     /// peer's tombstone has to delete.
     ///
+    /// Every tombstone counts this retention from an instant all replicas
+    /// agree on, capped at the receiving node's clock: the delete's version
+    /// stamp for a delete, the expiry for the tombstone of an expired entry.
+    /// A tombstone a peer sends that arrives already past its retention is
+    /// ignored and counted in `sundog_tombstones_ignored_total{cache}`; a
+    /// node's own delete is always stored. Keep node clocks well within
+    /// this retention of each other.
+    ///
     /// In a `Mode::Replicated` or `Mode::Distributed` cache whose resolver
     /// does not merge, the sweep also leaves a tombstone for an entry it
     /// removes for having expired, kept for this retention counted from the

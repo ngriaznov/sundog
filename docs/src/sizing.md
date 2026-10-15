@@ -87,21 +87,18 @@ Every node collects on a wall-clock grid, at each multiple of a quarter of
 `tombstone_ttl` (at least a second). The two kinds of tombstone meet that grid
 differently.
 
-The tombstone of an expired entry counts its retention from the expiry, so
-every replica that learns of it, by sweeping or from a peer, collects it at the
-same grid instant. One that arrives already past its retention is dropped, so a
-replica that collected it never takes it back from one that still holds it. The
-window in which one replica holds it and another does not is the clock skew
-between the two nodes.
+Every tombstone counts its retention from an instant all replicas agree on,
+capped at the receiving node's clock: the expiry for the tombstone of an
+expired entry, the delete's own version stamp for a delete. Every replica that
+learns of one, by sweeping or from a peer, derives the same deadlines, so they
+collect it at the same grid instant, up to the clock skew between the nodes. A
+tombstone a peer sends that arrives already past its retention is ignored, so
+a replica that collected it never takes it back from one that still holds it.
+The window in which one replica holds it and another does not is that clock
+skew. A node's own delete is stored however late it applies, and collected at
+its next tick.
 
-A delete's tombstone counts its retention from when each node receives it, so
-replicas collect it at different grid ticks. A node that collected it takes it
-back when anti-entropy offers it from a node that still holds it, with fresh
-deadlines, and keeps it for another `tombstone_ttl`. While replicas collect a
-delete's tombstone at different ticks, it can stay in the cluster past its
-retention.
-
-Either kind lasts longer where a node defers collection, for an absent member
+A tombstone lasts longer where a node defers collection, for an absent member
 or for its first `tombstone_ttl` after opening: that node keeps its tombstones
 while the other does not, until the deferral ends.
 

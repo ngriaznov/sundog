@@ -44,28 +44,39 @@ impl Ring {
     fn new(phases: &[u64]) -> Self {
         let clock = Arc::new(AtomicU64::new(START_MS));
         let shards = (1..=phases.len() as u64)
-            .map(|node| {
-                let reader = Arc::clone(&clock);
-                Arc::new(
-                    Shard::<u32, String>::new(
-                        SmolStr::new("drain"),
-                        Mode::Replicated,
-                        NodeId::from(node),
-                        10_000,
-                        None,
-                        None,
-                    )
-                    .with_clock(Arc::new(move || reader.load(Ordering::SeqCst)))
-                    .with_tombstone_ttl(Duration::from_millis(TOMBSTONE_TTL_MS))
-                    .with_tombstone_max_ttl(Duration::from_millis(TOMBSTONE_MAX_TTL_MS)),
-                )
-            })
+            .map(|node| Self::shard(&clock, node))
             .collect();
         Self {
             clock,
             shards,
             phases: phases.to_vec(),
         }
+    }
+
+    /// A fresh replica `node` on `clock`.
+    fn shard(clock: &Arc<AtomicU64>, node: u64) -> Arc<Shard<u32, String>> {
+        let reader = Arc::clone(clock);
+        Arc::new(
+            Shard::<u32, String>::new(
+                SmolStr::new("drain"),
+                Mode::Replicated,
+                NodeId::from(node),
+                10_000,
+                None,
+                None,
+            )
+            .with_clock(Arc::new(move || reader.load(Ordering::SeqCst)))
+            .with_tombstone_ttl(Duration::from_millis(TOMBSTONE_TTL_MS))
+            .with_tombstone_max_ttl(Duration::from_millis(TOMBSTONE_MAX_TTL_MS)),
+        )
+    }
+
+    /// Adds a replica built now, on `phase`: it starts deferring collection
+    /// until its first tick, as a restarted node does.
+    fn join(&mut self, phase: u64) {
+        let node = self.shards.len() as u64 + 1;
+        self.shards.push(Self::shard(&self.clock, node));
+        self.phases.push(phase);
     }
 
     fn now(&self) -> u64 {
@@ -337,4 +348,88 @@ async fn replicas_collecting_on_one_grid_never_move_a_lapsed_tombstone() {
         records_moved_while_draining(&[0, 5]).await > 0,
         "replicas on offset phases move the tombstones one has collected"
     );
+}
+
+/// The delete record of key 1, stamped at [`START_MS`].
+fn delete_stamped_at_start() -> WireRecord {
+    record(1, None, START_MS, None)
+}
+
+/// Each replica's digests agree with replica 0's.
+async fn assert_digests_agree(ring: &Ring, label: &str) {
+    let first = ring.ops(0).digests().await;
+    for node in 1..ring.shards.len() {
+        assert_eq!(
+            ring.ops(node).digests().await,
+            first,
+            "the replicas agree: {label}"
+        );
+    }
+}
+
+/// A delete leaves every replica, whatever phase each collects on and
+/// whenever each received it. Its tombstone counts its retention from the
+/// delete's stamp, so every replica derives the same deadlines, and a
+/// replica that collected it never takes it back from one that has not.
+/// Only a plain delete, with no value beside it, is applied here: the case
+/// the tests above, which apply values, do not reach.
+#[tokio::test]
+async fn a_delete_leaves_every_replica_whatever_phase_and_receipt_time() {
+    for phases in [vec![0, 5], vec![0, 5, 11], vec![7, 0]] {
+        let ring = Ring::new(&phases);
+        ring.shards[0].apply_remote(delete_stamped_at_start()).await;
+        // The second replica receives it 20 s later, between its ticks.
+        ring.clock.fetch_add(20_000, Ordering::SeqCst);
+        ring.shards[1].apply_remote(delete_stamped_at_start()).await;
+        assert_eq!(ring.tombstones()[..2], [1, 1], "both hold it: {phases:?}");
+
+        let counts = tombstones_after_retention(&ring, ring.now()).await;
+        assert_eq!(
+            counts,
+            vec![0; phases.len()],
+            "the delete drains from every replica: {phases:?}"
+        );
+        assert_digests_agree(&ring, &format!("{phases:?}")).await;
+
+        // It stays gone over the rounds that follow.
+        let mut step = 1_000;
+        for round in 0..6 {
+            step = ring
+                .run_until(ring.now() + AE_PERIOD_STEPS * 1_000, step)
+                .await;
+            assert_eq!(
+                ring.tombstones(),
+                vec![0; phases.len()],
+                "no replica takes it back, round {round}: {phases:?}"
+            );
+        }
+        assert_digests_agree(&ring, &format!("{phases:?}, later")).await;
+    }
+}
+
+/// A replica built after the delete, which defers collection until its first
+/// tick, takes the tombstone from the others and drops it with them.
+#[tokio::test]
+async fn a_replica_that_starts_late_takes_a_delete_and_drops_it_with_the_others() {
+    for join_phase in [0, 4, 11] {
+        let mut ring = Ring::new(&[0, 5]);
+        ring.shards[0].apply_remote(delete_stamped_at_start()).await;
+        ring.clock.fetch_add(20_000, Ordering::SeqCst);
+        ring.shards[1].apply_remote(delete_stamped_at_start()).await;
+        ring.clock.fetch_add(20_000, Ordering::SeqCst);
+        ring.join(join_phase);
+
+        let counts = tombstones_after_retention(&ring, ring.now()).await;
+        assert_eq!(
+            counts,
+            vec![0; 3],
+            "the delete drains from every replica: late phase {join_phase}"
+        );
+        assert_digests_agree(&ring, &format!("late phase {join_phase}")).await;
+        let step = ring
+            .run_until(ring.now() + 6 * AE_PERIOD_STEPS * 1_000, 1_000)
+            .await;
+        assert!(step > 1_000);
+        assert_eq!(ring.tombstones(), vec![0; 3], "and stays gone");
+    }
 }

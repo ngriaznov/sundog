@@ -21,7 +21,8 @@ use crate::store::{ConflictResolver, Incoming, Tombstone, Weigher, entry_fingerp
 #[cfg(feature = "spill")]
 use super::EntryState;
 use super::expiry::{
-    absent_at, decode_expiry, drops_lapsed_expiry_tombstone, encode_expiry, tombstone_deadlines,
+    absent_at, decode_expiry, drops_lapsed_tombstone, encode_expiry, tombstone_anchor_ms,
+    tombstone_deadlines,
 };
 use super::keys::{digest_slot, hasher_for, part_index_from_hash, stripe_index_from_hash};
 use super::merge::resolve_and_rebind;
@@ -112,6 +113,27 @@ pub(crate) enum ApplyScope {
     HeldOnly,
 }
 
+/// Where a batch of writes comes from, which decides whether a tombstone in
+/// it can be ignored as lapsed (see [`drops_lapsed_tombstone`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Arrival {
+    /// This node's own write ([`Shard::apply`](crate::store::Shard), `remove`,
+    /// `remove_many`, `clear`): a delete is always stored, however late it
+    /// applies.
+    Local,
+    /// A record a peer sent: replication, anti-entropy, state transfer, a
+    /// rebalance, a forward, or a released skew hold. A tombstone that
+    /// arrives already past its retention is ignored.
+    Peer,
+}
+
+impl Arrival {
+    /// Whether the batch came from a peer.
+    pub(crate) const fn is_peer(self) -> bool {
+        matches!(self, Self::Peer)
+    }
+}
+
 /// One entry's identity for the versioned-apply path, in place of three positional parameters.
 pub(crate) struct EntryKey<K> {
     pub(super) hash: u64,
@@ -145,9 +167,26 @@ pub(crate) struct ApplyCtx<'a, K, V> {
     /// [`Engine::gc_tombstones`].
     pub(super) deferring: bool,
     pub(super) now_ms: u64,
+    /// Whether the write came from a peer; see [`Arrival`].
+    pub(super) from_peer: bool,
+    /// Counts each peer tombstone [`apply_locked`] ignores as lapsed.
+    pub(super) ignored: &'a AtomicU64,
     /// Applies a write only as a fold into a visible live entry; see
     /// [`ApplyScope::HeldOnly`].
     pub(super) held_only: bool,
+}
+
+impl<K, V> ApplyCtx<'_, K, V> {
+    /// This context's [`ArrivalRule`].
+    fn rule(&self) -> ArrivalRule {
+        ArrivalRule {
+            from_peer: self.from_peer,
+            deferring: self.deferring,
+            ttl_ms: self.tombstone_ttl_ms,
+            max_ttl_ms: self.tombstone_max_ttl_ms,
+            now_ms: self.now_ms,
+        }
+    }
 }
 
 /// The live entry [`apply_locked`] finds for a key, as the collision
@@ -232,6 +271,15 @@ where
     K: Hash + Eq + Clone,
     V: Clone + DeserializeOwned,
 {
+    // A lapsed peer tombstone is ignored before anything about the key is
+    // read: no stripe lookup, no spill read, no resolver call. The verdict
+    // depends on the record, the clock and the arrival alone.
+    let rule = ctx.rule();
+    let deadlines = rule.deadlines(&incoming, ver);
+    if rule.ignores(deadlines) {
+        ctx.ignored.fetch_add(1, Ordering::Relaxed);
+        return (ApplyOutcome::Rejected, false);
+    }
     let EntryKey {
         hash,
         key,
@@ -284,27 +332,16 @@ where
         }
     }
 
-    if drops_on_arrival(ctx, &incoming) {
-        return (ApplyOutcome::Rejected, false);
-    }
-
     let had_live = prior_tombstone.is_none() && stored_ver.is_some();
     let was_visible = stored_live.as_ref().is_some_and(|s| s.visible);
-    let new_fp = entry_fingerprint(key_bytes.as_ref(), ver);
-
-    // Subtracts whatever this write displaces before adding the new fingerprint
-    // in.
-    if let Some(t) = prior_tombstone {
-        ctx.digest_bucket.fetch_xor(
-            entry_fingerprint(key_bytes.as_ref(), t.ver),
-            Ordering::Relaxed,
-        );
-        stripe.tombstones.remove(key_bytes.as_ref());
-    } else if let Some(sv) = stored_ver {
-        ctx.digest_bucket
-            .fetch_xor(entry_fingerprint(key_bytes.as_ref(), sv), Ordering::Relaxed);
-    }
-    ctx.digest_bucket.fetch_xor(new_fp, Ordering::Relaxed);
+    swap_fingerprint(
+        stripe,
+        ctx,
+        key_bytes.as_ref(),
+        ver,
+        prior_tombstone,
+        stored_ver,
+    );
 
     let entry = EntryKey {
         hash,
@@ -330,26 +367,75 @@ where
             was_visible,
         ),
         Incoming::Tombstone { expired_at_ms } => {
-            apply_tombstone(stripe, ctx, entry, ver, expired_at_ms, had_live)
+            let (ttl_deadline_ms, max_deadline_ms) = deadlines.unwrap_or_default();
+            let tombstone = Tombstone {
+                ver,
+                ttl_deadline_ms,
+                max_deadline_ms,
+                expired_at_ms,
+            };
+            apply_tombstone(stripe, ctx, entry, tombstone, had_live)
         }
     }
 }
 
-/// Whether `incoming` is a tombstone of an expired entry that arrives already
-/// past the retention the next collection applies, so [`apply_locked`] stores
-/// nothing for it whatever the key holds; see
-/// [`drops_lapsed_expiry_tombstone`].
-fn drops_on_arrival<K, V>(ctx: &ApplyCtx<'_, K, V>, incoming: &Incoming<V>) -> bool {
-    let Incoming::Tombstone { expired_at_ms } = *incoming else {
-        return false;
-    };
-    let deadlines = tombstone_deadlines(
-        expired_at_ms,
-        ctx.now_ms,
-        ctx.tombstone_ttl_ms,
-        ctx.tombstone_max_ttl_ms,
-    );
-    drops_lapsed_expiry_tombstone(expired_at_ms, deadlines, ctx.now_ms, ctx.deferring)
+/// Folds a write at `ver` into the digest bucket: subtracts whatever it
+/// displaces, a tombstone (`prior_tombstone`, removed from `stripe`) or else
+/// a live entry at `stored_ver`, then adds the new fingerprint.
+fn swap_fingerprint<K, V>(
+    stripe: &mut Stripe<K, V>,
+    ctx: &ApplyCtx<'_, K, V>,
+    key_bytes: &[u8],
+    ver: Hlc,
+    prior_tombstone: Option<Tombstone>,
+    stored_ver: Option<Hlc>,
+) {
+    if let Some(t) = prior_tombstone {
+        ctx.digest_bucket
+            .fetch_xor(entry_fingerprint(key_bytes, t.ver), Ordering::Relaxed);
+        stripe.tombstones.remove(key_bytes);
+    } else if let Some(sv) = stored_ver {
+        ctx.digest_bucket
+            .fetch_xor(entry_fingerprint(key_bytes, sv), Ordering::Relaxed);
+    }
+    ctx.digest_bucket
+        .fetch_xor(entry_fingerprint(key_bytes, ver), Ordering::Relaxed);
+}
+
+/// What decides whether a write is ignored on arrival, and what deadlines a
+/// tombstone that is stored gets: where the batch came from, whether
+/// collection defers, the two retentions and the clock.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ArrivalRule {
+    pub(super) from_peer: bool,
+    pub(super) deferring: bool,
+    pub(super) ttl_ms: u64,
+    pub(super) max_ttl_ms: u64,
+    pub(super) now_ms: u64,
+}
+
+impl ArrivalRule {
+    /// The two GC deadlines `incoming` is kept under if it is stored, as
+    /// `(ttl_deadline_ms, max_deadline_ms)`: `None` for a put, which carries
+    /// none. Anchored per [`tombstone_anchor_ms`]. Pure; unit tested directly.
+    pub(super) fn deadlines<V>(self, incoming: &Incoming<V>, ver: Hlc) -> Option<(u64, u64)> {
+        let Incoming::Tombstone { expired_at_ms } = *incoming else {
+            return None;
+        };
+        Some(tombstone_deadlines(
+            tombstone_anchor_ms(expired_at_ms, ver.wall_ms, self.now_ms),
+            self.ttl_ms,
+            self.max_ttl_ms,
+        ))
+    }
+
+    /// Whether a write with these `deadlines` (`None` for a put) is ignored
+    /// on arrival: a tombstone from a peer already past its retention. See
+    /// [`drops_lapsed_tombstone`]. Pure; unit tested directly.
+    pub(super) fn ignores(self, deadlines: Option<(u64, u64)>) -> bool {
+        deadlines
+            .is_some_and(|d| drops_lapsed_tombstone(self.from_peer, d, self.now_ms, self.deferring))
+    }
 }
 
 /// The held-only gate of [`apply_locked`]: whether the write at `ver` is
@@ -461,15 +547,14 @@ where
 }
 
 /// The `Incoming::Tombstone` half of [`apply_locked`]'s write: removes the
-/// displaced live entry from total weight and `live_count`, then records the
-/// tombstone with its two GC deadlines. The returned `bool` is whether the
+/// displaced live entry from total weight and `live_count`, then records
+/// `tombstone`, which carries its two GC deadlines. The returned `bool` is whether the
 /// displaced entry, if any, held a spilled payload.
 fn apply_tombstone<K, V>(
     stripe: &mut Stripe<K, V>,
     ctx: &ApplyCtx<'_, K, V>,
     entry: EntryKey<K>,
-    ver: Hlc,
-    expired_at_ms: Option<u64>,
+    tombstone: Tombstone,
     had_live: bool,
 ) -> (ApplyOutcome<K, V>, bool)
 where
@@ -487,25 +572,9 @@ where
         ctx.live_count.fetch_sub(1, Ordering::Relaxed);
         displaced_spilled = removed.was_spilled;
     }
-    let (ttl_deadline_ms, max_deadline_ms) = tombstone_deadlines(
-        expired_at_ms,
-        ctx.now_ms,
-        ctx.tombstone_ttl_ms,
-        ctx.tombstone_max_ttl_ms,
-    );
-    stripe.tombstones.insert(
-        key_bytes,
-        Tombstone {
-            ver,
-            ttl_deadline_ms,
-            max_deadline_ms,
-            expired_at_ms,
-        },
-    );
-    (
-        ApplyOutcome::Tombstoned { key, version: ver },
-        displaced_spilled,
-    )
+    let version = tombstone.ver;
+    stripe.tombstones.insert(key_bytes, tombstone);
+    (ApplyOutcome::Tombstoned { key, version }, displaced_spilled)
 }
 
 impl<K, V> Engine<K, V>
@@ -551,8 +620,13 @@ where
     ///
     /// A thin wrapper, `reservation: None`, over
     /// [`Engine::apply_many_with_reservation`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the call shape of `apply_many_with_reservation` without its reservation"
+    )]
     pub(crate) fn apply_many(
         &self,
+        arrival: Arrival,
         bucket: usize,
         entries: Vec<BatchEntry<K, V>>,
         resolver: &dyn ConflictResolver,
@@ -561,6 +635,7 @@ where
         now_ms: u64,
     ) -> Vec<ApplyOutcome<K, V>> {
         self.apply_many_with_reservation(
+            arrival,
             bucket,
             entries,
             resolver,
@@ -587,6 +662,7 @@ where
     )]
     pub(crate) fn apply_many_with_reservation(
         &self,
+        arrival: Arrival,
         bucket: usize,
         entries: Vec<BatchEntry<K, V>>,
         resolver: &dyn ConflictResolver,
@@ -598,6 +674,7 @@ where
     ) -> (Vec<ApplyOutcome<K, V>>, u64) {
         self.apply_many_in(
             ApplyScope::Any,
+            arrival,
             bucket,
             entries,
             resolver,
@@ -628,6 +705,7 @@ where
     pub(crate) fn apply_many_in(
         &self,
         scope: ApplyScope,
+        arrival: Arrival,
         bucket: usize,
         entries: Vec<BatchEntry<K, V>>,
         resolver: &dyn ConflictResolver,
@@ -638,14 +716,26 @@ where
         written: &mut Written,
     ) -> (Vec<ApplyOutcome<K, V>>, u64) {
         let held_only = scope == ApplyScope::HeldOnly;
-        let capped = self.max_capacity != u64::MAX;
+        let ignored = AtomicU64::new(0);
+        // Read once for the batch: a collection that lands mid-batch applies
+        // from the next call on.
+        let rule = ArrivalRule {
+            from_peer: arrival.is_peer(),
+            deferring: self.gc_deferring.load(Ordering::Relaxed),
+            ttl_ms: tombstone_ttl_ms,
+            max_ttl_ms: tombstone_max_ttl_ms,
+            now_ms,
+        };
         let prefold =
             resolver.merges() && !held_only && self.prefold_enabled.load(Ordering::Relaxed);
         #[cfg(feature = "spill")]
         let prefetched_spilled = prefetch_spilled_conflict_bytes(
             &self.stripes[bucket],
+            // A tombstone ignored as lapsed never meets its key's stored
+            // side, so nothing of that key is read for it.
             entries
                 .iter()
+                .filter(|(_, _, _, ver, incoming)| !rule.ignores(rule.deadlines(incoming, *ver)))
                 .map(|(hash, _, key_bytes, ..)| (*hash, key_bytes)),
             resolver,
             self.spill().map(Arc::as_ref),
@@ -682,9 +772,8 @@ where
                     outcomes.push(ApplyOutcome::Rejected);
                     continue;
                 };
-                let part = part_index_from_hash(hash);
                 let ctx = ApplyCtx {
-                    digest_bucket: &self.digest[digest_slot(bucket, part)],
+                    digest_bucket: &self.digest[digest_slot(bucket, part_index_from_hash(hash))],
                     total_weight: &self.total_weight,
                     live_count: &self.live_count,
                     weigher: self.weigher.as_ref(),
@@ -696,8 +785,10 @@ where
                     spill: self.spill().map(Arc::as_ref),
                     tombstone_ttl_ms,
                     tombstone_max_ttl_ms,
-                    deferring: self.gc_deferring.load(Ordering::Relaxed),
+                    deferring: rule.deferring,
                     now_ms,
+                    from_peer: rule.from_peer,
+                    ignored: &ignored,
                     held_only,
                 };
                 let (outcome, displaced_spilled) = apply_locked(
@@ -714,13 +805,14 @@ where
                 self.note_spill_departure(displaced_spilled);
                 if matches!(outcome, ApplyOutcome::Put { .. }) {
                     wrote = true;
-                    if capped {
+                    if self.max_capacity != u64::MAX {
                         written.insert(hash);
                     }
                 }
                 outcomes.push(outcome);
             }
         }
+        written.ignored_tombstones += ignored.load(Ordering::Relaxed);
         let deficit = if wrote {
             self.enforce_capacity_with_reservation(bucket, reservation, written, now_ms)
         } else {
@@ -744,6 +836,7 @@ where
         now_ms: u64,
     ) -> Option<ApplyOutcome<K, V>> {
         let (hash, key, key_bytes, ver, incoming) = entry;
+        let ignored = AtomicU64::new(0);
         let bucket = stripe_index_from_hash(hash);
         #[cfg(feature = "spill")]
         let prefetched_spilled = prefetch_spilled_conflict_bytes(
@@ -779,6 +872,8 @@ where
                 tombstone_max_ttl_ms,
                 deferring: self.gc_deferring.load(Ordering::Relaxed),
                 now_ms,
+                from_peer: false,
+                ignored: &ignored,
                 held_only: false,
             };
             let (outcome, displaced_spilled) = apply_locked(

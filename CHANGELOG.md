@@ -17,8 +17,27 @@ All notable changes to this project are documented in this file. Format follows
   drops instead, because the hold is `full` or the stamp is past its
   `horizon`.
 
+- **`sundog_tombstones_ignored_total{cache}`** counter: the tombstones a peer
+  sent that arrived already past their retention and were ignored. A forwarded
+  delete among them is the only copy of a non-owner's write, and also logs a
+  warning, at most once a minute.
+
 ### Changed
 
+- **A delete's tombstone counts its retention from the delete's version
+  stamp.** Every tombstone counts `tombstone_ttl` and `tombstone_max_ttl` from
+  an instant all replicas agree on, capped at the receiving node's clock: the
+  expiry for the tombstone of an expired entry, the stamp for a delete. Every
+  replica derives the same deadlines for a tombstone and collects it at the
+  same grid tick, so a tombstone no longer passes between replicas that
+  collect it at different ticks.
+- **A tombstone that arrives from a peer already past its retention is
+  ignored**, whatever the key holds, for a delete as for the tombstone of an
+  expired entry: it is not stored and deletes nothing. A node's own `remove`,
+  `remove_many` and `clear` are never ignored. A node that defers collection
+  judges an arrival against `tombstone_max_ttl`. A delete has to reach each
+  replica within `tombstone_ttl` of its stamp, and node clocks have to stay
+  well within `tombstone_ttl` of each other.
 - **The wire protocol is 9** (`wire::PROTOCOL_AE_LISTING_CHUNKS`). A reply to
   an anti-entropy listing request may carry one bucket across several
   `AeBucket` messages. A responder chunks only for a peer on protocol 9 or

@@ -58,6 +58,7 @@ fn apply_peer_record(
     engine
         .apply_many_in(
             ApplyScope::HeldOnly,
+            Arrival::Peer,
             bucket,
             vec![(
                 hash_key_bytes(kb.as_ref()),

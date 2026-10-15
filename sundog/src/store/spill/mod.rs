@@ -337,6 +337,10 @@ struct Inner {
     /// so a test can show a checkpoint ran once.
     #[cfg(test)]
     checkpoint_flushes: AtomicU64,
+    /// Test-only: how many times [`SpillTier::read_at`] has been called, so a
+    /// test can show a code path reads nothing from disk.
+    #[cfg(test)]
+    read_calls: AtomicU64,
     /// Lifetime count of jobs [`flusher_loop`] pulled off its channel.
     /// [`SpillTier::checkpoint_flush`] diffs this around its join to
     /// report this drain's count.
@@ -548,6 +552,8 @@ impl SpillTier {
     /// Returns the underlying [`io::Error`] if the positional read itself
     /// fails.
     pub(crate) fn read_at(&self, loc: SpillLoc) -> io::Result<Option<SpilledBytes>> {
+        #[cfg(test)]
+        self.inner.read_calls.fetch_add(1, Ordering::Relaxed);
         let Some(region) = self.inner.regions.get(loc.region as usize) else {
             return Ok(None);
         };

@@ -328,16 +328,21 @@ async fn a_resent_put_with_an_expiry_keeps_its_expiry() {
 #[tokio::test]
 async fn a_resent_tombstone_changes_nothing_and_does_not_resurrect_the_key() {
     let s = shard::<u32, String>(1);
-    ShardOps::apply_remote(&s, put(1, "a", hlc(1_000, 2))).await;
+    // Stamps just behind the shard's clock, so the tombstone arrives within
+    // its retention.
+    let base = now_ms() - 10_000;
+    ShardOps::apply_remote(&s, put(1, "a", hlc(base + 1_000, 2))).await;
     let tombstone = WireRecord {
         value: None,
-        ..put(1, "a", hlc(2_000, 2))
+        ..put(1, "a", hlc(base + 2_000, 2))
     };
     let (once, twice) = held_after_each_apply(&s, 1, tombstone).await;
     assert_eq!(twice, once);
+    assert_eq!(once.len(), 1, "the tombstone is stored, not ignored");
+    assert_eq!(once[0].value, None);
     assert_eq!(s.get(&1).await, None);
     // The put that preceded the tombstone, resent late, stays dead.
-    ShardOps::apply_remote(&s, put(1, "a", hlc(1_000, 2))).await;
+    ShardOps::apply_remote(&s, put(1, "a", hlc(base + 1_000, 2))).await;
     assert_eq!(s.get(&1).await, None, "a deleted entry never resurrects");
 }
 

@@ -211,39 +211,44 @@ pub(super) fn sweep_fate(
     }
 }
 
-/// The two GC deadlines a tombstone landing at `now_ms` is kept under, as
-/// `(ttl_deadline_ms, max_deadline_ms)`. A delete (`expired_at_ms` `None`)
-/// counts its retentions from `now_ms`. The tombstone of an expired entry
-/// counts them from the expiry, `expired_at_ms`, capped at `now_ms` so a
-/// stamp from a skewed clock never extends the hold: every replica that
-/// learns of it derives the same deadlines, whenever it learns. Saturating.
-/// Pure; unit tested directly.
-pub(super) fn tombstone_deadlines(
+/// The instant a tombstone counts its retention from: the instant every
+/// replica agrees on, capped at `now_ms`. That is the expiry
+/// (`expired_at_ms`) for the tombstone of an expired entry and the delete's
+/// own version stamp (`ver_wall_ms`) for a delete (`expired_at_ms` `None`).
+/// The cap keeps a stamp from a clock ahead of this node's from extending
+/// the hold: such a tombstone counts from its receipt instead. Every replica
+/// that learns of a tombstone after its agreed instant derives the same
+/// anchor, whenever it learns. Pure; unit tested directly.
+pub(super) fn tombstone_anchor_ms(
     expired_at_ms: Option<u64>,
+    ver_wall_ms: u64,
     now_ms: u64,
-    ttl_ms: u64,
-    max_ttl_ms: u64,
-) -> (u64, u64) {
-    let anchor = expired_at_ms.map_or(now_ms, |expired| expired.min(now_ms));
+) -> u64 {
+    expired_at_ms.unwrap_or(ver_wall_ms).min(now_ms)
+}
+
+/// The two GC deadlines of a tombstone anchored at `anchor_ms`, as
+/// `(ttl_deadline_ms, max_deadline_ms)`: the anchor plus the two
+/// retentions, saturating. Pure; unit tested directly.
+pub(super) fn tombstone_deadlines(anchor_ms: u64, ttl_ms: u64, max_ttl_ms: u64) -> (u64, u64) {
     (
-        anchor.saturating_add(ttl_ms),
-        anchor.saturating_add(max_ttl_ms),
+        anchor_ms.saturating_add(ttl_ms),
+        anchor_ms.saturating_add(max_ttl_ms),
     )
 }
 
 /// The deadlines of the tombstone a sweep at `now_ms` leaves for an entry
-/// that expired at `expired_at_ms`: [`tombstone_deadlines`], and never
-/// earlier than `now_ms`, so the tombstone outlives the sweep that made it
-/// even when the sweep runs long after the expiry. Pure; unit tested
-/// directly.
+/// that expired at `expired_at_ms`: [`tombstone_deadlines`] from the expiry
+/// capped at `now_ms`, and never earlier than `now_ms`, so the tombstone
+/// outlives the sweep that made it even when the sweep runs long after the
+/// expiry. Pure; unit tested directly.
 pub(super) fn swept_tombstone_deadlines(
     expired_at_ms: u64,
     now_ms: u64,
     retention: TombstoneRetention,
 ) -> (u64, u64) {
     let (ttl, max) = tombstone_deadlines(
-        Some(expired_at_ms),
-        now_ms,
+        tombstone_anchor_ms(Some(expired_at_ms), 0, now_ms),
         retention.ttl_ms,
         retention.max_ttl_ms,
     );
@@ -269,22 +274,23 @@ pub(super) fn tombstone_lapsed(
 }
 
 /// Whether [`apply_locked`](super::apply::apply_locked) drops a tombstone
-/// that arrives over the wire instead of storing it. Only the tombstone of
-/// an expired entry (`expired_at_ms` `Some`) can be dropped, and only when
-/// it has already lapsed. Whatever the key holds does not matter: the
-/// outcome depends on the tombstone and the clock alone, never on which
-/// record reached the node first, so replicas that receive the same records
-/// in any order store the same ones. A replica that collected such a
-/// tombstone would otherwise take it back from a peer that has not
-/// collected yet, with fresh deadlines, and the peers would hand it back
-/// and forth for good. Pure; unit tested directly.
-pub(super) fn drops_lapsed_expiry_tombstone(
-    expired_at_ms: Option<u64>,
+/// instead of storing it: one that comes from a peer (`from_peer`) and has
+/// already lapsed, past its `ttl_deadline_ms` or, while collection is
+/// deferred, its `max_deadline_ms` (see [`tombstone_lapsed`]). A node's own
+/// delete is never dropped. Whatever the key holds does not matter: the
+/// outcome depends on the tombstone, the clock and the arrival alone, never
+/// on which record reached the node first, so replicas that receive the same
+/// records in any order store the same ones. A replica that collected such a
+/// tombstone would otherwise take it back from a peer that has not collected
+/// yet, with fresh deadlines, and the peers would hand it back and forth for
+/// good. Pure; unit tested directly.
+pub(super) fn drops_lapsed_tombstone(
+    from_peer: bool,
     deadlines: (u64, u64),
     now_ms: u64,
     deferring: bool,
 ) -> bool {
-    expired_at_ms.is_some() && tombstone_lapsed(deadlines.0, deadlines.1, now_ms, deferring)
+    from_peer && tombstone_lapsed(deadlines.0, deadlines.1, now_ms, deferring)
 }
 
 /// The retention a shard's sweep leaves the tombstone of an expired entry

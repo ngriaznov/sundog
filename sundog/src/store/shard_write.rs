@@ -172,6 +172,7 @@ where
         let outcome = self
             .engine
             .apply_many(
+                engine::Arrival::Local,
                 bucket,
                 vec![(hash, key, key_bytes, ver, incoming)],
                 self.resolver.as_ref(),
@@ -679,6 +680,7 @@ where
                     continue;
                 }
                 let (outcomes, bucket_deficit) = self.engine.apply_many_with_reservation(
+                    engine::Arrival::Local,
                     bucket,
                     group,
                     self.resolver.as_ref(),

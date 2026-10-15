@@ -787,6 +787,18 @@ impl ResolverPair {
             .await;
     }
 
+    /// Whether the `on_a` side holds a tombstone for `key`, which an apply
+    /// that was ignored leaves out.
+    pub(super) async fn holds_a_tombstone(&self, on_a: bool, key: u32) -> bool {
+        let shard = if on_a { &self.shard_a } else { &self.shard_b };
+        let key = Bytes::from(postcard::to_stdvec(&key).expect("key encodes"));
+        shard
+            .records_for(vec![key])
+            .await
+            .iter()
+            .any(|rec| rec.value.is_none())
+    }
+
     /// One anti-entropy round, initiated by a when `from_a` and by b
     /// otherwise.
     pub(super) async fn round(&self, from_a: bool) -> RoundOutcome {
@@ -1026,14 +1038,18 @@ async fn a_version_ordered_value_reading_resolver_still_converges_in_one_round()
 
 #[tokio::test]
 async fn a_newer_tombstone_beats_a_value_under_a_value_reading_resolver_whatever_the_initiator() {
+    // Stamps just behind the shards' clock, so the tombstone arrives within
+    // its retention.
+    let base = crate::store::now_ms() - 10_000;
     for (label, from_a) in [("a-initiates", true), ("b-initiates", false)] {
         let pair = ResolverPair::open_with(
             &format!("cluster-it-ae-tombstone-newer-{label}"),
             GreaterVersionReadsValues,
         )
         .await;
-        pair.apply(true, 1, Some("value"), 100).await;
-        pair.apply(false, 1, None, 200).await;
+        pair.apply(true, 1, Some("value"), base + 100).await;
+        pair.apply(false, 1, None, base + 200).await;
+        assert!(pair.holds_a_tombstone(false, 1).await, "{label}: stored");
 
         assert_eq!(
             pair.round(from_a).await,
@@ -1049,6 +1065,7 @@ async fn a_newer_tombstone_beats_a_value_under_a_value_reading_resolver_whatever
 
 #[tokio::test]
 async fn a_tombstone_and_a_value_settle_by_version_even_for_a_resolver_preferring_values() {
+    let base = crate::store::now_ms() - 10_000;
     for (label, from_a) in [("a-initiates", true), ("b-initiates", false)] {
         // `LongerValueWins` ranks a tombstone below every value, yet the
         // newer tombstone still wins and the deleted key stays deleted.
@@ -1057,8 +1074,9 @@ async fn a_tombstone_and_a_value_settle_by_version_even_for_a_resolver_preferrin
             LongerValueWins,
         )
         .await;
-        pair.apply(true, 1, Some(LONG_VALUE), 100).await;
-        pair.apply(false, 1, None, 200).await;
+        pair.apply(true, 1, Some(LONG_VALUE), base + 100).await;
+        pair.apply(false, 1, None, base + 200).await;
+        assert!(pair.holds_a_tombstone(false, 1).await, "{label}: stored");
         assert_eq!(
             pair.round(from_a).await,
             RoundOutcome::Reconciled,
@@ -1069,8 +1087,9 @@ async fn a_tombstone_and_a_value_settle_by_version_even_for_a_resolver_preferrin
         assert_eq!(pair.cache_b.get(&1).await, None, "{label}");
 
         // A value newer than the tombstone wins on both replicas.
-        pair.apply(true, 2, Some("short"), 300).await;
-        pair.apply(false, 2, None, 250).await;
+        pair.apply(true, 2, Some("short"), base + 300).await;
+        pair.apply(false, 2, None, base + 250).await;
+        assert!(pair.holds_a_tombstone(false, 2).await, "{label}: stored");
         assert_eq!(
             pair.round(from_a).await,
             RoundOutcome::Reconciled,

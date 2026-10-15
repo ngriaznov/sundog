@@ -61,10 +61,35 @@ impl ExpiredAgo {
     }
 }
 
+/// How long before [`NOW_MS`] a generated delete was stamped, which decides
+/// whether it arrives inside its retention or already lapsed.
+#[derive(Debug, Clone, Copy)]
+enum DeletedAgo {
+    /// Inside `tombstone_ttl`: kept whatever the node does about collection.
+    Within,
+    /// Past `tombstone_ttl`, inside `tombstone_max_ttl`: kept while the
+    /// node defers collection, ignored once it does not.
+    PastTtl,
+    /// Past `tombstone_max_ttl`: ignored whatever the node does.
+    PastCap,
+}
+
+impl DeletedAgo {
+    fn stamp_ms(self) -> u64 {
+        NOW_MS
+            - match self {
+                Self::Within => TOMBSTONE_TTL_MS / 2,
+                Self::PastTtl => TOMBSTONE_TTL_MS + 1_000,
+                Self::PastCap => TOMBSTONE_MAX_TTL_MS + 1_000,
+            }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum OpKind {
     Put(u8, u16),
-    Remove(u8),
+    /// A delete, stamped explicitly `DeletedAgo` before the replicas' clock.
+    Remove(u8, DeletedAgo),
     /// The tombstone of an entry that expired, as a sweep leaves it.
     Expire(u8, ExpiredAgo),
 }
@@ -74,7 +99,15 @@ fn op_strategy() -> impl Strategy<Value = (u8, OpKind)> {
         0..NUM_NODES,
         prop_oneof![
             3 => (0..KEYSPACE, any::<u16>()).prop_map(|(k, v)| OpKind::Put(k, v)),
-            1 => (0..KEYSPACE).prop_map(OpKind::Remove),
+            1 => (
+                0..KEYSPACE,
+                prop_oneof![
+                    Just(DeletedAgo::Within),
+                    Just(DeletedAgo::PastTtl),
+                    Just(DeletedAgo::PastCap),
+                ],
+            )
+                .prop_map(|(k, ago)| OpKind::Remove(k, ago)),
             2 => (
                 0..KEYSPACE,
                 prop_oneof![
@@ -98,15 +131,29 @@ fn build_records(ops: &[(u8, OpKind)]) -> Vec<WireRecord> {
     let mut physical_ms: u64 = RECORDS_START_MS;
 
     ops.iter()
-        .map(|(origin, op)| {
+        .enumerate()
+        .map(|(index, (origin, op))| {
             physical_ms += 1;
             let origin_idx = usize::from(*origin);
-            let ver = clocks[origin_idx].now(physical_ms);
-            let gossip_idx = (origin_idx + 1) % clocks.len();
-            clocks[gossip_idx].observe(physical_ms, ver);
+            let ver = match op {
+                // A delete is stamped at its age, which the clocks, whose
+                // wall time only moves forward from the writes, cannot
+                // express; the index keeps every stamp distinct.
+                OpKind::Remove(_, ago) => Hlc {
+                    wall_ms: ago.stamp_ms(),
+                    logical: u32::try_from(index).expect("a short workload") + 1,
+                    node: NodeId::from(u64::from(*origin) + 1),
+                },
+                OpKind::Put(..) | OpKind::Expire(..) => {
+                    let ver = clocks[origin_idx].now(physical_ms);
+                    let gossip_idx = (origin_idx + 1) % clocks.len();
+                    clocks[gossip_idx].observe(physical_ms, ver);
+                    ver
+                }
+            };
 
             let key = match op {
-                OpKind::Put(k, _) | OpKind::Remove(k) | OpKind::Expire(k, _) => *k,
+                OpKind::Put(k, _) | OpKind::Remove(k, _) | OpKind::Expire(k, _) => *k,
             };
             let key_bytes = Bytes::from(postcard::to_stdvec(&key).expect("u8 key encodes"));
             match op {
@@ -118,7 +165,7 @@ fn build_records(ops: &[(u8, OpKind)]) -> Vec<WireRecord> {
                     ver,
                     expires_at_ms: None,
                 },
-                OpKind::Remove(_) => WireRecord {
+                OpKind::Remove(..) => WireRecord {
                     key: key_bytes,
                     value: None,
                     ver,
@@ -232,11 +279,11 @@ proptest! {
     /// removes and expiry tombstones, applied to several shards under
     /// independent permutation and duplication and alternating
     /// [`apply_mixed`] with [`apply_concurrent`], converges to
-    /// byte-identical state everywhere. An expiry tombstone arrives inside
-    /// its retention, lapsed past `tombstone_ttl` only or lapsed past
-    /// `tombstone_max_ttl`, alongside older values of the same key, and the
-    /// replicas either still defer collection, as a new shard does, or have
-    /// run a collection that does not (`settled`).
+    /// byte-identical state everywhere. An expiry tombstone or a delete
+    /// arrives inside its retention, lapsed past `tombstone_ttl` only or
+    /// lapsed past `tombstone_max_ttl`, alongside older values of the same
+    /// key, and the replicas either still defer collection, as a new shard
+    /// does, or have run a collection that does not (`settled`).
     #[test]
     fn permutation_convergence(
         ops in proptest::collection::vec(op_strategy(), 4..40),
@@ -285,6 +332,8 @@ proptest! {
 
     /// Focused tombstone/put race: the newer [`Hlc`] wins at a shared key,
     /// and that outcome and the full converged state hold under any order.
+    /// The replicas read a fixed clock, and both stamps fall within the ten
+    /// seconds before it, so the tombstone arrives inside its retention.
     #[test]
     fn tombstone_put_race_converges_regardless_of_order(
         put_wall in 0u64..10_000,
@@ -297,12 +346,12 @@ proptest! {
         // Disjoint node ranges keep put and tombstone stamps from tying, so
         // the race always has a definitive winner.
         let put_ver = Hlc {
-            wall_ms: put_wall,
+            wall_ms: NOW_MS - 10_000 + put_wall,
             logical: 0,
             node: NodeId::from(u64::from(put_node) + 1),
         };
         let tomb_ver = Hlc {
-            wall_ms: tomb_wall,
+            wall_ms: NOW_MS - 10_000 + tomb_wall,
             logical: 0,
             node: NodeId::from(u64::from(tomb_node) + 100),
         };
@@ -337,13 +386,19 @@ proptest! {
                     1_000,
                     None,
                     None,
-                );
+                )
+                .with_clock(Arc::new(|| NOW_MS));
                 apply_mixed(&shard, shuffled_with_duplicates(&records, seed), seed).await;
                 assert_eq!(
                     shard.get(&key).await,
                     expected_live,
                     "the newer of {{put, tombstone}} wins regardless of application order or \
                      whether it went through a single or batch apply"
+                );
+                assert_eq!(
+                    shard.tombstone_count(),
+                    u64::from(expected_live.is_none()),
+                    "a tombstone within its retention is stored exactly when it wins"
                 );
                 states.push(canonical_state(&shard));
             }
@@ -352,7 +407,84 @@ proptest! {
             }
         });
     }
+
+    /// The lapsed twin of the race: a delete that arrives past
+    /// `tombstone_ttl` from its stamp, at a node that is not deferring, is
+    /// ignored whatever order it and the put arrive in, so the put always
+    /// stands, whether it is older or newer than the delete.
+    #[test]
+    fn a_lapsed_delete_never_beats_a_put_regardless_of_order(
+        put_wall in 0u64..10_000,
+        tomb_wall in 0u64..10_000,
+        put_value in any::<u16>(),
+        seeds in proptest::collection::vec(any::<u64>(), NUM_REPLICAS),
+    ) {
+        let put_ver = Hlc {
+            wall_ms: NOW_MS - 20_000 + put_wall,
+            logical: 0,
+            node: NodeId::from(1),
+        };
+        // At least `LAPSED_RACE_TTL_MS` + 1 s before the clock.
+        let tomb_ver = Hlc {
+            wall_ms: NOW_MS - 20_000 + tomb_wall - 1_000,
+            logical: 0,
+            node: NodeId::from(100),
+        };
+        let key: u8 = 7;
+        let key_bytes = Bytes::from(postcard::to_stdvec(&key).expect("key encodes"));
+        let records = vec![
+            WireRecord {
+                key: key_bytes.clone(),
+                value: Some(Bytes::from(
+                    postcard::to_stdvec(&put_value).expect("value encodes"),
+                )),
+                ver: put_ver,
+                expires_at_ms: None,
+            },
+            WireRecord {
+                key: key_bytes,
+                value: None,
+                ver: tomb_ver,
+                expires_at_ms: None,
+            },
+        ];
+
+        let rt = current_thread_runtime();
+        rt.block_on(async {
+            let mut states = Vec::with_capacity(seeds.len());
+            for &seed in &seeds {
+                let shard = Shard::<u8, u16>::new(
+                    SmolStr::new("race-lapsed"),
+                    Mode::Replicated,
+                    NodeId::from(1000),
+                    1_000,
+                    None,
+                    None,
+                )
+                .with_tombstone_ttl(Duration::from_millis(LAPSED_RACE_TTL_MS))
+                .with_clock(Arc::new(|| NOW_MS));
+                // A collection ends the start deferral, so the ttl deadline
+                // is the horizon.
+                ShardOps::gc_tombstones(&shard, false).await;
+                apply_mixed(&shard, shuffled_with_duplicates(&records, seed), seed).await;
+                assert_eq!(
+                    shard.get(&key).await,
+                    Some(put_value),
+                    "the lapsed delete deletes nothing, in any order"
+                );
+                assert_eq!(shard.tombstone_count(), 0, "and is not stored");
+                states.push(canonical_state(&shard));
+            }
+            for state in &states[1..] {
+                assert_eq!(&states[0], state);
+            }
+        });
+    }
 }
+
+/// The `tombstone_ttl` of [`a_lapsed_delete_never_beats_a_put_regardless_of_order`]'s
+/// replicas: shorter than the gap between its delete's stamp and the clock.
+const LAPSED_RACE_TTL_MS: u64 = 1_000;
 
 /// Compares the incrementally maintained bucket digests, and the part digests
 /// beneath them, against a full recompute.
@@ -430,7 +562,11 @@ proptest! {
             let mut remote_clocks: Vec<HlcClock> = (0u8..3)
                 .map(|i| HlcClock::new(NodeId::from(u64::from(i) + 1)))
                 .collect();
-            let mut physical_ms: u64 = RECORDS_START_MS;
+            // Remote stamps start at the shard's own clock, so a delete
+            // arrives within its cap and is stored until a collection ends
+            // the start deferral.
+            let mut physical_ms: u64 = now_ms();
+            let mut collected = false;
 
             for op in &ops {
                 match *op {
@@ -444,15 +580,29 @@ proptest! {
                         let idx = usize::from(origin) % remote_clocks.len();
                         physical_ms += 1;
                         let ver = remote_clocks[idx].now(physical_ms);
+                        let key_bytes = Bytes::from(postcard::to_stdvec(&k).expect("u8 key encodes"));
                         let rec = WireRecord {
-                            key: Bytes::from(postcard::to_stdvec(&k).expect("u8 key encodes")),
+                            key: key_bytes.clone(),
                             value: v.map(|value| {
                                 Bytes::from(postcard::to_stdvec(&value).expect("u16 value encodes"))
                             }),
                             ver,
                             expires_at_ms: None,
                         };
+                        let held = !ShardOps::records_for(&shard, vec![key_bytes]).await.is_empty();
+                        let tombstones = shard.tombstone_count();
                         ShardOps::apply_remote(&shard, rec).await;
+                        if v.is_none() && !held {
+                            // Nothing to lose to: the delete is stored while the
+                            // shard defers, and ignored as lapsed (the ttl is
+                            // zero) once a collection has ended the deferral.
+                            assert_eq!(
+                                shard.tombstone_count(),
+                                tombstones + u64::from(!collected),
+                                "a remote delete over nothing is stored exactly while the \
+                                 shard defers"
+                            );
+                        }
                     }
                     DigestOp::Invalidate(k, origin) => {
                         let idx = usize::from(origin) % remote_clocks.len();
@@ -463,6 +613,7 @@ proptest! {
                     }
                     DigestOp::Gc => {
                         ShardOps::gc_tombstones(&shard, false).await;
+                        collected = true;
                         assert!(
                             shard.engine.debug_snapshot().1.is_empty(),
                             "zero tombstone_ttl means every tombstone is GC-eligible immediately"

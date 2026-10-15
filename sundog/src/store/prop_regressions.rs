@@ -169,3 +169,90 @@ fn the_pair_converges_under_every_shuffle_for_each_retention_state() {
         }
     }
 }
+
+/// A delete of key 255 stamped `deleted_ago_ms` before now, and an older
+/// value for the same key.
+fn delete_and_an_older_value(deleted_ago_ms: i16) -> Vec<RemoteRecord> {
+    vec![
+        RemoteRecord {
+            key: 255,
+            value: None,
+            wall_ms_offset: -deleted_ago_ms,
+            logical: 255,
+            node: 217,
+            expires_offset_ms: None,
+        },
+        RemoteRecord {
+            key: 255,
+            value: Some(255),
+            wall_ms_offset: -9745,
+            logical: 1,
+            node: 0,
+            expires_offset_ms: None,
+        },
+    ]
+}
+
+/// The delete twin of the fuzz crash: a delete stamped 2,253 ms ago, or
+/// 2,087 ms ago as the `apply_permutation` target shaped it, is past its
+/// `max` deadline before it arrives, so it is dropped in either order and the
+/// older value stays.
+#[test]
+fn a_lapsed_delete_and_an_older_value_converge_in_any_order() {
+    for deleted_ago_ms in [2_253, 2_087] {
+        let records = delete_and_an_older_value(deleted_ago_ms);
+        let (a, b) = converge(&records, 17, 0);
+        for shard in [&a, &b] {
+            assert_eq!(
+                futures::executor::block_on(shard.get(&255)),
+                Some(255),
+                "a lapsed delete is a no-op whatever the key holds: {deleted_ago_ms}"
+            );
+            assert_eq!(shard.tombstone_count(), 0, "{deleted_ago_ms}");
+        }
+    }
+}
+
+/// A delete past its `ttl` deadline but within its `max` one is kept by a new
+/// shard, which defers collection until a collection says otherwise: it
+/// deletes the older value in either order.
+#[test]
+fn a_delete_within_a_new_shards_deferral_is_kept_in_any_order() {
+    let records = delete_and_an_older_value(1_000);
+    let (a, b) = converge(&records, 17, 0);
+    for shard in [&a, &b] {
+        assert_eq!(
+            futures::executor::block_on(shard.get(&255)),
+            None,
+            "the delete is newer than the value and deletes it"
+        );
+        assert_eq!(shard.tombstone_count(), 1);
+    }
+}
+
+/// A delete stamped within its `ttl` is kept whatever the shard does about
+/// collection, and deletes the older value in either order.
+#[test]
+fn a_delete_within_its_ttl_deletes_the_older_value_in_any_order() {
+    let records = delete_and_an_older_value(100);
+    let (a, b) = converge(&records, 17, 0);
+    for shard in [&a, &b] {
+        assert_eq!(futures::executor::block_on(shard.get(&255)), None);
+        assert_eq!(shard.tombstone_count(), 1);
+    }
+}
+
+/// Every order of the delete pair converges for each retention state: past
+/// `max` (as shaped by the crash and by the target), past `ttl` only, and
+/// within `ttl`.
+#[test]
+fn the_delete_pair_converges_under_every_shuffle_for_each_retention_state() {
+    for deleted_ago_ms in [2_253, 2_087, 1_000, 100] {
+        let records = delete_and_an_older_value(deleted_ago_ms);
+        for seed_a in 0..16 {
+            for seed_b in 0..16 {
+                let _ = converge(&records, seed_a, seed_b);
+            }
+        }
+    }
+}

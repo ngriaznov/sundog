@@ -194,20 +194,48 @@ async fn a_peer_takes_the_served_tombstone_and_collects_it_at_the_same_instant()
 }
 
 #[tokio::test]
-async fn a_late_peer_applies_a_delete_tombstone_whatever_its_version() {
+async fn a_late_peer_ignores_a_delete_tombstone_stamped_past_its_retention() {
     let clock = manual_clock();
     let s = clocked::<String>(Mode::Replicated, &clock);
+    let delete = |wall_ms: u64| WireRecord {
+        key: key_bytes(&1u32),
+        value: None,
+        ver: writer(wall_ms),
+        expires_at_ms: None,
+    };
+
+    // A fresh shard defers, so the cap is its horizon: a delete stamped
+    // `TOMBSTONE_MAX_TTL` before now arrives lapsed even so.
+    ShardOps::apply_remote(&s, delete(START_MS - 600_000)).await;
+    assert_eq!(s.tombstone_count(), 0, "a delete past its cap is ignored");
+
+    ShardOps::apply_remote(&s, delete(START_MS - 599_999)).await;
+    assert_eq!(s.tombstone_count(), 1, "one inside its cap is kept");
+}
+
+#[tokio::test]
+async fn a_peer_delete_tombstone_counts_its_retention_from_its_stamp() {
+    let clock = manual_clock();
+    let s = clocked::<String>(Mode::Replicated, &clock);
+    ShardOps::gc_tombstones(&s, false).await;
+    // Stamped 59 s before it arrives: collectible a second after.
     ShardOps::apply_remote(
         &s,
         WireRecord {
             key: key_bytes(&1u32),
             value: None,
-            ver: writer(1),
+            ver: writer(START_MS - 59_000),
             expires_at_ms: None,
         },
     )
     .await;
-    assert_eq!(s.tombstone_count(), 1, "a delete counts from its arrival");
+    assert_eq!(s.tombstone_count(), 1);
+    clock.store(START_MS + 999, Ordering::SeqCst);
+    ShardOps::gc_tombstones(&s, false).await;
+    assert_eq!(s.tombstone_count(), 1, "kept until stamp + ttl");
+    clock.store(START_MS + 1_000, Ordering::SeqCst);
+    ShardOps::gc_tombstones(&s, false).await;
+    assert_eq!(s.tombstone_count(), 0, "collected at stamp + ttl");
 }
 
 #[tokio::test]

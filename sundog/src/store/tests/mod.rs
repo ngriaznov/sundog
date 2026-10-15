@@ -48,6 +48,7 @@ mod spill_lifecycle;
 /// I/O tests are gated like `store::spill`'s own.
 #[cfg(all(feature = "spill", not(feature = "sim")))]
 mod spill_reads;
+mod tombstone_arrival;
 mod ttl;
 mod values;
 mod wire_surface;

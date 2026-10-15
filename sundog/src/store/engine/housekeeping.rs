@@ -78,9 +78,9 @@ where
     /// hard cap `tombstone_max_ttl`, correcting the digest.
     ///
     /// Remembers `defer` for [`Engine::apply_many`]: while collection is
-    /// deferred, a tombstone that arrives lapsed past its `ttl_deadline_ms`
-    /// but not its `max_deadline_ms` is still worth keeping, and one that
-    /// arrives past its `max_deadline_ms` is dropped.
+    /// deferred, a tombstone a peer sends that arrives lapsed past its
+    /// `ttl_deadline_ms` but not its `max_deadline_ms` is still worth
+    /// keeping, and one that arrives past its `max_deadline_ms` is ignored.
     pub(crate) fn gc_tombstones(&self, defer: bool, now_ms: u64) {
         self.gc_deferring.store(defer, Ordering::Relaxed);
         for (idx, stripe_lock) in self.stripes.iter().enumerate() {

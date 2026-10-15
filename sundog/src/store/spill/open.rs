@@ -142,6 +142,8 @@ impl SpillTier {
             flusher_paused: AtomicBool::new(false),
             #[cfg(test)]
             checkpoint_flushes: AtomicU64::new(0),
+            #[cfg(test)]
+            read_calls: AtomicU64::new(0),
             flusher_jobs_drained: AtomicU64::new(0),
             flusher_jobs_abandoned: AtomicU64::new(0),
         });
@@ -317,6 +319,8 @@ impl SpillTier {
             flusher_paused: AtomicBool::new(false),
             #[cfg(test)]
             checkpoint_flushes: AtomicU64::new(0),
+            #[cfg(test)]
+            read_calls: AtomicU64::new(0),
             flusher_jobs_drained: AtomicU64::new(0),
             flusher_jobs_abandoned: AtomicU64::new(0),
         });

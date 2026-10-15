@@ -101,25 +101,8 @@ where
                 continue;
             };
             let origin = Origin::Remote(rec.ver.node);
-            let incoming = match rec.value {
-                Some(value_bytes) => {
-                    let Ok(value) = postcard::from_bytes::<V>(&value_bytes) else {
-                        tracing::warn!(
-                            cache = %self.name,
-                            "apply_remote_batch: undecodable value bytes"
-                        );
-                        continue;
-                    };
-                    Incoming::Put {
-                        value,
-                        expires_at_ms: rec.expires_at_ms,
-                        // The verbatim wire bytes, decoded above only for the resolver.
-                        encoded: value_bytes,
-                    }
-                }
-                None => Incoming::Tombstone {
-                    expired_at_ms: rec.expires_at_ms,
-                },
+            let Some(incoming) = self.decode_incoming(rec.value, rec.expires_at_ms) else {
+                continue;
             };
             decoded.push((hash, key, rec.key, rec.ver, incoming, origin));
         }
@@ -170,6 +153,7 @@ where
                     .collect();
                 let (outcomes, bucket_deficit) = self.engine.apply_many_in(
                     scope,
+                    engine::Arrival::Peer,
                     bucket,
                     entries,
                     self.resolver.as_ref(),
@@ -186,8 +170,37 @@ where
             }
             deficit
         };
+        self.note_ignored_tombstones(written.ignored_tombstones(), hold_skewed);
         self.retry_reservation_deficit(0, deficit, deadline, &mut written)
             .await;
+    }
+
+    /// The write a wire record stands for: a put of its decoded value, or the
+    /// tombstone of a record without one. `None`, after a warning, for value
+    /// bytes that do not decode.
+    fn decode_incoming(
+        &self,
+        value: Option<Bytes>,
+        expires_at_ms: Option<u64>,
+    ) -> Option<Incoming<V>> {
+        let Some(value_bytes) = value else {
+            return Some(Incoming::Tombstone {
+                expired_at_ms: expires_at_ms,
+            });
+        };
+        let Ok(value) = postcard::from_bytes::<V>(&value_bytes) else {
+            tracing::warn!(
+                cache = %self.name,
+                "apply_remote_batch: undecodable value bytes"
+            );
+            return None;
+        };
+        Some(Incoming::Put {
+            value,
+            expires_at_ms,
+            // The verbatim wire bytes, decoded above only for the resolver.
+            encoded: value_bytes,
+        })
     }
 
     /// [`ShardOps::invalidate`]'s body. `tombstone` says the caller knows the

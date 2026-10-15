@@ -22,7 +22,8 @@ use crate::pins::{
     SKEW_HOLD_PIN_CAPACITY, TOMBSTONE_PIN_COUNT, clock_skew_pin_metrics, count_hits_and_misses,
     fan_out_wait_timeout_pin_metrics, loader_calls_pin_metric, memory_ceiling_pin_metrics,
     read_durations_pin_metrics, refresh_hints_pin_metric, refresh_outcomes_pin_metrics,
-    skew_hold_pin_bytes, skew_hold_pin_metrics, tombstone_pin_metrics,
+    skew_hold_pin_bytes, skew_hold_pin_metrics, tombstone_ignored_pin_metrics,
+    tombstone_pin_metrics,
 };
 use crate::seeds::{
     seed_crdt_compaction_metrics, seed_distributed_metrics, seed_part_mismatch,
@@ -77,6 +78,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     read_durations_pin_metrics(&cluster).await;
     fan_out_wait_timeout_pin_metrics().await;
     clock_skew_pin_metrics().await;
+    tombstone_ignored_pin_metrics().await;
     let ceiling_pin_bytes = f64::from(
         u32::try_from(memory_ceiling_pin_metrics(&cluster).await).expect("one entry's bytes fit"),
     );
@@ -304,6 +306,27 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         ),
         Some(1.0),
         "expected exactly one refused record on the 'clock-skew-pin' cache; got body:\n{body}"
+    );
+    // sundog_tombstones_ignored_total: pinned by the bare-Shard scenario
+    // above, three deletes stamped an hour ago ignored and one stamped a
+    // second ago stored.
+    assert_eq!(
+        scraped_metric_value(
+            &body,
+            "sundog_tombstones_ignored_total",
+            &[("cache", "tombstone-ignored-pin")]
+        ),
+        Some(3.0),
+        "expected exactly three ignored tombstones on the 'tombstone-ignored-pin' cache; got body:\n{body}"
+    );
+    assert_eq!(
+        scraped_metric_value(
+            &body,
+            "sundog_tombstones_ignored_total",
+            &[("cache", "tombstone-pin")]
+        ),
+        None,
+        "a cache that ignored nothing exports no series; got body:\n{body}"
     );
     // The skew hold: pinned by skew_hold_pin_metrics. A raw peer that is no
     // owner forwards 16,385 distinct keys stamped an hour ahead and one

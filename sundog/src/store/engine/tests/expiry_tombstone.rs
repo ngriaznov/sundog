@@ -5,8 +5,8 @@
 use std::sync::Arc;
 
 use super::super::expiry::{
-    SweepFate, TombstoneRetention, drops_lapsed_expiry_tombstone, expiry_tombstone_retention,
-    sweep_fate, swept_tombstone_deadlines, tombstone_deadlines, tombstone_lapsed,
+    SweepFate, TombstoneRetention, drops_lapsed_tombstone, expiry_tombstone_retention, sweep_fate,
+    swept_tombstone_deadlines, tombstone_anchor_ms, tombstone_deadlines, tombstone_lapsed,
 };
 use super::*;
 use crate::store::{Mode, Tombstone};
@@ -81,13 +81,62 @@ fn sweep_fate_leaves_a_tombstone_only_for_a_passed_expiry_in_a_mode_that_keeps_o
 }
 
 #[test]
-fn tombstone_deadlines_count_a_delete_from_now_and_an_expiry_from_the_expiry() {
+fn tombstone_anchor_counts_a_delete_from_its_stamp_and_an_expiry_from_the_expiry() {
     assert_eq!(
-        tombstone_deadlines(None, 5_000, 60_000, 600_000),
-        (65_000, 605_000)
+        tombstone_anchor_ms(None, 1_000, 5_000),
+        1_000,
+        "a delete counts from its version stamp"
     );
     assert_eq!(
-        tombstone_deadlines(Some(1_000), 5_000, 60_000, 600_000),
+        tombstone_anchor_ms(Some(2_000), 1_000, 5_000),
+        2_000,
+        "an expired entry's tombstone counts from the expiry, not the stamp"
+    );
+    assert_eq!(
+        tombstone_anchor_ms(None, 0, 5_000),
+        0,
+        "a stamp of zero is a valid anchor"
+    );
+    assert_eq!(
+        tombstone_anchor_ms(None, 5_000, 5_000),
+        5_000,
+        "a stamp at now is itself"
+    );
+}
+
+#[test]
+fn tombstone_anchor_never_counts_from_beyond_now() {
+    assert_eq!(
+        tombstone_anchor_ms(None, 9_000_000, 5_000),
+        5_000,
+        "a delete stamped ahead of this clock counts from its receipt"
+    );
+    assert_eq!(
+        tombstone_anchor_ms(Some(9_000_000), 1_000, 5_000),
+        5_000,
+        "so does an expiry ahead of it"
+    );
+    assert_eq!(tombstone_anchor_ms(None, u64::MAX, u64::MAX), u64::MAX);
+    assert_eq!(
+        tombstone_anchor_ms(None, 7, 0),
+        0,
+        "now at zero caps at zero"
+    );
+}
+
+#[test]
+fn tombstone_deadlines_add_the_two_retentions_to_the_anchor() {
+    assert_eq!(
+        tombstone_deadlines(tombstone_anchor_ms(None, 1_000, 5_000), 60_000, 600_000),
+        (61_000, 601_000),
+        "a delete stamped at 1,000 and received at 5,000 counts from the stamp"
+    );
+    assert_eq!(
+        tombstone_deadlines(
+            tombstone_anchor_ms(Some(1_000), 3_000, 5_000),
+            60_000,
+            600_000
+        ),
         (61_000, 601_000),
         "an expired entry's tombstone counts from the expiry"
     );
@@ -96,7 +145,11 @@ fn tombstone_deadlines_count_a_delete_from_now_and_an_expiry_from_the_expiry() {
 #[test]
 fn tombstone_deadlines_never_count_from_an_expiry_ahead_of_now() {
     assert_eq!(
-        tombstone_deadlines(Some(9_000_000), 5_000, 60_000, 600_000),
+        tombstone_deadlines(
+            tombstone_anchor_ms(Some(9_000_000), 0, 5_000),
+            60_000,
+            600_000
+        ),
         (65_000, 605_000),
         "a skewed stamp never extends the hold"
     );
@@ -105,13 +158,14 @@ fn tombstone_deadlines_never_count_from_an_expiry_ahead_of_now() {
 #[test]
 fn tombstone_deadlines_saturate() {
     assert_eq!(
-        tombstone_deadlines(None, u64::MAX, 60_000, 600_000),
+        tombstone_deadlines(u64::MAX, 60_000, 600_000),
         (u64::MAX, u64::MAX)
     );
     assert_eq!(
-        tombstone_deadlines(Some(u64::MAX - 1), u64::MAX, u64::MAX, u64::MAX),
+        tombstone_deadlines(u64::MAX - 1, u64::MAX, u64::MAX),
         (u64::MAX, u64::MAX)
     );
+    assert_eq!(tombstone_deadlines(0, 0, 0), (0, 0));
 }
 
 #[test]
@@ -139,23 +193,50 @@ fn tombstone_lapsed_reads_the_ttl_deadline_or_the_cap_while_deferring() {
     assert!(tombstone_lapsed(100, 1_000, 1_000, true));
 }
 
+/// `drops_lapsed_tombstone`'s whole truth table: (from a peer) x (deferring)
+/// x (within the ttl deadline, past it only, past the cap), with deadlines
+/// `(100, 1_000)`.
 #[test]
-fn drops_lapsed_expiry_tombstone_drops_exactly_a_lapsed_one() {
-    let lapsed = (100, 1_000);
-    assert!(drops_lapsed_expiry_tombstone(Some(40), lapsed, 200, false));
-    assert!(
-        !drops_lapsed_expiry_tombstone(Some(40), lapsed, 99, false),
-        "a tombstone within its retention is kept"
-    );
-    assert!(
-        !drops_lapsed_expiry_tombstone(Some(40), lapsed, 200, true),
-        "collection is deferred, so the cap is the horizon"
-    );
-    assert!(drops_lapsed_expiry_tombstone(Some(40), lapsed, 1_000, true));
-    assert!(
-        !drops_lapsed_expiry_tombstone(None, lapsed, 5_000, false),
-        "a delete's deadlines count from its arrival and it is never dropped"
-    );
+fn drops_lapsed_tombstone_drops_exactly_a_lapsed_peer_tombstone() {
+    let deadlines = (100, 1_000);
+    for (from_peer, deferring, now_ms, dropped) in [
+        (true, false, 99, false),
+        (true, false, 100, true),
+        (true, false, 999, true),
+        (true, false, 1_000, true),
+        (true, true, 99, false),
+        (true, true, 100, false),
+        (true, true, 999, false),
+        (true, true, 1_000, true),
+        (true, true, u64::MAX, true),
+        (false, false, 99, false),
+        (false, false, 100, false),
+        (false, false, 1_000, false),
+        (false, true, 100, false),
+        (false, true, 1_000, false),
+        (false, true, u64::MAX, false),
+    ] {
+        assert_eq!(
+            drops_lapsed_tombstone(from_peer, deadlines, now_ms, deferring),
+            dropped,
+            "from_peer {from_peer}, deferring {deferring}, now {now_ms}"
+        );
+    }
+}
+
+#[test]
+fn drops_lapsed_tombstone_agrees_with_tombstone_lapsed_for_a_peer() {
+    for (ttl, max) in [(0, 0), (100, 1_000), (100, 100), (u64::MAX, u64::MAX)] {
+        for now_ms in [0, 99, 100, 101, 999, 1_000, 1_001, u64::MAX] {
+            for deferring in [false, true] {
+                assert_eq!(
+                    drops_lapsed_tombstone(true, (ttl, max), now_ms, deferring),
+                    tombstone_lapsed(ttl, max, now_ms, deferring),
+                    "({ttl}, {max}) at {now_ms}, deferring {deferring}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -623,14 +704,27 @@ fn a_lapsed_expiry_tombstone_within_its_cap_replaces_an_older_tombstone_while_de
 #[test]
 fn a_lapsed_delete_tombstone_is_always_stored() {
     let engine = engine_u32_string(u64::MAX, None);
-    let outcome = tombstone_of(&engine, 1, key_bytes(1), hlc(1, 2), None, 9_000_000, false);
-    assert!(matches!(outcome, ApplyOutcome::Tombstoned { .. }));
+    let outcome = tombstone_arriving(
+        &engine,
+        1,
+        key_bytes(1),
+        hlc(1, 2),
+        None,
+        9_000_000,
+        false,
+        Arrival::Local,
+    );
+    assert!(
+        matches!(outcome, ApplyOutcome::Tombstoned { .. }),
+        "this node's own delete is stored however late it applies"
+    );
     let t = tombstone_state(&engine, 1).expect("stored");
     assert_eq!(
         (t.ttl_deadline_ms, t.max_deadline_ms),
-        (9_060_000, 9_600_000),
-        "a delete counts its retention from its arrival, whatever its version says"
+        (60_001, 600_001),
+        "a delete counts its retention from its stamp, so this one is collectible at once"
     );
+    assert_eq!(engine.tombstone_count(), 1);
 }
 
 #[test]
@@ -658,6 +752,7 @@ fn apply_expiry_tombstone(engine: &Engine<u32, String>, key: u32) -> ApplyOutcom
     let hash = hash_key_bytes(kb.as_ref());
     engine
         .apply_many(
+            Arrival::Peer,
             stripe_index_from_hash(hash),
             vec![(
                 hash,

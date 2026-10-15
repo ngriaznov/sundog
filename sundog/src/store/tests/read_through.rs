@@ -394,6 +394,7 @@ async fn get_or_load_hits_when_a_write_lands_between_the_fast_path_miss_and_the_
             let value = "landed".to_string();
             let encoded = Bytes::from(postcard::to_stdvec(&value).expect("encode"));
             let _ = engine_for_clock.apply_many(
+                engine::Arrival::Peer,
                 bucket,
                 vec![(
                     hash,

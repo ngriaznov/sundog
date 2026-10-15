@@ -295,18 +295,22 @@ async fn a_tombstone_and_a_value_settle_by_version_for_a_resolver_preferring_val
         expires_at_ms: None,
     };
 
+    // Stamps just behind the shard's clock, so no tombstone arrives lapsed.
+    let base = now_ms() - 10_000;
+
     // A newer tombstone buries a longer value, which `LongestValueWins`
     // would otherwise keep.
-    ShardOps::apply_remote(&s, put(10, hlc(100, 2))).await;
-    ShardOps::apply_remote(&s, tombstone(hlc(200, 3))).await;
+    ShardOps::apply_remote(&s, put(10, hlc(base + 100, 2))).await;
+    ShardOps::apply_remote(&s, tombstone(hlc(base + 200, 3))).await;
     assert_eq!(s.get(&1).await, None, "the newer tombstone wins");
+    assert_eq!(s.tombstone_count(), 1, "and is stored, not ignored");
 
     // An older value cannot resurrect the key, however long it is.
-    ShardOps::apply_remote(&s, put(50, hlc(150, 2))).await;
+    ShardOps::apply_remote(&s, put(50, hlc(base + 150, 2))).await;
     assert_eq!(s.get(&1).await, None, "an older value never resurrects");
 
     // A newer value does, however short it is.
-    ShardOps::apply_remote(&s, put(1, hlc(300, 2))).await;
+    ShardOps::apply_remote(&s, put(1, hlc(base + 300, 2))).await;
     assert_eq!(s.get(&1).await, Some(vec![0u8; 1]), "a newer value lands");
 }
 
@@ -373,10 +377,12 @@ async fn custom_resolver_converges_across_permutations_and_duplicates() {
             expires_at_ms: None,
         });
     }
+    // Newer than every value, and just behind the shards' clocks, so the
+    // tombstone arrives inside its retention and is stored.
     records.push(WireRecord {
         key: key_bytes(&1u32),
         value: None,
-        ver: hlc(1_100, 9),
+        ver: hlc(now_ms() - 10_000, 9),
         expires_at_ms: None,
     });
 
@@ -397,6 +403,16 @@ async fn custom_resolver_converges_across_permutations_and_duplicates() {
             "key {key} diverged across permutations under a shared custom resolver"
         );
     }
+    assert_eq!(
+        a.get(&1).await,
+        None,
+        "the newest record of key 1 deletes it"
+    );
+    assert_eq!(
+        (a.tombstone_count(), b.tombstone_count()),
+        (1, 1),
+        "the tombstone is stored on both, not ignored"
+    );
     assert_eq!(
         ShardOps::digests(&a).await,
         ShardOps::digests(&b).await,

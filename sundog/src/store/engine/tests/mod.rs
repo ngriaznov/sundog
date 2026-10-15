@@ -6,7 +6,7 @@ use std::time::Duration;
 use super::apply::prefetch_spilled_conflict_bytes;
 #[cfg(feature = "spill")]
 use super::apply::read_stored_live;
-use super::apply::{ApplyCtx, EntryKey, apply_locked};
+use super::apply::{ApplyCtx, Arrival, EntryKey, apply_locked};
 use super::evict::{
     EVICTION_BATCH, EVICTION_BATCH_SAMPLE, EVICTION_SAMPLE, EvictOutcome, defer_to_flusher,
     deficit_once_still_over_capacity, eviction_batch_size,
@@ -64,6 +64,9 @@ fn empty_prefetched() -> &'static HashMap<SpillLoc, Bytes> {
     EMPTY.get_or_init(HashMap::new)
 }
 
+/// The sink for the ignored-tombstone count of a test that does not read it.
+static UNCOUNTED: AtomicU64 = AtomicU64::new(0);
+
 /// An [`ApplyCtx`] against `engine`'s own weigher/tti, no spill prefetch or tier, for a test driving [`apply_locked`] directly.
 fn test_ctx<'a, K, V>(
     engine: &'a Engine<K, V>,
@@ -89,6 +92,8 @@ fn test_ctx<'a, K, V>(
         tombstone_max_ttl_ms,
         deferring: false,
         now_ms,
+        from_peer: false,
+        ignored: &UNCOUNTED,
         held_only: false,
     }
 }
@@ -137,7 +142,10 @@ where
 /// [`tombstone`] for the tombstone of an entry that expired at
 /// `expired_at_ms` (`Some`) or a delete (`None`), landing while collection
 /// is deferred for an absent member when `deferring`. Retentions are 60 s
-/// and 600 s.
+/// and 600 s. The tombstone of an expired entry arrives from a peer
+/// ([`Arrival::Peer`]) and is ignored when lapsed; a delete is this node's
+/// own ([`Arrival::Local`]) and always stored. [`tombstone_arriving`] names
+/// the arrival.
 fn tombstone_of<K, V>(
     engine: &Engine<K, V>,
     key: K,
@@ -146,6 +154,39 @@ fn tombstone_of<K, V>(
     expired_at_ms: Option<u64>,
     now_ms: u64,
     deferring: bool,
+) -> ApplyOutcome<K, V>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    let arrival = if expired_at_ms.is_some() {
+        Arrival::Peer
+    } else {
+        Arrival::Local
+    };
+    tombstone_arriving(
+        engine,
+        key,
+        key_bytes,
+        ver,
+        expired_at_ms,
+        now_ms,
+        deferring,
+        arrival,
+    )
+}
+
+/// [`tombstone_of`] with the arrival given.
+#[allow(clippy::too_many_arguments)]
+fn tombstone_arriving<K, V>(
+    engine: &Engine<K, V>,
+    key: K,
+    key_bytes: Bytes,
+    ver: Hlc,
+    expired_at_ms: Option<u64>,
+    now_ms: u64,
+    deferring: bool,
+    arrival: Arrival,
 ) -> ApplyOutcome<K, V>
 where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
@@ -179,6 +220,8 @@ where
         tombstone_max_ttl_ms: 600_000,
         deferring,
         now_ms,
+        from_peer: arrival.is_peer(),
+        ignored: &UNCOUNTED,
         held_only: false,
     };
     apply_locked(
@@ -244,6 +287,8 @@ where
         tombstone_max_ttl_ms: 600_000,
         deferring: false,
         now_ms,
+        from_peer: false,
+        ignored: &UNCOUNTED,
         held_only: false,
     };
     let (outcome, displaced_spilled) = {
@@ -400,6 +445,7 @@ mod inflight;
 mod read;
 mod release;
 mod serve;
+mod tombstone_arrival;
 
 #[cfg(feature = "spill")]
 mod spill_payload;

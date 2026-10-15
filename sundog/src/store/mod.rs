@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 #[cfg(feature = "spill")]
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -38,6 +38,7 @@ mod read_timing;
 mod refresh;
 mod resolver;
 mod shard_build;
+mod shard_ignored;
 mod shard_merge;
 mod shard_ops;
 mod shard_read;
@@ -167,12 +168,14 @@ pub(crate) fn bucket_of(key_bytes: &[u8]) -> u16 {
 /// `max_deadline_ms` is the hard cap past which it collects regardless of
 /// member absence. See [`ShardOps::gc_tombstones`].
 ///
-/// A delete makes a tombstone at the delete's version with deadlines a
-/// retention past the moment it lands. In a replicated mode the sweep also
-/// makes one for an entry that reached its deadline, at that entry's version
-/// (`expired_at_ms` is `Some`), with deadlines a retention past the expiry,
-/// so every replica that learns of it, by sweeping or by anti-entropy,
-/// collects it at the same instant. See [`ShardOps::run_pending_tasks`].
+/// Every tombstone counts its retention from an instant every replica
+/// agrees on, capped at the receiving node's clock: the delete's own version
+/// stamp (`ver.wall_ms`) for a delete, the expiry for the tombstone of an
+/// entry that expired (`expired_at_ms` is `Some`; the sweep makes one in a
+/// replicated mode, at that entry's version). Every replica that learns of
+/// a tombstone derives the same deadlines, whenever it learns, so they
+/// collect it on the same gc tick. A tombstone that arrives from a peer
+/// already past its retention is ignored. See [`ShardOps::run_pending_tasks`].
 #[derive(Debug, Clone, Copy)]
 struct Tombstone {
     ver: Hlc,
@@ -198,12 +201,13 @@ enum Incoming<V> {
         encoded: Bytes,
     },
     /// A deletion marker. `expired_at_ms` is `Some` for the tombstone of an
-    /// entry that expired, whose retention counts from that expiry.
+    /// entry that expired, whose retention counts from that expiry; a
+    /// delete's counts from its version stamp.
     Tombstone { expired_at_ms: Option<u64> },
 }
 
 impl<V> Incoming<V> {
-    /// A delete's marker: kept for a retention from the moment it lands.
+    /// A delete's marker: kept for a retention from the delete's version stamp.
     const DELETE: Self = Self::Tombstone {
         expired_at_ms: None,
     };
@@ -512,6 +516,9 @@ where
     /// Set once the first forwarded record dropped instead of held has been
     /// logged at `warn`; later drops log at `debug` and only count.
     skew_drop_warned: AtomicBool,
+    /// The clock reading of the last warning about forwarded tombstones
+    /// ignored as lapsed, `u64::MAX` before the first; see `shard_ignored.rs`.
+    ignored_forward_warned_ms: AtomicU64,
     /// Runs the spill tier's checkpointed close once. The flag is true once
     /// a close finished; the lock is held for the whole checkpoint by the
     /// task running it, so later and concurrent closers, and one that

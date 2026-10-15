@@ -2,7 +2,7 @@
 //! derive a record's version and expiry.
 
 use std::hash::Hash;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 
@@ -170,6 +170,7 @@ where
             skew_hold: StdMutex::new(SkewHold::new(SKEW_HOLD_MAX_RECORDS, SKEW_HOLD_MAX_BYTES)),
             skew_wake: Notify::new(),
             skew_drop_warned: AtomicBool::new(false),
+            ignored_forward_warned_ms: AtomicU64::new(u64::MAX),
             spill_close: Arc::new(tokio::sync::Mutex::new(false)),
             #[cfg(all(test, feature = "spill"))]
             spill_checkpoint_panic: AtomicBool::new(false),

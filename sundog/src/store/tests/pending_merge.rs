@@ -118,13 +118,34 @@ async fn a_remote_tombstone_older_than_the_pending_fold_leaves_it() {
     let s = coalescing_shard();
     s.merge(1, 5).await.expect("merge");
 
-    ShardOps::apply_remote(&s, tombstone_record(1, hlc(1, 2))).await;
+    // Stamped before the merge call, yet inside its retention.
+    ShardOps::apply_remote(&s, tombstone_record(1, hlc(now_ms() - 5_000, 2))).await;
+    assert_eq!(s.tombstone_count(), 1, "the tombstone is stored");
     s.flush_all_pending_merges();
 
     assert_eq!(
         s.get(&1).await,
         Some(5),
         "a tombstone the merge call outranks never reaches the fold"
+    );
+}
+
+#[tokio::test]
+async fn a_lapsed_remote_tombstone_leaves_the_pending_fold_to_flush_at_its_own_version() {
+    let s = coalescing_shard();
+    s.merge(1, 5).await.expect("merge");
+    ShardOps::gc_tombstones(&s, false).await;
+
+    // Stamped past the tombstone ttl, and newer than nothing the key holds.
+    let lapsed = now_ms() - 2 * s.tombstone_ttl_ms;
+    ShardOps::apply_remote(&s, tombstone_record(1, hlc(lapsed, 2))).await;
+    assert_eq!(s.tombstone_count(), 0, "the lapsed tombstone is ignored");
+    s.flush_all_pending_merges();
+
+    assert_eq!(
+        s.get(&1).await,
+        Some(5),
+        "an ignored tombstone discards no fold"
     );
 }
 

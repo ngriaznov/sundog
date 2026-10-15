@@ -103,9 +103,9 @@ mod slab_tests;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use self::apply::ApplyScope;
 #[cfg(doc)]
 use self::apply::apply_locked;
+pub(crate) use self::apply::{ApplyScope, Arrival};
 #[cfg(feature = "spill")]
 pub(crate) use self::checkpoint::CheckpointFinalizeCounts;
 #[cfg(doc)]
@@ -269,8 +269,14 @@ fn is_spill_candidate<K, V>(live: &Live<K, V>) -> bool {
 /// whole batch; the eviction clears it once a scan finds nothing but these
 /// entries, so later passes for the same batch skip that scan. Each hash
 /// is already an xxh3 of the key bytes, so the table keys on it as is.
+///
+/// It also totals, across the same batch, the peer tombstones the apply
+/// ignored as lapsed; see [`Written::ignored_tombstones`].
 #[derive(Debug, Default)]
-pub(crate) struct Written(HashTable<u64>);
+pub(crate) struct Written {
+    hashes: HashTable<u64>,
+    ignored_tombstones: u64,
+}
 
 impl Written {
     /// `hash` alone.
@@ -283,26 +289,32 @@ impl Written {
     /// Adds `hash`.
     pub(crate) fn insert(&mut self, hash: u64) {
         if !self.contains(hash) {
-            self.0.insert_unique(hash, hash, |&held| held);
+            self.hashes.insert_unique(hash, hash, |&held| held);
         }
     }
 
     fn contains(&self, hash: u64) -> bool {
-        self.0.find(hash, |&held| held == hash).is_some()
+        self.hashes.find(hash, |&held| held == hash).is_some()
     }
 
     fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.hashes.is_empty()
     }
 
     /// Drops every hash, leaving the writes' entries to ordinary sampling.
     fn clear(&mut self) {
-        self.0.clear();
+        self.hashes.clear();
+    }
+
+    /// How many peer tombstones the applies sharing this `Written` ignored as
+    /// lapsed so far.
+    pub(crate) const fn ignored_tombstones(&self) -> u64 {
+        self.ignored_tombstones
     }
 
     /// Whether `live` is one of the entries these writes stored.
     fn holds<K, V>(&self, live: &Live<K, V>) -> bool {
-        !self.0.is_empty() && self.contains(hash_key_bytes(record_key(&live.record)))
+        !self.hashes.is_empty() && self.contains(hash_key_bytes(record_key(&live.record)))
     }
 }
 
@@ -611,7 +623,7 @@ pub(crate) struct Engine<K, V> {
     /// collection defers, or what [`Engine::starting_gc_deferred`] set before
     /// the first call. A tombstone that arrives already past the retention
     /// that call applies is dropped rather than stored; see
-    /// [`expiry::drops_lapsed_expiry_tombstone`].
+    /// [`expiry::drops_lapsed_tombstone`].
     gc_deferring: AtomicBool,
     #[cfg(test)]
     eviction_lock_acquisitions: AtomicU64,

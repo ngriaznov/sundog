@@ -106,6 +106,7 @@ fn a_write_never_evicts_its_own_entry_while_another_is_left() {
     let bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(fresh).as_ref()));
 
     let _ = engine.apply_many(
+        Arrival::Peer,
         bucket,
         vec![put_entry(fresh, "fresh", hlc(100, 1), None)],
         &LwwResolver,
@@ -141,6 +142,7 @@ fn a_batch_evicts_its_own_entries_last_and_still_fits_the_cap() {
         .collect();
 
     let _ = engine.apply_many(
+        Arrival::Peer,
         bucket,
         batch
             .iter()
@@ -188,6 +190,7 @@ fn a_write_heavier_than_the_whole_cap_goes_and_the_older_entry_stays() {
     let bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(heavy).as_ref()));
 
     let _ = engine.apply_many(
+        Arrival::Peer,
         bucket,
         vec![put_entry(heavy, &"x".repeat(10), hlc(100, 1), None)],
         &LwwResolver,
@@ -226,6 +229,7 @@ fn a_scan_finding_only_written_entries_clears_them_for_the_next_group() {
 
     let first_group = engine.debug_eviction_lock_acquisitions();
     let _ = engine.apply_many_with_reservation(
+        Arrival::Peer,
         early_bucket,
         early
             .iter()
@@ -251,6 +255,7 @@ fn a_scan_finding_only_written_entries_clears_them_for_the_next_group() {
 
     let before = engine.debug_eviction_lock_acquisitions();
     let _ = engine.apply_many_with_reservation(
+        Arrival::Peer,
         late_bucket,
         vec![put_entry(late, "late", hlc(101, 1), None)],
         &LwwResolver,

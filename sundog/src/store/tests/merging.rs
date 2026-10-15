@@ -24,7 +24,9 @@ async fn merge_against_a_tombstone_is_never_consulted_and_falls_back_to_hlc_orde
         WireRecord {
             key: key_bytes(&1u32),
             value: None,
-            ver: hlc(1, 1),
+            // Just behind the shard's clock, so the tombstone arrives
+            // within its retention and is stored.
+            ver: hlc(now_ms() - 5_000, 1),
             expires_at_ms: None,
         },
     )
@@ -34,10 +36,10 @@ async fn merge_against_a_tombstone_is_never_consulted_and_falls_back_to_hlc_orde
         None,
         "tombstoned before the colliding write arrives"
     );
-    let _ = events
-        .recv()
-        .await
-        .expect("Removed for the setup tombstone");
+    assert_eq!(s.tombstone_count(), 1, "the setup tombstone is stored");
+    // The apply has returned, so the event is already queued: reading it
+    // without waiting fails at once if none was sent.
+    let _ = events.try_recv().expect("Removed for the setup tombstone");
 
     // Genuinely newer than the tombstone by `Hlc`: the tombstone's
     // value-less side means `merge` is never consulted no matter what
@@ -59,11 +61,7 @@ async fn merge_against_a_tombstone_is_never_consulted_and_falls_back_to_hlc_orde
          resolver's synthesized merge bytes, since a tombstone's value-less side means \
          merge is never consulted"
     );
-    match events
-        .recv()
-        .await
-        .expect("an event for the colliding write")
-    {
+    match events.try_recv().expect("an event for the colliding write") {
         Event::Created { key, value, origin } => {
             assert_eq!(key, 1);
             assert_eq!(value, 42);

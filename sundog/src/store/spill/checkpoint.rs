@@ -26,6 +26,12 @@ impl SpillTier {
         self.inner.checkpoint_flushes.load(Ordering::Relaxed)
     }
 
+    /// Test-only: how many times [`SpillTier::read_at`] has been called.
+    #[cfg(test)]
+    pub(crate) fn read_calls(&self) -> u64 {
+        self.inner.read_calls.load(Ordering::Relaxed)
+    }
+
     /// The checkpoint half of a warm-reopen-enabled close: blocks until the
     /// flusher thread [`SpillTier::attach`] started drains its queue and
     /// exits (the only place the spill module joins that thread; run this in a

@@ -53,7 +53,15 @@ fn apply_batch(
     }
     let mut outcomes = Vec::new();
     for (bucket, group) in by_bucket {
-        outcomes.extend(engine.apply_many(bucket, group, resolver, 60_000, 600_000, 0));
+        outcomes.extend(engine.apply_many(
+            Arrival::Peer,
+            bucket,
+            group,
+            resolver,
+            60_000,
+            600_000,
+            0,
+        ));
     }
     outcomes
 }
@@ -184,7 +192,15 @@ fn apply_batch_at(engine: &SetEngine, entries: Vec<SetEntry>, now_ms: u64) {
             .push(entry);
     }
     for (bucket, group) in by_bucket {
-        engine.apply_many(bucket, group, &UnionSetResolver, 60_000, 600_000, now_ms);
+        engine.apply_many(
+            Arrival::Peer,
+            bucket,
+            group,
+            &UnionSetResolver,
+            60_000,
+            600_000,
+            now_ms,
+        );
     }
 }
 
@@ -420,7 +436,15 @@ fn a_non_merging_resolver_never_prefolds() {
         value_entry(hlc(3, 1), "c"),
     ];
 
-    let outcomes = engine.apply_many(bucket, entries, &resolver, 60_000, 600_000, 0);
+    let outcomes = engine.apply_many(
+        Arrival::Peer,
+        bucket,
+        entries,
+        &resolver,
+        60_000,
+        600_000,
+        0,
+    );
     assert_eq!(outcomes.len(), 3);
     assert!(
         matches!(outcomes[0], ApplyOutcome::Put { created: true, .. }),
@@ -458,7 +482,15 @@ fn prefold_never_folds_a_run_across_a_tombstone() {
     };
 
     let prefolded: SetEngine = Engine::new(u64::MAX, None, None, None);
-    let outcomes = prefolded.apply_many(bucket, build(), &resolver, 60_000, 600_000, 0);
+    let outcomes = prefolded.apply_many(
+        Arrival::Peer,
+        bucket,
+        build(),
+        &resolver,
+        60_000,
+        600_000,
+        0,
+    );
     assert_eq!(outcomes.len(), 4);
     assert!(
         matches!(outcomes[0], ApplyOutcome::Rejected),
@@ -481,7 +513,15 @@ fn prefold_never_folds_a_run_across_a_tombstone() {
 
     let sequential: SetEngine = Engine::new(u64::MAX, None, None, None);
     sequential.set_prefold_enabled(false);
-    let sequential_outcomes = sequential.apply_many(bucket, build(), &resolver, 60_000, 600_000, 0);
+    let sequential_outcomes = sequential.apply_many(
+        Arrival::Peer,
+        bucket,
+        build(),
+        &resolver,
+        60_000,
+        600_000,
+        0,
+    );
     assert!(matches!(
         sequential_outcomes[0],
         ApplyOutcome::Put { created: true, .. }

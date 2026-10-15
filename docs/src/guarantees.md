@@ -140,7 +140,16 @@ for every dead writer it has seen, and stays exact.
 
 `remove` writes a tombstone that replicates like a value and outvotes
 every older copy of the key. Tombstones stay for `tombstone_ttl`, 10
-minutes by default. While a member that gossip remembers is absent, a
+minutes by default, counted from the delete's version stamp, so every
+replica collects one at the same grid tick. A tombstone a peer sends that
+arrives after its stamp plus `tombstone_ttl` is ignored: it deletes nothing
+and is not stored, and `sundog_tombstones_ignored_total{cache}` counts it. A
+delete therefore has to reach each replica within `tombstone_ttl` of its stamp,
+or that replica has to be deferring. Keep node clocks within seconds of each
+other: a receiver whose clock runs ahead of a writer's by nearly
+`tombstone_ttl` ignores that writer's fresh deletes, and a writer whose clock
+runs behind by `tombstone_ttl` stamps deletes that arrive lapsed. A node's own
+`remove`, `remove_many` and `clear` are never ignored. While a member that gossip remembers is absent, a
 cache keeps its tombstones longer, up to `tombstone_max_ttl`, 24 hours by
 default, and for another `tombstone_ttl` once that member is back, so a
 node returning from a partition cannot bring a deleted key back. A
@@ -157,7 +166,7 @@ away.
 
 The tombstone an expired entry leaves in `Replicated` and `Distributed` under
 a non-merging resolver is kept by the same rules, counted from the entry's
-expiry instead of from the delete. `sundog_tombstones{cache}` reports how many
+expiry instead of from the delete's stamp. `sundog_tombstones{cache}` reports how many
 a node holds.
 
 A member gone longer than `tombstone_max_ttl` returns after the tombstone

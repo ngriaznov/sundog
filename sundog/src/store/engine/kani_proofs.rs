@@ -2,7 +2,8 @@
 
 use super::expiry::{
     LONG_TTL, MAX_INLINE_TTL_MS, MAX_STAMP_LEAD_MS, MAX_TTI_MS, NEVER_EXPIRES, clamp_tti_ms,
-    encode_expiry, idle_elapsed_ms, touch_stamp,
+    drops_lapsed_tombstone, encode_expiry, idle_elapsed_ms, tombstone_anchor_ms,
+    tombstone_deadlines, touch_stamp,
 };
 use super::housekeeping::should_shrink_stripe;
 use super::keys::{digest_slot, part_index_from_hash, stripe_index_from_hash};
@@ -202,4 +203,32 @@ fn shrink_fires_only_at_an_eighth_of_the_allocation() {
     if capacity == 0 || len > capacity / 8 {
         assert!(!shrink);
     }
+}
+
+/// A tombstone's anchor is never beyond the receiving clock, and its
+/// deadlines are never before the anchor, whatever the stamps and
+/// retentions.
+#[kani::proof]
+fn a_tombstone_anchor_is_never_ahead_of_now_and_its_deadlines_never_before_it() {
+    let (expired_at_ms, ver_wall_ms, now_ms): (Option<u64>, u64, u64) =
+        (kani::any(), kani::any(), kani::any());
+    let anchor = tombstone_anchor_ms(expired_at_ms, ver_wall_ms, now_ms);
+    assert!(anchor <= now_ms);
+    let (ttl_ms, max_ttl_ms): (u64, u64) = (kani::any(), kani::any());
+    let (ttl_deadline, max_deadline) = tombstone_deadlines(anchor, ttl_ms, max_ttl_ms);
+    assert!(ttl_deadline >= anchor && max_deadline >= anchor);
+}
+
+/// This node's own tombstone is never dropped, and a peer's is dropped
+/// exactly when the next collection would collect it.
+#[kani::proof]
+fn only_a_peer_tombstone_that_the_next_collection_would_collect_is_dropped() {
+    let deadlines: (u64, u64) = (kani::any(), kani::any());
+    let (now_ms, deferring): (u64, bool) = (kani::any(), kani::any());
+    assert!(!drops_lapsed_tombstone(false, deadlines, now_ms, deferring));
+    let horizon = if deferring { deadlines.1 } else { deadlines.0 };
+    assert_eq!(
+        drops_lapsed_tombstone(true, deadlines, now_ms, deferring),
+        now_ms >= horizon
+    );
 }

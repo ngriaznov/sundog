@@ -415,6 +415,55 @@ pub(crate) async fn clock_skew_pin_metrics() {
     assert_eq!(shard.get(&2).await.as_deref(), Some("v"));
 }
 
+/// Drives `sundog_tombstones_ignored_total{cache}` through a bare `Shard`
+/// that keeps tombstones for a minute and has ended its start deferral:
+/// three deletes stamped an hour ago arrive lapsed and are ignored, one
+/// stamped a second ago is stored, so the counter reads exactly three.
+pub(crate) async fn tombstone_ignored_pin_metrics() {
+    let shard = Shard::<u32, String>::new(
+        SmolStr::new("tombstone-ignored-pin"),
+        Mode::Replicated,
+        NodeId::from(1),
+        10_000,
+        None,
+        None,
+    )
+    .with_tombstone_ttl(Duration::from_secs(60));
+    shard.gc_tombstones(false).await;
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is past the epoch")
+            .as_millis(),
+    )
+    .expect("epoch milliseconds fit in u64");
+    let delete = |key: u32, ago_ms: u64| sundog::wire::WireRecord {
+        key: bytes::Bytes::from(postcard::to_stdvec(&key).expect("key encodes")),
+        value: None,
+        ver: sundog::Hlc {
+            wall_ms: now_ms - ago_ms,
+            logical: 0,
+            node: NodeId::from(2),
+        },
+        expires_at_ms: None,
+    };
+    shard
+        .apply_remote_batch(vec![
+            delete(1, 3_600_000),
+            delete(2, 3_600_000),
+            delete(3, 3_600_000),
+            delete(4, 1_000),
+        ])
+        .await;
+    let held = |key: u32| {
+        shard.records_for(vec![bytes::Bytes::from(
+            postcard::to_stdvec(&key).expect("key encodes"),
+        )])
+    };
+    assert_eq!(held(4).await.len(), 1, "the fresh delete is kept");
+    assert!(held(1).await.is_empty(), "a lapsed one is not");
+}
+
 /// The records the skew hold keeps per cache: the cap
 /// `ShardOps::apply_forwarded_batch` holds forwards up to, documented with
 /// `sundog_clock_skew_held` in operations.md.

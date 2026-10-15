@@ -8,6 +8,7 @@ mod flush_slots;
 mod held_only;
 mod refusal;
 mod reservation;
+mod tombstone_arrival;
 
 fn temp_dir(label: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -944,6 +945,7 @@ fn an_apply_many_over_an_expired_spilled_counter_starts_a_new_value() {
     let delta = PnCounter::local_delta(node_b, 4);
     let encoded = Bytes::from(postcard::to_stdvec(&delta).expect("encodes"));
     let outcomes = engine.apply_many(
+        Arrival::Peer,
         bucket,
         vec![(
             hash,
@@ -1063,6 +1065,7 @@ fn prefold_over_an_expired_spilled_seed_matches_sequential_application() {
         )
     };
     let _ = batched.apply_many(
+        Arrival::Peer,
         bucket,
         vec![entry(e0), entry(e1)],
         &resolver,
@@ -1210,6 +1213,7 @@ fn prefold_seeds_a_spilled_stored_record_so_the_batch_matches_sequential_applica
     let e0_encoded = Bytes::from(postcard::to_stdvec(&e0.1).expect("encodes"));
     let e1_encoded = Bytes::from(postcard::to_stdvec(&e1.1).expect("encodes"));
     let outcomes = batched.apply_many(
+        Arrival::Peer,
         bucket,
         vec![
             (

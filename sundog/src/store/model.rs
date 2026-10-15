@@ -187,18 +187,17 @@ impl Model {
     }
 
     /// A versioned tombstone write under the same version rule as
-    /// [`Model::apply`], its two GC deadlines stamped from the clock. A
-    /// delete counts them from now. The tombstone of an expired entry
-    /// (`expired_at_ms` `Some`) counts them from that expiry, capped at now,
-    /// and is dropped on arrival, whatever the key holds, when its retention
-    /// has already lapsed: the `ttl` deadline, or the `max` one while the
-    /// last [`Model::gc`] deferred.
-    pub fn remove(&mut self, key: u8, ver: Hlc, expired_at_ms: Option<u64>) {
-        if self.incoming_loses(key, ver) {
-            return;
-        }
+    /// [`Model::apply`], its two GC deadlines stamped from the clock. Every
+    /// tombstone counts them from an instant all replicas agree on, capped
+    /// at now: the version's `wall_ms` for a delete, the expiry
+    /// (`expired_at_ms` `Some`) for the tombstone of an expired entry. One
+    /// that comes from a peer (`from_peer`) is dropped on arrival, whatever
+    /// the key holds, when its retention has already lapsed: the `ttl`
+    /// deadline, or the `max` one while the last [`Model::gc`] deferred. A
+    /// local delete is always stored.
+    pub fn remove(&mut self, key: u8, ver: Hlc, expired_at_ms: Option<u64>, from_peer: bool) {
         let now = self.now_ms();
-        let anchor = expired_at_ms.map_or(now, |expired| expired.min(now));
+        let anchor = expired_at_ms.unwrap_or(ver.wall_ms).min(now);
         let ttl_deadline_ms = anchor.saturating_add(self.tombstone_ttl_ms);
         let max_deadline_ms = anchor.saturating_add(self.tombstone_max_ttl_ms);
         let horizon = if self.gc_deferring {
@@ -206,7 +205,10 @@ impl Model {
         } else {
             ttl_deadline_ms
         };
-        if expired_at_ms.is_some() && now >= horizon {
+        if from_peer && now >= horizon {
+            return;
+        }
+        if self.incoming_loses(key, ver) {
             return;
         }
         self.entries.insert(
@@ -509,6 +511,7 @@ fn apply_remote_to_model(model: &mut Model, record: &RemoteRecord, now_ms: u64) 
             record.key,
             ver,
             remote_expiry(now_ms, record.expires_offset_ms),
+            true,
         ),
     }
 }
@@ -533,7 +536,7 @@ fn apply_op(op: &Op, shard: &Shard<u8, u8>, model: &mut Model) {
         Op::LocalRemove { key } => {
             let ver = model.stamp_local();
             let _ = futures::executor::block_on(shard.remove(key));
-            model.remove(*key, ver, None);
+            model.remove(*key, ver, None, false);
         }
         Op::RemoteApply {
             key,
@@ -743,29 +746,96 @@ mod tests {
         let mut model = model();
         model.gc(false);
         let long_ago = Some(START_CLOCK_MS - 5_000);
-        model.remove(1, ver(5), long_ago);
+        model.remove(1, ver(5), long_ago, true);
         assert_eq!(held(&model, 1), None, "nothing held, already lapsed");
 
         model.apply(2, ver(4), 1, None);
-        model.remove(2, ver(5), long_ago);
+        model.remove(2, ver(5), long_ago, true);
         assert_eq!(model.visible(2), Some(1), "the older copy stays");
         assert_eq!(held(&model, 2), Some(ver(4)), "and nothing replaces it");
 
-        model.remove(3, ver(3), None);
-        model.remove(3, ver(5), long_ago);
+        model.remove(3, ver(3), None, false);
+        model.remove(3, ver(5), long_ago, true);
         assert_eq!(held(&model, 3), Some(ver(3)), "an older tombstone stays");
 
-        model.remove(4, ver(5), None);
-        assert_eq!(held(&model, 4), Some(ver(5)), "a delete is always stored");
+        model.remove(4, ver(5), None, false);
+        assert_eq!(
+            held(&model, 4),
+            Some(ver(5)),
+            "a local delete is always stored"
+        );
+    }
+
+    #[test]
+    fn a_lapsed_peer_delete_stores_nothing_whatever_the_key_holds() {
+        let mut model = model();
+        model.gc(false);
+        let lapsed = ver(START_CLOCK_MS - 5_000);
+        model.remove(1, lapsed, None, true);
+        assert_eq!(held(&model, 1), None, "nothing held, already lapsed");
+
+        model.apply(2, ver(4), 1, None);
+        model.remove(2, lapsed, None, true);
+        assert_eq!(model.visible(2), Some(1), "the older copy stays");
+        assert_eq!(held(&model, 2), Some(ver(4)), "and nothing replaces it");
+
+        model.remove(3, ver(3), None, false);
+        model.remove(3, lapsed, None, true);
+        assert_eq!(held(&model, 3), Some(ver(3)), "an older tombstone stays");
+
+        let fresh = ver(START_CLOCK_MS - 100);
+        model.apply(4, ver(4), 1, None);
+        model.remove(4, fresh, None, true);
+        assert_eq!(model.visible(4), None, "a delete within its ttl lands");
+        assert_eq!(held(&model, 4), Some(fresh));
+    }
+
+    #[test]
+    fn a_local_remove_is_always_stored() {
+        let mut model = model();
+        model.gc(false);
+        let long_ago = START_CLOCK_MS - 5_000;
+        model.remove(1, ver(long_ago), None, false);
+        assert_eq!(
+            held(&model, 1),
+            Some(ver(long_ago)),
+            "a local delete past its retention is stored"
+        );
+        model.apply(2, ver(4), 1, None);
+        model.remove(2, ver(5), Some(long_ago), false);
+        assert_eq!(model.visible(2), None, "and deletes the older copy");
+    }
+
+    #[test]
+    fn a_delete_counts_its_retention_from_its_stamp_capped_at_now() {
+        let mut model = model();
+        model.gc(false);
+        model.remove(1, ver(START_CLOCK_MS - 999), None, true);
+        model.gc(false);
+        assert!(held(&model, 1).is_some(), "kept until stamp + ttl");
+        model.advance_clock(1);
+        model.gc(false);
+        assert_eq!(held(&model, 1), None, "collected at stamp + ttl");
+
+        model.remove(2, ver(model.now_ms() + 50_000), None, true);
+        model.advance_clock(999);
+        model.gc(false);
+        assert!(
+            held(&model, 2).is_some(),
+            "a stamp ahead counts from the receipt"
+        );
+        model.advance_clock(1);
+        model.gc(false);
+        assert_eq!(held(&model, 2), None);
     }
 
     #[test]
     fn a_deferring_collection_keeps_a_lapsed_expiry_tombstone_to_its_cap() {
         let mut model = model();
         model.gc(true);
-        model.remove(1, ver(5), Some(START_CLOCK_MS - 20_000));
+        model.remove(1, ver(5), Some(START_CLOCK_MS - 20_000), true);
         assert_eq!(held(&model, 1), None, "past its cap too");
-        model.remove(1, ver(5), Some(START_CLOCK_MS - 2_000));
+        model.remove(1, ver(5), Some(START_CLOCK_MS - 2_000), true);
         assert_eq!(
             held(&model, 1),
             Some(ver(5)),
@@ -773,9 +843,22 @@ mod tests {
         );
 
         model.apply(2, ver(4), 1, None);
-        model.remove(2, ver(5), Some(START_CLOCK_MS - 2_000));
+        model.remove(2, ver(5), Some(START_CLOCK_MS - 2_000), true);
         assert_eq!(model.visible(2), None, "it deletes the older copy");
         assert_eq!(held(&model, 2), Some(ver(5)));
+    }
+
+    #[test]
+    fn a_deferring_collection_keeps_a_lapsed_peer_delete_to_its_cap() {
+        let mut model = model();
+        model.gc(true);
+        model.remove(1, ver(START_CLOCK_MS - 20_000), None, true);
+        assert_eq!(held(&model, 1), None, "past its cap");
+        let within_cap = ver(START_CLOCK_MS - 2_000);
+        model.remove(2, within_cap, None, true);
+        assert_eq!(held(&model, 2), Some(within_cap), "past its ttl only");
+        model.gc(false);
+        assert_eq!(held(&model, 2), None, "collected once collection resumes");
     }
 
     #[test]
@@ -783,7 +866,7 @@ mod tests {
         let mut model = model();
         let past_its_ttl = Some(START_CLOCK_MS - 2_000);
         model.apply(1, ver(4), 1, None);
-        model.remove(1, ver(5), past_its_ttl);
+        model.remove(1, ver(5), past_its_ttl, true);
         assert_eq!(
             model.visible(1),
             None,
@@ -794,7 +877,7 @@ mod tests {
         model.gc(false);
         assert_eq!(held(&model, 1), None, "the collection ends the deferral");
         model.apply(2, ver(4), 1, None);
-        model.remove(2, ver(5), past_its_ttl);
+        model.remove(2, ver(5), past_its_ttl, true);
         assert_eq!(model.visible(2), Some(1), "and the next one is dropped");
     }
 

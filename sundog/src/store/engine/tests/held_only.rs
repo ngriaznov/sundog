@@ -53,6 +53,7 @@ fn apply_in(
     engine
         .apply_many_in(
             scope,
+            Arrival::Peer,
             bucket,
             entries,
             &UnionSetResolver,
@@ -281,6 +282,7 @@ fn a_batch_folds_its_held_keys_and_rejects_the_rest_in_order() {
     let outcomes = engine
         .apply_many_in(
             ApplyScope::HeldOnly,
+            Arrival::Peer,
             bucket,
             vec![
                 set_entry(unheld, &["x"], hlc(2_000, 2), None),
