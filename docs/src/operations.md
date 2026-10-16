@@ -128,8 +128,8 @@ addresses once it forms, under `cluster formed`.
 `sundog_accept_dropped_total` rises.
 
 - `hello_timeout` counts a connection that opens and then stays silent, or
-  sends part of a hello, for 10 seconds. A port scan, or a health check that
-  opens the port and holds it, does. A connection that fails its TLS
+  sends part of a hello, for 10 seconds. A monitoring check, or any client,
+  that opens the port and holds it does. A connection that fails its TLS
   handshake, or whose first frame is not a hello, closes at once and does not
   count. A TLS node and a plaintext node refusing each other's connections
   show as debug-level log lines, `TLS handshake failed on accept` on the TLS
