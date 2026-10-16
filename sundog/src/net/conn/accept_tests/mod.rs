@@ -6,8 +6,11 @@
 //! observed through a `JoinHandle` or a counter, with no `timeout` guard
 //! armed while waiting on socket IO: a paused runtime advances to the next
 //! timer as soon as it has no ready task, so a socket event that arrives
-//! after that point loses to the timer by the whole gap. Tests that need a
-//! socket event run on the real clock with real-time guards.
+//! after that point loses to the timer by the whole gap. A handler's own
+//! deadline is such a timer from the moment it first runs, so a paused test
+//! with several handlers connects every socket first and then spawns the
+//! handlers back to back. Tests that need a socket event run on the real clock
+//! with real-time guards.
 
 mod backoff;
 mod cap;
@@ -65,12 +68,16 @@ struct Accepted {
 /// in the cap that the accept loop gives a connection from an unknown source.
 async fn spawn_accepted(tls: TlsCtx) -> Accepted {
     let mesh = MeshInner::for_tests(tls, CancellationToken::new());
-    spawn_accepted_in(&mesh).await
+    spawn_handler(loopback_pair().await, &mesh)
 }
 
-/// [`spawn_accepted`] in an existing `mesh`, which several connections share.
-async fn spawn_accepted_in(mesh: &Arc<MeshInner>) -> Accepted {
-    let (client, server, client_addr) = loopback_pair().await;
+/// `handle_accepted` on the server end of a `pair` that [`loopback_pair`]
+/// connected, in `mesh`, which several connections can share. It awaits
+/// nothing: a test that spawns several handlers on a paused clock connects
+/// every pair first and spawns them without a yield between, so no connect
+/// waits while a handler's deadline is armed.
+fn spawn_handler(pair: (TcpStream, TcpStream, SocketAddr), mesh: &Arc<MeshInner>) -> Accepted {
+    let (client, server, client_addr) = pair;
     let (inbound_tx, inbound) = mpsc::channel(8);
     let pre_hello = match mesh.admission.admit(client_addr.ip()) {
         Admit::Known => None,

@@ -7,8 +7,8 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    Accepted, Dropped, Warnings, framed, hello, invalidate, peer, replicate_of, send_each,
-    spawn_accepted, spawn_accepted_in,
+    Accepted, Dropped, Warnings, framed, hello, invalidate, loopback_pair, peer, replicate_of,
+    send_each, spawn_accepted, spawn_handler,
 };
 use crate::net::MeshInner;
 use crate::net::conn::admit::HELLO_TIMEOUT;
@@ -114,10 +114,17 @@ async fn each_connection_closed_at_the_deadline_is_counted_and_the_warning_is_ra
     let _metrics = metrics::set_default_local_recorder(&recorder);
     let (warnings, _log) = Warnings::capture();
     let mesh = MeshInner::for_tests(no_tls(), CancellationToken::new());
-    let mut silent = Vec::new();
+    // Every connect finishes before the first handler runs, and the handlers
+    // are spawned without a yield between, so each one's deadline is armed
+    // before the test waits on anything.
+    let mut pairs = Vec::new();
     for _ in 0..3 {
-        silent.push(spawn_accepted_in(&mesh).await);
+        pairs.push(loopback_pair().await);
     }
+    let mut silent: Vec<Accepted> = pairs
+        .into_iter()
+        .map(|pair| spawn_handler(pair, &mesh))
+        .collect();
     assert_eq!(dropped.total("hello_timeout"), None);
 
     all_end_at_the_deadline(&mut silent).await;
