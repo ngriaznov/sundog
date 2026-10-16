@@ -703,7 +703,7 @@ fn a_lapsed_expiry_tombstone_within_its_cap_replaces_an_older_tombstone_while_de
 }
 
 #[test]
-fn a_lapsed_delete_tombstone_is_always_stored() {
+fn a_lapsed_local_delete_tombstone_is_always_stored() {
     let engine = engine_u32_string(u64::MAX, None);
     let outcome = tombstone_arriving(
         &engine,

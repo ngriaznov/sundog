@@ -463,3 +463,69 @@ async fn the_previous_release_stores_and_serves_a_merge_derived_version_from_the
     new.stop().await.expect("new node stops");
     net.close().await.expect("network closes");
 }
+
+/// A delete the previous release's node makes drains from this release's
+/// node and stays gone. The previous release keeps its tombstone from the
+/// moment it lands and offers it to anti-entropy again after this node has
+/// collected its own; this node ignores that copy once its retention has
+/// passed, so its tombstone count reaches zero and stays there while the old
+/// node still offers.
+///
+/// The test node's `tombstone_ttl` is 20 s and its anti-entropy interval 2 s.
+/// The delete is made after this node's first 20 s of start deferral, so the
+/// deferral does not mask the collection under test.
+#[tokio::test]
+async fn a_delete_the_previous_release_makes_drains_from_this_node_and_stays_gone() {
+    const TOMBSTONE_TTL: Duration = Duration::from_secs(20);
+    const AE_INTERVAL: Duration = Duration::from_secs(2);
+    const KEY: &str = "doomed";
+
+    require_containers!();
+
+    let previous = build_previous_testnode();
+    let net = Arc::new(Network::new_network());
+    let old = Node::spawn_binary(&net, "mixed-delete-cluster", "n1", &[], &[], previous).await;
+    let new = Node::spawn(&net, "mixed-delete-cluster", "n2", &[&seed("n1")]).await;
+    wait_for_peers(&[&old, &new], 1).await;
+
+    old.put(KEY, "v").await.expect("the old node writes");
+    eventually(CONVERGE_WAIT, || async {
+        new.get(KEY).await == Ok(Some("v".to_string()))
+    })
+    .await;
+
+    // Past the new node's start deferral.
+    tokio::time::sleep(TOMBSTONE_TTL).await;
+    old.del(KEY).await.expect("the old node deletes");
+
+    // The delete reaches this node and is stored: the drain below is not
+    // vacuous.
+    eventually(CONVERGE_WAIT, || async {
+        new.get(KEY).await == Ok(None)
+            && scrape_metric(&new, "sundog_tombstones", ("cache", "it")).await > 0
+    })
+    .await;
+
+    // The tombstone counts its retention from the delete's stamp and leaves
+    // this node at the first collection after it.
+    eventually(TOMBSTONE_TTL * 4, || async {
+        scrape_metric(&new, "sundog_tombstones", ("cache", "it")).await == 0
+    })
+    .await;
+
+    // The old node still offers its copy for a while; this node ignores it.
+    for round in 0..6 {
+        tokio::time::sleep(AE_INTERVAL).await;
+        assert_eq!(
+            scrape_metric(&new, "sundog_tombstones", ("cache", "it")).await,
+            0,
+            "round {round}: a collected tombstone is not taken again"
+        );
+        assert_eq!(new.get(KEY).await, Ok(None), "round {round}");
+        assert_eq!(old.get(KEY).await, Ok(None), "round {round}");
+    }
+
+    old.stop().await.expect("old node stops");
+    new.stop().await.expect("new node stops");
+    net.close().await.expect("network closes");
+}

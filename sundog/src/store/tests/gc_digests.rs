@@ -51,7 +51,8 @@ async fn gc_tombstones_defers_collection_while_a_member_is_absent() {
 
 #[tokio::test]
 async fn gc_tombstones_proceeds_once_no_member_is_absent() {
-    let mut s = shard::<u32, String>(1);
+    // A fixed clock: two collections a stall apart cannot read as a pause.
+    let mut s = shard::<u32, String>(1).with_clock(Arc::new(|| 1_700_000_000_000));
     s.remove(&1).await.expect("remove creates a tombstone");
     s.tombstone_ttl_ms = 0;
     force_tombstone_past_ttl(&s, &key_bytes(&1u32), false);

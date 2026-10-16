@@ -31,6 +31,15 @@ const RECORDS_START_MS: u64 = 1_700_000_000_000;
 /// The fixed clock [`permutation_convergence`]'s replicas read: an hour after
 /// every generated write.
 const NOW_MS: u64 = RECORDS_START_MS + 3_600_000;
+/// The wall clock reading of the first write [`build_records`] generates: a
+/// little over a thousand seconds before [`NOW_MS`], so the writes span the
+/// stamps of a delete inside its retention and of one lapsed past
+/// `tombstone_ttl`, and a delete lands before some writes and after others.
+const WRITES_START_MS: u64 = NOW_MS - 1_000_003;
+/// The wall clock distance between two generated writes. A workload of at
+/// most 40 writes stays before [`NOW_MS`], and no write is stamped on a
+/// delete's instant.
+const WRITE_STRIDE_MS: u64 = 24_997;
 /// The tombstone retention [`permutation_convergence`]'s replicas count.
 const TOMBSTONE_TTL_MS: u64 = 600_000;
 /// The cap on that retention.
@@ -128,17 +137,19 @@ fn build_records(ops: &[(u8, OpKind)]) -> Vec<WireRecord> {
     let mut clocks: Vec<HlcClock> = (0..NUM_NODES)
         .map(|i| HlcClock::new(NodeId::from(u64::from(i) + 1)))
         .collect();
-    let mut physical_ms: u64 = RECORDS_START_MS;
+    let mut physical_ms: u64 = WRITES_START_MS;
 
     ops.iter()
         .enumerate()
         .map(|(index, (origin, op))| {
-            physical_ms += 1;
+            physical_ms += WRITE_STRIDE_MS;
             let origin_idx = usize::from(*origin);
             let ver = match op {
                 // A delete is stamped at its age, which the clocks, whose
                 // wall time only moves forward from the writes, cannot
-                // express; the index keeps every stamp distinct.
+                // express; the index keeps every stamp distinct. The
+                // writes' stamps straddle those of a delete inside its
+                // retention and of one past `tombstone_ttl`.
                 OpKind::Remove(_, ago) => Hlc {
                     wall_ms: ago.stamp_ms(),
                     logical: u32::try_from(index).expect("a short workload") + 1,
@@ -482,6 +493,40 @@ proptest! {
     }
 }
 
+/// The generated workload orders a delete against writes both ways: a delete
+/// inside its retention and one past `tombstone_ttl` each have a write
+/// stamped before them and one stamped after, the two cases a stored delete
+/// loses to a newer value and beats an older one.
+#[test]
+fn generated_deletes_are_ordered_against_writes_both_ways() {
+    for ago in [DeletedAgo::Within, DeletedAgo::PastTtl] {
+        let ops: Vec<(u8, OpKind)> = (0..30)
+            .map(|i| {
+                if i == 15 {
+                    (0, OpKind::Remove(0, ago))
+                } else {
+                    (0, OpKind::Put(0, 0))
+                }
+            })
+            .collect();
+        let records = build_records(&ops);
+        let delete = records[15].ver;
+        assert_eq!(delete.wall_ms, ago.stamp_ms());
+        assert!(
+            records.iter().any(|r| r.value.is_some() && r.ver < delete),
+            "a write older than a {ago:?} delete"
+        );
+        assert!(
+            records.iter().any(|r| r.value.is_some() && r.ver > delete),
+            "a write newer than a {ago:?} delete"
+        );
+        assert!(
+            records.iter().all(|r| r.ver.wall_ms <= NOW_MS),
+            "no write is stamped after the replicas' clock"
+        );
+    }
+}
+
 /// The `tombstone_ttl` of [`a_lapsed_delete_never_beats_a_put_regardless_of_order`]'s
 /// replicas: shorter than the gap between its delete's stamp and the clock.
 const LAPSED_RACE_TTL_MS: u64 = 1_000;
@@ -558,14 +603,16 @@ proptest! {
                 None,
                 None,
             )
-            .with_tombstone_ttl(Duration::ZERO);
+            .with_tombstone_ttl(Duration::ZERO)
+            // A fixed clock: no stall of the test thread can read as a pause.
+            .with_clock(Arc::new(|| NOW_MS));
             let mut remote_clocks: Vec<HlcClock> = (0u8..3)
                 .map(|i| HlcClock::new(NodeId::from(u64::from(i) + 1)))
                 .collect();
             // Remote stamps start at the shard's own clock, so a delete
             // arrives within its cap and is stored until a collection ends
             // the start deferral.
-            let mut physical_ms: u64 = now_ms();
+            let mut physical_ms: u64 = NOW_MS;
             let mut collected = false;
 
             for op in &ops {

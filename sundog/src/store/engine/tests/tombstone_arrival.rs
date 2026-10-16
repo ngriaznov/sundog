@@ -218,7 +218,7 @@ fn a_peer_delete_arrives_anchored_on_its_stamp() {
         assert_eq!(
             (t.ttl_deadline_ms, t.max_deadline_ms),
             (61_000, 601_000),
-            "{arrival:?}: counted from the stamp at 1,000, not the receipt at 5,000"
+            "{arrival:?}: counted from the stamp at 1,000, not the arrival at 5,000"
         );
         assert_eq!(t.expired_at_ms, None);
         assert_eq!(engine.digests(), engine.recompute_digests_paired());
@@ -226,7 +226,7 @@ fn a_peer_delete_arrives_anchored_on_its_stamp() {
 }
 
 #[test]
-fn a_delete_stamped_ahead_of_the_clock_anchors_on_its_receipt() {
+fn a_delete_stamped_ahead_of_the_clock_anchors_on_this_clock() {
     for arrival in [Arrival::Peer, Arrival::Local] {
         let engine = engine_u32_string(u64::MAX, None);
         let _ = apply_records(
