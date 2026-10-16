@@ -230,12 +230,16 @@ pub trait ShardOps: Send + Sync {
     /// versioned [`ShardOps::apply_remote`] path as live traffic.
     fn snapshot_chunks(&self) -> BoxStream<'static, Vec<WireRecord>>;
 
-    /// Garbage-collects tombstones older than `tombstone_ttl`: a delete's,
-    /// counted from when this node receives or makes it, and an expired
-    /// entry's, counted from its expiry. While `defer`, a tombstone past `tombstone_ttl` but not
-    /// `tombstone_max_ttl` is left in place instead. A tombstone of an
-    /// expired entry that arrives from a peer already past the retention
-    /// this call applies is dropped on arrival, whatever the key holds.
+    /// Garbage-collects tombstones past `tombstone_ttl`, counted from an
+    /// instant all replicas agree on: a delete's version stamp, an expired
+    /// entry's expiry. While `defer`, a tombstone past `tombstone_ttl` but not
+    /// `tombstone_max_ttl` is left in place instead. On a `Replicated` or
+    /// `Distributed` shard a call more than twice the gc period (a quarter of
+    /// `tombstone_ttl`, at least a second) after the previous one defers too,
+    /// as does every later call for `tombstone_ttl`: the shard did not run,
+    /// and may hold values whose deletes it never saw. A tombstone that
+    /// arrives from a peer already past the retention this shard applies is
+    /// dropped on arrival, whatever the key holds.
     fn gc_tombstones(&self, defer: bool) -> BoxFuture<'_, ()>;
 
     /// Runs `engine::Engine::sweep`, since the engine has no free-running sweep

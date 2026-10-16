@@ -2,8 +2,9 @@
 
 use super::expiry::{
     LONG_TTL, MAX_INLINE_TTL_MS, MAX_STAMP_LEAD_MS, MAX_TTI_MS, NEVER_EXPIRES, clamp_tti_ms,
-    drops_lapsed_tombstone, encode_expiry, idle_elapsed_ms, tombstone_anchor_ms,
-    tombstone_deadlines, touch_stamp,
+    drops_lapsed_tombstone, encode_expiry, gc_defer_decision, gc_period_ms, idle_elapsed_ms,
+    pause_gap_ms, pause_hold_after, paused_since, tombstone_anchor_ms, tombstone_deadlines,
+    touch_stamp,
 };
 use super::housekeeping::should_shrink_stripe;
 use super::keys::{digest_slot, part_index_from_hash, stripe_index_from_hash};
@@ -231,4 +232,36 @@ fn only_a_peer_tombstone_that_the_next_collection_would_collect_is_dropped() {
         drops_lapsed_tombstone(true, deadlines, now_ms, deferring),
         now_ms >= horizon
     );
+}
+
+/// The pause gap is never below a second and never below the period, so a
+/// healthy tick, one period after the last, is never a pause; and a longer
+/// gap since the last collection is never less paused.
+#[kani::proof]
+fn a_longer_gap_is_never_less_paused_and_a_healthy_tick_is_not_a_pause() {
+    let (last_gc_ms, now_ms, later_ms, ttl_ms): (u64, u64, u64, u64) =
+        (kani::any(), kani::any(), kani::any(), kani::any());
+    assert!(gc_period_ms(ttl_ms) >= 1_000);
+    assert!(pause_gap_ms(ttl_ms) >= gc_period_ms(ttl_ms));
+    kani::assume(later_ms >= now_ms);
+    if paused_since(last_gc_ms, now_ms, ttl_ms) {
+        assert!(paused_since(last_gc_ms, later_ms, ttl_ms));
+    }
+    if let Some(on_time) = last_gc_ms.checked_add(gc_period_ms(ttl_ms)) {
+        assert!(!paused_since(last_gc_ms, on_time, ttl_ms));
+    }
+    assert!(!paused_since(0, now_ms, ttl_ms));
+}
+
+/// A pause hold is never shortened, and a collection that sees a pause
+/// always defers.
+#[kani::proof]
+fn a_pause_hold_never_shrinks_and_a_pause_always_defers() {
+    let (hold_ms, now_ms, ttl_ms): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+    let (defer, paused): (bool, bool) = (kani::any(), kani::any());
+    assert!(pause_hold_after(hold_ms, paused, now_ms, ttl_ms) >= hold_ms);
+    let (effective, entered_hold) = gc_defer_decision(defer, paused, hold_ms, now_ms);
+    assert!(effective || !(defer || paused || now_ms < hold_ms));
+    assert!(!paused || effective);
+    assert!(!entered_hold || paused);
 }

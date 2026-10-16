@@ -293,6 +293,62 @@ pub(super) fn drops_lapsed_tombstone(
     from_peer && tombstone_lapsed(deadlines.0, deadlines.1, now_ms, deferring)
 }
 
+/// The period of the tombstone gc task for a `tombstone_ttl` of `ttl_ms`: a
+/// quarter of it, at least one second. The task ticks on this period and the
+/// pause guard measures its gap against it ([`pause_gap_ms`]), so the two
+/// cannot drift apart. Pure; unit tested directly.
+pub(crate) fn gc_period_ms(ttl_ms: u64) -> u64 {
+    (ttl_ms / 4).max(1_000)
+}
+
+/// How long a node may go without a tombstone collection before it counts as
+/// paused: two gc periods. A healthy task collects once per period, so the
+/// second period is the room for scheduler jitter. The gap is half the
+/// `tombstone_ttl` for a ttl of 4 s or more; below that the one-second floor
+/// of the period dominates. Pure; unit tested directly.
+pub(crate) fn pause_gap_ms(ttl_ms: u64) -> u64 {
+    gc_period_ms(ttl_ms).saturating_mul(2)
+}
+
+/// Whether the wall clock shows this node did not collect tombstones for
+/// longer than [`pause_gap_ms`] before `now_ms`, given the reading of its
+/// last collection (`last_gc_ms`, `0` before the first). A process that was
+/// stopped, a VM that was suspended and a starved gc task all leave such a
+/// gap, and none of them can have received the deletes its peers made
+/// meanwhile. The comparison is strict and saturating, so a clock that stepped
+/// back never reads as a pause. Pure; unit tested directly.
+pub(crate) fn paused_since(last_gc_ms: u64, now_ms: u64, ttl_ms: u64) -> bool {
+    last_gc_ms != 0 && now_ms.saturating_sub(last_gc_ms) > pause_gap_ms(ttl_ms)
+}
+
+/// The instant a pause hold lasts to after a collection at `now_ms`: a node
+/// that `paused` defers for another `ttl_ms` from now, and a later pause
+/// extends an earlier hold, never shortens it. Pure; unit tested directly.
+pub(crate) fn pause_hold_after(hold_until_ms: u64, paused: bool, now_ms: u64, ttl_ms: u64) -> u64 {
+    if paused {
+        hold_until_ms.max(now_ms.saturating_add(ttl_ms))
+    } else {
+        hold_until_ms
+    }
+}
+
+/// Whether a collection or an arrival at `now_ms` defers, as
+/// `(effective, entered_hold)`: it defers when the gc task says so
+/// (`defer`: an absent member, a returned member's settle window, the first
+/// `tombstone_ttl` after the task starts, or the previous collection's
+/// decision), when the node is `paused`, or while the hold from an earlier
+/// pause (`hold_until_ms`) lasts. `entered_hold` is whether the pause starts
+/// a hold: one that was not already inside one. Pure; unit tested directly.
+pub(crate) fn gc_defer_decision(
+    defer: bool,
+    paused: bool,
+    hold_until_ms: u64,
+    now_ms: u64,
+) -> (bool, bool) {
+    let holding = now_ms < hold_until_ms;
+    (defer || paused || holding, paused && !holding)
+}
+
 /// The retention a shard's sweep leaves the tombstone of an expired entry
 /// under, or `None` when it leaves none: in a mode that runs no
 /// anti-entropy ([`Mode::tombstones_expired_entries`]), or under a resolver

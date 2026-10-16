@@ -24,7 +24,7 @@ fn tombstone_state(engine: &Engine<u32, String>, key: u32) -> Option<Tombstone> 
         .copied()
 }
 
-fn put_of(value: &str) -> Incoming<String> {
+pub(super) fn put_of(value: &str) -> Incoming<String> {
     let value = value.to_owned();
     Incoming::Put {
         encoded: Bytes::from(postcard::to_stdvec(&value).expect("encodes")),
@@ -57,7 +57,7 @@ impl Spec {
     }
 }
 
-fn entry(key: u32, ver: Hlc, incoming: Incoming<String>) -> BatchEntry<u32, String> {
+pub(super) fn entry(key: u32, ver: Hlc, incoming: Incoming<String>) -> BatchEntry<u32, String> {
     let kb = key_bytes(key);
     (hash_key_bytes(kb.as_ref()), key, kb, ver, incoming)
 }
@@ -65,7 +65,7 @@ fn entry(key: u32, ver: Hlc, incoming: Incoming<String>) -> BatchEntry<u32, Stri
 /// Applies `records` as one batch through [`Engine::apply_many_with_reservation`],
 /// grouped by bucket in order, with `ttl_ms` and `MAX` as the retentions.
 /// Returns the outcomes and the number of tombstones the batch ignored.
-fn apply_with_ttl(
+pub(super) fn apply_with_ttl(
     engine: &Engine<u32, String>,
     arrival: Arrival,
     ttl_ms: u64,
@@ -102,7 +102,7 @@ fn apply_with_ttl(
 }
 
 /// [`apply_with_ttl`] at the retentions `TTL` and `MAX`.
-fn apply_records(
+pub(super) fn apply_records(
     engine: &Engine<u32, String>,
     arrival: Arrival,
     now_ms: u64,
@@ -140,7 +140,7 @@ fn engine_holding(held: Held, deferring: bool) -> Engine<u32, String> {
             let _ = tombstone(&engine, 1, key_bytes(1), hlc(500, 2), 1_000);
         }
     }
-    engine.gc_tombstones(deferring, 0);
+    engine.gc_tombstones(deferring, 0, 60_000);
     engine
 }
 

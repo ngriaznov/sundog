@@ -9,18 +9,18 @@ use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use super::*;
 use crate::store::shard_ignored::{IGNORED_FORWARD_WARN_SPACING_MS, ignored_forward_warn_due};
 
-const START_MS: u64 = 10_000_000;
+pub(super) const START_MS: u64 = 10_000_000;
 const TTL: Duration = Duration::from_secs(60);
 const TTL_MS: u64 = 60_000;
 const MAX_TTL: Duration = Duration::from_secs(600);
 
-fn manual_clock() -> Arc<AtomicU64> {
+pub(super) fn manual_clock() -> Arc<AtomicU64> {
     Arc::new(AtomicU64::new(START_MS))
 }
 
 /// A `Mode::Replicated` shard on `clock` with a 60 s retention and a 600 s
 /// cap.
-fn clocked(clock: &Arc<AtomicU64>, ttl: Duration) -> Shard<u32, String> {
+pub(super) fn clocked(clock: &Arc<AtomicU64>, ttl: Duration) -> Shard<u32, String> {
     let reader = Arc::clone(clock);
     Shard::<u32, String>::new(
         SmolStr::new("arrival"),
@@ -35,7 +35,7 @@ fn clocked(clock: &Arc<AtomicU64>, ttl: Duration) -> Shard<u32, String> {
     .with_clock(Arc::new(move || reader.load(Ordering::SeqCst)))
 }
 
-fn delete_record(key: u32, wall_ms: u64) -> WireRecord {
+pub(super) fn delete_record(key: u32, wall_ms: u64) -> WireRecord {
     WireRecord {
         key: key_bytes(&key),
         value: None,
@@ -237,7 +237,7 @@ async fn an_older_value_losing_to_a_stored_version_is_not_counted_as_ignored() {
 /// Tests that read the log, which the `sim` build's cluster test support
 /// does not provide a subscriber for.
 #[cfg(not(feature = "sim"))]
-mod logged {
+pub(super) mod logged {
     use std::sync::Mutex;
 
     use tracing_subscriber::layer::SubscriberExt as _;
@@ -246,7 +246,7 @@ mod logged {
 
     /// A tracing layer that keeps the message of every `WARN` event.
     #[derive(Clone, Default)]
-    struct Warnings(Arc<Mutex<Vec<String>>>);
+    pub(in crate::store::tests) struct Warnings(Arc<Mutex<Vec<String>>>);
 
     /// Collects the `message` field of one event.
     struct Message(String);
@@ -274,7 +274,7 @@ mod logged {
     }
 
     impl Warnings {
-        fn taken(&self) -> Vec<String> {
+        pub(in crate::store::tests) fn taken(&self) -> Vec<String> {
             std::mem::take(&mut *self.0.lock().expect("lock"))
         }
     }
@@ -307,8 +307,16 @@ mod logged {
         assert_eq!(ignored_since_last_read(&snapshotter), 1);
         assert!(warnings.taken().is_empty(), "rate limited");
 
-        // After the spacing it warns again.
-        clock.store(START_MS + IGNORED_FORWARD_WARN_SPACING_MS, Ordering::SeqCst);
+        // After the spacing it warns again. The clock steps a gc period at a
+        // time with a collection at each, as the gc task would: a node that
+        // collects that often is not paused.
+        let mut at = START_MS;
+        while at < START_MS + IGNORED_FORWARD_WARN_SPACING_MS {
+            at += 15_000;
+            clock.store(at, Ordering::SeqCst);
+            ShardOps::gc_tombstones(&s, false).await;
+        }
+        assert_eq!(at, START_MS + IGNORED_FORWARD_WARN_SPACING_MS);
         ShardOps::apply_forwarded_batch(&s, vec![delete_record(2, lapsed)]).await;
         assert_eq!(ignored_since_last_read(&snapshotter), 1);
         assert_eq!(warnings.taken().len(), 1);

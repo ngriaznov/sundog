@@ -143,7 +143,8 @@ where
     ) -> Self {
         let engine = Arc::new(
             Engine::new(max_capacity, tti, None, None)
-                .starting_gc_deferred(mode.defers_tombstone_gc()),
+                .starting_gc_deferred(mode.defers_tombstone_gc())
+                .guarding_pauses(mode.defers_tombstone_gc()),
         );
         let hits = metrics::counter!("sundog_cache_hits_total", "cache" => name.to_string());
         let misses = metrics::counter!("sundog_cache_misses_total", "cache" => name.to_string());
@@ -214,7 +215,9 @@ where
     /// [`ShardOps::gc_tombstones`], defaulting
     /// to [`ClusterConfig::default`]'s value. Own-and-return, for the
     /// composition layer to thread a live cluster's configured
-    /// `tombstone_ttl` through right after construction.
+    /// `tombstone_ttl` through right after construction. The engine reads the
+    /// retention at each call, including the pause guard's gap, so no
+    /// rebuild is needed.
     #[must_use]
     pub fn with_tombstone_ttl(mut self, tombstone_ttl: Duration) -> Self {
         self.tombstone_ttl_ms = duration_ms(tombstone_ttl);
@@ -488,7 +491,8 @@ where
             self.weigher.clone().map(boxed_weigher),
             self.capacity_hint,
         )
-        .starting_gc_deferred(self.mode.defers_tombstone_gc());
+        .starting_gc_deferred(self.mode.defers_tombstone_gc())
+        .guarding_pauses(self.mode.defers_tombstone_gc());
         engine.set_prefold_enabled(self.engine.prefold_enabled());
         Arc::new(if self.max_resident_bytes == u64::MAX {
             engine

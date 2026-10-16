@@ -112,9 +112,13 @@ pub(crate) use self::checkpoint::CheckpointFinalizeCounts;
 use self::evict::VictimOutcome;
 #[cfg(doc)]
 use self::expiry::encode_expiry;
+#[cfg(all(test, not(feature = "sim")))]
+pub(crate) use self::expiry::pause_gap_ms;
 #[cfg(doc)]
 use self::expiry::{LONG_TTL, decode_expiry, idle_elapsed_ms};
-pub(crate) use self::expiry::{Lapsed, TombstoneRetention, expiry_tombstone_retention};
+pub(crate) use self::expiry::{
+    Lapsed, TombstoneRetention, expiry_tombstone_retention, gc_period_ms,
+};
 use self::expiry::{absent_at, absent_under, clamp_tti_ms, touch_stamp};
 pub(crate) use self::housekeeping::{CompactCandidate, CompactReplace, CompactScan};
 pub(crate) use self::inflight::{FillOutcome, FreshLoad, JoinOutcome};
@@ -625,6 +629,16 @@ pub(crate) struct Engine<K, V> {
     /// that call applies is dropped rather than stored; see
     /// [`expiry::drops_lapsed_tombstone`].
     gc_deferring: AtomicBool,
+    /// The wall-clock reading of the last [`Engine::gc_tombstones`] call, at
+    /// least `1`; `0` before the first. The pause guard measures the gap
+    /// between two collections on it ([`expiry::paused_since`]).
+    last_gc_ms: AtomicU64,
+    /// The instant the hold a pause started lasts to; `0` when none. While
+    /// the clock is before it, collection and arrivals defer; see
+    /// [`expiry::gc_defer_decision`].
+    pause_hold_until_ms: AtomicU64,
+    /// Whether the pause guard is on; see [`Engine::guarding_pauses`].
+    pause_guard: bool,
     #[cfg(test)]
     eviction_lock_acquisitions: AtomicU64,
     /// Test-only: how many stripe read locks [`Engine::compact`] has taken
@@ -684,6 +698,9 @@ where
             prefold_enabled: AtomicBool::new(true),
             compact_cursor: AtomicU64::new(0),
             gc_deferring: AtomicBool::new(false),
+            last_gc_ms: AtomicU64::new(0),
+            pause_hold_until_ms: AtomicU64::new(0),
+            pause_guard: false,
             #[cfg(test)]
             eviction_lock_acquisitions: AtomicU64::new(0),
             #[cfg(test)]
@@ -863,6 +880,58 @@ where
     #[cfg(test)]
     pub(crate) fn gc_deferring(&self) -> bool {
         self.gc_deferring.load(Ordering::Relaxed)
+    }
+
+    /// Turns the pause guard on (`on`) for an engine that defers tombstone
+    /// collection: a node that went longer than [`expiry::pause_gap_ms`]
+    /// without collecting is treated as having missed the deletes its peers
+    /// made, so it defers for `tombstone_ttl` from then on. Evaluated at
+    /// apply time ([`Engine::deferring_at`]) and at the next collection
+    /// ([`Engine::gc_tombstones`]). Off by default, and for a mode that
+    /// defers nothing ([`Mode::defers_tombstone_gc`]), whose peers hold no
+    /// tombstones for it.
+    #[must_use]
+    pub(crate) fn guarding_pauses(mut self, on: bool) -> Self {
+        self.pause_guard = on;
+        self
+    }
+
+    /// Whether an arrival at `now_ms` is judged against the cap deadline
+    /// rather than the `tombstone_ttl` one: the last collection decided to
+    /// defer, or the pause guard sees a gap since that collection longer than
+    /// [`expiry::pause_gap_ms`] for `tombstone_ttl_ms`, or the hold a pause
+    /// started still lasts. Read from the clock rather than from the last
+    /// collection alone, so the guard is in force for the first arrival after
+    /// a resume, before the gc task has woken.
+    pub(crate) fn deferring_at(&self, now_ms: u64, tombstone_ttl_ms: u64) -> bool {
+        let defer = self.gc_deferring.load(Ordering::Relaxed);
+        if !self.pause_guard {
+            return defer;
+        }
+        let paused = expiry::paused_since(
+            self.last_gc_ms.load(Ordering::Relaxed),
+            now_ms,
+            tombstone_ttl_ms,
+        );
+        expiry::gc_defer_decision(
+            defer,
+            paused,
+            self.pause_hold_until_ms.load(Ordering::Relaxed),
+            now_ms,
+        )
+        .0
+    }
+
+    /// The wall-clock reading of the last collection; `0` before the first.
+    #[cfg(test)]
+    pub(crate) fn last_gc_ms(&self) -> u64 {
+        self.last_gc_ms.load(Ordering::Relaxed)
+    }
+
+    /// The instant the current pause hold lasts to; `0` when none.
+    #[cfg(test)]
+    pub(crate) fn pause_hold_until_ms(&self) -> u64 {
+        self.pause_hold_until_ms.load(Ordering::Relaxed)
     }
 
     /// Turns resident byte counting on, for an engine that holds no

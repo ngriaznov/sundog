@@ -1470,7 +1470,7 @@ fn gc_tombstones_never_touches_a_spilled_live_entry() {
     engine.debug_insert_spilled(&kb, hlc(1, 1), None, loc(0, 0, 4, 0), 0);
     let digest_before = engine.digests();
 
-    engine.gc_tombstones(true, u64::MAX);
+    engine.gc_tombstones(true, u64::MAX, 60_000);
 
     assert_eq!(
         engine.digests(),

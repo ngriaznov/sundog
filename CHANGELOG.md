@@ -38,6 +38,15 @@ All notable changes to this project are documented in this file. Format follows
   judges an arrival against `tombstone_max_ttl`. A delete has to reach each
   replica within `tombstone_ttl` of its stamp, and node clocks have to stay
   well within `tombstone_ttl` of each other.
+- **A pause defers tombstone collection.** A `Replicated` or `Distributed`
+  node whose wall clock shows more than twice the collection period (a quarter
+  of `tombstone_ttl`, at least a second) between two tombstone collections
+  defers for `tombstone_ttl` after it, as for an absent member: it judges an
+  arriving tombstone against `tombstone_max_ttl` and keeps its own to it. The
+  check runs when a record arrives, so the first delete after a resume is
+  judged before the gc task wakes. Each hold logs one warning with its gap. A
+  stopped process or a suspended virtual machine therefore applies the deletes
+  that its peers made while it was gone, though they lapsed meanwhile.
 - **The wire protocol is 9** (`wire::PROTOCOL_AE_LISTING_CHUNKS`). A reply to
   an anti-entropy listing request may carry one bucket across several
   `AeBucket` messages. A responder chunks only for a peer on protocol 9 or

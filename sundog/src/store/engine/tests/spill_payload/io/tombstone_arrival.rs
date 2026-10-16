@@ -39,7 +39,7 @@ fn spilled_holder(
         poll_until(POLL_TIMEOUT, || is_spilled(&engine, &kb)),
         "the flusher installs the spilled entry"
     );
-    engine.gc_tombstones(false, 0);
+    engine.gc_tombstones(false, 0, 60_000);
     (dir, tier, engine, kb)
 }
 

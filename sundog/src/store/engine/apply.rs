@@ -164,7 +164,7 @@ pub(crate) struct ApplyCtx<'a, K, V> {
     pub(super) tombstone_ttl_ms: u64,
     pub(super) tombstone_max_ttl_ms: u64,
     /// Whether tombstone collection is deferred; see
-    /// [`Engine::gc_tombstones`].
+    /// [`Engine::deferring_at`].
     pub(super) deferring: bool,
     pub(super) now_ms: u64,
     /// Whether the write came from a peer; see [`Arrival`].
@@ -721,7 +721,7 @@ where
         // from the next call on.
         let rule = ArrivalRule {
             from_peer: arrival.is_peer(),
-            deferring: self.gc_deferring.load(Ordering::Relaxed),
+            deferring: self.deferring_at(now_ms, tombstone_ttl_ms),
             ttl_ms: tombstone_ttl_ms,
             max_ttl_ms: tombstone_max_ttl_ms,
             now_ms,
@@ -870,7 +870,7 @@ where
                 spill: self.spill().map(Arc::as_ref),
                 tombstone_ttl_ms,
                 tombstone_max_ttl_ms,
-                deferring: self.gc_deferring.load(Ordering::Relaxed),
+                deferring: self.deferring_at(now_ms, tombstone_ttl_ms),
                 now_ms,
                 from_peer: false,
                 ignored: &ignored,

@@ -442,6 +442,7 @@ mod expiry_tombstone;
 mod held_only;
 mod housekeeping;
 mod inflight;
+mod pause_guard;
 mod read;
 mod release;
 mod serve;

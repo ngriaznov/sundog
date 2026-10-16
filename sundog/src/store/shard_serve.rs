@@ -837,7 +837,9 @@ where
 
     fn gc_tombstones(&self, defer: bool) -> BoxFuture<'_, ()> {
         let now = self.now_ms();
-        self.engine.gc_tombstones(defer, now);
+        if let Some(gap_ms) = self.engine.gc_tombstones(defer, now, self.tombstone_ttl_ms) {
+            self.warn_paused(gap_ms);
+        }
         Box::pin(async move {})
     }
 

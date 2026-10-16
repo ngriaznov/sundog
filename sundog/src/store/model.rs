@@ -50,7 +50,8 @@ pub fn key_from_bytes(bytes: &[u8]) -> Option<u8> {
 }
 
 /// Tombstone retention for every [`new_shard_and_model`] pair. Short
-/// enough that [`Op::AdvanceClock`] routinely crosses both deadlines.
+/// enough that [`Op::AdvanceClock`] routinely crosses both deadlines. The
+/// gc period is the one-second floor, so the pause gap is 2,000 ms.
 pub const TOMBSTONE_TTL_MS: u64 = 200;
 /// Hard cap on tombstone retention for every [`new_shard_and_model`] pair.
 pub const TOMBSTONE_MAX_TTL_MS: u64 = 2_000;
@@ -94,6 +95,16 @@ pub struct Model {
     /// defers; `true` until the first one, as a new `Replicated` or
     /// `Distributed` shard starts.
     gc_deferring: bool,
+    /// The clock reading of the last [`Model::gc`], at least `1`; `None`
+    /// before the first. Mirrors the engine's `last_gc_ms`, whose `0` is the
+    /// sentinel for no collection yet.
+    last_gc_ms: Option<u64>,
+    /// The instant the hold a pause started lasts to; `0` when none.
+    pause_hold_until_ms: u64,
+    /// How many collections after the first came after a pause and how many
+    /// after a normal gap.
+    paused_gcs: u64,
+    steady_gcs: u64,
     /// `Some` only for [`new_shard_and_model_with_ownership`]'s pair: the
     /// same view attached to the paired `Shard`, so [`Model::owns`] answers
     /// exactly what that shard's own inbound/write guards would. `None`
@@ -117,6 +128,10 @@ impl Model {
             tombstone_ttl_ms,
             tombstone_max_ttl_ms,
             gc_deferring: true,
+            last_gc_ms: None,
+            pause_hold_until_ms: 0,
+            paused_gcs: 0,
+            steady_gcs: 0,
             ownership: None,
         }
     }
@@ -200,7 +215,7 @@ impl Model {
         let anchor = expired_at_ms.unwrap_or(ver.wall_ms).min(now);
         let ttl_deadline_ms = anchor.saturating_add(self.tombstone_ttl_ms);
         let max_deadline_ms = anchor.saturating_add(self.tombstone_max_ttl_ms);
-        let horizon = if self.gc_deferring {
+        let horizon = if self.deferring_at(now) {
             max_deadline_ms
         } else {
             ttl_deadline_ms
@@ -219,6 +234,34 @@ impl Model {
                 max_deadline_ms,
             },
         );
+    }
+
+    /// The pause gap, restated here rather than imported so the model stays
+    /// an independent oracle: twice the gc period, a quarter of the
+    /// retention with a one-second floor.
+    fn pause_gap_ms(&self) -> u64 {
+        2 * (self.tombstone_ttl_ms / 4).max(1_000)
+    }
+
+    /// Whether the clock at `now` shows more than the pause gap since the
+    /// last collection. Strict; a clock that stepped back is not a pause.
+    fn paused_at(&self, now: u64) -> bool {
+        self.last_gc_ms
+            .is_some_and(|last| now.saturating_sub(last) > self.pause_gap_ms())
+    }
+
+    /// Whether an arrival at `now` is judged against the cap deadline: the
+    /// last collection deferred, or a pause is showing, or its hold lasts.
+    fn deferring_at(&self, now: u64) -> bool {
+        self.gc_deferring || self.paused_at(now) || now < self.pause_hold_until_ms
+    }
+
+    /// How many collections after the first came after a pause and how many
+    /// after a normal gap, as `(paused, steady)`. A fuzz run that never
+    /// reaches one of them leaves that side of the pause guard untested.
+    #[must_use]
+    pub fn gc_branch_counts(&self) -> (u64, u64) {
+        (self.paused_gcs, self.steady_gcs)
     }
 
     /// Whether an incoming write at `ver` loses to what is stored at `key`.
@@ -247,9 +290,28 @@ impl Model {
 
     /// [`super::ShardOps::gc_tombstones`]'s rule: drops tombstones past
     /// `tombstone_ttl`, and, while `defer`, past `tombstone_max_ttl` instead.
+    /// A collection more than the pause gap after the previous one also
+    /// defers, and so does every later one for a `tombstone_ttl` after it: a
+    /// later pause extends that hold. The first collection is a baseline.
     pub fn gc(&mut self, defer: bool) {
-        self.gc_deferring = defer;
         let now = self.now_ms();
+        let paused = self.paused_at(now);
+        let holding = now < self.pause_hold_until_ms;
+        if self.last_gc_ms.is_some() {
+            if paused {
+                self.paused_gcs += 1;
+            } else {
+                self.steady_gcs += 1;
+            }
+        }
+        self.last_gc_ms = Some(now.max(1));
+        if paused {
+            self.pause_hold_until_ms = self
+                .pause_hold_until_ms
+                .max(now.saturating_add(self.tombstone_ttl_ms));
+        }
+        let defer = defer || paused || holding;
+        self.gc_deferring = defer;
         self.entries.retain(|_, entry| match entry {
             ModelEntry::Tombstone {
                 ttl_deadline_ms,
@@ -411,8 +473,16 @@ pub enum Op {
     },
     /// [`ShardOps::run_pending_tasks`], the engine's explicit sweep.
     Sweep,
-    /// Moves the shared manual clock forward by `ms` milliseconds.
+    /// Moves the shared manual clock forward by a small step, `ms` modulo
+    /// 700 milliseconds: past `tombstone_ttl` in a few steps and, summed
+    /// over several, past the pause gap, though seldom between two
+    /// collections.
     AdvanceClock { ms: u16 },
+    /// Moves the shared manual clock forward by a long jump of 2,000 to
+    /// 7,999 milliseconds, `2_000 + ms % 6_000`: at least the pause gap, so
+    /// a collection right after it sees a pause unless it lands exactly on
+    /// the gap.
+    JumpClock { ms: u16 },
 }
 
 /// Caps a generated batch to its first 16 entries.
@@ -591,7 +661,10 @@ fn apply_op(op: &Op, shard: &Shard<u8, u8>, model: &mut Model) {
             model.sweep();
         }
         Op::AdvanceClock { ms } => {
-            model.advance_clock(u64::from(*ms));
+            model.advance_clock(u64::from(*ms) % 700);
+        }
+        Op::JumpClock { ms } => {
+            model.advance_clock(2_000 + u64::from(*ms) % 6_000);
         }
     }
 }
@@ -879,6 +952,135 @@ mod tests {
         model.apply(2, ver(4), 1, None);
         model.remove(2, ver(5), past_its_ttl, true);
         assert_eq!(model.visible(2), Some(1), "and the next one is dropped");
+    }
+
+    /// Gap of this module's model: twice the one-second floor of the period.
+    const GAP: u64 = 2_000;
+
+    #[test]
+    fn a_pause_longer_than_the_gap_defers_collection_for_a_ttl() {
+        // A retention of 8 s: a 2 s gc period and a 4 s gap.
+        let mut model = Model::new(NodeId::from(1), 8_000, 80_000);
+        model.gc(false);
+        model.remove(1, ver(START_CLOCK_MS - 7_999), None, true);
+        assert!(
+            held(&model, 1).is_some(),
+            "stored, a millisecond from its ttl"
+        );
+
+        // The clock jumps past the gap: the tombstone is past its ttl, and
+        // the collection that sees the pause keeps it.
+        model.advance_clock(4_001);
+        model.gc(false);
+        assert!(held(&model, 1).is_some(), "past its ttl, held by the pause");
+        let hold_ends = model.now_ms() + 8_000;
+        assert_eq!(model.pause_hold_until_ms, hold_ends);
+
+        // Ticks one gap apart through the hold keep it; the one at its end
+        // collects.
+        model.advance_clock(4_000);
+        model.gc(false);
+        assert!(held(&model, 1).is_some(), "inside the hold");
+        model.advance_clock(hold_ends - 1 - model.now_ms());
+        model.gc(false);
+        assert!(held(&model, 1).is_some(), "a millisecond before it ends");
+        model.advance_clock(1);
+        model.gc(false);
+        assert_eq!(held(&model, 1), None, "collected once the hold ends");
+    }
+
+    #[test]
+    fn the_gap_is_strict_and_the_first_collection_is_a_baseline() {
+        let mut model = model();
+        assert!(!model.paused_at(u64::MAX), "no collection yet");
+        model.gc(false);
+        assert_eq!(model.gc_branch_counts(), (0, 0), "the first is neither");
+        model.advance_clock(GAP);
+        assert!(!model.paused_at(model.now_ms()));
+        model.advance_clock(1);
+        assert!(model.paused_at(model.now_ms()));
+        model.gc(false);
+        assert_eq!(model.gc_branch_counts(), (1, 0));
+        model.advance_clock(GAP);
+        model.gc(false);
+        assert_eq!(model.gc_branch_counts(), (1, 1));
+    }
+
+    #[test]
+    fn a_collection_at_clock_zero_is_a_collection() {
+        let mut model = model();
+        model.clock.store(0, Ordering::Relaxed);
+        model.gc(false);
+        assert_eq!(model.last_gc_ms, Some(1), "stored as 1, as the engine does");
+        model.advance_clock(GAP + 1);
+        assert!(
+            !model.paused_at(model.now_ms()),
+            "1 + 2000 + 1 - 1 is the gap"
+        );
+        model.advance_clock(1);
+        assert!(model.paused_at(model.now_ms()));
+    }
+
+    #[test]
+    fn an_arrival_after_a_resume_is_judged_against_the_cap_before_any_collection() {
+        let mut model = model();
+        model.gc(false);
+        let lapsed = ver(model.now_ms() - 2_000);
+        model.apply(1, ver(4), 1, None);
+        model.remove(1, lapsed, None, true);
+        assert_eq!(model.visible(1), Some(1), "ignored on a normal gap");
+
+        model.advance_clock(GAP + 1);
+        model.remove(1, ver(model.now_ms() - 2_000), None, true);
+        assert_eq!(model.visible(1), None, "stored: the pause defers at once");
+    }
+
+    #[test]
+    fn a_clock_that_steps_back_is_not_a_pause() {
+        let mut model = model();
+        model.gc(false);
+        model
+            .clock
+            .store(START_CLOCK_MS - 10 * GAP, Ordering::Relaxed);
+        assert!(!model.paused_at(model.now_ms()));
+        model.gc(false);
+        assert_eq!(model.pause_hold_until_ms, 0);
+        assert_eq!(model.gc_branch_counts(), (0, 1));
+    }
+
+    /// Op sequences drawn the way the fuzz targets and the model property
+    /// test draw them reach collections after a pause and collections after
+    /// a normal gap often, so neither side of the guard goes untested.
+    #[test]
+    fn generated_op_sequences_reach_both_sides_of_the_pause_guard() {
+        use arbitrary::Arbitrary as _;
+        use rand::{RngExt as _, SeedableRng as _, rngs::StdRng};
+
+        let mut rng = StdRng::seed_from_u64(0x5EED_7157);
+        let (mut paused, mut steady) = (0u64, 0u64);
+        for run_index in 0..60 {
+            let bytes: Vec<u8> = (0..2_048).map(|_| rng.random()).collect();
+            let mut unstructured = arbitrary::Unstructured::new(&bytes);
+            let mut ops = Vec::new();
+            while ops.len() < 128 && !unstructured.is_empty() {
+                ops.push(Op::arbitrary(&mut unstructured).expect("random bytes make an op"));
+            }
+            let (shard, mut model) = new_shard_and_model(&format!("coverage-{run_index}"), 1);
+            run(&ops, &shard, &mut model);
+            let (p, s) = model.gc_branch_counts();
+            paused += p;
+            steady += s;
+        }
+        let total = paused + steady;
+        assert!(total >= 200, "enough collections to judge: {total}");
+        assert!(
+            paused * 3 >= total,
+            "at least a third after a pause: {paused} of {total}"
+        );
+        assert!(
+            steady * 3 >= total,
+            "at least a third after a normal gap: {steady} of {total}"
+        );
     }
 
     #[test]

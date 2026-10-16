@@ -98,9 +98,11 @@ The window in which one replica holds it and another does not is that clock
 skew. A node's own delete is stored however late it applies, and collected at
 its next tick.
 
-A tombstone lasts longer where a node defers collection, for an absent member
-or for its first `tombstone_ttl` after opening: that node keeps its tombstones
-while the other does not, until the deferral ends.
+A tombstone lasts longer where a node defers collection, for an absent member,
+for its first `tombstone_ttl` after opening, or for `tombstone_ttl` after a
+pause (a gap between its collections of more than twice the period, half of
+`tombstone_ttl` from 4 seconds up): that node keeps its tombstones while the
+other does not, until the deferral ends.
 
 ## Allocator
 

@@ -37,6 +37,7 @@ mod invalidation_fold;
 mod merge_expiry;
 mod merging;
 mod ownership;
+mod pause_guard;
 mod pending_merge;
 mod read_through;
 mod skew_hold;

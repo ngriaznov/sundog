@@ -164,6 +164,23 @@ a node that reopened warm can hold a copy that a peer's tombstone has to
 delete, and a node that just started has no memory of which members were
 away.
 
+A pause defers collection too. A process that was stopped, a virtual machine
+that was suspended and a starved gc task all miss the deletes their peers
+make, and gossip does not reliably flag them: the monotonic clock the failure
+detector reads does not advance across a suspend. A `Replicated` or
+`Distributed` node compares the wall clock at each tombstone collection with
+the one before. A gap of more than twice the collection period, a quarter of
+`tombstone_ttl` and at least a second, counts as a pause. The node then
+defers for another `tombstone_ttl` and logs one warning with the gap; a second
+pause inside the hold extends it. The check also runs when a record arrives,
+so the first delete after a resume is judged against `tombstone_max_ttl`
+before the gc task wakes. The gap is half of `tombstone_ttl` for a
+`tombstone_ttl` of 4 seconds or more; the one-second floor of the period makes
+it 2 seconds below that. A pause shorter than the gap is not detected: the
+deletes made meanwhile have the rest of `tombstone_ttl` from their stamp to
+reach the node. A false positive, such as a clock stepped forward, only
+lengthens the deferral.
+
 The tombstone an expired entry leaves in `Replicated` and `Distributed` under
 a non-merging resolver is kept by the same rules, counted from the entry's
 expiry instead of from the delete's stamp. `sundog_tombstones{cache}` reports how many

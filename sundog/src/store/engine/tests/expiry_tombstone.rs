@@ -5,7 +5,8 @@
 use std::sync::Arc;
 
 use super::super::expiry::{
-    SweepFate, TombstoneRetention, drops_lapsed_tombstone, expiry_tombstone_retention, sweep_fate,
+    SweepFate, TombstoneRetention, drops_lapsed_tombstone, expiry_tombstone_retention,
+    gc_defer_decision, gc_period_ms, pause_gap_ms, pause_hold_after, paused_since, sweep_fate,
     swept_tombstone_deadlines, tombstone_anchor_ms, tombstone_deadlines, tombstone_lapsed,
 };
 use super::*;
@@ -332,9 +333,9 @@ fn sweep_with_retention_keeps_the_digest_until_the_tombstone_is_collected() {
     );
     assert_eq!(engine.digests(), engine.recompute_digests_paired());
 
-    engine.gc_tombstones(false, 61_499);
+    engine.gc_tombstones(false, 61_499, RETENTION.ttl_ms);
     assert_eq!(engine.tombstone_count(), 1, "kept until its retention ends");
-    engine.gc_tombstones(false, 61_500);
+    engine.gc_tombstones(false, 61_500, RETENTION.ttl_ms);
     assert_eq!(engine.tombstone_count(), 0);
     assert_ne!(engine.digests(), before, "collecting drops the fingerprint");
     assert_eq!(engine.digests(), engine.recompute_digests_paired());
@@ -348,11 +349,11 @@ fn sweep_with_retention_keeps_the_digest_until_the_tombstone_is_collected() {
 fn sweep_with_retention_holds_the_cap_while_collection_is_deferred() {
     let engine = engine_with_an_expiring_entry(Some(1_500));
     engine.sweep(2_000, Some(RETENTION));
-    engine.gc_tombstones(true, 100_000);
+    engine.gc_tombstones(true, 100_000, RETENTION.ttl_ms);
     assert_eq!(engine.tombstone_count(), 1, "an absent member holds it");
-    engine.gc_tombstones(true, 601_499);
+    engine.gc_tombstones(true, 601_499, RETENTION.ttl_ms);
     assert_eq!(engine.tombstone_count(), 1);
-    engine.gc_tombstones(true, 601_500);
+    engine.gc_tombstones(true, 601_500, RETENTION.ttl_ms);
     assert_eq!(
         engine.tombstone_count(),
         0,
@@ -620,7 +621,7 @@ fn a_lapsed_expiry_tombstone_within_its_cap_removes_the_older_entry_while_deferr
         tombstone_lapsed(t.ttl_deadline_ms, t.max_deadline_ms, 70_000, false),
         "already collectible once collection stops deferring"
     );
-    engine.gc_tombstones(false, 70_000);
+    engine.gc_tombstones(false, 70_000, RETENTION.ttl_ms);
     assert_eq!(engine.tombstone_count(), 0);
     assert_eq!(engine.digests(), engine.recompute_digests_paired());
 }
@@ -775,12 +776,12 @@ fn apply_expiry_tombstone(engine: &Engine<u32, String>, key: u32) -> ApplyOutcom
 fn collection_tells_the_apply_path_whether_it_is_deferring() {
     let engine = engine_u32_string(u64::MAX, None);
 
-    engine.gc_tombstones(false, 70_000);
+    engine.gc_tombstones(false, 70_000, RETENTION.ttl_ms);
     assert!(matches!(
         apply_expiry_tombstone(&engine, 1),
         ApplyOutcome::Rejected
     ));
-    engine.gc_tombstones(true, 70_000);
+    engine.gc_tombstones(true, 70_000, RETENTION.ttl_ms);
     assert!(
         matches!(
             apply_expiry_tombstone(&engine, 2),
@@ -788,7 +789,7 @@ fn collection_tells_the_apply_path_whether_it_is_deferring() {
         ),
         "a deferred collection holds the tombstone to its cap"
     );
-    engine.gc_tombstones(false, 70_000);
+    engine.gc_tombstones(false, 70_000, RETENTION.ttl_ms);
     assert!(matches!(
         apply_expiry_tombstone(&engine, 3),
         ApplyOutcome::Rejected
@@ -836,7 +837,7 @@ fn an_engine_built_to_start_deferred_judges_arrivals_against_the_cap_until_a_col
         "and so deletes the old copy"
     );
 
-    settling.gc_tombstones(false, 70_000);
+    settling.gc_tombstones(false, 70_000, RETENTION.ttl_ms);
     assert_eq!(settling.tombstone_count(), 0);
     let _ = put(
         &settling,
@@ -874,4 +875,116 @@ fn a_sweep_after_a_fill_over_the_expiry_tombstone_keeps_the_accounting_exact() {
     assert_eq!(t.expired_at_ms, Some(3_500));
     assert_eq!(engine.tombstone_count(), 1);
     assert_eq!(engine.digests(), engine.recompute_digests_paired());
+}
+
+#[test]
+fn gc_period_is_a_quarter_of_the_ttl_with_a_floor_of_a_second() {
+    for (ttl_ms, period_ms) in [
+        (0, 1_000),
+        (1_000, 1_000),
+        (3_999, 1_000),
+        (4_000, 1_000),
+        (7_999, 1_999),
+        (8_000, 2_000),
+        (600_000, 150_000),
+        (u64::MAX, u64::MAX / 4),
+    ] {
+        assert_eq!(gc_period_ms(ttl_ms), period_ms, "ttl {ttl_ms}");
+    }
+}
+
+#[test]
+fn pause_gap_is_twice_the_gc_period_and_half_the_ttl_from_four_seconds_up() {
+    for ttl_ms in [0, 1_000, 2_000, 3_000, 4_000, 8_000, 600_000, u64::MAX] {
+        assert_eq!(
+            pause_gap_ms(ttl_ms),
+            gc_period_ms(ttl_ms).saturating_mul(2),
+            "ttl {ttl_ms}"
+        );
+    }
+    assert_eq!(
+        pause_gap_ms(2_000),
+        2_000,
+        "the floor: a gap as long as the ttl"
+    );
+    assert_eq!(pause_gap_ms(4_000), 2_000, "half the ttl from here up");
+    assert_eq!(pause_gap_ms(600_000), 300_000);
+    assert_eq!(pause_gap_ms(u64::MAX), u64::MAX / 4 * 2);
+}
+
+#[test]
+fn paused_since_is_strictly_over_the_gap_and_never_before_a_collection() {
+    let ttl_ms = 60_000;
+    let gap = pause_gap_ms(ttl_ms);
+    assert_eq!(gap, 30_000);
+    assert!(
+        !paused_since(0, u64::MAX, ttl_ms),
+        "0 means no collection yet"
+    );
+    assert!(!paused_since(100_000, 100_000, ttl_ms));
+    assert!(
+        !paused_since(100_000, 100_000 + gap, ttl_ms),
+        "exactly the gap"
+    );
+    assert!(paused_since(100_000, 100_000 + gap + 1, ttl_ms), "one over");
+    assert!(
+        !paused_since(100_000, 99_999, ttl_ms),
+        "a clock that stepped back"
+    );
+    assert!(!paused_since(100_000, 0, ttl_ms));
+    assert!(paused_since(1, u64::MAX, ttl_ms));
+    assert!(!paused_since(u64::MAX, u64::MAX, ttl_ms));
+    assert!(
+        !paused_since(1, 1 + gap, u64::MAX),
+        "a gap of u64::MAX / 2 saturates without wrapping"
+    );
+}
+
+#[test]
+fn a_longer_gap_is_never_less_paused() {
+    for last in [1, 1_000, 1_000_000] {
+        let mut was = false;
+        for now in (0..200_000).step_by(997).map(|n| last + n) {
+            let is = paused_since(last, now, 60_000);
+            assert!(is || !was, "last {last} now {now}");
+            was = is;
+        }
+    }
+}
+
+#[test]
+fn pause_hold_after_extends_a_hold_for_a_pause_and_leaves_it_otherwise() {
+    assert_eq!(pause_hold_after(0, true, 100_000, 60_000), 160_000);
+    assert_eq!(pause_hold_after(500_000, true, 100_000, 60_000), 500_000);
+    assert_eq!(pause_hold_after(150_000, true, 100_000, 60_000), 160_000);
+    assert_eq!(pause_hold_after(0, false, 100_000, 60_000), 0);
+    assert_eq!(pause_hold_after(500_000, false, 100_000, 60_000), 500_000);
+    assert_eq!(pause_hold_after(0, true, u64::MAX, 60_000), u64::MAX);
+    assert_eq!(pause_hold_after(0, true, 100_000, 0), 100_000);
+}
+
+#[test]
+fn gc_defer_decision_defers_for_the_caller_a_pause_or_a_hold() {
+    // (defer, paused, hold_until, now) -> (effective, entered_hold)
+    for (defer, paused, hold_until, now, expected) in [
+        (false, false, 0, 100, (false, false)),
+        (true, false, 0, 100, (true, false)),
+        (false, true, 0, 100, (true, true)),
+        (true, true, 0, 100, (true, true)),
+        (false, false, 101, 100, (true, false)),
+        (false, false, 100, 100, (false, false)),
+        (false, false, 99, 100, (false, false)),
+        (true, false, 101, 100, (true, false)),
+        (false, true, 101, 100, (true, false)),
+        (true, true, 101, 100, (true, false)),
+        (false, true, 100, 100, (true, true)),
+        (false, false, u64::MAX, u64::MAX, (false, false)),
+        (false, false, u64::MAX, u64::MAX - 1, (true, false)),
+    ] {
+        assert_eq!(
+            gc_defer_decision(defer, paused, hold_until, now),
+            expected,
+            "defer {defer} paused {paused} hold {hold_until} now {now}"
+        );
+    }
 }

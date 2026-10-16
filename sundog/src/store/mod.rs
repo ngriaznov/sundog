@@ -41,6 +41,7 @@ mod shard_build;
 mod shard_ignored;
 mod shard_merge;
 mod shard_ops;
+mod shard_pause;
 mod shard_read;
 mod shard_rearm;
 mod shard_serve;
@@ -79,7 +80,9 @@ pub const BUCKET_COUNT: usize = 1024;
 /// finer grain before either side sends a listing or a sketch.
 pub const PART_COUNT: usize = 64;
 
-pub(crate) use engine::hash_key_bytes;
+#[cfg(all(test, not(feature = "sim")))]
+pub(crate) use engine::pause_gap_ms;
+pub(crate) use engine::{gc_period_ms, hash_key_bytes};
 #[cfg(feature = "sim")]
 #[doc(hidden)]
 pub use fan_out::SimFanOut;

@@ -67,7 +67,12 @@ pub struct ClusterConfig {
     /// is eligible again. A `Mode::Replicated` or `Mode::Distributed` cache
     /// also defers collection for the first `tombstone_ttl` after it opens,
     /// whoever is absent, since a node that just opened can hold a copy a
-    /// peer's tombstone has to delete.
+    /// peer's tombstone has to delete, and for another `tombstone_ttl` after
+    /// a pause: a wall-clock gap of more than twice the collection period,
+    /// a quarter of this retention and at least a second, between two of its
+    /// tombstone collections. A stopped or suspended process leaves such a
+    /// gap, and misses the deletes its peers make meanwhile. The gap is half
+    /// of this retention from 4 seconds up.
     ///
     /// Every tombstone counts this retention from an instant all replicas
     /// agree on, capped at the receiving node's clock: the delete's version

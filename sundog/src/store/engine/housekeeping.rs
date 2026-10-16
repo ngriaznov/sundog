@@ -16,8 +16,8 @@ use crate::store::{
 #[cfg(all(doc, feature = "spill"))]
 use super::EntryState;
 use super::expiry::{
-    LONG_TTL, SweepFate, TombstoneRetention, decode_expiry, encode_expiry, sweep_fate,
-    swept_tombstone_deadlines,
+    LONG_TTL, SweepFate, TombstoneRetention, decode_expiry, encode_expiry, gc_defer_decision,
+    pause_hold_after, paused_since, sweep_fate, swept_tombstone_deadlines,
 };
 use super::keys::{
     digest_slot, hash_key_bytes, hasher_for, part_index_from_hash, stripe_index_from_hash,
@@ -74,14 +74,42 @@ where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    /// Drops tombstones past `tombstone_ttl`, or, while `defer`, past the
-    /// hard cap `tombstone_max_ttl`, correcting the digest.
+    /// Drops tombstones past `tombstone_ttl_ms`, or, while collection defers,
+    /// past the hard cap `tombstone_max_ttl`, correcting the digest.
     ///
-    /// Remembers `defer` for [`Engine::apply_many`]: while collection is
+    /// Collection defers when the caller says so (`defer`), and, with the pause
+    /// guard on ([`Engine::guarding_pauses`]), when the wall-clock gap since
+    /// the last call exceeds [`expiry::pause_gap_ms`] and for
+    /// `tombstone_ttl_ms` after that: a node that did not run for that long
+    /// may hold values whose deletes it never saw, and its peers hold those
+    /// tombstones only so long. A later pause extends the hold.
+    ///
+    /// Remembers the decision for [`Engine::apply_many`]: while collection is
     /// deferred, a tombstone a peer sends that arrives lapsed past its
     /// `ttl_deadline_ms` but not its `max_deadline_ms` is still worth
     /// keeping, and one that arrives past its `max_deadline_ms` is ignored.
-    pub(crate) fn gc_tombstones(&self, defer: bool, now_ms: u64) {
+    ///
+    /// Returns the gap in milliseconds when this call starts a pause hold,
+    /// for the caller to report, and `None` otherwise.
+    pub(crate) fn gc_tombstones(
+        &self,
+        defer: bool,
+        now_ms: u64,
+        tombstone_ttl_ms: u64,
+    ) -> Option<u64> {
+        let (defer, entered_hold_gap) = if self.pause_guard {
+            let prior = self.last_gc_ms.swap(now_ms.max(1), Ordering::Relaxed);
+            let paused = paused_since(prior, now_ms, tombstone_ttl_ms);
+            let hold = self.pause_hold_until_ms.load(Ordering::Relaxed);
+            let (effective, entered) = gc_defer_decision(defer, paused, hold, now_ms);
+            self.pause_hold_until_ms.store(
+                pause_hold_after(hold, paused, now_ms, tombstone_ttl_ms),
+                Ordering::Relaxed,
+            );
+            (effective, entered.then(|| now_ms.saturating_sub(prior)))
+        } else {
+            (defer, None)
+        };
         self.gc_deferring.store(defer, Ordering::Relaxed);
         for (idx, stripe_lock) in self.stripes.iter().enumerate() {
             let mut stripe = stripe_lock.write();
@@ -97,6 +125,7 @@ where
                 !collect
             });
         }
+        entered_hold_gap
     }
 
     /// The engine's only free-running housekeeping: visits every stripe whose

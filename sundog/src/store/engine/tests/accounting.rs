@@ -154,7 +154,9 @@ fn digest_matches_full_recompute_after_random_ops(
                 );
             }
             2 => engine.sweep(now, retention),
-            _ => engine.gc_tombstones(false, now),
+            _ => {
+                engine.gc_tombstones(false, now, 60_000);
+            }
         }
         assert_eq!(
             engine.live_entry_count(),
@@ -327,7 +329,9 @@ fn resident_bytes_matches_a_full_recount_after_random_ops_including_sweeps_and_e
                 apply_direct(&engine, bucket, entry, ver, Incoming::DELETE, now);
             }
             2 => engine.sweep(now, None),
-            _ => engine.gc_tombstones(false, now),
+            _ => {
+                engine.gc_tombstones(false, now, 60_000);
+            }
         }
         assert_eq!(
             engine.resident_bytes(),

@@ -16,6 +16,7 @@ mod merge_expiry;
 mod nonowner_fill;
 mod nonowner_read_through;
 mod observability;
+mod pause_guard;
 mod rules;
 #[cfg(feature = "spill")]
 mod spill_gate;

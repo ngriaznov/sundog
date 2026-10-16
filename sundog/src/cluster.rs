@@ -46,7 +46,7 @@ use crate::membership::{CacheModes, Membership, Peer};
 use crate::net::{BoundListener, Greeting, InboundMsg, Mesh, RequestHandler};
 use crate::node::{NodeId, NodeName};
 use crate::ownership::OwnershipView;
-use crate::store::{Mode, PartId, Shard, ShardOps};
+use crate::store::{Mode, PartId, Shard, ShardOps, gc_period_ms};
 use crate::wire;
 use handler::ClusterRequestHandler;
 use inbound::inbound_loop;
@@ -1115,7 +1115,11 @@ fn until_next_grid_tick(now_ms: u64, period: Duration) -> Duration {
 /// may hold a copy from before it went down, or have no memory of which
 /// members were absent, and a tombstone a peer has held past its `ttl` still
 /// has to reach it. `uptime` counts from when the gc task started. `Local` and
-/// `Invalidation` never defer. Pure; unit tested directly.
+/// `Invalidation` never defer. The shard adds one more reason of its own,
+/// which this task does not decide: a pause, a gap between its collections of
+/// more than twice the period [`tombstone_gc_task`] ticks on, which it
+/// measures on the wall clock and holds for `settle` after the gap. Pure; unit
+/// tested directly.
 fn gc_defers(mode: Mode, absent_defers: bool, uptime: Duration, settle: Duration) -> bool {
     mode.defers_tombstone_gc() && (absent_defers || uptime < settle)
 }
@@ -1140,7 +1144,11 @@ fn gc_defers(mode: Mode, absent_defers: bool, uptime: Duration, settle: Duration
 /// co-owns a part with this node when it is eligible again. Either mode also
 /// defers for the first `tombstone_ttl` after the task starts. The shard
 /// itself starts deferring when it is built, so the records that arrive
-/// before the first tick, state transfer among them, meet the same rule.
+/// before the first tick, state transfer among them, meet the same rule. The
+/// shard also defers on its own for `tombstone_ttl` after a pause, a wall-clock
+/// gap of more than twice this period between two ticks, and judges arrivals
+/// against that gap before the task wakes; the task only has to tick on
+/// [`gc_period_ms`], which the gap is measured against.
 /// `now_ms` reads the wall clock in epoch milliseconds that places the grid;
 /// the cache's tasks pass [`crate::store::now_ms`]. The uptime comes from
 /// the tokio clock.
@@ -1153,7 +1161,9 @@ pub(crate) async fn tombstone_gc_task(
     now_ms: impl Fn() -> u64,
     cancel: CancellationToken,
 ) {
-    let period = (tombstone_ttl / 4).max(Duration::from_secs(1));
+    let period = Duration::from_millis(gc_period_ms(
+        u64::try_from(tombstone_ttl.as_millis()).unwrap_or(u64::MAX),
+    ));
     let started = tokio::time::Instant::now();
     loop {
         if cancel.is_cancelled() {
