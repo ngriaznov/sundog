@@ -12,8 +12,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::{Dropped, framed, hello, invalidate, peer, send_each};
+use super::{Dropped, Warnings, framed, hello, invalidate, peer, send_each};
 use crate::net::conn::accept::accept_loop;
+use crate::net::conn::admit::Admission;
 use crate::net::conn::tests::{EmptyHandler, no_tls};
 use crate::net::{InboundMsg, MeshInner};
 use crate::node::NodeId;
@@ -113,6 +114,7 @@ async fn unknown_sources_over_the_cap_are_closed_at_once_and_an_established_peer
     let recorder = metrics_util::debugging::DebuggingRecorder::new();
     let dropped = Dropped::new(recorder.snapshotter());
     let _metrics = metrics::set_default_local_recorder(&recorder);
+    let (warnings, _log) = Warnings::capture();
     let mut node = node_with_cap(3).await;
 
     // An established peer holds no slot.
@@ -145,8 +147,39 @@ async fn unknown_sources_over_the_cap_are_closed_at_once_and_an_established_peer
     assert_eq!(dropped.total("over_cap"), Some(2));
     assert_eq!(dropped.total("hello_timeout"), None);
 
+    // Two closes inside the spacing log one warning, which names the cap's
+    // series and not the deadline's.
+    let logged = warnings.taken();
+    assert_eq!(
+        logged.len(),
+        1,
+        "one warning for both closes, none for anything else: {logged:?}"
+    );
+    assert!(logged[0].contains("over_cap"), "{logged:?}");
+    assert!(!logged[0].contains("hello_timeout"), "{logged:?}");
+
     drop(silent);
     node.stop().await;
+}
+
+#[test]
+fn the_over_cap_and_hello_timeout_warnings_use_separate_rate_limiters() {
+    let (warnings, _log) = Warnings::capture();
+    let admission = Admission::with_cap(1);
+    let remote: SocketAddr = "10.0.0.1:4000".parse().expect("valid addr");
+
+    // Repeats of one reason stay inside its spacing, and neither reason's
+    // warning uses the other's slot.
+    admission.note_over_cap(remote);
+    admission.note_over_cap(remote);
+    admission.note_hello_timeout(Some(remote));
+    admission.note_hello_timeout(Some(remote));
+    admission.note_over_cap(remote);
+
+    let logged = warnings.taken();
+    assert_eq!(logged.len(), 2, "one warning per reason: {logged:?}");
+    assert!(logged[0].contains("over_cap"), "{logged:?}");
+    assert!(logged[1].contains("hello_timeout"), "{logged:?}");
 }
 
 #[tokio::test]
@@ -279,7 +312,8 @@ async fn over_cap_closes_appear_in_the_prometheus_exposition() {
 
     let text = handle.render();
     assert!(
-        text.contains("sundog_accept_dropped_total{reason=\"over_cap\"} 1"),
+        text.lines()
+            .any(|line| line == "sundog_accept_dropped_total{reason=\"over_cap\"} 1"),
         "{text}"
     );
     assert!(
