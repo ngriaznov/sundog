@@ -91,9 +91,12 @@ write after it does not repeat it.
 
 That floor covers the entries the snapshot holds. A delete stamped ahead of
 the restarted clock leaves a tombstone, which the snapshot does not hold, so
-the floor does not include its stamp. A peer that still keeps that tombstone
-refuses the node's lower-stamped write of the same key until the clock passes
-it, and anti-entropy then deletes the value the node wrote. A
+the floor does not include its stamp. A tombstone counts its retention from
+its stamp, capped at the clock of the node that holds it, so a tombstone
+stamped ahead of that clock counts from the clock's reading when it lands. A
+peer that still keeps that tombstone refuses the node's lower-stamped write of
+the same key until the clock passes it, and anti-entropy then deletes the value
+the node wrote. A
 tombstone the node receives from a peer pulls its clock past the tombstone's
 stamp when that stamp is within `max_clock_skew`, so only a write made before
 it arrives, or against a stamp ahead by more than `max_clock_skew`, meets it.
@@ -105,7 +108,7 @@ open with no clean close between is cold, and a node down longer than
 collected a tombstone that would outvote a stale replayed entry. A node
 defers tombstone collection for its first `tombstone_ttl` after it opens, so a
 tombstone from a peer that is past `tombstone_ttl` but not `tombstone_max_ttl`
-still removes an older replayed entry.
+of its stamp still removes an older replayed entry.
 `sundog_spill_reopen_total{outcome, reason}` records which path each open
 took.
 

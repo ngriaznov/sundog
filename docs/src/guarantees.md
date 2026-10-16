@@ -70,10 +70,10 @@ stamped ahead.
 
 The floor covers the entries the snapshot holds. The snapshot holds no
 tombstones, so a delete this node stamped ahead of its restarted clock is not
-in it. In `Replicated` and `Distributed`, a peer keeps that tombstone for
-`tombstone_ttl` and refuses the node's lower-stamped write of the same key;
-anti-entropy then sends the tombstone back and the node deletes the value it
-wrote. A tombstone the node receives from a peer pulls its clock past the
+in it. In `Replicated` and `Distributed`, a peer keeps that tombstone until its
+stamp plus `tombstone_ttl` and refuses the node's lower-stamped write of the
+same key; anti-entropy then sends the tombstone back and the node deletes the
+value it wrote. A tombstone the node receives from a peer pulls its clock past the
 tombstone's stamp when that stamp is within `max_clock_skew`, so a write made
 after the node has received it stamps past it. A write made before then, or
 against a stamp ahead by more than `max_clock_skew`, is lost this way until
@@ -139,17 +139,33 @@ for every dead writer it has seen, and stays exact.
 ## Deletes
 
 `remove` writes a tombstone that replicates like a value and outvotes
-every older copy of the key. Tombstones stay for `tombstone_ttl`, 10
-minutes by default, counted from the delete's version stamp, so every
-replica collects one at the same grid tick. A tombstone a peer sends that
-arrives after its stamp plus `tombstone_ttl` is ignored: it deletes nothing
-and is not stored, and `sundog_tombstones_ignored_total{cache}` counts it. A
-delete therefore has to reach each replica within `tombstone_ttl` of its stamp,
-or that replica has to be deferring. Keep node clocks within seconds of each
-other: a receiver whose clock runs ahead of a writer's by nearly
-`tombstone_ttl` ignores that writer's fresh deletes, and a writer whose clock
-runs behind by `tombstone_ttl` stamps deletes that arrive lapsed. A node's own
-`remove`, `remove_many` and `clear` are never ignored. While a member that gossip remembers is absent, a
+every older copy of the key. A tombstone counts its retention from the
+delete's own version stamp, capped at the receiving node's clock, and stays for
+`tombstone_ttl`, 10 minutes by default. Every replica that learns of the
+delete derives the same deadline and collects the tombstone at the same grid
+tick, so it does not pass between replicas that collect it at different ticks.
+
+The contract: a delete reaches every live replica within `tombstone_ttl` of its
+stamp, or that replica defers collection. A replica that is not deferring
+ignores a tombstone a peer sends after the stamp plus `tombstone_ttl`: it is
+not stored and deletes nothing, whatever the key holds, and
+`sundog_tombstones_ignored_total{cache}` counts it. The replica keeps an older
+value of the key, as Cassandra does for a replica that misses a delete for
+longer than `gc_grace_seconds`; `tombstone_ttl` is this cache's
+`gc_grace_seconds`. A node's own `remove`, `remove_many` and `clear` are never
+ignored.
+
+The contract needs node clocks to stay well within `tombstone_ttl` of each
+other. `max_clock_skew`, 1 minute by default, refuses a remote stamp ahead of
+the receiver's clock by more than that, which bounds the clock error between
+connected nodes. A tombstone stamped ahead of a receiver's clock counts from
+the receiver's clock at its arrival, so a peer can take it again until that
+clock passes the stamp. A tombstone lives until its stamp plus `tombstone_ttl`
+plus one collection period plus the stamp's lead over the slowest clock;
+`max_clock_skew` caps the lead. With `None` nothing bounds the lead, and so
+nothing bounds the lifetime.
+
+While a member that gossip remembers is absent, a
 cache keeps its tombstones longer, up to `tombstone_max_ttl`, 24 hours by
 default, and for another `tombstone_ttl` once that member is back, so a
 node returning from a partition cannot bring a deleted key back. A
@@ -162,7 +178,8 @@ off and keeps nothing. A `Replicated` or `Distributed` cache also defers
 collection for the first `tombstone_ttl` after it opens, whoever is absent:
 a node that reopened warm can hold a copy that a peer's tombstone has to
 delete, and a node that just started has no memory of which members were
-away.
+away. A deferring node judges an arriving tombstone against its stamp plus
+`tombstone_max_ttl` and keeps its own tombstones to the same point.
 
 A pause defers collection too. A process that was stopped, a virtual machine
 that was suspended and a starved gc task all miss the deletes their peers
@@ -181,9 +198,33 @@ deletes made meanwhile have the rest of `tombstone_ttl` from their stamp to
 reach the node. A false positive, such as a clock stepped forward, only
 lengthens the deferral.
 
+Three cases fall outside the contract, because no deferral covers them. In each
+a replica ignores a delete that reached it past its stamp plus
+`tombstone_ttl`, keeps its older value, and offers it to peers that have
+collected the tombstone. `sundog_tombstones_ignored_total{cache}` rising is the
+signal for all three.
+
+- **A data-plane stall with healthy gossip.** A replica that stays in the live
+  set while its mesh link, inbound queue or apply backlog runs more than
+  `tombstone_ttl` behind is not absent, so nothing defers it. Raise
+  `tombstone_ttl` above the longest stall you tolerate.
+- **A clock off by `tombstone_ttl` or more.** A receiver whose clock runs ahead
+  of a writer's by that much less the delivery time ignores that writer's fresh
+  deletes. A writer whose clock runs behind by `tombstone_ttl` or more, such as
+  a node resumed with a stale clock that has merged no recent stamp, stamps
+  deletes that arrive lapsed on every peer that is not deferring; the writer
+  keeps its own tombstone until its next tick, and then the peers' older value
+  returns to it. Keep clocks synchronized.
+- **A forward queued past `tombstone_ttl`.** In a `Distributed` cache a
+  non-owner's `remove` keeps no copy: the forwarded delete waits in the send
+  queue for as long as the owner is slow to read, and `remove` has returned by
+  then. A forward that reaches the owner more than `tombstone_ttl` after its
+  stamp is ignored there. It also logs a warning, at most once a minute, since
+  the delete is lost.
+
 The tombstone an expired entry leaves in `Replicated` and `Distributed` under
-a non-merging resolver is kept by the same rules, counted from the entry's
-expiry instead of from the delete's stamp. `sundog_tombstones{cache}` reports how many
+a non-merging resolver follows the same rules, counted from the entry's expiry
+instead of from the delete's stamp. `sundog_tombstones{cache}` reports how many
 a node holds.
 
 A member gone longer than `tombstone_max_ttl` returns after the tombstone

@@ -16,7 +16,6 @@ All notable changes to this project are documented in this file. Format follows
   writes an owner holds for clock skew, the memory they take, and the ones it
   drops instead, because the hold is `full` or the stamp is past its
   `horizon`.
-
 - **`sundog_tombstones_ignored_total{cache}`** counter: the tombstones a peer
   sent that arrived already past their retention and were ignored. A forwarded
   delete among them is the only copy of a non-owner's write, and also logs a
@@ -24,29 +23,6 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Changed
 
-- **A delete's tombstone counts its retention from the delete's version
-  stamp.** Every tombstone counts `tombstone_ttl` and `tombstone_max_ttl` from
-  an instant all replicas agree on, capped at the receiving node's clock: the
-  expiry for the tombstone of an expired entry, the stamp for a delete. Every
-  replica derives the same deadlines for a tombstone and collects it at the
-  same grid tick, so a tombstone no longer passes between replicas that
-  collect it at different ticks.
-- **A tombstone that arrives from a peer already past its retention is
-  ignored**, whatever the key holds, for a delete as for the tombstone of an
-  expired entry: it is not stored and deletes nothing. A node's own `remove`,
-  `remove_many` and `clear` are never ignored. A node that defers collection
-  judges an arrival against `tombstone_max_ttl`. A delete has to reach each
-  replica within `tombstone_ttl` of its stamp, and node clocks have to stay
-  well within `tombstone_ttl` of each other.
-- **A pause defers tombstone collection.** A `Replicated` or `Distributed`
-  node whose wall clock shows more than twice the collection period (a quarter
-  of `tombstone_ttl`, at least a second) between two tombstone collections
-  defers for `tombstone_ttl` after it, as for an absent member: it judges an
-  arriving tombstone against `tombstone_max_ttl` and keeps its own to it. The
-  check runs when a record arrives, so the first delete after a resume is
-  judged before the gc task wakes. Each hold logs one warning with its gap. A
-  stopped process or a suspended virtual machine therefore applies the deletes
-  that its peers made while it was gone, though they lapsed meanwhile.
 - **The wire protocol is 9** (`wire::PROTOCOL_AE_LISTING_CHUNKS`). A reply to
   an anti-entropy listing request may carry one bucket across several
   `AeBucket` messages. A responder chunks only for a peer on protocol 9 or
@@ -55,6 +31,29 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **A delete's tombstone leaves every replica within `tombstone_ttl` of its
+  stamp.** Every tombstone counts `tombstone_ttl` and `tombstone_max_ttl` from
+  an instant all replicas agree on, capped at the receiving node's clock: the
+  delete's own version stamp for a delete, the expiry for the tombstone of an
+  expired entry. Replicas derive the same deadlines and collect a tombstone at
+  the same grid tick, so a replica that collected it never takes it back from
+  one that still holds it, with fresh deadlines, and it does not pass between
+  replicas that collect at different ticks. A tombstone that arrives from a
+  peer already past its retention is ignored, whatever the key holds: it is not
+  stored, deletes nothing and counts in `sundog_tombstones_ignored_total`. A
+  node's own `remove`, `remove_many` and `clear` are never ignored. A node that
+  defers collection judges an arrival against `tombstone_max_ttl`. A
+  `Replicated` or `Distributed` node defers for `tombstone_ttl` after a pause,
+  a wall-clock gap of more than twice the collection period (a quarter of
+  `tombstone_ttl`, at least a second) between two of its tombstone collections,
+  as a stopped process or a suspended virtual machine leaves. The check runs
+  when a record arrives, so the first delete after a resume is judged before
+  the gc task wakes, and each hold logs one warning with its gap. A delete has
+  to reach each replica within `tombstone_ttl` of its stamp, or the replica has
+  to defer, and node clocks have to stay well within `tombstone_ttl` of each
+  other. A data-plane stall with healthy gossip, a clock off by
+  `tombstone_ttl` or more and a forward queued past `tombstone_ttl` fall
+  outside that contract; `sundog_tombstones_ignored_total` signals them.
 - **`sundog_ae_repaired_total` counts each repair chunk as it moves.** An
   anti-entropy round adds every batch of records it pushes or pulls to the
   counter when the batch moves, so a scrape during a long round sees the
@@ -196,14 +195,16 @@ All notable changes to this project are documented in this file. Format follows
   when the older copy arrived, and anti-entropy removes that copy from the
   replica that still holds it. The same holds for a lifetime shortened with
   `expire`: a cut-off peer's longer-lived copy is deleted instead of bringing
-  the entry back. The tombstone counts its `tombstone_ttl` (and, while a
-  member is absent, `tombstone_max_ttl`) from the entry's expiry, and every
-  node collects on a wall-clock grid of a quarter of `tombstone_ttl`, so every
-  replica collects it at the same instant, give or take their clock skew. A
-  tombstone that arrives already past that retention is ignored whatever the
-  node holds for the key, so replicas that receive the same records in any
-  order hold the same ones, and a replica that collected it never takes it back
-  from one that has not. A cache defers collection for its first
+  the entry back. The tombstone follows the one retention rule of a delete's
+  tombstone, with the entry's expiry as the agreed instant: it counts its
+  `tombstone_ttl` (and, while a node defers, `tombstone_max_ttl`) from the
+  expiry, capped at the receiving node's clock, and every node collects on a
+  wall-clock grid of a quarter of `tombstone_ttl`, so every replica collects it
+  at the same instant, give or take their clock skew. One that arrives from a
+  peer already past that retention is ignored whatever the node holds for the
+  key, so replicas that receive the same records in any order hold the same
+  ones, and a replica that collected it never takes it back from one that has
+  not. A cache defers collection for its first
   `tombstone_ttl` after it opens, whoever is absent, so a node that just opened
   keeps a tombstone that is past `tombstone_ttl` but not `tombstone_max_ttl`
   and deletes its older copy. The expiry travels as the tombstone record's

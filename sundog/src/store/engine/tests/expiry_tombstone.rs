@@ -1,6 +1,6 @@
 //! The tombstone an expired entry leaves: the sweep's verdict and deadlines,
-//! the digest it keeps, what it serves and the receipt rule that stops
-//! replicas handing a collected one back and forth.
+//! the digest it keeps, what it serves and the lapsed-arrival rule that
+//! stops replicas handing a collected one back and forth.
 
 use std::sync::Arc;
 
@@ -110,7 +110,7 @@ fn tombstone_anchor_never_counts_from_beyond_now() {
     assert_eq!(
         tombstone_anchor_ms(None, 9_000_000, 5_000),
         5_000,
-        "a delete stamped ahead of this clock counts from its receipt"
+        "a delete stamped ahead of this clock counts from this clock"
     );
     assert_eq!(
         tombstone_anchor_ms(Some(9_000_000), 1_000, 5_000),

@@ -215,7 +215,8 @@ pub enum LocalRecord {
     Absent,
     /// A tombstone: the key was deleted, or, in a `Replicated` or
     /// `Distributed` cache whose resolver does not merge, its entry expired
-    /// and was swept.
+    /// and was swept. A delete this node ignored because it arrived past its
+    /// retention stores nothing, so the key reads as `Live` or `Absent`.
     #[non_exhaustive]
     Tombstone {
         /// The delete's version, or the expired entry's.

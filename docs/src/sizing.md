@@ -84,11 +84,9 @@ before an absent member makes it grow, and lower `tombstone_max_ttl` if a day
 of expiries does not fit.
 
 Every node collects on a wall-clock grid, at each multiple of a quarter of
-`tombstone_ttl` (at least a second). The two kinds of tombstone meet that grid
-differently.
-
-Every tombstone counts its retention from an instant all replicas agree on,
-capped at the receiving node's clock: the expiry for the tombstone of an
+`tombstone_ttl` (at least a second), and one rule gives every tombstone its
+deadline. A tombstone counts its retention from an instant all replicas agree
+on, capped at the receiving node's clock: the expiry for the tombstone of an
 expired entry, the delete's own version stamp for a delete. Every replica that
 learns of one, by sweeping or from a peer, derives the same deadlines, so they
 collect it at the same grid instant, up to the clock skew between the nodes. A
@@ -98,11 +96,30 @@ The window in which one replica holds it and another does not is that clock
 skew. A node's own delete is stored however late it applies, and collected at
 its next tick.
 
-A tombstone lasts longer where a node defers collection, for an absent member,
-for its first `tombstone_ttl` after opening, or for `tombstone_ttl` after a
-pause (a gap between its collections of more than twice the period, half of
-`tombstone_ttl` from 4 seconds up): that node keeps its tombstones while the
-other does not, until the deferral ends.
+A node defers collection for an absent member, for its first `tombstone_ttl`
+after opening, and for `tombstone_ttl` after a pause. While it defers, it keeps
+its tombstones to `tombstone_max_ttl` and judges an arriving one against that
+cap, so a tombstone lasts longer there than on a node that does not defer.
+
+A pause is a gap between a node's collections of more than twice the period,
+half of `tombstone_ttl` from 4 seconds up. The hold costs the tombstones the
+node would have collected during the `tombstone_ttl` after the pause: budget
+for the removal and expiry rate times that retention on top of the usual
+count, outside `max_capacity` and visible in `sundog_tombstones{cache}`. A
+host that stalls a node for longer than the gap costs the hold each time; a
+longer `tombstone_ttl` widens the gap.
+
+In a `Distributed` cache the deferral is node-wide, while an absent member
+affects only the parts it shares with this node. A node that shares a part
+with the absent member defers and keeps offering its tombstones to a co-owner
+that does not defer, which ignores them each anti-entropy round. The bucket
+digests of the two differ until the deferring node collects, up to
+`tombstone_max_ttl`, and each round lists and pulls the lapsed tombstones of
+the mismatched buckets again: about 23 bytes per listed entry and 40 bytes per
+pulled tombstone, per mismatched bucket per round. The cost grows with the
+delete and expiry rate, and `sundog_tombstones_ignored_total{cache}` counts
+what the non-deferring node ignores. A `Replicated` cache sees the same absent member on
+every node, so its nodes defer together.
 
 ## Allocator
 

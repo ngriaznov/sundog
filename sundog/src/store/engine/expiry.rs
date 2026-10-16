@@ -216,7 +216,7 @@ pub(super) fn sweep_fate(
 /// (`expired_at_ms`) for the tombstone of an expired entry and the delete's
 /// own version stamp (`ver_wall_ms`) for a delete (`expired_at_ms` `None`).
 /// The cap keeps a stamp from a clock ahead of this node's from extending
-/// the hold: such a tombstone counts from its receipt instead. Every replica
+/// the hold: such a tombstone counts from this node's clock instead. Every replica
 /// that learns of a tombstone after its agreed instant derives the same
 /// anchor, whenever it learns. Pure; unit tested directly.
 pub(super) fn tombstone_anchor_ms(

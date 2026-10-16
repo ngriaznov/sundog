@@ -181,7 +181,8 @@ pub struct WireRecord {
     /// Absolute expiry in epoch milliseconds, or `None` for no TTL. On a
     /// tombstone, `Some` marks the tombstone of an entry that expired and
     /// holds the expiry, which the receiver counts its retention from; a
-    /// delete's tombstone carries `None`. A peer that predates this reading
+    /// delete's tombstone carries `None` and counts its retention from `ver`.
+    /// A peer that predates this reading
     /// ignores the field on a tombstone.
     pub expires_at_ms: Option<u64>,
 }

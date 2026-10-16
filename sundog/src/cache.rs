@@ -1122,6 +1122,11 @@ where
     /// [`Cache::merge`] fold still pending in its coalesce window is
     /// discarded with the key.
     ///
+    /// The tombstone counts `tombstone_ttl` from the delete's version stamp.
+    /// A replica that is not deferring ignores it when it arrives after that,
+    /// and keeps an older value of the key; this node's own removal is stored
+    /// however late it applies.
+    ///
     /// # Errors
     ///
     /// Returns a [`CacheError`] if the removal cannot apply or fan out.

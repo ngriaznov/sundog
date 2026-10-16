@@ -90,8 +90,12 @@ pub struct ClusterConfig {
     pub tombstone_ttl: Duration,
     /// Hard cap on tombstone retention regardless of any member's absence.
     /// Bounds [`tombstone_ttl`](Self::tombstone_ttl)'s deferral against a
-    /// member that never comes back. While a member is absent, a cache holds
-    /// one tombstone per entry that expired in the last `tombstone_max_ttl`.
+    /// member that never comes back. A node that defers, for an absent
+    /// member, after opening or after a pause, counts this cap from the same
+    /// instant as `tombstone_ttl`, the delete's version stamp or the entry's
+    /// expiry: it keeps its tombstones to it, and ignores a tombstone a peer
+    /// sends after it. While a member is absent, a cache holds one tombstone
+    /// per entry that expired in the last `tombstone_max_ttl`.
     pub tombstone_max_ttl: Duration,
     /// How far ahead of this node's clock a remote write's version stamp
     /// may be. A replicated write, invalidation, anti-entropy repair or
@@ -102,6 +106,15 @@ pub struct ClusterConfig {
     /// other. `None` accepts any stamp, and then one node whose clock runs
     /// an hour fast wins every conflicting write and pulls every other
     /// node's clock an hour forward.
+    ///
+    /// The bound also caps the clock error that delete retention relies on.
+    /// A tombstone counts [`tombstone_ttl`](Self::tombstone_ttl) from its
+    /// version stamp, capped at the receiver's clock, so a peer can take a
+    /// delete stamped ahead of a receiver's clock again until that clock
+    /// passes the stamp. The tombstone lives until its stamp plus
+    /// `tombstone_ttl`, one collection period and the stamp's lead over the
+    /// slowest clock; this bound caps the lead. With `None` the lead is
+    /// unbounded, and so is the lifetime.
     ///
     /// A `Mode::Distributed` write that a node forwards without owning its
     /// part leaves no copy behind for anti-entropy to offer, so an owner that

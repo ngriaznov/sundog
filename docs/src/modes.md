@@ -67,6 +67,12 @@ to move cold entries to disk. `open` returns
 A [memory ceiling](sizing.md#memory-ceiling) evicts nothing, so it needs no
 tier.
 
+A delete reaches every node as a tombstone that counts its retention from the
+delete's stamp. Every node collects it at the same tick, and a node that is
+absent, freshly opened or paused defers (see
+[guarantees](guarantees.md#deletes)). All nodes see the same absent member, so
+they defer together.
+
 ## Distributed
 
 A `Distributed` cache splits its keys into 65,536 parts, 64 in each of the
@@ -82,7 +88,10 @@ A write for a part this node does not own goes to that part's owners. The
 forwarded batch carries the writer's ownership view, and an owner whose view
 differs passes it on once more, so a write routed under a view that has since
 changed still reaches every current owner. A forwarded write is held by no
-replica until an owner applies it, so anti-entropy cannot repair it. An owner
+replica until an owner applies it, so anti-entropy cannot repair it. A
+forwarded delete counts its retention from its stamp at the owner, so one that
+waits in the send queue for more than `tombstone_ttl` is ignored there (see
+[guarantees](guarantees.md#deletes)). An owner
 whose clock refuses the write's stamp for clock skew holds it in memory until
 its clock is within `max_clock_skew` of the stamp (see
 [guarantees](guarantees.md#conflicting-writes)). The sender's writer holds a
@@ -130,6 +139,11 @@ owner confirms. A lost part that no other previous owner still owns, as
 when a node opened the cache before its peers and owned every part alone,
 goes to its new owners as soon as the views agree, not at the end of the
 grace.
+
+A `Distributed` node defers tombstone collection when it shares a part with an
+absent member, for every part it owns, so a co-owner that does not defer
+ignores the tombstones it keeps offering until it collects them (see
+[sizing](sizing.md#tombstones)).
 
 A finite `max_capacity` needs a spill tier here too, and `tti` is refused.
 A [memory ceiling](sizing.md#memory-ceiling) needs no tier.

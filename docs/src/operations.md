@@ -32,7 +32,7 @@ addresses once it forms, under `cluster formed`.
 | `sundog_read_duration_seconds{cache, outcome}` | histogram of `get` and `get_sync` durations, `hit` or `miss`, about one read in 256 per thread |
 | `sundog_cache_entries{cache}` | live entries on this node |
 | `sundog_tombstones{cache}` | tombstones this node holds: its deletes and, in a `Replicated` or `Distributed` cache whose resolver does not merge, its swept expired entries, until they are collected |
-| `sundog_tombstones_ignored_total{cache}` | tombstones a peer sent that arrived already past their retention and were ignored: stored nowhere, deleting nothing. A forwarded delete among them is the only copy of a non-owner's write and also logs a warning, at most once a minute |
+| `sundog_tombstones_ignored_total{cache}` | tombstones a peer sent that arrived already past their retention and were ignored: stored nowhere, deleting nothing. A forwarded delete among them is the only copy of a non-owner's write and also logs a warning, at most once a minute. A delete reached that replica later than `tombstone_ttl` after its stamp; see [guarantees](guarantees.md#deletes) |
 | `sundog_cache_bytes{cache}` | a cache with a `max_resident_bytes` ceiling: resident bytes of this node's live entries, as `Cache::resident_bytes` counts them |
 | `sundog_ceiling_refusals_total{cache, kind}` | a cache with a `max_resident_bytes` ceiling: local writes refused (`write`) and fills returned uncached (`fill`) |
 | `sundog_fan_out_backlog{cache}` | written keys not yet sent to peers |
@@ -188,7 +188,8 @@ not merge its entry expired and was swept), a `Live` entry (`spilled` when its
 value is on disk), or a `Lapsed` entry a read no longer returns because it
 `Expired` or went `Idle`, not yet swept. After a sweep a `Local` or
 `Invalidation` cache, or a cache with a merging resolver, reports `Absent` for
-it.
+it. A delete this node ignored because it arrived past its retention leaves no
+tombstone, so the key reads as the `Live` entry it holds or as `Absent`.
 `source` predicts where a `fetch` takes its answer. In a `Distributed`
 cache, `distributed` adds:
 

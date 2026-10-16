@@ -895,7 +895,7 @@ mod tests {
         model.gc(false);
         assert!(
             held(&model, 2).is_some(),
-            "a stamp ahead counts from the receipt"
+            "a stamp ahead counts from this clock"
         );
         model.advance_clock(1);
         model.gc(false);

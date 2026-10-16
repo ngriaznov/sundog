@@ -16,7 +16,17 @@ runs have each passed on that exact commit.
    planner through random view sequences, with views coalesced and pulls
    superseded, against a model of which parts hold every write: a part
    missing writes must read as cold, and one completed pull must fill every
-   owned part.
+   owned part. The tombstone rule has its own pins. The drain tests
+   (`a_delete_leaves_every_replica_whatever_phase_and_receipt_time` and
+   `a_replica_that_starts_late_takes_a_delete_and_drops_it_with_the_others`)
+   run a ring of replicas that collect on different phases and require a
+   delete's tombstone to leave every one of them, the digests to agree, and
+   the count to stay at zero over further anti-entropy rounds. The pause tests
+   (`store/tests/pause_guard.rs`, `store/engine/tests/pause_guard.rs`) drive a
+   shard through a pause on a manual clock: the gap boundary, the hold and its
+   end, a second pause, a backward clock step. A reference model that tracks
+   the same pause state runs against a real shard through arbitrary operation
+   sequences.
 2. **Deterministic simulation** with `turmoil`, behind the `sim` feature.
    It drives the real network layer and store with no real sockets, and
    replays partitions under load, message loss, reordering and duplication,
@@ -35,6 +45,9 @@ runs have each passed on that exact commit.
    owners; one while the views disagree is counted as allowed staleness.
    Between steps every owner must hold its copies. CI
    runs one seed, the weekly run thirty fresh ones.
+   `tests/false_partition.rs` freezes a node's runtime for longer than
+   `tombstone_ttl` while its peer deletes fifty keys, then thaws it, and
+   requires every key to stay deleted: the end-to-end pin for the pause guard.
 3. **Container integration** through [`rightsize`](https://crates.io/crates/rightsize).
    Separate processes run on a real virtual network: three-node
    convergence, tombstones reaching every node, cold joins of up to a
