@@ -124,6 +124,31 @@ each other's connections instead of downgrading. Gossip itself stays
 plaintext UDP and carries membership only: node ids, addresses and cache
 modes, never keys or values.
 
+## The data-plane port
+
+Open the data-plane port between the service's instances and nowhere else.
+A plaintext node takes a peer's word for who it is in the hello that opens a
+connection, so a network that carries other traffic needs the `tls` feature:
+with it, a connection presents a certificate from the shared root CA before
+its hello is read.
+
+A node limits the connections that have not yet sent a hello. A connection
+has 10 seconds, plus any wait for the node to schedule its handler, to finish
+its TLS handshake, when the node runs TLS, and send a complete hello. The
+node closes it after that. Until the hello arrives, a frame is at most
+1 KiB. At most 512 connections from addresses that are not a peer's wait for
+their hello at once, and the node closes any further one as it accepts it. A
+known peer's connections are not capped. A node whose peer table is empty, as
+a node that has just started is, and a peer behind NAT or an `advertise_ip`
+override that dials from an address other than the one it advertises, meet the
+cap like any other source. The limits are fixed.
+`sundog_accept_dropped_total` counts the closes; see
+[Operations](operations.md#data-plane-connections-close-before-the-hello).
+
+Set the process's descriptor limit well above 512 plus the descriptors the
+peer connections and the spill files use: `LimitNOFILE=65536` under systemd,
+for example, or `ulimit -n 65536` in a shell.
+
 ## Rolling upgrades
 
 Every node states its wire protocol version in the hello that opens each

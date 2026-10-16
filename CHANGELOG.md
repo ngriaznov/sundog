@@ -20,9 +20,20 @@ All notable changes to this project are documented in this file. Format follows
   sent that arrived already past their retention and were ignored. A forwarded
   delete among them is the only copy of a non-owner's write, and also logs a
   warning, at most once a minute.
+- **`sundog_accept_dropped_total{reason}`** counter: the data-plane
+  connections a node closed before they sent a hello, `hello_timeout` or
+  `over_cap`. Each reason also logs a warning, at most once a minute.
 
 ### Changed
 
+- **The data-plane listener limits connections until they send their hello.**
+  A connection has 10 seconds, TLS handshake included, to send a complete
+  hello, and a frame before the hello is at most 1 KiB. At most 512
+  connections from unknown sources wait for their hello at once, and a known
+  peer's connections are not capped. A failing accept waits 5 ms, doubling to
+  one second, before the next. The limits are fixed. A hello stays within 1 KiB
+  for every release that interoperates with this one. The wire protocol does
+  not change.
 - **The wire protocol is 9** (`wire::PROTOCOL_AE_LISTING_CHUNKS`). A reply to
   an anti-entropy listing request may carry one bucket across several
   `AeBucket` messages. A responder chunks only for a peer on protocol 9 or

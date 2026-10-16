@@ -23,9 +23,9 @@ pub fn fast_config() -> ClusterConfig {
     })
 }
 
-/// A loopback TCP address nothing holds: probe-bound, read back, then
-/// released, for a test that needs a node's data-plane address before the
-/// node binds it.
+/// A loopback TCP address nothing holds: bound once to find a free port, read
+/// back, then released, for a test that needs a node's data-plane address
+/// before the node binds it.
 pub async fn reserve_tcp_addr() -> SocketAddr {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await

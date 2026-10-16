@@ -54,6 +54,7 @@ addresses once it forms, under `cluster formed`.
 | `sundog_open_caches` | caches open on this node |
 | `sundog_frames_sent_total` | data-plane frames sent |
 | `sundog_bytes_sent_total` | data-plane bytes sent |
+| `sundog_accept_dropped_total{reason}` | data-plane connections this node closed before they sent a hello: `hello_timeout` (no complete hello within 10 seconds of the connection's handler first running, TLS handshake included) or `over_cap` (512 connections from addresses that are not a peer's already waited for their hello) |
 | `sundog_fan_out_wait_seconds_total{peer}` | whole seconds writers spent waiting for a live peer's full outbox |
 | `sundog_backlog_dropped_total{peer}` | frames dropped before reaching the peer's connection: an outbox that stayed full, the oldest invalidation displaced by a newer one, a message that failed to encode, a re-forward lane that already held 64 MiB for a live peer, or the peer leaving the mesh. Each drop marks the peer for the next anti-entropy round, which repairs a record the dropping node owns but not one it only passed on. A broken connection drops a frame only if the writer cannot send it again: the writer resends the burst whose send failed and the frames it wrote in the last second, up to 1 MiB |
 
@@ -121,6 +122,27 @@ addresses once it forms, under `cluster formed`.
    port mapping needs `advertise_ip`.
 5. A TLS node and a plaintext node never connect. Give every node the same
    TLS setting.
+
+### Data-plane connections close before the hello
+
+`sundog_accept_dropped_total` rises.
+
+- `hello_timeout` counts a connection that opens and then stays silent, or
+  sends part of a hello, for 10 seconds. A port scan, or a health check that
+  opens the port and holds it, does. A connection that fails its TLS
+  handshake, or whose first frame is not a hello, closes at once and does not
+  count. A TLS node and a plaintext node refusing each other's connections
+  show as debug-level log lines, `TLS handshake failed on accept` on the TLS
+  node and `unreadable first frame on a data-plane connection` on the
+  plaintext node, and not in this counter.
+- A sustained rise in either reason logs one warning a minute that names the
+  remote address. Check that the port is reachable from the cluster only, per
+  [Deployment](deployment.md#the-data-plane-port).
+- `over_cap` means 512 connections from addresses that are not a peer's
+  already waited for their hello. A burst of more than 512 new connections
+  from such addresses, as a restart of a large fleet can cause, closes the
+  excess. A broadcast link redials after 500 milliseconds. A request that
+  meets a closed connection fails.
 
 ### Opening a cache fails with `ModeMismatch`
 
