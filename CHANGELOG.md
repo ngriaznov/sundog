@@ -53,7 +53,8 @@ All notable changes to this project are documented in this file. Format follows
   to defer, and node clocks have to stay well within `tombstone_ttl` of each
   other. A data-plane stall with healthy gossip, a clock off by
   `tombstone_ttl` or more and a forward queued past `tombstone_ttl` fall
-  outside that contract; `sundog_tombstones_ignored_total` signals them.
+  outside that contract; a sustained rise of `sundog_tombstones_ignored_total`
+  on a node while no peer defers signals them.
 - **`sundog_ae_repaired_total` counts each repair chunk as it moves.** An
   anti-entropy round adds every batch of records it pushes or pulls to the
   counter when the batch moves, so a scrape during a long round sees the

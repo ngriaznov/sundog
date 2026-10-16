@@ -107,14 +107,15 @@ pub struct ClusterConfig {
     /// an hour fast wins every conflicting write and pulls every other
     /// node's clock an hour forward.
     ///
-    /// The bound also caps the clock error that delete retention relies on.
-    /// A tombstone counts [`tombstone_ttl`](Self::tombstone_ttl) from its
-    /// version stamp, capped at the receiver's clock, so a peer can take a
-    /// delete stamped ahead of a receiver's clock again until that clock
-    /// passes the stamp. The tombstone lives until its stamp plus
-    /// `tombstone_ttl`, one collection period and the stamp's lead over the
-    /// slowest clock; this bound caps the lead. With `None` the lead is
-    /// unbounded, and so is the lifetime.
+    /// The bound caps how far a writer's clock can lead a receiver's, which
+    /// delete retention relies on. It does not bound a receiver running ahead
+    /// of a writer or a writer running behind. A tombstone counts
+    /// [`tombstone_ttl`](Self::tombstone_ttl) from its version stamp, capped
+    /// at the receiver's clock, so a peer can take a delete stamped ahead of a
+    /// receiver's clock again until that clock passes the stamp. The
+    /// tombstone lives until its stamp plus `tombstone_ttl`, one collection
+    /// period and the stamp's lead over the slowest clock; this bound caps the
+    /// lead. With `None` the lead is unbounded, and so is the lifetime.
     ///
     /// A `Mode::Distributed` write that a node forwards without owning its
     /// part leaves no copy behind for anti-entropy to offer, so an owner that

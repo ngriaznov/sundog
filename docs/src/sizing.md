@@ -101,8 +101,8 @@ after opening, and for `tombstone_ttl` after a pause. While it defers, it keeps
 its tombstones to `tombstone_max_ttl` and judges an arriving one against that
 cap, so a tombstone lasts longer there than on a node that does not defer.
 
-A pause is a gap between a node's collections of more than twice the period,
-half of `tombstone_ttl` from 4 seconds up. The hold costs the tombstones the
+A pause is a gap between a node's collections of more than twice the period
+(half of `tombstone_ttl` from 4 seconds up). The hold costs the tombstones the
 node would have collected during the `tombstone_ttl` after the pause: budget
 for the removal and expiry rate times that retention on top of the usual
 count, outside `max_capacity` and visible in `sundog_tombstones{cache}`. A
@@ -118,8 +118,8 @@ digests of the two differ until the deferring node collects, up to
 the mismatched buckets again: about 23 bytes per listed entry and 40 bytes per
 pulled tombstone, per mismatched bucket per round. The cost grows with the
 delete and expiry rate, and `sundog_tombstones_ignored_total{cache}` counts
-what the non-deferring node ignores. A `Replicated` cache sees the same absent member on
-every node, so its nodes defer together.
+what the non-deferring node ignores. A `Replicated` cache sees the same absent
+member on every node, so its nodes defer together.
 
 ## Allocator
 

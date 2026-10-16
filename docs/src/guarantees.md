@@ -73,10 +73,10 @@ tombstones, so a delete this node stamped ahead of its restarted clock is not
 in it. In `Replicated` and `Distributed`, a peer keeps that tombstone until its
 stamp plus `tombstone_ttl` and refuses the node's lower-stamped write of the
 same key; anti-entropy then sends the tombstone back and the node deletes the
-value it wrote. A tombstone the node receives from a peer pulls its clock past the
-tombstone's stamp when that stamp is within `max_clock_skew`, so a write made
-after the node has received it stamps past it. A write made before then, or
-against a stamp ahead by more than `max_clock_skew`, is lost this way until
+value it wrote. A tombstone the node receives from a peer pulls its clock past
+the tombstone's stamp when that stamp is within `max_clock_skew`, so a write
+made after the node has received it stamps past it. A write made before then,
+or against a stamp ahead by more than `max_clock_skew`, is lost this way until
 the system clock passes the tombstone's stamp.
 
 ### Values that merge
@@ -157,8 +157,9 @@ ignored.
 
 The contract needs node clocks to stay well within `tombstone_ttl` of each
 other. `max_clock_skew`, 1 minute by default, refuses a remote stamp ahead of
-the receiver's clock by more than that, which bounds the clock error between
-connected nodes. A tombstone stamped ahead of a receiver's clock counts from
+the receiver's clock by more than that, which caps how far a writer's clock can
+lead. It does not bound a receiver running ahead or a writer running behind
+(see below). A tombstone stamped ahead of a receiver's clock counts from
 the receiver's clock at its arrival, so a peer can take it again until that
 clock passes the stamp. A tombstone lives until its stamp plus `tombstone_ttl`
 plus one collection period plus the stamp's lead over the slowest clock;
@@ -201,8 +202,10 @@ lengthens the deferral.
 Three cases fall outside the contract, because no deferral covers them. In each
 a replica ignores a delete that reached it past its stamp plus
 `tombstone_ttl`, keeps its older value, and offers it to peers that have
-collected the tombstone. `sundog_tombstones_ignored_total{cache}` rising is the
-signal for all three.
+collected the tombstone. A sustained rise of
+`sundog_tombstones_ignored_total{cache}` on a node while no peer defers is the
+signal for all three. A peer that defers re-offers tombstones the node has
+collected, and those raise the counter without losing a delete.
 
 - **A data-plane stall with healthy gossip.** A replica that stays in the live
   set while its mesh link, inbound queue or apply backlog runs more than
@@ -213,8 +216,8 @@ signal for all three.
   deletes. A writer whose clock runs behind by `tombstone_ttl` or more, such as
   a node resumed with a stale clock that has merged no recent stamp, stamps
   deletes that arrive lapsed on every peer that is not deferring; the writer
-  keeps its own tombstone until its next tick, and then the peers' older value
-  returns to it. Keep clocks synchronized.
+  keeps its own tombstone for `tombstone_ttl` on its own clock, and when it
+  collects it the peers' older value returns to it. Keep clocks synchronized.
 - **A forward queued past `tombstone_ttl`.** In a `Distributed` cache a
   non-owner's `remove` keeps no copy: the forwarded delete waits in the send
   queue for as long as the owner is slow to read, and `remove` has returned by

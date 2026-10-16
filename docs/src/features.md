@@ -96,10 +96,10 @@ its stamp, capped at the clock of the node that holds it, so a tombstone
 stamped ahead of that clock counts from the clock's reading when it lands. A
 peer that still keeps that tombstone refuses the node's lower-stamped write of
 the same key until the clock passes it, and anti-entropy then deletes the value
-the node wrote. A
-tombstone the node receives from a peer pulls its clock past the tombstone's
-stamp when that stamp is within `max_clock_skew`, so only a write made before
-it arrives, or against a stamp ahead by more than `max_clock_skew`, meets it.
+the node wrote. A tombstone the node receives from a peer pulls its clock past
+the tombstone's stamp when that stamp is within `max_clock_skew`, so only a
+write made before it arrives, or against a stamp ahead by more than
+`max_clock_skew`, meets it.
 
 The snapshot holds no tombstones and no expired entries. A crash leaves no
 snapshot, a successful warm reopen deletes the one it replayed, so a second

@@ -708,9 +708,10 @@ where
     /// [`Shard::insert`] does. A [`Shard::merge`] fold still pending for the
     /// key is discarded first. The tombstone counts `tombstone_ttl` from the
     /// delete's version stamp, and this shard never ignores its own delete as
-    /// lapsed. On a `Mode::Distributed` non-owner the tombstone is only forwarded, and an owner that refuses its stamp for
-    /// clock skew holds it: the key stays readable there until the owner's
-    /// clock is within `max_clock_skew` of the stamp.
+    /// lapsed. On a `Mode::Distributed` non-owner the tombstone is only
+    /// forwarded, and an owner that refuses its stamp for clock skew holds it:
+    /// the key stays readable there until the owner's clock is within
+    /// `max_clock_skew` of the stamp.
     ///
     /// # Errors
     ///

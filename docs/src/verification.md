@@ -24,7 +24,9 @@ runs have each passed on that exact commit.
    the count to stay at zero over further anti-entropy rounds. The pause tests
    (`store/tests/pause_guard.rs`, `store/engine/tests/pause_guard.rs`) drive a
    shard through a pause on a manual clock: the gap boundary, the hold and its
-   end, a second pause, a backward clock step. A reference model that tracks
+   end, a second pause, a backward clock step. A concurrent test reads the
+   deferral from one thread while another runs the collection that detects a
+   pause, and requires every read to defer. A reference model that tracks
    the same pause state runs against a real shard through arbitrary operation
    sequences.
 2. **Deterministic simulation** with `turmoil`, behind the `sim` feature.
@@ -56,7 +58,9 @@ runs have each passed on that exact commit.
    workloads draining to zero, 64 KiB values checked byte for byte, and a
    five-node `Distributed` cluster losing an owner, including while a new
    node is still pulling its share. A mixed-version test runs the previous
-   release's node against the current one in both directions. A chaos run
+   release's node against the current one in both directions, and requires a
+   delete the old node makes to drain from the new node's tombstone count and
+   stay at zero while the old node still offers it. A chaos run
    crashes, restarts, churns and drops keys on a seeded schedule for ten
    minutes every week and requires every node to converge; the same run
    repeats the owner-crash scenarios fifteen times at random crash timings.

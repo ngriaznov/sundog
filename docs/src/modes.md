@@ -68,10 +68,10 @@ A [memory ceiling](sizing.md#memory-ceiling) evicts nothing, so it needs no
 tier.
 
 A delete reaches every node as a tombstone that counts its retention from the
-delete's stamp. Every node collects it at the same tick, and a node that is
-absent, freshly opened or paused defers (see
-[guarantees](guarantees.md#deletes)). All nodes see the same absent member, so
-they defer together.
+delete's stamp. Every node collects it at the same tick. A node defers while a
+member is absent, for its first `tombstone_ttl` after opening and for
+`tombstone_ttl` after a pause (see [guarantees](guarantees.md#deletes)). Every
+node sees the same absent member, so they defer for it together.
 
 ## Distributed
 
