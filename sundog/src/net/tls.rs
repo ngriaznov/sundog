@@ -12,8 +12,9 @@
 //! A TLS-configured node and a plaintext node cannot join the same mesh: the
 //! plaintext side never speaks the TLS record layer, so the connection
 //! fails outright rather than downgrading. It surfaces like any other
-//! connection failure, retried by dial backoff and dropped silently on
-//! accept.
+//! connection failure, retried by dial backoff and dropped on accept with a
+//! debug log. A handshake that never completes is closed at the `Hello`
+//! deadline.
 //!
 //! Compiled only under `not(feature = "sim")`; a turmoil-hosted simulation
 //! build stays plaintext regardless of `ClusterConfig::tls`.
@@ -147,23 +148,23 @@ impl MeshTls {
     }
 }
 
+/// Certificates and contexts for the tests of the accept path.
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc as StdArc;
+pub(crate) mod fixtures {
+    use std::sync::Arc;
 
     use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    use tokio::net::TcpListener;
 
-    use super::*;
+    use super::{MESH_SERVER_NAME, MeshTls};
+    use crate::config::TlsConfig;
 
-    struct Ca {
-        der: CertificateDer<'static>,
-        issuer: Issuer<'static, KeyPair>,
+    pub(crate) struct Ca {
+        pub(crate) der: CertificateDer<'static>,
+        pub(crate) issuer: Issuer<'static, KeyPair>,
     }
 
-    fn generate_ca() -> Ca {
+    pub(crate) fn generate_ca() -> Ca {
         let key = KeyPair::generate().expect("generate ca key");
         let mut params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -173,7 +174,9 @@ mod tests {
         Ca { der, issuer }
     }
 
-    fn generate_node_cert(ca: &Issuer<'static, KeyPair>) -> (CertificateDer<'static>, KeyPair) {
+    pub(crate) fn generate_node_cert(
+        ca: &Issuer<'static, KeyPair>,
+    ) -> (CertificateDer<'static>, KeyPair) {
         let key = KeyPair::generate().expect("generate node key");
         let params =
             CertificateParams::new(vec![MESH_SERVER_NAME.to_string()]).expect("node params");
@@ -181,7 +184,7 @@ mod tests {
         (cert.der().clone(), key)
     }
 
-    fn tls_config(
+    pub(crate) fn tls_config(
         ca_der: &CertificateDer<'static>,
         leaf: CertificateDer<'static>,
         key: &KeyPair,
@@ -190,10 +193,30 @@ mod tests {
             key.serialize_der().try_into().expect("valid pkcs8 der");
         TlsConfig {
             cert_chain: vec![leaf],
-            private_key: StdArc::new(private_key),
+            private_key: Arc::new(private_key),
             root_ca_certs: vec![ca_der.clone()],
         }
     }
+
+    /// Two nodes' contexts under one fresh CA, each able to dial and accept
+    /// the other.
+    pub(crate) fn mesh_tls_pair() -> (Arc<MeshTls>, Arc<MeshTls>) {
+        let ca = generate_ca();
+        let node = || {
+            let (cert, key) = generate_node_cert(&ca.issuer);
+            Arc::new(MeshTls::new(&tls_config(&ca.der, cert, &key)).expect("node tls config"))
+        };
+        (node(), node())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::TcpListener;
+
+    use super::fixtures::{generate_ca, generate_node_cert, tls_config};
+    use super::*;
 
     #[tokio::test]
     async fn mutual_tls_handshake_succeeds_between_certs_from_the_same_ca() {

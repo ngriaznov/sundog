@@ -1,9 +1,21 @@
-//! Admission of accepted data-plane connections: the wait between failed
-//! accepts and the rate-limited warning that reports them.
+//! Admission of accepted data-plane connections: the deadline on a
+//! connection that has not sent its `Hello`, the wait between failed
+//! accepts, and the counters and rate-limited warnings that report them.
 
 use std::io;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+/// How long an accepted connection has, from the moment its handler first
+/// runs, to finish its TLS handshake (on a node that runs TLS) and send a
+/// complete `Hello`. A connection that has not by then is closed, so the
+/// real bound is this plus the time the handler waits to be scheduled.
+///
+/// Equal to the request timeout: a dialer abandons a request exchange, its
+/// connection and handshake included, after that long, so the acceptor never
+/// cuts a dial that is still waited on.
+pub(crate) const HELLO_TIMEOUT: Duration = crate::net::request::REQUEST_TIMEOUT;
 
 /// The wait after the first failed accept in a row.
 const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(5);
@@ -80,13 +92,31 @@ impl WarnLimiter {
 
 /// What a mesh keeps to admit the connections its listener accepts.
 pub(in crate::net) struct Admission {
+    warn_hello_timeout: WarnLimiter,
     warn_accept_error: WarnLimiter,
 }
 
 impl Admission {
     pub(in crate::net) const fn new() -> Self {
         Self {
+            warn_hello_timeout: WarnLimiter::new(),
             warn_accept_error: WarnLimiter::new(),
+        }
+    }
+
+    /// Counts a connection closed at [`HELLO_TIMEOUT`] in
+    /// `sundog_accept_dropped_total{reason="hello_timeout"}` and warns about
+    /// it at most once a minute.
+    pub(super) fn note_hello_timeout(&self, peer: Option<SocketAddr>) {
+        metrics::counter!("sundog_accept_dropped_total", "reason" => "hello_timeout").increment(1);
+        if self.warn_hello_timeout.claim(crate::net::mono_ms()) {
+            tracing::warn!(
+                peer = peer.map(|addr| addr.to_string()),
+                timeout_secs = HELLO_TIMEOUT.as_secs(),
+                "closed a data-plane connection that sent no complete hello in time; the \
+                 data-plane port is for cluster members only, and \
+                 sundog_accept_dropped_total{{reason=\"hello_timeout\"}} counts every such close"
+            );
         }
     }
 
@@ -122,6 +152,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::net::conn::framing::HELLO_MAX_FRAME;
+    use crate::node::NodeId;
+    use crate::wire::{self, Msg};
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
@@ -148,6 +181,36 @@ mod tests {
             }
             assert!(wait <= ACCEPT_BACKOFF_MAX, "at most the maximum");
             previous = wait;
+        }
+    }
+
+    #[test]
+    fn the_hello_deadline_is_ten_seconds_and_no_shorter_than_a_request() {
+        assert_eq!(HELLO_TIMEOUT, Duration::from_secs(10));
+        assert!(HELLO_TIMEOUT >= crate::net::request::REQUEST_TIMEOUT);
+    }
+
+    /// A `Hello` never grows past 128 bytes; anything larger goes in a later
+    /// message gated on the peer's protocol. An acceptor of every release
+    /// that carries the pre-Hello frame limit closes a connection whose
+    /// first frame exceeds it, so a `Hello` that outgrew `HELLO_MAX_FRAME`
+    /// would be refused by every such peer, and raising the limit in the
+    /// release that grows the `Hello` does not reach them.
+    #[test]
+    fn the_largest_hello_encodes_to_at_most_128_bytes() {
+        let largest = Msg::Hello {
+            node: NodeId::from(u64::MAX),
+            incarnation: u64::MAX,
+            protocol: u16::MAX,
+            cluster: u64::MAX,
+        };
+        let len = wire::encode(&largest).expect("encodes").len();
+        assert!(len <= 128, "the largest hello encodes to {len} bytes");
+        const {
+            assert!(
+                128 * 8 <= HELLO_MAX_FRAME,
+                "the pre-hello frame limit leaves eightfold room over a hello"
+            );
         }
     }
 

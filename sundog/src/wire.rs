@@ -202,6 +202,12 @@ impl WireRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Msg {
     /// Sent once a new connection is established: identifies the sender.
+    ///
+    /// An acceptor closes a connection whose first frame is longer than
+    /// 1,024 bytes, so a `Hello` stays within that size for every release
+    /// that has to interoperate with a build that enforces the limit. A
+    /// `Hello` is at most 128 bytes. Anything larger goes in a later message
+    /// gated on the peer's protocol.
     Hello {
         node: NodeId,
         /// The sender's membership incarnation number.

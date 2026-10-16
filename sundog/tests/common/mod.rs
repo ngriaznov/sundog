@@ -23,6 +23,18 @@ pub fn fast_config() -> ClusterConfig {
     })
 }
 
+/// A loopback TCP address nothing holds: probe-bound, read back, then
+/// released, for a test that needs a node's data-plane address before the
+/// node binds it.
+pub async fn reserve_tcp_addr() -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind an ephemeral loopback tcp port to reserve it");
+    listener
+        .local_addr()
+        .expect("a freshly bound tcp listener reports a local address")
+}
+
 /// Polls `cond` on a short fixed cadence until it returns `true`, or panics
 /// once `timeout` elapses. `sundog`'s public API exposes only point-in-time
 /// snapshots, never a change stream, so bounded polling is the only

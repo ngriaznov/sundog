@@ -103,6 +103,69 @@ async fn nodes_sharing_a_ca_replicate_a_put_over_tls() {
     common::shutdown_all(vec![cluster_a, cluster_b]).await;
 }
 
+/// A raw socket that opens the data-plane port and stalls inside a
+/// `ClientHello` holds a connection that has not authenticated. The nodes'
+/// own links, which complete their handshakes, replicate beside it.
+#[tokio::test]
+async fn a_stalled_client_hello_does_not_stop_two_tls_nodes_replicating() {
+    use tokio::io::AsyncWriteExt as _;
+
+    let ca = generate_ca();
+    let data_addr = common::reserve_tcp_addr().await;
+    let cluster_a = Cluster::builder("it-tls-stalled-client-hello")
+        .seeds(std::iter::empty())
+        .config(tls_node_config(generate_node_tls(&ca)).with(|c| c.data_bind_addr = data_addr))
+        .build()
+        .await
+        .expect("node a builds with tls");
+    let cluster_b = Cluster::builder("it-tls-stalled-client-hello")
+        .seeds([cluster_a.local_gossip_addr()])
+        .config(tls_node_config(generate_node_tls(&ca)))
+        .build()
+        .await
+        .expect("node b builds with tls");
+    common::wait_for_peer_count(&cluster_a, 1, Duration::from_secs(15)).await;
+    common::wait_for_peer_count(&cluster_b, 1, Duration::from_secs(15)).await;
+
+    // The 5-byte record header of a ClientHello, and nothing after it.
+    let mut stalled = tokio::net::TcpStream::connect(data_addr)
+        .await
+        .expect("the data-plane port accepts");
+    stalled
+        .write_all(&[0x16, 0x03, 0x01, 0x01, 0x00])
+        .await
+        .expect("the start of a ClientHello");
+
+    let (cache_a, cache_b) = tokio::join!(
+        cluster_a
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open(),
+        cluster_b
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open(),
+    );
+    let cache_a = cache_a.expect("a opens");
+    let cache_b = cache_b.expect("b opens");
+    cache_a
+        .insert(1, "from a".into())
+        .await
+        .expect("a inserts over tls");
+    cache_b
+        .insert(2, "from b".into())
+        .await
+        .expect("b inserts over tls");
+    common::eventually(Duration::from_secs(10), || async {
+        cache_b.get(&1).await.as_deref() == Some("from a")
+            && cache_a.get(&2).await.as_deref() == Some("from b")
+    })
+    .await;
+
+    drop(stalled);
+    common::shutdown_all(vec![cluster_a, cluster_b]).await;
+}
+
 #[tokio::test]
 async fn nodes_with_certs_from_different_cas_never_replicate() {
     let ca_a = generate_ca();

@@ -2,9 +2,11 @@
 //! mesh traffic and pooled request/response, and the per-peer dial-and-write
 //! loop over the broadcast outboxes.
 //!
-//! - `accept`: the accept loop and per-connection dispatch.
-//! - `admit`: the admission of accepted connections: the wait between failed
-//!   accepts and the warnings that report them.
+//! - `accept`: the accept loop, the `Hello` handshake and per-connection
+//!   dispatch.
+//! - `admit`: the admission of accepted connections: the `Hello` deadline,
+//!   the wait between failed accepts and the counters and warnings that
+//!   report them.
 //! - `framing`: framed IO primitives and TLS layering.
 //! - `pool`: the per-peer request connection pool and reuse probe.
 //! - `reply`: requester-side reply readers and lazy streams.
@@ -27,6 +29,8 @@ mod writer_tests;
 
 pub(super) use accept::accept_loop;
 pub(super) use admit::Admission;
+#[cfg(all(test, not(feature = "sim")))]
+pub(crate) use admit::HELLO_TIMEOUT;
 pub(super) use framing::{recv_msg, send_msg};
 pub(super) use pool::{ReqPool, ReusedProbe, probe_reused};
 pub(super) use reply::{

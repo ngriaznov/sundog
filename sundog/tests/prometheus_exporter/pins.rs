@@ -488,6 +488,39 @@ pub(crate) fn skew_hold_pin_bytes() -> f64 {
     f64::from(u32::try_from(held).expect("the pinned hold fits in u32"))
 }
 
+/// A node whose data-plane port holds two connections that never send a
+/// hello: one silent, one that writes two bytes of a length prefix. Both
+/// close at the hello deadline, so `sundog_accept_dropped_total
+/// {reason="hello_timeout"}` reaches 2, the only connections in this binary
+/// that wait out the deadline. Returns the node and the two sockets, which
+/// stay open until the metrics are scraped.
+pub(crate) async fn accept_drop_pin_metrics()
+-> (Cluster, tokio::net::TcpStream, tokio::net::TcpStream) {
+    use tokio::io::AsyncWriteExt;
+
+    let data_addr = reserve_tcp_addr().await;
+    let node = Cluster::builder("it-prometheus-accept-drop")
+        .seeds(std::iter::empty())
+        .config(
+            node_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .with(|c| c.data_bind_addr = data_addr),
+        )
+        .build()
+        .await
+        .expect("node builds");
+    let silent = tokio::net::TcpStream::connect(data_addr)
+        .await
+        .expect("the node's data port accepts");
+    let mut partial = tokio::net::TcpStream::connect(data_addr)
+        .await
+        .expect("the node's data port accepts");
+    partial
+        .write_all(&[0, 0])
+        .await
+        .expect("two bytes of a length prefix");
+    (node, silent, partial)
+}
+
 /// Drives the skew hold's metrics on a `Mode::Distributed` cache that owns
 /// every part, with a raw data-plane peer that is no owner forwarding it
 /// records stamped an hour ahead of the default one-minute skew bound: the

@@ -19,11 +19,11 @@ mod spill;
 mod support;
 
 use crate::pins::{
-    SKEW_HOLD_PIN_CAPACITY, TOMBSTONE_PIN_COUNT, clock_skew_pin_metrics, count_hits_and_misses,
-    fan_out_wait_timeout_pin_metrics, loader_calls_pin_metric, memory_ceiling_pin_metrics,
-    read_durations_pin_metrics, refresh_hints_pin_metric, refresh_outcomes_pin_metrics,
-    skew_hold_pin_bytes, skew_hold_pin_metrics, tombstone_ignored_pin_metrics,
-    tombstone_pin_metrics,
+    SKEW_HOLD_PIN_CAPACITY, TOMBSTONE_PIN_COUNT, accept_drop_pin_metrics, clock_skew_pin_metrics,
+    count_hits_and_misses, fan_out_wait_timeout_pin_metrics, loader_calls_pin_metric,
+    memory_ceiling_pin_metrics, read_durations_pin_metrics, refresh_hints_pin_metric,
+    refresh_outcomes_pin_metrics, skew_hold_pin_bytes, skew_hold_pin_metrics,
+    tombstone_ignored_pin_metrics, tombstone_pin_metrics,
 };
 use crate::seeds::{
     seed_crdt_compaction_metrics, seed_distributed_metrics, seed_part_mismatch,
@@ -71,6 +71,11 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         .expect("peer builds");
     common::wait_for_peer_count(&cluster, 1, Duration::from_secs(15)).await;
     common::wait_for_peer_count(&peer, 1, Duration::from_secs(15)).await;
+
+    // First, so the 10 second hello deadline elapses while the scenarios
+    // below run.
+    let (accept_drop_node, accept_drop_silent, accept_drop_partial) =
+        accept_drop_pin_metrics().await;
 
     seed_sketch_mismatch(&cluster, &peer).await;
     seed_part_mismatch(&cluster, &peer).await;
@@ -137,6 +142,13 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
                 "sundog_clock_skew_hold_dropped_total",
                 &[("cache", "skew-hold-pin"), ("reason", "horizon")],
             ) == Some(1.0)
+            // The two held connections that sent no hello close at its
+            // deadline, 10 seconds after the first scenario opened them.
+            && scraped_metric_value(
+                &body,
+                "sundog_accept_dropped_total",
+                &[("reason", "hello_timeout")],
+            ) == Some(2.0)
             && (cfg!(not(feature = "spill"))
                 || scraped_metric_value(
                     &body,
@@ -195,6 +207,20 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     assert!(
         scraped_metric_value(&body, "sundog_cache_entries", &[("cache", "counted")]).is_some(),
         "expected a sundog_cache_entries line for the 'counted' cache; got body:\n{body}"
+    );
+
+    // sundog_accept_dropped_total: pinned by accept_drop_pin_metrics, a
+    // silent connection and one with a partial length prefix. The only other
+    // raw connection to a data-plane port, the skew-hold peer, sends its
+    // hello at once.
+    assert_eq!(
+        scraped_metric_value(
+            &body,
+            "sundog_accept_dropped_total",
+            &[("reason", "hello_timeout")]
+        ),
+        Some(2.0),
+        "expected two connections closed at the hello deadline; got body:\n{body}"
     );
 
     // sundog_tombstones: pinned by tombstone_pin_metrics, two deletes and one
@@ -817,6 +843,8 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     tombstone_node.shutdown().await;
     drop(skew_hold_peer);
     skew_hold_node.shutdown().await;
+    drop((accept_drop_silent, accept_drop_partial));
+    accept_drop_node.shutdown().await;
     cluster.shutdown().await;
     #[cfg(feature = "spill")]
     for dir in &spill_dirs {

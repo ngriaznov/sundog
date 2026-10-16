@@ -33,6 +33,22 @@ pub(super) fn new_framed(stream: MeshStream) -> PeerFramed {
         .new_framed(stream)
 }
 
+/// The largest frame an accepted connection may send before its `Hello`
+/// decodes. A `Hello` encodes to a few dozen bytes. The codec reserves the
+/// declared length in its read buffer as soon as it reads a frame's length
+/// prefix, so the limit keeps a connection that has said nothing from
+/// committing the buffer to [`MAX_FRAME`] bytes.
+pub(super) const HELLO_MAX_FRAME: usize = 1024;
+
+/// [`new_framed`] for an accepted connection that has not sent its `Hello`:
+/// frames are capped at [`HELLO_MAX_FRAME`] until the caller lifts the cap
+/// with `set_max_frame_length(MAX_FRAME)` on the codec.
+pub(super) fn new_framed_pre_hello(stream: MeshStream) -> PeerFramed {
+    LengthDelimitedCodec::builder()
+        .max_frame_length(HELLO_MAX_FRAME)
+        .new_framed(stream)
+}
+
 /// Layers TLS onto a freshly dialed `stream` per `tls`, a no-op passthrough
 /// whenever TLS isn't compiled in for this transport.
 #[cfg(all(feature = "tls", not(feature = "sim")))]

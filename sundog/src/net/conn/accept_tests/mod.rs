@@ -1,5 +1,6 @@
 //! Tests of the accept loop's admission over real loopback sockets: the wait
-//! between failed accepts, and the helpers the topic modules share.
+//! between failed accepts, the deadline and frame limit on a connection that
+//! has not sent its `Hello`, and the helpers the topic modules share.
 //!
 //! A paused clock appears only where the asserted event is a timer firing,
 //! observed through a `JoinHandle` or a counter, with no `timeout` guard
@@ -9,13 +10,29 @@
 //! socket event run on the real clock with real-time guards.
 
 mod backoff;
+mod hello;
+#[cfg(feature = "tls")]
+mod tls;
 
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
+use metrics_util::debugging::{DebugValue, Snapshotter};
+use tokio::io::AsyncWriteExt as _;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::layer::SubscriberExt as _;
+
+use super::accept::handle_accepted;
+use super::tests::EmptyHandler;
+use crate::hlc::Hlc;
+use crate::net::{InboundMsg, MeshInner, TlsCtx};
+use crate::node::NodeId;
+use crate::wire::{self, Msg, WireRecord};
 
 /// A connected loopback pair: the client end, then the server end as an
 /// accept returns it.
@@ -28,6 +45,123 @@ async fn loopback_pair() -> (TcpStream, TcpStream, SocketAddr) {
     let client = TcpStream::connect(addr).await.expect("connect");
     let (server, client_addr) = accept.await.expect("connection accepted");
     (client, server, client_addr)
+}
+
+/// One `handle_accepted` task over a loopback pair, with the client end and
+/// the channel the handler forwards to.
+struct Accepted {
+    client: TcpStream,
+    task: JoinHandle<()>,
+    cancel: CancellationToken,
+    inbound: mpsc::Receiver<InboundMsg>,
+}
+
+/// Spawns `handle_accepted` on the server end of a fresh loopback pair, in a
+/// mesh with no peers that runs TLS per `tls`.
+async fn spawn_accepted(tls: TlsCtx) -> Accepted {
+    let mesh = MeshInner::for_tests(tls, CancellationToken::new());
+    spawn_accepted_in(&mesh).await
+}
+
+/// [`spawn_accepted`] in an existing `mesh`, which several connections share.
+async fn spawn_accepted_in(mesh: &Arc<MeshInner>) -> Accepted {
+    let (client, server, _) = loopback_pair().await;
+    let (inbound_tx, inbound) = mpsc::channel(8);
+    let task = tokio::spawn(handle_accepted(
+        server,
+        inbound_tx,
+        Arc::new(EmptyHandler),
+        Arc::clone(mesh),
+    ));
+    Accepted {
+        client,
+        task,
+        cancel: mesh.accept_cancel.clone(),
+        inbound,
+    }
+}
+
+/// The node every test peer claims to be.
+fn peer() -> NodeId {
+    NodeId::from(9)
+}
+
+fn hello() -> Msg {
+    Msg::Hello {
+        node: peer(),
+        incarnation: 1,
+        protocol: wire::PROTOCOL_VERSION,
+        cluster: wire::UNNAMED_CLUSTER,
+    }
+}
+
+/// A small broadcast message, forwarded to the inbound channel once the
+/// handler serves the connection.
+fn invalidate(n: u8) -> Msg {
+    Msg::Invalidate {
+        cache: "users".into(),
+        key: Bytes::from(vec![n]),
+        ver: Hlc {
+            wall_ms: u64::from(n),
+            logical: 0,
+            node: peer(),
+        },
+    }
+}
+
+/// A replicate message whose frame is `value_len` bytes and a little more.
+fn replicate_of(value_len: usize) -> Msg {
+    Msg::Replicate {
+        cache: "users".into(),
+        rec: WireRecord {
+            key: Bytes::from_static(b"k"),
+            value: Some(Bytes::from(vec![7u8; value_len])),
+            ver: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                node: peer(),
+            },
+            expires_at_ms: None,
+        },
+    }
+}
+
+/// `msg` as a length-prefixed frame.
+fn framed(msg: &Msg) -> Vec<u8> {
+    let body = wire::encode(msg).expect("encodes");
+    let mut frame = u32::try_from(body.len())
+        .expect("a frame fits u32")
+        .to_be_bytes()
+        .to_vec();
+    frame.extend_from_slice(&body);
+    frame
+}
+
+/// Writes every message in `msgs` as one frame each, in separate writes.
+async fn send_each(client: &mut TcpStream, msgs: &[Msg]) {
+    for msg in msgs {
+        client.write_all(&framed(msg)).await.expect("write");
+    }
+}
+
+/// The value of the counter `sundog_accept_dropped_total{reason}` a recorder
+/// has seen, `None` when the series does not exist.
+fn dropped(snapshotter: &Snapshotter, reason: &str) -> Option<u64> {
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .find(|(key, ..)| {
+            key.key().name() == "sundog_accept_dropped_total"
+                && key
+                    .key()
+                    .labels()
+                    .any(|label| label.key() == "reason" && label.value() == reason)
+        })
+        .map(|(_, _, _, value)| match value {
+            DebugValue::Counter(n) => n,
+            other => panic!("a counter, got {other:?}"),
+        })
 }
 
 /// A tracing layer that keeps the message of every `WARN` event.

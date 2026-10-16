@@ -8,9 +8,10 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::admit::{accept_backoff, accept_error_backs_off};
+use super::admit::{HELLO_TIMEOUT, accept_backoff, accept_error_backs_off};
 use super::framing::{
-    PeerFramed, disable_nagle, establish_accept, new_framed, recv_msg, send_batch_or_cancelled,
+    PeerFramed, disable_nagle, establish_accept, new_framed_pre_hello, recv_msg,
+    send_batch_or_cancelled,
 };
 use super::pool::{REQ_CONN_IDLE_TIMEOUT, REQ_CONN_MAX_REQUESTS};
 use super::serve::{
@@ -20,9 +21,9 @@ use super::serve::{
 };
 use crate::error::CodecError;
 use crate::net::tcp::{TcpListener, TcpStream};
-use crate::net::{InboundMsg, MeshInner, RequestHandler};
+use crate::net::{InboundMsg, MeshInner, RequestHandler, TlsCtx};
 use crate::node::NodeId;
-use crate::wire::{self, Msg};
+use crate::wire::{self, MAX_FRAME, Msg};
 
 /// Reads the next message off `framed`, bounded by `idle_timeout` when set.
 /// Used only once a connection has served at least one request/response
@@ -119,6 +120,52 @@ pub(super) async fn accept_loop_over<S: ConnSource>(
     }
 }
 
+/// A connection whose TLS handshake (when the node runs TLS) and `Hello`
+/// are done.
+struct OpenedLink {
+    framed: PeerFramed,
+    from: NodeId,
+    peer_protocol: u16,
+    peer_cluster: u64,
+}
+
+/// Layers TLS onto `stream` per `tls` and reads the first message: everything
+/// [`HELLO_TIMEOUT`] bounds. `None` for a failed handshake, a stream that
+/// closes or breaks first, a frame past the pre-`Hello` limit, or a first
+/// message other than `Hello`.
+async fn open_link(stream: TcpStream, tls: &TlsCtx) -> Option<OpenedLink> {
+    let stream = match establish_accept(stream, tls).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            tracing::debug!(%error, "TLS handshake failed on accept; dropping connection");
+            return None;
+        }
+    };
+    let mut framed = new_framed_pre_hello(stream);
+    match recv_msg(&mut framed).await {
+        Some(Ok(Msg::Hello {
+            node,
+            protocol,
+            cluster,
+            ..
+        })) => Some(OpenedLink {
+            framed,
+            from: node,
+            peer_protocol: protocol,
+            peer_cluster: cluster,
+        }),
+        Some(Ok(_)) => {
+            tracing::debug!("first message on a data-plane connection is not a hello; dropping it");
+            None
+        }
+        Some(Err(error)) => {
+            tracing::debug!(%error, "unreadable first frame on a data-plane connection; dropping it");
+            None
+        }
+        None => None,
+    }
+}
+
 /// Serves one accepted connection: layers TLS on per `tls`, requires
 /// `Hello` first, then dispatches each subsequent message.
 /// `Invalidate`/`Replicate`/`ReplicateBatch` keep the connection open and
@@ -126,6 +173,12 @@ pub(super) async fn accept_loop_over<S: ConnSource>(
 /// stays open for reuse, subject to [`REQ_CONN_IDLE_TIMEOUT`] and
 /// [`REQ_CONN_MAX_REQUESTS`]. A failed serve or TLS handshake closes the
 /// connection immediately, since it may be mid-frame and unsafe to reuse.
+///
+/// A connection that has not sent a complete `Hello` within [`HELLO_TIMEOUT`]
+/// of the handler first running, TLS handshake included, is closed and
+/// counted in `sundog_accept_dropped_total{reason="hello_timeout"}`. Until
+/// the `Hello` decodes a frame is at most `HELLO_MAX_FRAME` bytes (1 KiB);
+/// afterwards it is at most [`MAX_FRAME`].
 ///
 /// Every read and write below races against `mesh`'s accept token, tearing
 /// a slow snapshot or AE reply down promptly on [`crate::net::Mesh::shutdown`].
@@ -140,28 +193,27 @@ pub(super) async fn handle_accepted(
     mesh: Arc<MeshInner>,
 ) {
     let cancel = mesh.accept_cancel.clone();
-    let stream = match establish_accept(stream, &mesh.tls).await {
-        Ok(stream) => stream,
-        Err(error) => {
-            tracing::debug!(%error, "TLS handshake failed on accept; dropping connection");
+    let peer_addr = stream.peer_addr().ok();
+    let opened = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return,
+        opened = tokio::time::timeout(HELLO_TIMEOUT, open_link(stream, &mesh.tls)) => opened,
+    };
+    let OpenedLink {
+        mut framed,
+        from,
+        peer_protocol,
+        peer_cluster,
+    } = match opened {
+        Ok(Some(link)) => link,
+        Ok(None) => return,
+        Err(_elapsed) => {
+            mesh.admission.note_hello_timeout(peer_addr);
             return;
         }
     };
-    let mut framed = new_framed(stream);
-    let hello = tokio::select! {
-        biased;
-        () = cancel.cancelled() => return,
-        hello = recv_msg(&mut framed) => hello,
-    };
-    let Some(Ok(Msg::Hello {
-        node: from,
-        protocol: peer_protocol,
-        cluster: peer_cluster,
-        ..
-    })) = hello
-    else {
-        return;
-    };
+    // Frames buffered behind the `Hello` decode under the full limit.
+    framed.codec_mut().set_max_frame_length(MAX_FRAME);
     // A peer of another cluster dialed an address this node now holds,
     // left over from a node of its own that held it before: nothing it
     // sends belongs in this cluster's caches.

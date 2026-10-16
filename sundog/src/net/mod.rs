@@ -12,6 +12,11 @@
 //! the message after `Hello` decides whether the connection serves requests
 //! until idle or loops as the persistent link.
 //!
+//! A connection must send a complete `Hello`, after its TLS handshake when
+//! the node runs TLS, within `HELLO_TIMEOUT` (10 seconds) of the moment its
+//! handler first runs, or the node closes it. Until the `Hello` decodes, a
+//! frame is at most 1 KiB.
+//!
 //! A failed accept on the listener is retried after 5 milliseconds, doubling to
 //! one second while failures continue; a connection reset or aborted before
 //! its accept returns is skipped at once.
@@ -23,6 +28,8 @@
 
 mod conn;
 
+#[cfg(all(test, not(feature = "sim")))]
+pub(crate) use conn::HELLO_TIMEOUT;
 pub(crate) use conn::{REPLICATE_BATCH_BUDGET, REPLICATE_BATCH_COUNT};
 mod frames;
 mod handler;
