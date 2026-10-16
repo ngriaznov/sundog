@@ -3,6 +3,8 @@
 //! loop over the broadcast outboxes.
 //!
 //! - `accept`: the accept loop and per-connection dispatch.
+//! - `admit`: the admission of accepted connections: the wait between failed
+//!   accepts and the warnings that report them.
 //! - `framing`: framed IO primitives and TLS layering.
 //! - `pool`: the per-peer request connection pool and reuse probe.
 //! - `reply`: requester-side reply readers and lazy streams.
@@ -10,6 +12,9 @@
 //! - `writer`: dial, the persistent per-peer writer and the replicate coalescer.
 
 mod accept;
+#[cfg(all(test, not(feature = "sim")))]
+mod accept_tests;
+mod admit;
 mod framing;
 mod pool;
 mod reply;
@@ -21,6 +26,7 @@ mod writer;
 mod writer_tests;
 
 pub(super) use accept::accept_loop;
+pub(super) use admit::Admission;
 pub(super) use framing::{recv_msg, send_msg};
 pub(super) use pool::{ReqPool, ReusedProbe, probe_reused};
 pub(super) use reply::{

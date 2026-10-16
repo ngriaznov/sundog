@@ -706,7 +706,7 @@ pub(super) fn no_tls() -> crate::net::TlsCtx {
 /// empty, never called in the tests that use it since they exercise
 /// paths that never reach the handler.
 #[cfg(not(feature = "sim"))]
-struct EmptyHandler;
+pub(super) struct EmptyHandler;
 #[cfg(not(feature = "sim"))]
 impl crate::net::RequestHandler for EmptyHandler {
     fn snapshot_chunks(

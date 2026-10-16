@@ -1,11 +1,14 @@
 //! The accept loop and per-connection dispatch.
 
+use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use super::admit::{accept_backoff, accept_error_backs_off};
 use super::framing::{
     PeerFramed, disable_nagle, establish_accept, new_framed, recv_msg, send_batch_or_cancelled,
 };
@@ -37,6 +40,18 @@ async fn recv_msg_or_idle_timeout(
     }
 }
 
+/// Where the accept loop takes connections from: the listener, or a script
+/// in a test.
+pub(super) trait ConnSource: Send {
+    fn next_conn(&mut self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + Send;
+}
+
+impl ConnSource for TcpListener {
+    async fn next_conn(&mut self) -> io::Result<(TcpStream, SocketAddr)> {
+        self.accept().await
+    }
+}
+
 /// Accepts connections until `mesh`'s accept token fires, spawning a handler
 /// per connection.
 pub(in crate::net) async fn accept_loop(
@@ -45,22 +60,62 @@ pub(in crate::net) async fn accept_loop(
     handler: Arc<dyn RequestHandler>,
     mesh: Arc<MeshInner>,
 ) {
+    accept_loop_over(listener, inbound_tx, handler, mesh).await;
+}
+
+/// [`accept_loop`] over any [`ConnSource`].
+///
+/// A failed accept that concerns one connection ([`accept_error_backs_off`])
+/// is skipped after a yield. Any other failure waits [`accept_backoff`],
+/// which grows with the failures in a row and resets on the next accepted
+/// connection, so a process out of descriptors retries at most once a
+/// second. The wait ends when the accept token fires.
+pub(super) async fn accept_loop_over<S: ConnSource>(
+    mut source: S,
+    inbound_tx: mpsc::Sender<InboundMsg>,
+    handler: Arc<dyn RequestHandler>,
+    mesh: Arc<MeshInner>,
+) {
     let cancel = mesh.accept_cancel.clone();
+    let mut failures: u32 = 0;
     loop {
-        tokio::select! {
+        let accepted = tokio::select! {
             biased;
             () = cancel.cancelled() => return,
-            accepted = listener.accept() => {
-                let Ok((stream, _peer_addr)) = accepted else { continue };
-                disable_nagle(&stream);
-                tokio::spawn(handle_accepted(
-                    stream,
-                    inbound_tx.clone(),
-                    Arc::clone(&handler),
-                    Arc::clone(&mesh),
-                ));
+            accepted = source.next_conn() => accepted,
+        };
+        let stream = match accepted {
+            Ok((stream, _peer_addr)) => {
+                failures = 0;
+                stream
             }
-        }
+            Err(error) => {
+                let retry_in = if accept_error_backs_off(error.kind()) {
+                    failures = failures.saturating_add(1);
+                    accept_backoff(failures)
+                } else {
+                    Duration::ZERO
+                };
+                mesh.admission.note_accept_error(&error, failures, retry_in);
+                if retry_in.is_zero() {
+                    tokio::task::yield_now().await;
+                } else {
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => return,
+                        () = tokio::time::sleep(retry_in) => {}
+                    }
+                }
+                continue;
+            }
+        };
+        disable_nagle(&stream);
+        tokio::spawn(handle_accepted(
+            stream,
+            inbound_tx.clone(),
+            Arc::clone(&handler),
+            Arc::clone(&mesh),
+        ));
     }
 }
 

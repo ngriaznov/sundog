@@ -12,6 +12,10 @@
 //! the message after `Hello` decides whether the connection serves requests
 //! until idle or loops as the persistent link.
 //!
+//! A failed accept on the listener is retried after 5 milliseconds, doubling to
+//! one second while failures continue; a connection reset or aborted before
+//! its accept returns is skipped at once.
+//!
 //! With feature `tls` and `ClusterConfig::tls` set, every connection is
 //! wrapped in mutual TLS. The `MeshStream` and `TlsCtx` aliases collapse to
 //! plain types when the feature is off or `sim` is on, so the framing code
@@ -189,6 +193,8 @@ struct MeshInner {
     peers: RwLock<HashMap<NodeId, PeerHandle>>,
     accept_cancel: CancellationToken,
     tls: TlsCtx,
+    /// Admission of the connections the data-plane listener accepts.
+    admission: conn::Admission,
     /// Bucket acks from `Msg::StBucketAck`, written by
     /// `conn::serve_st_buckets` when a requester releases a bucket.
     /// `rebalance_task` uses a fresh, current-view entry to skip a
@@ -332,6 +338,7 @@ impl MeshInner {
             peers: RwLock::new(HashMap::new()),
             accept_cancel,
             tls,
+            admission: conn::Admission::new(),
             acked_buckets: RwLock::new(HashMap::new()),
         })
     }
