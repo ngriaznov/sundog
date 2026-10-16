@@ -98,19 +98,25 @@ where
         tombstone_ttl_ms: u64,
     ) -> Option<u64> {
         let (defer, entered_hold_gap) = if self.pause_guard {
-            let prior = self.last_gc_ms.swap(now_ms.max(1), Ordering::Relaxed);
+            let prior = self.last_gc_ms.load(Ordering::Relaxed);
             let paused = paused_since(prior, now_ms, tombstone_ttl_ms);
             let hold = self.pause_hold_until_ms.load(Ordering::Relaxed);
             let (effective, entered) = gc_defer_decision(defer, paused, hold, now_ms);
             self.pause_hold_until_ms.store(
                 pause_hold_after(hold, paused, now_ms, tombstone_ttl_ms),
-                Ordering::Relaxed,
+                Ordering::Release,
             );
+            self.gc_deferring.store(effective, Ordering::Release);
+            // The collection time goes last: an arrival that reads it with
+            // `Acquire` (`Engine::deferring_at`) sees the hold and the
+            // deferral that belong to it, so the gap it reads as closed is
+            // never closed without the node deferring.
+            self.last_gc_ms.store(now_ms.max(1), Ordering::Release);
             (effective, entered.then(|| now_ms.saturating_sub(prior)))
         } else {
+            self.gc_deferring.store(defer, Ordering::Relaxed);
             (defer, None)
         };
-        self.gc_deferring.store(defer, Ordering::Relaxed);
         for (idx, stripe_lock) in self.stripes.iter().enumerate() {
             let mut stripe = stripe_lock.write();
             stripe.tombstones.retain(|key_bytes, t| {

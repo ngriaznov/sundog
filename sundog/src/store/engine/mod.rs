@@ -904,19 +904,19 @@ where
     /// collection alone, so the guard is in force for the first arrival after
     /// a resume, before the gc task has woken.
     pub(crate) fn deferring_at(&self, now_ms: u64, tombstone_ttl_ms: u64) -> bool {
-        let defer = self.gc_deferring.load(Ordering::Relaxed);
         if !self.pause_guard {
-            return defer;
+            return self.gc_deferring.load(Ordering::Relaxed);
         }
-        let paused = expiry::paused_since(
-            self.last_gc_ms.load(Ordering::Relaxed),
-            now_ms,
-            tombstone_ttl_ms,
-        );
+        // The collection time first, with `Acquire`: the collection that
+        // wrote it published its hold and deferral before it, so they are at
+        // least as new as the time read here.
+        let last_gc_ms = self.last_gc_ms.load(Ordering::Acquire);
+        let defer = self.gc_deferring.load(Ordering::Acquire);
+        let paused = expiry::paused_since(last_gc_ms, now_ms, tombstone_ttl_ms);
         expiry::gc_defer_decision(
             defer,
             paused,
-            self.pause_hold_until_ms.load(Ordering::Relaxed),
+            self.pause_hold_until_ms.load(Ordering::Acquire),
             now_ms,
         )
         .0

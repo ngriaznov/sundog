@@ -272,3 +272,58 @@ fn the_caller_deferral_composes_with_the_guard() {
     assert_eq!(engine.gc_tombstones(false, 52_000, TTL), None);
     assert!(!engine.gc_deferring());
 }
+
+/// An arrival on another thread never sees the collection that detects a
+/// pause half published. The collection records its time last, so a reader
+/// that sees the new time sees the hold and the deferral flag that go with
+/// it. Before that instant the reader sees the old time and reads the gap as
+/// a pause; after it the hold. At no instant in between is the node not
+/// deferring.
+#[test]
+fn a_concurrent_arrival_never_sees_the_gap_closed_before_the_hold_is_set() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    const ROUNDS: u64 = 4_000;
+    let engine = guarded(1_000);
+    let target = AtomicU64::new(0);
+    let stop = AtomicBool::new(false);
+    let lapses = AtomicU64::new(0);
+
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Acquire) {
+                    let now = target.load(Ordering::Acquire);
+                    if now != 0 && !engine.deferring_at(now, TTL) {
+                        lapses.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+        let mut now = 1_000;
+        for _ in 0..ROUNDS {
+            // The resume: a gap past the pause threshold, then the reader's
+            // clock reads the resume instant.
+            now += GAP + 1;
+            target.store(now, Ordering::Release);
+            assert!(engine.gc_tombstones(false, now, TTL).is_some());
+            // Ticks one period apart until the hold ends, so the next round
+            // starts from a collection that does not defer.
+            for _ in 0..TTL / gc_period_ms(TTL) {
+                now += gc_period_ms(TTL);
+                assert_eq!(engine.gc_tombstones(false, now, TTL), None);
+            }
+            assert!(!engine.gc_deferring(), "the hold has ended at {now}");
+            if lapses.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+        }
+        stop.store(true, Ordering::Release);
+    });
+
+    assert_eq!(
+        lapses.load(Ordering::Relaxed),
+        0,
+        "a reader saw the new collection time without the hold"
+    );
+}
