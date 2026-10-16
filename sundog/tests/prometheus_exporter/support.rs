@@ -1,21 +1,13 @@
 //! Loopback scrape helpers and the anti-entropy node config the exporter tests share.
 
 use crate::common;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 
-/// Reserves a loopback TCP port the way `cluster.rs`'s own
-/// `reserve_data_bind_addr` does: probe-bind, read back, then drop it.
-pub(crate) async fn reserve_tcp_addr() -> SocketAddr {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind an ephemeral loopback tcp port to reserve a metrics address");
-    listener
-        .local_addr()
-        .expect("a freshly bound tcp listener reports a local address")
-}
+// The exporter files and `tests/tls.rs` reserve a port through one helper.
+pub(crate) use crate::common::reserve_tcp_addr;
 
 /// A minimal raw-socket `GET /metrics`. Returns `None` if the listener
 /// is not accepting connections yet.
