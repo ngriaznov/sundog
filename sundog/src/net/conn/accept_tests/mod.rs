@@ -10,10 +10,12 @@
 //! socket event run on the real clock with real-time guards.
 
 mod backoff;
+mod cap;
 mod hello;
 #[cfg(feature = "tls")]
 mod tls;
 
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -28,6 +30,7 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::layer::SubscriberExt as _;
 
 use super::accept::handle_accepted;
+use super::admit::Admit;
 use super::tests::EmptyHandler;
 use crate::hlc::Hlc;
 use crate::net::{InboundMsg, MeshInner, TlsCtx};
@@ -47,17 +50,19 @@ async fn loopback_pair() -> (TcpStream, TcpStream, SocketAddr) {
     (client, server, client_addr)
 }
 
-/// One `handle_accepted` task over a loopback pair, with the client end and
-/// the channel the handler forwards to.
+/// One `handle_accepted` task over a loopback pair, with the client end, the
+/// channel the handler forwards to and the mesh it runs in.
 struct Accepted {
     client: TcpStream,
     task: JoinHandle<()>,
     cancel: CancellationToken,
     inbound: mpsc::Receiver<InboundMsg>,
+    mesh: Arc<MeshInner>,
 }
 
 /// Spawns `handle_accepted` on the server end of a fresh loopback pair, in a
-/// mesh with no peers that runs TLS per `tls`.
+/// mesh with no peers that runs TLS per `tls`. The connection holds the slot
+/// in the cap that the accept loop gives a connection from an unknown source.
 async fn spawn_accepted(tls: TlsCtx) -> Accepted {
     let mesh = MeshInner::for_tests(tls, CancellationToken::new());
     spawn_accepted_in(&mesh).await
@@ -65,19 +70,26 @@ async fn spawn_accepted(tls: TlsCtx) -> Accepted {
 
 /// [`spawn_accepted`] in an existing `mesh`, which several connections share.
 async fn spawn_accepted_in(mesh: &Arc<MeshInner>) -> Accepted {
-    let (client, server, _) = loopback_pair().await;
+    let (client, server, client_addr) = loopback_pair().await;
     let (inbound_tx, inbound) = mpsc::channel(8);
+    let pre_hello = match mesh.admission.admit(client_addr.ip()) {
+        Admit::Known => None,
+        Admit::Waiting(permit) => Some(permit),
+        Admit::OverCap => panic!("the test mesh is under its cap"),
+    };
     let task = tokio::spawn(handle_accepted(
         server,
         inbound_tx,
         Arc::new(EmptyHandler),
         Arc::clone(mesh),
+        pre_hello,
     ));
     Accepted {
         client,
         task,
         cancel: mesh.accept_cancel.clone(),
         inbound,
+        mesh: Arc::clone(mesh),
     }
 }
 
@@ -144,24 +156,39 @@ async fn send_each(client: &mut TcpStream, msgs: &[Msg]) {
     }
 }
 
-/// The value of the counter `sundog_accept_dropped_total{reason}` a recorder
-/// has seen, `None` when the series does not exist.
-fn dropped(snapshotter: &Snapshotter, reason: &str) -> Option<u64> {
-    snapshotter
-        .snapshot()
-        .into_vec()
-        .into_iter()
-        .find(|(key, ..)| {
-            key.key().name() == "sundog_accept_dropped_total"
-                && key
-                    .key()
-                    .labels()
-                    .any(|label| label.key() == "reason" && label.value() == reason)
-        })
-        .map(|(_, _, _, value)| match value {
-            DebugValue::Counter(n) => n,
-            other => panic!("a counter, got {other:?}"),
-        })
+/// Reads `sundog_accept_dropped_total{reason}` from a recorder. A snapshot
+/// resets the counters it reads, so the reader keeps the running totals.
+struct Dropped {
+    snapshotter: Snapshotter,
+    totals: Mutex<HashMap<String, u64>>,
+}
+
+impl Dropped {
+    fn new(snapshotter: Snapshotter) -> Self {
+        Self {
+            snapshotter,
+            totals: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The total counted under `reason`, `None` while the series does not
+    /// exist.
+    fn total(&self, reason: &str) -> Option<u64> {
+        let mut totals = self.totals.lock().expect("lock");
+        for (key, _, _, value) in self.snapshotter.snapshot().into_vec() {
+            if key.key().name() != "sundog_accept_dropped_total" {
+                continue;
+            }
+            let Some(label) = key.key().labels().find(|label| label.key() == "reason") else {
+                continue;
+            };
+            let DebugValue::Counter(n) = value else {
+                panic!("a counter, got {value:?}");
+            };
+            *totals.entry(label.value().to_owned()).or_default() += n;
+        }
+        totals.get(reason).copied()
+    }
 }
 
 /// A tracing layer that keeps the message of every `WARN` event.

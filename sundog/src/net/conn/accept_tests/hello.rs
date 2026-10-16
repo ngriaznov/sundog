@@ -7,7 +7,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    Accepted, Warnings, dropped, framed, hello, invalidate, peer, replicate_of, send_each,
+    Accepted, Dropped, Warnings, framed, hello, invalidate, peer, replicate_of, send_each,
     spawn_accepted, spawn_accepted_in,
 };
 use crate::net::MeshInner;
@@ -94,9 +94,23 @@ async fn a_partial_hello_body_closes_at_the_hello_deadline() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_deadline_close_frees_the_slot() {
+    let mut accepted = spawn_accepted(no_tls()).await;
+    assert_eq!(
+        accepted.mesh.admission.in_flight(),
+        1,
+        "waiting for its hello"
+    );
+
+    ends_at_the_deadline(&mut accepted).await;
+
+    assert_eq!(accepted.mesh.admission.in_flight(), 0);
+}
+
+#[tokio::test(start_paused = true)]
 async fn each_connection_closed_at_the_deadline_is_counted_and_the_warning_is_rate_limited() {
     let recorder = metrics_util::debugging::DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
+    let dropped = Dropped::new(recorder.snapshotter());
     let _metrics = metrics::set_default_local_recorder(&recorder);
     let (warnings, _log) = Warnings::capture();
     let mesh = MeshInner::for_tests(no_tls(), CancellationToken::new());
@@ -104,12 +118,12 @@ async fn each_connection_closed_at_the_deadline_is_counted_and_the_warning_is_ra
     for _ in 0..3 {
         silent.push(spawn_accepted_in(&mesh).await);
     }
-    assert_eq!(dropped(&snapshotter, "hello_timeout"), None);
+    assert_eq!(dropped.total("hello_timeout"), None);
 
     all_end_at_the_deadline(&mut silent).await;
 
-    assert_eq!(dropped(&snapshotter, "hello_timeout"), Some(3));
-    assert_eq!(dropped(&snapshotter, "over_cap"), None);
+    assert_eq!(dropped.total("hello_timeout"), Some(3));
+    assert_eq!(dropped.total("over_cap"), None);
     let logged = warnings.taken();
     assert_eq!(
         logged.len(),
@@ -122,7 +136,7 @@ async fn each_connection_closed_at_the_deadline_is_counted_and_the_warning_is_ra
 #[tokio::test]
 async fn an_oversized_first_frame_closes_at_once_and_is_not_a_deadline_close() {
     let recorder = metrics_util::debugging::DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
+    let dropped = Dropped::new(recorder.snapshotter());
     let _metrics = metrics::set_default_local_recorder(&recorder);
     let mut accepted = spawn_accepted(no_tls()).await;
     accepted
@@ -134,7 +148,7 @@ async fn an_oversized_first_frame_closes_at_once_and_is_not_a_deadline_close() {
     ends_at_once(&mut accepted).await;
 
     assert_closed_by_server(&mut accepted).await;
-    assert_eq!(dropped(&snapshotter, "hello_timeout"), None);
+    assert_eq!(dropped.total("hello_timeout"), None);
 }
 
 #[tokio::test]
@@ -212,7 +226,7 @@ async fn a_frame_past_the_hello_limit_is_accepted_after_the_hello_in_one_write()
 #[tokio::test]
 async fn a_non_hello_first_message_closes_the_connection_at_once() {
     let recorder = metrics_util::debugging::DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
+    let dropped = Dropped::new(recorder.snapshotter());
     let _metrics = metrics::set_default_local_recorder(&recorder);
     let mut accepted = spawn_accepted(no_tls()).await;
     let mut both = framed(&Msg::ReqDone);
@@ -230,20 +244,71 @@ async fn a_non_hello_first_message_closes_the_connection_at_once() {
         accepted.inbound.try_recv().is_err(),
         "nothing is forwarded from a connection that did not open with a hello"
     );
-    assert_eq!(dropped(&snapshotter, "hello_timeout"), None);
+    assert_eq!(dropped.total("hello_timeout"), None);
+}
+
+#[tokio::test]
+async fn a_hello_frees_the_slot_while_the_connection_stays_open() {
+    let mut accepted = spawn_accepted(no_tls()).await;
+    assert_eq!(
+        accepted.mesh.admission.in_flight(),
+        1,
+        "waiting for its hello"
+    );
+
+    send_each(&mut accepted.client, &[hello(), invalidate(1)]).await;
+    let delivered = tokio::time::timeout(AT_ONCE, accepted.inbound.recv())
+        .await
+        .expect("the message behind the hello is served")
+        .expect("the inbound channel is open");
+
+    assert_eq!(delivered.msg, invalidate(1));
+    assert_eq!(
+        accepted.mesh.admission.in_flight(),
+        0,
+        "the hello released it"
+    );
+    assert!(!accepted.task.is_finished(), "the link stays open");
+    send_each(&mut accepted.client, &[invalidate(2)]).await;
+    let second = tokio::time::timeout(AT_ONCE, accepted.inbound.recv())
+        .await
+        .expect("the link still serves")
+        .expect("the inbound channel is open");
+    assert_eq!(second.msg, invalidate(2));
+}
+
+#[tokio::test]
+async fn a_non_hello_first_message_frees_the_slot() {
+    let mut accepted = spawn_accepted(no_tls()).await;
+    send_each(&mut accepted.client, &[Msg::ReqDone]).await;
+
+    ends_at_once(&mut accepted).await;
+
+    assert_eq!(accepted.mesh.admission.in_flight(), 0);
+}
+
+#[tokio::test]
+async fn cancel_frees_the_slot_of_a_pending_hello() {
+    let mut accepted = spawn_accepted(no_tls()).await;
+    assert_eq!(accepted.mesh.admission.in_flight(), 1);
+
+    accepted.cancel.cancel();
+
+    ends_at_once(&mut accepted).await;
+    assert_eq!(accepted.mesh.admission.in_flight(), 0);
 }
 
 #[tokio::test]
 async fn cancel_ends_a_pending_hello_without_counting_a_timeout() {
     let recorder = metrics_util::debugging::DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
+    let dropped = Dropped::new(recorder.snapshotter());
     let _metrics = metrics::set_default_local_recorder(&recorder);
     let mut accepted = spawn_accepted(no_tls()).await;
 
     accepted.cancel.cancel();
 
     ends_at_once(&mut accepted).await;
-    assert_eq!(dropped(&snapshotter, "hello_timeout"), None);
+    assert_eq!(dropped.total("hello_timeout"), None);
 }
 
 #[tokio::test]

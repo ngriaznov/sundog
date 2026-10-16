@@ -5,10 +5,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use super::admit::{HELLO_TIMEOUT, accept_backoff, accept_error_backs_off};
+use super::admit::{Admit, HELLO_TIMEOUT, accept_backoff, accept_error_backs_off};
 use super::framing::{
     PeerFramed, disable_nagle, establish_accept, new_framed_pre_hello, recv_msg,
     send_batch_or_cancelled,
@@ -71,6 +71,12 @@ pub(in crate::net) async fn accept_loop(
 /// which grows with the failures in a row and resets on the next accepted
 /// connection, so a process out of descriptors retries at most once a
 /// second. The wait ends when the accept token fires.
+///
+/// A connection from the IP of a current peer's data address is admitted
+/// without limit. At most `MAX_PRE_HELLO_CONNS` connections
+/// from any other source wait for their `Hello` at once, and one that arrives
+/// beyond that is closed as it is accepted, before a handshake or a task
+/// exists.
 pub(super) async fn accept_loop_over<S: ConnSource>(
     mut source: S,
     inbound_tx: mpsc::Sender<InboundMsg>,
@@ -85,10 +91,10 @@ pub(super) async fn accept_loop_over<S: ConnSource>(
             () = cancel.cancelled() => return,
             accepted = source.next_conn() => accepted,
         };
-        let stream = match accepted {
-            Ok((stream, _peer_addr)) => {
+        let (stream, peer_addr) = match accepted {
+            Ok(conn) => {
                 failures = 0;
-                stream
+                conn
             }
             Err(error) => {
                 let retry_in = if accept_error_backs_off(error.kind()) {
@@ -110,12 +116,22 @@ pub(super) async fn accept_loop_over<S: ConnSource>(
                 continue;
             }
         };
+        let pre_hello = match mesh.admission.admit(peer_addr.ip()) {
+            Admit::Known => None,
+            Admit::Waiting(permit) => Some(permit),
+            Admit::OverCap => {
+                mesh.admission.note_over_cap(peer_addr);
+                // `stream` drops: closed before a handshake or a task exists.
+                continue;
+            }
+        };
         disable_nagle(&stream);
         tokio::spawn(handle_accepted(
             stream,
             inbound_tx.clone(),
             Arc::clone(&handler),
             Arc::clone(&mesh),
+            pre_hello,
         ));
     }
 }
@@ -180,6 +196,11 @@ async fn open_link(stream: TcpStream, tls: &TlsCtx) -> Option<OpenedLink> {
 /// the `Hello` decodes a frame is at most `HELLO_MAX_FRAME` bytes (1 KiB);
 /// afterwards it is at most [`MAX_FRAME`].
 ///
+/// `pre_hello` is the slot a connection from an unknown source holds in the
+/// cap on connections waiting for their `Hello`; it is released when the
+/// `Hello` decodes or the handler returns, whichever comes first. A known
+/// source holds none.
+///
 /// Every read and write below races against `mesh`'s accept token, tearing
 /// a slow snapshot or AE reply down promptly on [`crate::net::Mesh::shutdown`].
 /// An `AeDigest` from a peer this node still has replicate frames queued
@@ -191,6 +212,7 @@ pub(super) async fn handle_accepted(
     inbound_tx: mpsc::Sender<InboundMsg>,
     handler: Arc<dyn RequestHandler>,
     mesh: Arc<MeshInner>,
+    pre_hello: Option<OwnedSemaphorePermit>,
 ) {
     let cancel = mesh.accept_cancel.clone();
     let peer_addr = stream.peer_addr().ok();
@@ -212,6 +234,8 @@ pub(super) async fn handle_accepted(
             return;
         }
     };
+    // No longer waiting for its hello: the cap does not count it again.
+    drop(pre_hello);
     // Frames buffered behind the `Hello` decode under the full limit.
     framed.codec_mut().set_max_frame_length(MAX_FRAME);
     // A peer of another cluster dialed an address this node now holds,

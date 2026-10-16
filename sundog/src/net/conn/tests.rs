@@ -1113,6 +1113,7 @@ async fn req_done_and_ae_bucket_after_hello_are_not_served_or_forwarded() {
         inbound_tx,
         handler,
         crate::net::MeshInner::for_tests(no_tls(), cancel.clone()),
+        None,
     ));
 
     let mut client = LengthDelimitedCodec::builder()
@@ -1554,6 +1555,7 @@ async fn handle_accepted_records_a_bucket_ack_that_arrives_after_any_serve_st_bu
         inbound_tx,
         handler,
         Arc::clone(&mesh),
+        None,
     ));
 
     let mut client = LengthDelimitedCodec::builder()

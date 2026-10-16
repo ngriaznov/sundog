@@ -696,3 +696,44 @@ async fn a_forwarded_write_sent_awaiting_into_a_closed_connection_reaches_the_re
         "the only copy of a non-owner's write survives a stale owner link"
     );
 }
+
+#[tokio::test]
+async fn update_peers_keeps_the_ips_of_the_peers_data_addresses_as_known_sources() {
+    let (mesh, _inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+    let ip = |text: &str| -> std::net::IpAddr { text.parse().expect("valid ip") };
+    let at = |node: u64, addr: &str| peer_at(NodeId::from(node), addr.parse().expect("valid addr"));
+    let known = |text: &str| mesh.inner.admission.is_known_source(ip(text));
+    assert!(
+        !known("127.0.0.2"),
+        "a node with no peer table knows no source"
+    );
+
+    mesh.update_peers(vec![
+        at(2, "127.0.0.2:4000"),
+        at(3, "127.0.0.2:4001"),
+        at(4, "127.0.0.3:4000"),
+    ]);
+    assert!(known("127.0.0.2"));
+    assert!(known("127.0.0.3"));
+    assert!(!known("127.0.0.4"));
+
+    mesh.update_peers(vec![at(3, "127.0.0.2:4001"), at(4, "127.0.0.3:4000")]);
+    assert!(
+        known("127.0.0.2"),
+        "another peer still dials from the address a departed peer shared"
+    );
+
+    mesh.update_peers(vec![at(3, "127.0.0.4:4001"), at(4, "127.0.0.3:4000")]);
+    assert!(
+        !known("127.0.0.2"),
+        "a peer that moved leaves its old address"
+    );
+    assert!(known("127.0.0.4"));
+
+    mesh.update_peers(vec![at(1, "127.0.0.9:4000"), at(4, "127.0.0.3:4000")]);
+    assert!(!known("127.0.0.9"), "the node itself is not a peer");
+    assert!(!known("127.0.0.4"));
+
+    mesh.update_peers(Vec::new());
+    assert!(!known("127.0.0.3"), "an empty table knows no source");
+}

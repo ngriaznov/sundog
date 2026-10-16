@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::time::Instant;
 
-use super::{Accepted, dropped, framed, hello, invalidate, peer, spawn_accepted};
+use super::{Accepted, Dropped, framed, hello, invalidate, peer, spawn_accepted};
 use crate::net::conn::admit::HELLO_TIMEOUT;
 use crate::net::conn::framing::{new_framed, send_msg};
 use crate::net::conn::tests::no_tls;
@@ -40,7 +40,7 @@ async fn tls_a_silent_connection_closes_at_the_hello_deadline() {
 #[tokio::test(start_paused = true)]
 async fn tls_a_stalled_client_hello_closes_at_the_hello_deadline() {
     let recorder = metrics_util::debugging::DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
+    let dropped = Dropped::new(recorder.snapshotter());
     let _metrics = metrics::set_default_local_recorder(&recorder);
     let (server_tls, _client_tls) = mesh_tls_pair();
     let mut accepted = spawn_accepted(Some(server_tls)).await;
@@ -58,13 +58,13 @@ async fn tls_a_stalled_client_hello_closes_at_the_hello_deadline() {
         (HELLO_TIMEOUT..HELLO_TIMEOUT + DEADLINE_SLACK).contains(&elapsed),
         "{elapsed:?}"
     );
-    assert_eq!(dropped(&snapshotter, "hello_timeout"), Some(1));
+    assert_eq!(dropped.total("hello_timeout"), Some(1));
 }
 
 #[tokio::test]
 async fn tls_a_finished_handshake_without_a_hello_closes_at_the_hello_deadline() {
     let recorder = metrics_util::debugging::DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
+    let dropped = Dropped::new(recorder.snapshotter());
     let _metrics = metrics::set_default_local_recorder(&recorder);
     let (server_tls, client_tls) = mesh_tls_pair();
     let Accepted {
@@ -86,7 +86,7 @@ async fn tls_a_finished_handshake_without_a_hello_closes_at_the_hello_deadline()
     (&mut task).await.expect("the handler ends");
 
     assert!(started.elapsed() >= HELLO_TIMEOUT);
-    assert_eq!(dropped(&snapshotter, "hello_timeout"), Some(1));
+    assert_eq!(dropped.total("hello_timeout"), Some(1));
 }
 
 #[tokio::test]
@@ -115,9 +115,40 @@ async fn tls_a_hello_over_a_finished_handshake_is_served() {
 }
 
 #[tokio::test]
+async fn tls_the_slot_is_held_through_the_handshake_and_freed_at_the_hello() {
+    let (server_tls, client_tls) = mesh_tls_pair();
+    let Accepted {
+        client,
+        mut inbound,
+        mesh,
+        ..
+    } = spawn_accepted(Some(server_tls)).await;
+    assert_eq!(mesh.admission.in_flight(), 1, "waiting for the handshake");
+
+    let stream = client_tls
+        .connect(client)
+        .await
+        .expect("the handshake completes");
+    let mut link = new_framed(stream);
+    assert_eq!(
+        mesh.admission.in_flight(),
+        1,
+        "the handshake is not a hello"
+    );
+    send_msg(&mut link, &hello()).await.expect("hello");
+    send_msg(&mut link, &invalidate(1)).await.expect("message");
+    tokio::time::timeout(AT_ONCE, inbound.recv())
+        .await
+        .expect("the message behind the hello is served")
+        .expect("the inbound channel is open");
+
+    assert_eq!(mesh.admission.in_flight(), 0, "the hello released the slot");
+}
+
+#[tokio::test]
 async fn tls_a_plaintext_client_is_dropped_at_the_handshake_without_a_timeout_count() {
     let recorder = metrics_util::debugging::DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
+    let dropped = Dropped::new(recorder.snapshotter());
     let _metrics = metrics::set_default_local_recorder(&recorder);
     let (server_tls, _client_tls) = mesh_tls_pair();
     let mut accepted = spawn_accepted(Some(server_tls)).await;
@@ -132,7 +163,7 @@ async fn tls_a_plaintext_client_is_dropped_at_the_handshake_without_a_timeout_co
         .expect("a failed handshake ends the handler at once")
         .expect("the handler does not panic");
 
-    assert_eq!(dropped(&snapshotter, "hello_timeout"), None);
+    assert_eq!(dropped.total("hello_timeout"), None);
     // The node may send a TLS alert before it closes the link.
     let mut alert = Vec::new();
     // EOF and a reset both end the read.
@@ -144,7 +175,7 @@ async fn tls_a_plaintext_client_is_dropped_at_the_handshake_without_a_timeout_co
 #[tokio::test]
 async fn tls_a_client_against_a_plaintext_node_fails_at_once() {
     let recorder = metrics_util::debugging::DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
+    let dropped = Dropped::new(recorder.snapshotter());
     let _metrics = metrics::set_default_local_recorder(&recorder);
     let (_server_tls, client_tls) = mesh_tls_pair();
     let Accepted {
@@ -160,5 +191,5 @@ async fn tls_a_client_against_a_plaintext_node_fails_at_once() {
         .expect("the plaintext node drops the connection at once")
         .expect("the handler does not panic");
 
-    assert_eq!(dropped(&snapshotter, "hello_timeout"), None);
+    assert_eq!(dropped.total("hello_timeout"), None);
 }

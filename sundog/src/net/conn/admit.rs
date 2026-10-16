@@ -1,11 +1,15 @@
-//! Admission of accepted data-plane connections: the deadline on a
-//! connection that has not sent its `Hello`, the wait between failed
+//! Admission of accepted data-plane connections: the deadline and the cap on
+//! connections that have not sent their `Hello`, the wait between failed
 //! accepts, and the counters and rate-limited warnings that report them.
 
+use std::collections::HashSet;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
+
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// How long an accepted connection has, from the moment its handler first
 /// runs, to finish its TLS handshake (on a node that runs TLS) and send a
@@ -16,6 +20,11 @@ use std::time::Duration;
 /// connection and handshake included, after that long, so the acceptor never
 /// cuts a dial that is still waited on.
 pub(crate) const HELLO_TIMEOUT: Duration = crate::net::request::REQUEST_TIMEOUT;
+
+/// How many connections from sources that are not mesh peers wait for their
+/// `Hello` at once. A connection from such a source that arrives with this
+/// many already waiting is closed as it is accepted.
+pub(super) const MAX_PRE_HELLO_CONNS: usize = 512;
 
 /// The wait after the first failed accept in a row.
 const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(5);
@@ -90,17 +99,106 @@ impl WarnLimiter {
     }
 }
 
+/// What the accept loop does with one accepted connection.
+pub(super) enum Admit {
+    /// The source is a mesh peer's address: no slot, and the cap never
+    /// refuses it. The `Hello` deadline and frame limit still apply.
+    Known,
+    /// Any other source with room under the cap: the connection holds
+    /// `permit` until its `Hello` decodes or it closes.
+    Waiting(OwnedSemaphorePermit),
+    /// Any other source with the cap full: closed at once.
+    OverCap,
+}
+
 /// What a mesh keeps to admit the connections its listener accepts.
 pub(in crate::net) struct Admission {
+    /// One permit per connection from an unknown source waiting for its
+    /// `Hello`.
+    gate: Arc<Semaphore>,
+    cap: usize,
+    /// The IPs of the data addresses of the mesh's current peers, kept by
+    /// `Mesh::update_peers`. A peer behind NAT, or whose advertised address
+    /// differs from the one it dials from, is not in it and takes the gate
+    /// like any other source; so does every source before the first peer
+    /// table.
+    known_sources: RwLock<HashSet<IpAddr>>,
+    warn_over_cap: WarnLimiter,
     warn_hello_timeout: WarnLimiter,
     warn_accept_error: WarnLimiter,
 }
 
 impl Admission {
-    pub(in crate::net) const fn new() -> Self {
+    pub(in crate::net) fn new() -> Self {
+        Self::with_cap(MAX_PRE_HELLO_CONNS)
+    }
+
+    pub(in crate::net) fn with_cap(cap: usize) -> Self {
         Self {
+            gate: Arc::new(Semaphore::new(cap)),
+            cap,
+            known_sources: RwLock::new(HashSet::new()),
+            warn_over_cap: WarnLimiter::new(),
             warn_hello_timeout: WarnLimiter::new(),
             warn_accept_error: WarnLimiter::new(),
+        }
+    }
+
+    /// Replaces the set of source addresses the cap never refuses with
+    /// `sources`. An IPv4 address mapped into IPv6 counts as the IPv4
+    /// address, as a dual-stack listener reports it.
+    pub(in crate::net) fn set_known_sources(&self, sources: impl IntoIterator<Item = IpAddr>) {
+        let sources = sources.into_iter().map(|ip| ip.to_canonical()).collect();
+        *self
+            .known_sources
+            .write()
+            .expect("invariant: known_sources lock is never poisoned") = sources;
+    }
+
+    /// Whether `source` is the IP of a current peer's data address.
+    pub(in crate::net) fn is_known_source(&self, source: IpAddr) -> bool {
+        self.known_sources
+            .read()
+            .expect("invariant: known_sources lock is never poisoned")
+            .contains(&source.to_canonical())
+    }
+
+    /// Decides the fate of a connection accepted from `source`.
+    pub(super) fn admit(&self, source: IpAddr) -> Admit {
+        if self.is_known_source(source) {
+            return Admit::Known;
+        }
+        match Arc::clone(&self.gate).try_acquire_owned() {
+            Ok(permit) => Admit::Waiting(permit),
+            Err(_no_permits) => Admit::OverCap,
+        }
+    }
+
+    /// The connections from unknown sources waiting for their `Hello`.
+    #[cfg(test)]
+    pub(in crate::net) fn in_flight(&self) -> usize {
+        self.cap - self.gate.available_permits()
+    }
+
+    #[cfg(test)]
+    pub(in crate::net) const fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// Counts a connection closed because the cap was full in
+    /// `sundog_accept_dropped_total{reason="over_cap"}` and warns about it at
+    /// most once a minute.
+    pub(super) fn note_over_cap(&self, peer: SocketAddr) {
+        metrics::counter!("sundog_accept_dropped_total", "reason" => "over_cap").increment(1);
+        if self.warn_over_cap.claim(crate::net::mono_ms()) {
+            tracing::warn!(
+                %peer,
+                cap = self.cap,
+                "closed a data-plane connection: the cap on connections from unknown sources \
+                 that wait for their hello is full; the data-plane port is for cluster \
+                 members only, and sundog_accept_dropped_total{{reason=\"over_cap\"}} counts \
+                 every such close"
+            );
         }
     }
 
@@ -149,6 +247,7 @@ impl Admission {
 #[cfg(test)]
 mod tests {
     use std::io::ErrorKind;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::Arc;
 
     use super::*;
@@ -182,6 +281,166 @@ mod tests {
             assert!(wait <= ACCEPT_BACKOFF_MAX, "at most the maximum");
             previous = wait;
         }
+    }
+
+    fn ip(last: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, last))
+    }
+
+    /// The permit of an admission that must wait under the cap.
+    fn waiting(admission: &Admission, source: IpAddr) -> OwnedSemaphorePermit {
+        match admission.admit(source) {
+            Admit::Waiting(permit) => permit,
+            Admit::Known => panic!("{source} is not a known source"),
+            Admit::OverCap => panic!("{source} is refused under the cap"),
+        }
+    }
+
+    #[test]
+    fn the_cap_is_512_connections_from_unknown_sources() {
+        assert_eq!(MAX_PRE_HELLO_CONNS, 512);
+        let admission = Admission::new();
+        assert_eq!(admission.cap(), 512);
+        assert_eq!(admission.in_flight(), 0);
+    }
+
+    #[test]
+    fn unknown_sources_are_admitted_up_to_the_cap_and_the_next_is_refused() {
+        let admission = Admission::with_cap(3);
+        let permits: Vec<_> = (0..3).map(|n| waiting(&admission, ip(n))).collect();
+        assert_eq!(admission.in_flight(), 3);
+        assert!(matches!(admission.admit(ip(9)), Admit::OverCap));
+        assert!(matches!(admission.admit(ip(0)), Admit::OverCap));
+        assert_eq!(admission.in_flight(), 3, "a refusal takes no slot");
+        drop(permits);
+        assert_eq!(admission.in_flight(), 0);
+    }
+
+    #[test]
+    fn a_dropped_permit_frees_its_slot_for_the_next_connection() {
+        let admission = Admission::with_cap(1);
+        let first = waiting(&admission, ip(1));
+        assert!(matches!(admission.admit(ip(2)), Admit::OverCap));
+        drop(first);
+        let _second = waiting(&admission, ip(2));
+        assert_eq!(admission.in_flight(), 1);
+    }
+
+    #[test]
+    fn a_cap_of_zero_admits_no_unknown_source() {
+        let admission = Admission::with_cap(0);
+        assert!(matches!(admission.admit(ip(1)), Admit::OverCap));
+        admission.set_known_sources([ip(1)]);
+        assert!(matches!(admission.admit(ip(1)), Admit::Known));
+    }
+
+    #[test]
+    fn a_known_source_takes_no_slot_and_is_admitted_with_the_gate_full() {
+        let admission = Admission::with_cap(2);
+        admission.set_known_sources([ip(7)]);
+        let _held: Vec<_> = (0..2).map(|n| waiting(&admission, ip(n))).collect();
+        assert!(matches!(admission.admit(ip(9)), Admit::OverCap));
+
+        for _ in 0..10 {
+            assert!(matches!(admission.admit(ip(7)), Admit::Known));
+        }
+        assert_eq!(admission.in_flight(), 2, "a known source holds no slot");
+    }
+
+    #[test]
+    fn every_source_takes_the_general_gate_until_a_peer_is_known() {
+        let admission = Admission::with_cap(1);
+        assert!(!admission.is_known_source(ip(1)));
+        let _held = waiting(&admission, ip(1));
+        assert!(matches!(admission.admit(ip(1)), Admit::OverCap));
+    }
+
+    #[test]
+    fn setting_the_known_sources_replaces_the_set() {
+        let admission = Admission::with_cap(1);
+        admission.set_known_sources([ip(1), ip(2)]);
+        assert!(admission.is_known_source(ip(1)));
+        assert!(admission.is_known_source(ip(2)));
+        admission.set_known_sources([ip(2), ip(3)]);
+        assert!(
+            !admission.is_known_source(ip(1)),
+            "a departed peer is dropped"
+        );
+        assert!(admission.is_known_source(ip(2)));
+        assert!(admission.is_known_source(ip(3)));
+        admission.set_known_sources([]);
+        assert!(!admission.is_known_source(ip(2)));
+    }
+
+    #[test]
+    fn an_ipv4_address_mapped_into_ipv6_matches_its_ipv4_peer() {
+        let admission = Admission::with_cap(1);
+        let mapped = IpAddr::V6(Ipv4Addr::new(10, 0, 0, 1).to_ipv6_mapped());
+        admission.set_known_sources([ip(1)]);
+        assert!(admission.is_known_source(mapped));
+        admission.set_known_sources([mapped]);
+        assert!(admission.is_known_source(ip(1)));
+        assert!(!admission.is_known_source(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn racing_connections_never_exceed_the_cap() {
+        let admission = Arc::new(Admission::with_cap(64));
+        let permits: Vec<OwnedSemaphorePermit> = (0..8)
+            .map(|_| {
+                let admission = Arc::clone(&admission);
+                std::thread::spawn(move || {
+                    (0..1_000u32)
+                        .filter_map(|n| {
+                            match admission.admit(ip(u8::try_from(n % 200).expect("under 200"))) {
+                                Admit::Waiting(permit) => Some(permit),
+                                Admit::Known | Admit::OverCap => None,
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flat_map(|thread| thread.join().expect("the thread does not panic"))
+            .collect();
+        assert_eq!(permits.len(), 64);
+        assert_eq!(admission.in_flight(), 64);
+    }
+
+    #[test]
+    fn over_cap_closes_are_counted_by_reason() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let admission = Admission::with_cap(1);
+        let peer: SocketAddr = "10.0.0.1:4000".parse().expect("valid addr");
+
+        admission.note_over_cap(peer);
+        admission.note_over_cap(peer);
+        admission.note_hello_timeout(Some(peer));
+
+        // One snapshot: reading resets the counters it reads.
+        let counted: std::collections::HashMap<String, metrics_util::debugging::DebugValue> =
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .filter(|(key, ..)| key.key().name() == "sundog_accept_dropped_total")
+                .filter_map(|(key, _, _, value)| {
+                    let reason = key.key().labels().find(|l| l.key() == "reason")?;
+                    Some((reason.value().to_owned(), value))
+                })
+                .collect();
+        assert_eq!(
+            counted["over_cap"],
+            metrics_util::debugging::DebugValue::Counter(2)
+        );
+        assert_eq!(
+            counted["hello_timeout"],
+            metrics_util::debugging::DebugValue::Counter(1)
+        );
+        assert_eq!(counted.len(), 2, "no other reason: {:?}", counted.keys());
     }
 
     #[test]

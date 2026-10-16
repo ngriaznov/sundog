@@ -15,7 +15,9 @@
 //! A connection must send a complete `Hello`, after its TLS handshake when
 //! the node runs TLS, within `HELLO_TIMEOUT` (10 seconds) of the moment its
 //! handler first runs, or the node closes it. Until the `Hello` decodes, a
-//! frame is at most 1 KiB.
+//! frame is at most 1 KiB. At most 512 connections from addresses that are
+//! not a peer's wait for their `Hello` at once; the node closes any further
+//! one as it accepts it.
 //!
 //! A failed accept on the listener is retried after 5 milliseconds, doubling to
 //! one second while failures continue; a connection reset or aborted before
@@ -337,6 +339,26 @@ impl MeshInner {
     /// `handle_accepted` over a raw accepted stream.
     #[cfg(all(test, not(feature = "sim")))]
     pub(super) fn for_tests(tls: TlsCtx, accept_cancel: CancellationToken) -> Arc<Self> {
+        Self::for_tests_admitting(tls, accept_cancel, conn::Admission::new())
+    }
+
+    /// [`MeshInner::for_tests`] with `cap` connections from unknown sources
+    /// allowed to wait for their `Hello`.
+    #[cfg(all(test, not(feature = "sim")))]
+    pub(super) fn for_tests_with_cap(
+        tls: TlsCtx,
+        accept_cancel: CancellationToken,
+        cap: usize,
+    ) -> Arc<Self> {
+        Self::for_tests_admitting(tls, accept_cancel, conn::Admission::with_cap(cap))
+    }
+
+    #[cfg(all(test, not(feature = "sim")))]
+    fn for_tests_admitting(
+        tls: TlsCtx,
+        accept_cancel: CancellationToken,
+        admission: conn::Admission,
+    ) -> Arc<Self> {
         Arc::new(Self {
             node: NodeId::from(1),
             incarnation: 1,
@@ -345,7 +367,7 @@ impl MeshInner {
             peers: RwLock::new(HashMap::new()),
             accept_cancel,
             tls,
-            admission: conn::Admission::new(),
+            admission,
             acked_buckets: RwLock::new(HashMap::new()),
         })
     }

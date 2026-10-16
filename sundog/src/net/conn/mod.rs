@@ -5,8 +5,8 @@
 //! - `accept`: the accept loop, the `Hello` handshake and per-connection
 //!   dispatch.
 //! - `admit`: the admission of accepted connections: the `Hello` deadline,
-//!   the wait between failed accepts and the counters and warnings that
-//!   report them.
+//!   the cap on connections waiting for their `Hello`, the wait between
+//!   failed accepts and the counters and warnings that report them.
 //! - `framing`: framed IO primitives and TLS layering.
 //! - `pool`: the per-peer request connection pool and reuse probe.
 //! - `reply`: requester-side reply readers and lazy streams.

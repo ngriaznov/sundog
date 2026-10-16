@@ -119,7 +119,9 @@ impl Mesh {
 
     /// Refreshes the set of peers the mesh dials and fans traffic out to:
     /// spawns a writer for each newly seen peer, cancels it for any that
-    /// departed or changed `data_addr`. Called on every
+    /// departed or changed `data_addr`. The IPs of the peers' data addresses
+    /// are the sources the cap on connections waiting for their `Hello`
+    /// never refuses. Called on every
     /// [`crate::membership::Membership::peers`] change.
     ///
     /// # Panics
@@ -167,6 +169,9 @@ impl Mesh {
                 self.spawn_peer_handle(peer.node, peer.data_addr, peer.protocol)
             });
         }
+        self.inner
+            .admission
+            .set_known_sources(table.values().map(|handle| handle.data_addr.ip()));
     }
 
     fn spawn_peer_handle(&self, peer: NodeId, data_addr: SocketAddr, protocol: u16) -> PeerHandle {

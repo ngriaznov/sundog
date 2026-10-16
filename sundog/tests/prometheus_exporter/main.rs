@@ -222,6 +222,16 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         Some(2.0),
         "expected two connections closed at the hello deadline; got body:\n{body}"
     );
+    // The cap never fills here, and a path never taken exports no series.
+    assert_eq!(
+        scraped_metric_value(
+            &body,
+            "sundog_accept_dropped_total",
+            &[("reason", "over_cap")]
+        ),
+        None,
+        "no connection was refused over the cap; got body:\n{body}"
+    );
 
     // sundog_tombstones: pinned by tombstone_pin_metrics, two deletes and one
     // swept expired entry (the wait above), beside two live entries that
