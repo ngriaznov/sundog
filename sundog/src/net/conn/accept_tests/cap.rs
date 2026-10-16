@@ -265,35 +265,46 @@ async fn a_known_source_is_admitted_while_the_gate_is_full() {
 
 #[tokio::test]
 async fn a_storm_of_clients_below_the_cap_is_fully_served() {
+    /// The clients that connect, send and drain together. A wave closes
+    /// before the next opens, so the test holds descriptors for one wave on
+    /// each end, not for all the clients: a platform whose default descriptor
+    /// limit is small runs the rest of the suite beside it.
+    const WAVE: u64 = 16;
     const CLIENTS: u64 = 64;
     let recorder = metrics_util::debugging::DebuggingRecorder::new();
     let dropped = Dropped::new(recorder.snapshotter());
     let _metrics = metrics::set_default_local_recorder(&recorder);
     let mut node = node_with_cap(crate::net::conn::admit::MAX_PRE_HELLO_CONNS).await;
 
-    let mut clients = Vec::new();
-    for id in 0..CLIENTS {
-        let mut client = node.connect().await;
-        let greeting = Msg::Hello {
-            node: NodeId::from(id),
-            incarnation: 1,
-            protocol: wire::PROTOCOL_VERSION,
-            cluster: wire::UNNAMED_CLUSTER,
-        };
-        let mut both = framed(&greeting);
-        both.extend(framed(&invalidate(0)));
-        client.write_all(&both).await.expect("hello and a message");
-        clients.push(client);
+    let mut senders = std::collections::BTreeSet::new();
+    for wave in 0..CLIENTS / WAVE {
+        let mut clients = Vec::new();
+        for id in wave * WAVE..(wave + 1) * WAVE {
+            let mut client = node.connect().await;
+            let greeting = Msg::Hello {
+                node: NodeId::from(id),
+                incarnation: 1,
+                protocol: wire::PROTOCOL_VERSION,
+                cluster: wire::UNNAMED_CLUSTER,
+            };
+            let mut both = framed(&greeting);
+            both.extend(framed(&invalidate(0)));
+            client.write_all(&both).await.expect("hello and a message");
+            clients.push(client);
+        }
+        for _ in 0..WAVE {
+            senders.insert(node.next().await.from);
+        }
+        node.wait_in_flight(0).await;
+        drop(clients);
     }
 
-    let mut senders = std::collections::BTreeSet::new();
-    for _ in 0..CLIENTS {
-        senders.insert(node.next().await.from);
-    }
-    assert_eq!(senders.len(), 64, "every client's message arrived");
-    node.wait_in_flight(0).await;
+    assert_eq!(
+        u64::try_from(senders.len()),
+        Ok(CLIENTS),
+        "every client's message arrived"
+    );
     assert_eq!(dropped.total("over_cap"), None);
-    drop(clients);
     node.stop().await;
 }
 

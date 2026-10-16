@@ -11,7 +11,10 @@ use crate::cluster::test_support::wait_until;
 use crate::net::HELLO_TIMEOUT;
 
 /// How many silent and how many partial connections each node's port holds.
-const HELD_PER_KIND: usize = 8;
+/// A few of each show that neither kind blocks the nodes' links, and keep the
+/// descriptors the test holds, on both ends, few beside the suite's other
+/// tests.
+const HELD_PER_KIND: usize = 2;
 
 /// Opens `HELD_PER_KIND` connections to `addr` that send nothing and as many
 /// that send two bytes of a length prefix, and keeps them open.
