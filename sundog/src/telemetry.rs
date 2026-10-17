@@ -15,14 +15,17 @@
 //!
 //! The listener answers `GET` and `HEAD` for `/metrics`, `/readyz`,
 //! `/healthz` and its `/health` alias, and ignores a query string. `HEAD`
-//! answers with the headers of the `GET` and no body, any other method gets
-//! `405 Method Not Allowed` with `Allow: GET, HEAD`, and any other path gets
-//! `404 Not Found`. A client has `REQUEST_TIMEOUT` (5 seconds) to send its
-//! request head, the request line and the headers, which is at most
-//! `MAX_REQUEST_HEAD` (8 KiB): a head that has not arrived in time is closed
-//! without a response, and a longer or malformed one gets `400 Bad Request`.
-//! At most `MAX_CONNECTIONS` (64) connections are served at once, and a
-//! connection over that is closed at once.
+//! answers with the headers of the `GET` and no body, and any other method on
+//! those paths gets `405 Method Not Allowed` with `Allow: GET, HEAD`. Any
+//! other path gets `404 Not Found`, whatever the method. A client has
+//! `REQUEST_TIMEOUT` (5 seconds) for the whole exchange: to send its request
+//! head, the request line and the headers, of at most `MAX_REQUEST_HEAD`
+//! (8 KiB), and to take the response. A connection that has not finished by
+//! then is closed, and a head that has not arrived gets no response. A head
+//! over the size limit, or a request line that is not `METHOD target
+//! HTTP/version`, gets `400 Bad Request`. At most `MAX_CONNECTIONS` (64)
+//! connections are served at once, and a connection over that is closed at
+//! once.
 //!
 //! Both install the same recorder: each of [`DURATION_HISTOGRAMS`] renders
 //! as Prometheus histogram buckets from [`LATENCY_BUCKETS`], which aggregate
@@ -104,8 +107,9 @@ pub(crate) trait ReadinessSource: Send + Sync + 'static {
     fn is_ready(&self) -> bool;
 }
 
-/// How long a client has to send its whole request head, request line and
-/// headers, once it connects.
+/// How long a client has to complete one request once it connects: send its
+/// whole request head, request line and headers, and take the response. The
+/// listener closes a connection that has not finished by then.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The most bytes of request line and headers the listener reads. A head
@@ -119,16 +123,27 @@ pub(crate) const MAX_CONNECTIONS: usize = 64;
 /// The methods a known path answers, as the `Allow` header of a `405`.
 const ALLOWED_METHODS: &str = "GET, HEAD";
 
-/// The bounds `serve` enforces. `install_listener` passes `REQUEST_TIMEOUT`,
-/// `MAX_REQUEST_HEAD` and `MAX_CONNECTIONS`; the tests pass smaller ones.
+/// The bounds `serve` enforces. `install_listener` passes `Limits::SERVED`;
+/// the tests pass smaller ones.
 #[derive(Clone, Copy, Debug)]
 struct Limits {
-    /// How long a client has to send its whole request head.
+    /// How long a client has to complete its exchange: send its whole request
+    /// head and take the response.
     request_timeout: Duration,
     /// The most bytes of request line and headers read from a client.
     max_request_head: usize,
     /// The most connections served at once.
     max_connections: usize,
+}
+
+impl Limits {
+    /// `REQUEST_TIMEOUT`, `MAX_REQUEST_HEAD` and `MAX_CONNECTIONS`: the bounds
+    /// the listener runs under.
+    const SERVED: Self = Self {
+        request_timeout: REQUEST_TIMEOUT,
+        max_request_head: MAX_REQUEST_HEAD,
+        max_connections: MAX_CONNECTIONS,
+    };
 }
 
 /// Installs a Prometheus recorder and serves `GET` and `HEAD` for
@@ -153,13 +168,8 @@ pub(crate) fn install_listener(
         .map_err(|error| BuildError::FailedToCreateHTTPListener(error.to_string()))?;
     let listener = TcpListener::from_std(std_listener)
         .map_err(|error| BuildError::FailedToCreateHTTPListener(error.to_string()))?;
-    let limits = Limits {
-        request_timeout: REQUEST_TIMEOUT,
-        max_request_head: MAX_REQUEST_HEAD,
-        max_connections: MAX_CONNECTIONS,
-    };
     tokio::spawn(upkeep(handle.clone()));
-    tokio::spawn(serve(listener, handle, readiness, limits));
+    tokio::spawn(serve(listener, handle, readiness, Limits::SERVED));
     Ok(())
 }
 
@@ -177,7 +187,8 @@ const UPKEEP_INTERVAL: Duration = Duration::from_secs(5);
 /// Accepts connections on `listener` forever, answering each on its own task.
 /// A connection that arrives while `limits.max_connections` are being served
 /// is dropped before anything is read from it. A connection's slot is held by
-/// its task until the connection is closed.
+/// its task until the connection is closed, at the latest
+/// `limits.request_timeout` after it arrives.
 async fn serve(
     listener: TcpListener,
     handle: PrometheusHandle,
@@ -209,22 +220,34 @@ async fn serve(
     }
 }
 
-/// Answers one request on `stream`, then closes it. The request head must
-/// arrive within `limits.request_timeout`: a head that has not, or that the
-/// client abandons, is closed without a response, and a head over
-/// `limits.max_request_head` or with a malformed request line gets `400`.
+/// Answers one request on `stream`, then closes it. The whole exchange, the
+/// request head and the response, must finish within `limits.request_timeout`:
+/// a connection that has not is closed, with no response if the head had not
+/// arrived. A head the client abandons is closed without a response, and a head
+/// over `limits.max_request_head` or with a malformed request line gets `400`.
 async fn respond(
     mut stream: TcpStream,
     handle: &PrometheusHandle,
     readiness: &dyn ReadinessSource,
     limits: Limits,
 ) -> io::Result<()> {
-    let head = tokio::time::timeout(
+    tokio::time::timeout(
         limits.request_timeout,
-        read_head(&mut stream, limits.max_request_head),
+        answer(&mut stream, handle, readiness, limits.max_request_head),
     )
     .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "request head not received in time"))??;
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "request not finished in time"))?
+}
+
+/// Reads one request head from `stream` and writes the response to it. The
+/// caller bounds the time.
+async fn answer(
+    stream: &mut TcpStream,
+    handle: &PrometheusHandle,
+    readiness: &dyn ReadinessSource,
+    max_request_head: usize,
+) -> io::Result<()> {
+    let head = read_head(&mut *stream, max_request_head).await?;
     let reply = match head {
         Head::Complete(line) => match parse_request_line(&line) {
             Some((method, target)) => {
@@ -243,18 +266,20 @@ async fn respond(
 #[derive(Debug, PartialEq, Eq)]
 enum Head {
     /// The request line of a head that ended at its empty line, or at the
-    /// client closing its sending side after the request line.
+    /// client closing its sending side after the request line, even inside a
+    /// header line.
     Complete(Vec<u8>),
     /// The head ran past the byte limit without ending.
     TooLong,
-    /// The client closed its sending side before the request line ended.
+    /// The client closed its sending side before the request line ended, or
+    /// before it sent anything.
     Incomplete,
 }
 
 /// Reads a request head from `stream` line by line, up to and including the
 /// empty line that ends it, and reads no more than `max` bytes. A client that
-/// closes its sending side after the request line ends the head as well. The
-/// caller bounds the time.
+/// closes its sending side after the request line, even inside a header line,
+/// ends the head as well. The caller bounds the time.
 async fn read_head<R: AsyncRead + Unpin>(stream: R, max: usize) -> io::Result<Head> {
     let limit = u64::try_from(max).unwrap_or(u64::MAX);
     let mut reader = BufReader::new(stream.take(limit));
@@ -266,12 +291,10 @@ async fn read_head<R: AsyncRead + Unpin>(stream: R, max: usize) -> io::Result<He
         if line.last() != Some(&b'\n') {
             // The reader ended inside a line, or between two: the limit ran
             // out with the head unfinished, or the client closed.
-            return Ok(if reader.get_ref().limit() == 0 {
-                Head::TooLong
-            } else if let (true, Some(request_line)) = (line.is_empty(), request_line) {
-                Head::Complete(request_line)
-            } else {
-                Head::Incomplete
+            return Ok(match request_line {
+                _ if reader.get_ref().limit() == 0 => Head::TooLong,
+                Some(request_line) => Head::Complete(request_line),
+                None => Head::Incomplete,
             });
         }
         let content = trim_line_end(&line);
@@ -437,6 +460,7 @@ pub fn prometheus_handle() -> Result<PrometheusHandle, BuildError> {
 mod tests {
     use super::*;
     use std::time::Instant;
+    use tokio::net::TcpSocket;
 
     #[test]
     fn latency_buckets_rise_from_a_microsecond_to_ten_seconds() {
@@ -534,6 +558,10 @@ mod tests {
     /// hanging it.
     const GUARD: Duration = Duration::from_secs(5);
 
+    /// The size of the `/metrics` body of the tests that need a response
+    /// larger than the socket buffers on both ends.
+    const LARGE_METRICS: usize = 8 * 1024 * 1024;
+
     /// The request timeout of the tests that watch a deadline pass.
     const SHORT: Duration = Duration::from_millis(300);
 
@@ -541,20 +569,15 @@ mod tests {
     /// deadline less the slack of the timer and the clock reads.
     const SHORT_FLOOR: Duration = Duration::from_millis(250);
 
-    /// The limits `install_listener` uses.
-    const DEFAULT_LIMITS: Limits = Limits {
-        request_timeout: REQUEST_TIMEOUT,
-        max_request_head: MAX_REQUEST_HEAD,
-        max_connections: MAX_CONNECTIONS,
-    };
-
     /// Serves on a free loopback port under `limits`. `GET /metrics` renders
-    /// one counter, and `/readyz` reports `ready`.
-    async fn start_listener(limits: Limits, ready: bool) -> SocketAddr {
+    /// what `record` records, and `/readyz` reports `ready`.
+    async fn start_listener_recording(
+        limits: Limits,
+        ready: bool,
+        record: impl FnOnce(),
+    ) -> SocketAddr {
         let recorder = builder().build_recorder();
-        metrics::with_local_recorder(&recorder, || {
-            metrics::counter!("telemetry_test_requests_total").increment(1);
-        });
+        metrics::with_local_recorder(&recorder, record);
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         tokio::spawn(serve(
@@ -564,6 +587,15 @@ mod tests {
             limits,
         ));
         addr
+    }
+
+    /// Serves on a free loopback port under `limits`. `GET /metrics` renders
+    /// one counter, and `/readyz` reports `ready`.
+    async fn start_listener(limits: Limits, ready: bool) -> SocketAddr {
+        start_listener_recording(limits, ready, || {
+            metrics::counter!("telemetry_test_requests_total").increment(1);
+        })
+        .await
     }
 
     /// What a client saw before the server closed the connection.
@@ -634,7 +666,7 @@ mod tests {
 
     /// One `GET` of `path` on a listener under the default limits.
     async fn get_once(path: &str) -> Seen {
-        let addr = start_listener(DEFAULT_LIMITS, true).await;
+        let addr = start_listener(Limits::SERVED, true).await;
         exchange(addr, &[&format!("GET {path} HTTP/1.1\r\n\r\n")]).await
     }
 
@@ -643,6 +675,10 @@ mod tests {
         assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(5));
         assert_eq!(MAX_REQUEST_HEAD, 8192);
         assert_eq!(MAX_CONNECTIONS, 64);
+        let served = Limits::SERVED;
+        assert_eq!(served.request_timeout, Duration::from_secs(5));
+        assert_eq!(served.max_request_head, 8192);
+        assert_eq!(served.max_connections, 64);
     }
 
     #[test]
@@ -741,12 +777,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_head_report_covers_complete_over_long_and_abandoned_heads() {
+    async fn a_head_report_covers_complete_and_abandoned_heads() {
         fn complete(line: &str) -> Head {
             Head::Complete(line.as_bytes().to_vec())
         }
         let line = "GET /metrics HTTP/1.1";
-        let table: [(&[u8], Head); 12] = [
+        let table: [(&[u8], Head); 13] = [
             (b"GET /metrics HTTP/1.1\r\n\r\n", complete(line)),
             (b"GET /metrics HTTP/1.1\n\n", complete(line)),
             (
@@ -758,12 +794,14 @@ mod tests {
                 b"GET /metrics HTTP/1.1\r\n\r\nGET /x HTTP/1.1\r\n\r\n",
                 complete(line),
             ),
-            // The client closed after the request line, or after a header.
+            // The client closed after the request line, after a header, or
+            // inside a header.
             (b"GET /metrics HTTP/1.1\r\n", complete(line)),
             (b"GET /metrics HTTP/1.1\r\nHost: a\r\n", complete(line)),
-            // The client closed inside a line, or before one.
+            (b"GET /metrics HTTP/1.1\r\nHost: a", complete(line)),
+            // The client closed inside the request line, or before it.
             (b"GET /metrics HTT", Head::Incomplete),
-            (b"GET /metrics HTTP/1.1\r\nHost: a", Head::Incomplete),
+            (b"GET /metrics HTTP/1.1", Head::Incomplete),
             (b"", Head::Incomplete),
             // An empty first line is a request line with nothing in it.
             (b"\r\n\r\n", complete("")),
@@ -844,7 +882,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_line_split_across_writes_is_served() {
-        let addr = start_listener(DEFAULT_LIMITS, true).await;
+        let addr = start_listener(Limits::SERVED, true).await;
         let seen = exchange(addr, &["GET /rea", "dyz HTTP/1.1\r\n\r\n"]).await;
         assert!(seen.text.starts_with("HTTP/1.1 200 OK"), "{}", seen.text);
         assert_eq!(seen.body(), "ready\n");
@@ -852,7 +890,7 @@ mod tests {
 
     #[tokio::test]
     async fn headers_split_across_writes_are_served() {
-        let addr = start_listener(DEFAULT_LIMITS, true).await;
+        let addr = start_listener(Limits::SERVED, true).await;
         let seen = exchange(
             addr,
             &[
@@ -870,7 +908,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_post_to_a_known_path_is_refused() {
-        let addr = start_listener(DEFAULT_LIMITS, true).await;
+        let addr = start_listener(Limits::SERVED, true).await;
         for path in ["/metrics", "/readyz", "/healthz", "/health"] {
             let seen = exchange(addr, &[&format!("POST {path} HTTP/1.1\r\n\r\n")]).await;
             assert!(
@@ -887,7 +925,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_path_is_not_found_whatever_the_method() {
-        let addr = start_listener(DEFAULT_LIMITS, true).await;
+        let addr = start_listener(Limits::SERVED, true).await;
         for method in ["GET", "HEAD", "POST"] {
             let seen = exchange(addr, &[&format!("{method} /nope HTTP/1.1\r\n\r\n")]).await;
             assert!(
@@ -901,7 +939,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_head_request_has_the_headers_of_a_get_and_no_body() {
-        let addr = start_listener(DEFAULT_LIMITS, true).await;
+        let addr = start_listener(Limits::SERVED, true).await;
         for path in ["/healthz", "/health", "/readyz", "/metrics"] {
             let get = exchange(addr, &[&format!("GET {path} HTTP/1.1\r\n\r\n")]).await;
             let head = exchange(addr, &[&format!("HEAD {path} HTTP/1.1\r\n\r\n")]).await;
@@ -923,7 +961,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_node_that_is_not_ready_answers_503_to_get_and_head() {
-        let addr = start_listener(DEFAULT_LIMITS, false).await;
+        let addr = start_listener(Limits::SERVED, false).await;
         let get = exchange(addr, &["GET /readyz HTTP/1.1\r\n\r\n"]).await;
         assert!(
             get.text.starts_with("HTTP/1.1 503 Service Unavailable"),
@@ -940,7 +978,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_client_closing_after_the_request_line_still_gets_an_answer() {
-        let addr = start_listener(DEFAULT_LIMITS, true).await;
+        let addr = start_listener(Limits::SERVED, true).await;
         let (mut stream, started) = send(addr, &["GET /healthz HTTP/1.0\r\n"]).await;
         stream.shutdown().await.expect("half close");
         let seen = read_until_closed(stream, started).await;
@@ -950,7 +988,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_malformed_request_line_gets_400() {
-        let addr = start_listener(DEFAULT_LIMITS, true).await;
+        let addr = start_listener(Limits::SERVED, true).await;
         for request in [
             "GARBAGE\r\n\r\n",
             "GET /metrics\r\n\r\n",
@@ -973,7 +1011,7 @@ mod tests {
         let addr = start_listener(
             Limits {
                 request_timeout: SHORT,
-                ..DEFAULT_LIMITS
+                ..Limits::SERVED
             },
             true,
         )
@@ -991,7 +1029,7 @@ mod tests {
         let addr = start_listener(
             Limits {
                 request_timeout: SHORT,
-                ..DEFAULT_LIMITS
+                ..Limits::SERVED
             },
             true,
         )
@@ -1011,7 +1049,7 @@ mod tests {
         let addr = start_listener(
             Limits {
                 request_timeout: SHORT,
-                ..DEFAULT_LIMITS
+                ..Limits::SERVED
             },
             true,
         )
@@ -1053,7 +1091,7 @@ mod tests {
     async fn a_head_over_the_limit_gets_400() {
         let limits = Limits {
             max_request_head: 256,
-            ..DEFAULT_LIMITS
+            ..Limits::SERVED
         };
         let addr = start_listener(limits, true).await;
         // Exactly the limit, unfinished: the server has read all of it.
@@ -1074,7 +1112,7 @@ mod tests {
     async fn a_head_of_exactly_the_limit_is_served() {
         let limits = Limits {
             max_request_head: 256,
-            ..DEFAULT_LIMITS
+            ..Limits::SERVED
         };
         let addr = start_listener(limits, true).await;
         let mut request = String::from("GET /healthz HTTP/1.1\r\nX-Pad: ");
@@ -1092,7 +1130,7 @@ mod tests {
         let limits = Limits {
             request_timeout: timeout,
             max_connections: 2,
-            ..DEFAULT_LIMITS
+            ..Limits::SERVED
         };
         let addr = start_listener(limits, true).await;
         // Two idle connections hold both slots until their deadline.
@@ -1126,10 +1164,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_client_that_does_not_read_its_response_loses_its_slot_at_the_deadline() {
+        let limits = Limits {
+            request_timeout: SHORT,
+            max_connections: 1,
+            ..Limits::SERVED
+        };
+        let addr = start_listener_recording(limits, true, || {
+            metrics::counter!("telemetry_test_padded_total", "padding" => "x".repeat(LARGE_METRICS))
+                .increment(1);
+        })
+        .await;
+        // A small receive buffer on the client: the response outgrows it and
+        // the listener's send buffer, so the listener cannot finish writing.
+        let socket = TcpSocket::new_v4().expect("socket");
+        socket.set_recv_buffer_size(4096).expect("receive buffer");
+        let started = Instant::now();
+        let mut stream = socket.connect(addr).await.expect("connect");
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\n\r\n")
+            .await
+            .expect("write");
+        // The client never reads, and keeps the stream until the test ends.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let over_the_cap = exchange(addr, &["GET /healthz HTTP/1.1\r\n\r\n"]).await;
+        assert_eq!(
+            over_the_cap.text, "",
+            "the unread response holds the only slot, or the metrics fit the socket buffers"
+        );
+        let mut served_at = None;
+        while started.elapsed() < GUARD {
+            let seen = exchange(addr, &["GET /healthz HTTP/1.1\r\n\r\n"]).await;
+            if seen.text.starts_with("HTTP/1.1 200 OK") {
+                served_at = Some(started.elapsed());
+                break;
+            }
+        }
+        let served_at = served_at.expect("the unread response held the slot past the deadline");
+        assert!(
+            served_at >= SHORT_FLOOR,
+            "the slot freed after {served_at:?}, before the {SHORT:?} deadline"
+        );
+    }
+
+    #[tokio::test]
     async fn a_finished_request_frees_its_slot() {
         let limits = Limits {
             max_connections: 1,
-            ..DEFAULT_LIMITS
+            ..Limits::SERVED
         };
         let addr = start_listener(limits, true).await;
         for round in 0..5 {

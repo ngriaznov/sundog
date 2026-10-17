@@ -44,13 +44,16 @@ All notable changes to this project are documented in this file. Format follows
   its segments arrive, and routes on the path without its query string. It
   answers `GET` and `HEAD` for `/metrics`, `/readyz`, `/healthz` and
   `/health`, and a `HEAD` gets the headers of the `GET` and no body. A method
-  other than `GET` or `HEAD` now gets `405 Method Not Allowed` with
-  `Allow: GET, HEAD` instead of `200`. A client has 5 seconds to send its
-  request head, the request line and the headers, of at most 8 KiB: a head
-  that has not arrived by then is closed without a response, and a longer or
-  malformed one gets `400 Bad Request`. At most 64 connections are served at
-  once, and a connection over that is closed as soon as it arrives. The
-  limits are fixed. Open the telemetry port to scrapers and probes only.
+  other than `GET` or `HEAD` on those paths now gets `405 Method Not Allowed`
+  with `Allow: GET, HEAD` instead of `200`, and an unknown path gets `404`
+  whatever the method. A client has 5 seconds for the whole exchange: to send
+  its request head, the request line and the headers, of at most 8 KiB, and to
+  take the response. A connection that has not finished by then is closed, and
+  a head that has not arrived gets no response. A head over 8 KiB, or a
+  request line that is not `METHOD target HTTP/version`, gets
+  `400 Bad Request`. At most 64 connections are served at once, and a
+  connection over that is closed as soon as it arrives. The limits are fixed.
+  Open the telemetry port to scrapers and probes only.
 
 ### Fixed
 
