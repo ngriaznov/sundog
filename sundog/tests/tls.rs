@@ -103,6 +103,77 @@ async fn nodes_sharing_a_ca_replicate_a_put_over_tls() {
     common::shutdown_all(vec![cluster_a, cluster_b]).await;
 }
 
+/// `ClusterBuilder::tls` before `ClusterBuilder::config` leaves a node on TLS.
+/// Node c takes its TLS setting from its config, and a TLS node and a
+/// plaintext node refuse each other's connections, so a write reaches c from
+/// a and b only if both run TLS.
+#[tokio::test]
+async fn nodes_with_tls_set_before_config_replicate_over_tls() {
+    let ca = generate_ca();
+
+    let cluster_a = Cluster::builder("it-tls-before-config")
+        .seeds(std::iter::empty())
+        .tls(generate_node_tls(&ca))
+        .config(common::fast_config())
+        .build()
+        .await
+        .expect("node a builds with tls before config");
+    let cluster_b = Cluster::builder("it-tls-before-config")
+        .seeds([cluster_a.local_gossip_addr()])
+        .tls(generate_node_tls(&ca))
+        .config(common::fast_config())
+        .build()
+        .await
+        .expect("node b builds with tls before config");
+    let cluster_c = Cluster::builder("it-tls-before-config")
+        .seeds([cluster_a.local_gossip_addr()])
+        .config(tls_node_config(generate_node_tls(&ca)))
+        .build()
+        .await
+        .expect("node c builds with tls in its config");
+
+    common::wait_for_peer_count(&cluster_a, 2, Duration::from_secs(15)).await;
+    common::wait_for_peer_count(&cluster_b, 2, Duration::from_secs(15)).await;
+    common::wait_for_peer_count(&cluster_c, 2, Duration::from_secs(15)).await;
+
+    let (cache_a, cache_b, cache_c) = tokio::join!(
+        cluster_a
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open(),
+        cluster_b
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open(),
+        cluster_c
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open(),
+    );
+    let cache_a = cache_a.expect("a opens");
+    let cache_b = cache_b.expect("b opens");
+    let cache_c = cache_c.expect("c opens");
+
+    cache_a
+        .insert(1, "hello".into())
+        .await
+        .expect("a inserts over tls");
+    cache_c
+        .insert(2, "from c".into())
+        .await
+        .expect("c inserts over tls");
+
+    common::eventually(Duration::from_secs(10), || async {
+        cache_b.get(&1).await.as_deref() == Some("hello")
+            && cache_c.get(&1).await.as_deref() == Some("hello")
+            && cache_a.get(&2).await.as_deref() == Some("from c")
+            && cache_b.get(&2).await.as_deref() == Some("from c")
+    })
+    .await;
+
+    common::shutdown_all(vec![cluster_a, cluster_b, cluster_c]).await;
+}
+
 /// A raw socket that opens the data-plane port and stalls inside a
 /// `ClientHello` holds a connection that has not authenticated. The nodes'
 /// own links, which complete their handshakes, replicate beside it.

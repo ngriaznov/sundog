@@ -315,6 +315,10 @@ All notable changes to this project are documented in this file. Format follows
   resent, and the invalidation does not leave a version floor, so a
   partitioned or late-joining peer can still bring an older value back through
   anti-entropy.
+- **`ClusterBuilder::tls` takes effect whatever the call order.** `config()`
+  after `tls()` no longer drops the TLS setting and builds a plaintext node;
+  an explicit `tls()` takes precedence over `ClusterConfig::tls`, and a
+  `config()` that sets `tls` alone keeps it.
 
 ## [0.6.7] – 2026-10-13
 

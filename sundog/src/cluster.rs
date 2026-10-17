@@ -284,6 +284,10 @@ pub struct ClusterBuilder {
     discovery: Option<DiscoveryKind>,
     config: ClusterConfig,
     node_id: Option<NodeId>,
+    /// What [`ClusterBuilder::tls`] set, applied over `config` at `build()` so
+    /// a later [`ClusterBuilder::config`] does not replace it.
+    #[cfg(feature = "tls")]
+    tls: Option<crate::config::TlsConfig>,
     #[cfg(feature = "prometheus")]
     prometheus_listen: Option<SocketAddr>,
 }
@@ -296,6 +300,8 @@ impl Cluster {
             discovery: None,
             config: ClusterConfig::default(),
             node_id: None,
+            #[cfg(feature = "tls")]
+            tls: None,
             #[cfg(feature = "prometheus")]
             prometheus_listen: None,
         }
@@ -674,7 +680,8 @@ impl ClusterBuilder {
         self
     }
 
-    /// Overrides the default [`ClusterConfig`].
+    /// Overrides the default [`ClusterConfig`] as a whole. A `tls` setting
+    /// survives this call, whether it comes before or after.
     pub fn config(mut self, config: ClusterConfig) -> Self {
         self.config = config;
         self
@@ -704,11 +711,12 @@ impl ClusterBuilder {
         self
     }
 
-    /// Enables mutual TLS on the mesh; equivalent to setting
-    /// [`ClusterConfig::tls`] via [`Self::config`].
+    /// Enables mutual TLS on the mesh. The setting takes precedence over
+    /// [`ClusterConfig::tls`], whatever the order of this call and
+    /// [`Self::config`].
     #[cfg(feature = "tls")]
     pub fn tls(mut self, tls: crate::config::TlsConfig) -> Self {
-        self.config.tls = Some(tls);
+        self.tls = Some(tls);
         self
     }
 
@@ -728,10 +736,14 @@ impl ClusterBuilder {
             discovery,
             config,
             node_id,
+            #[cfg(feature = "tls")]
+            tls,
             #[cfg(feature = "prometheus")]
             prometheus_listen,
         } = self;
 
+        #[cfg(feature = "tls")]
+        let config = with_explicit_tls(config, tls);
         validate_config(&config)?;
         if let Some(id) = node_id.filter(|id| id.is_merge_derived()) {
             // Mirrors `NodeId::MERGE_BIT`: a real id always has this bit
@@ -851,6 +863,20 @@ impl crate::telemetry::ReadinessSource for ClusterReadiness {
 /// at least one seed.
 fn use_static_from_env(discovery_set: bool, seeds_env: Option<&str>) -> bool {
     !discovery_set && seeds_env.is_some_and(|raw| !raw.trim().is_empty())
+}
+
+/// `config` with the TLS setting of [`ClusterBuilder::tls`] applied: `explicit`
+/// replaces [`ClusterConfig::tls`] when set, and `config` is unchanged when
+/// not. Pure; unit tested directly.
+#[cfg(feature = "tls")]
+fn with_explicit_tls(
+    mut config: ClusterConfig,
+    explicit: Option<crate::config::TlsConfig>,
+) -> ClusterConfig {
+    if explicit.is_some() {
+        config.tls = explicit;
+    }
+    config
 }
 
 /// Validates the `ClusterConfig` invariants `build()` cannot recover from:

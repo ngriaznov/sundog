@@ -273,7 +273,9 @@ pub struct ClusterConfig {
     /// address under host networking. When set, no probe runs at all.
     pub advertise_ip: Option<IpAddr>,
     /// Mutual-TLS material for the data-plane mesh; `None` (the default)
-    /// means the mesh runs plaintext. See [`TlsConfig`].
+    /// means the mesh runs plaintext. See [`TlsConfig`]. A call to
+    /// [`ClusterBuilder::tls`](crate::ClusterBuilder::tls) takes precedence
+    /// over this field.
     #[cfg(feature = "tls")]
     pub tls: Option<TlsConfig>,
     /// How many anti-entropy intervals a `Mode::Distributed` node keeps a

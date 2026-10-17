@@ -43,6 +43,9 @@ mod tcp;
 pub(crate) mod test_support;
 #[cfg(all(feature = "tls", not(feature = "sim")))]
 mod tls;
+/// The certificates the tests of other modules build a TLS node from.
+#[cfg(all(test, feature = "tls", not(feature = "sim")))]
+pub(crate) use tls::fixtures as tls_fixtures;
 mod types;
 
 use frames::record_frame_sent; // consumed by conn::framing via crate::net::record_frame_sent

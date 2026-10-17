@@ -320,3 +320,115 @@ async fn advertise_ip_override_skips_the_probe_and_covers_both_addresses() {
 
     cluster.shutdown().await;
 }
+
+/// A TLS setting told apart by `mark`, a stand-in the builder never hands to
+/// rustls.
+#[cfg(feature = "tls")]
+fn marked_tls(mark: u8) -> crate::config::TlsConfig {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+    crate::config::TlsConfig {
+        cert_chain: vec![CertificateDer::from(vec![mark])],
+        private_key: std::sync::Arc::new(PrivateKeyDer::from(PrivatePkcs8KeyDer::from(vec![mark]))),
+        root_ca_certs: vec![CertificateDer::from(vec![mark, mark])],
+    }
+}
+
+#[cfg(feature = "tls")]
+fn config_with_tls(tls: &crate::config::TlsConfig) -> ClusterConfig {
+    ClusterConfig::default().with(|c| c.tls = Some(tls.clone()))
+}
+
+/// The TLS setting `build()` hands to the mesh for `builder`.
+#[cfg(feature = "tls")]
+fn built_tls(builder: ClusterBuilder) -> Option<crate::config::TlsConfig> {
+    with_explicit_tls(builder.config, builder.tls).tls
+}
+
+/// `tls()` and `config()` in every order: an explicit `tls()` wins over
+/// `ClusterConfig::tls`, `config()` alone keeps its own, and neither call
+/// drops the other's setting.
+#[cfg(feature = "tls")]
+#[test]
+fn the_tls_setting_holds_whatever_the_call_order() {
+    let a = marked_tls(1);
+    let b = marked_tls(2);
+    let none = ClusterConfig::default();
+
+    let cases = [
+        (
+            "tls(A) then config(default)",
+            built_tls(Cluster::builder("t").tls(a.clone()).config(none.clone())),
+            Some(a.clone()),
+        ),
+        (
+            "config(default) then tls(A)",
+            built_tls(Cluster::builder("t").config(none.clone()).tls(a.clone())),
+            Some(a.clone()),
+        ),
+        (
+            "config(A) then tls(B)",
+            built_tls(
+                Cluster::builder("t")
+                    .config(config_with_tls(&a))
+                    .tls(b.clone()),
+            ),
+            Some(b.clone()),
+        ),
+        (
+            "tls(A) then config(B)",
+            built_tls(
+                Cluster::builder("t")
+                    .tls(a.clone())
+                    .config(config_with_tls(&b)),
+            ),
+            Some(a.clone()),
+        ),
+        (
+            "config(A) alone",
+            built_tls(Cluster::builder("t").config(config_with_tls(&a))),
+            Some(a.clone()),
+        ),
+        (
+            "config(default) alone",
+            built_tls(Cluster::builder("t").config(none.clone())),
+            None,
+        ),
+        ("neither", built_tls(Cluster::builder("t")), None),
+        (
+            "tls(A) then tls(B)",
+            built_tls(Cluster::builder("t").tls(a.clone()).tls(b.clone())),
+            Some(b.clone()),
+        ),
+    ];
+    for (order, got, want) in cases {
+        assert!(got == want, "{order}: the built TLS setting differs");
+    }
+}
+
+/// A cluster built with the TLS setting before the whole config runs TLS: the
+/// effective config, which the mesh and the accept path read, carries it.
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn a_cluster_built_with_tls_before_config_runs_tls() {
+    use crate::net::tls_fixtures::{generate_ca, generate_node_cert, tls_config};
+
+    let ca = generate_ca();
+    let (cert, key) = generate_node_cert(&ca.issuer);
+    let tls = tls_config(&ca.der, cert, &key);
+
+    let cluster = Cluster::builder("cluster-it-tls-before-config")
+        .seeds(std::iter::empty())
+        .tls(tls.clone())
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("a node with tls before config builds");
+
+    assert!(
+        cluster.config().tls.as_ref() == Some(&tls),
+        "config() after tls() leaves the node's TLS setting in place"
+    );
+
+    cluster.shutdown().await;
+}

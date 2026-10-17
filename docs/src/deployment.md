@@ -115,12 +115,14 @@ the node left on purpose:
 ## Mutual TLS
 
 With the `tls` feature, `ClusterBuilder::tls` wraps every data-plane
-connection in mutual TLS. A `TlsConfig` holds the node's certificate
-chain, its private key and the root CAs it trusts. Every certificate
-carries the fixed name `sundog-mesh.internal` as a DNS subject alternative
-name instead of the node's IP, so one certificate profile serves every
-node and survives address changes. A TLS node and a plaintext node refuse
-each other's connections instead of downgrading. Gossip itself stays
+connection in mutual TLS, whether it comes before or after
+`ClusterBuilder::config`, and takes precedence over `ClusterConfig::tls`. A
+`TlsConfig` holds the node's certificate chain, its private key and the root
+CAs it trusts. Every certificate carries the fixed name
+`sundog-mesh.internal` as a DNS subject alternative name instead of the
+node's IP, so one certificate profile serves every node and survives address
+changes. A TLS node and a plaintext node refuse each other's connections
+instead of downgrading. Gossip itself stays
 plaintext UDP and carries membership only: node ids, addresses and cache
 modes, never keys or values.
 
