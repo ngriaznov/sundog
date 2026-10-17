@@ -5,17 +5,15 @@
 use std::sync::Arc;
 
 use super::super::expiry::{
-    SweepFate, TombstoneRetention, drops_lapsed_tombstone, expiry_tombstone_retention,
-    gc_defer_decision, gc_period_ms, pause_gap_ms, pause_hold_after, paused_since, sweep_fate,
-    swept_tombstone_deadlines, tombstone_anchor_ms, tombstone_deadlines, tombstone_lapsed,
+    SweepFate, TombstoneRetention, deferred_retention_ms, drops_lapsed_tombstone,
+    expiry_tombstone_retention, gc_defer_decision, gc_period_ms, pause_gap_ms, pause_hold_after,
+    paused_since, sweep_fate, swept_tombstone_deadlines, tombstone_anchor_ms, tombstone_deadlines,
+    tombstone_lapsed,
 };
 use super::*;
 use crate::store::{Mode, Tombstone};
 
-const RETENTION: TombstoneRetention = TombstoneRetention {
-    ttl_ms: 60_000,
-    max_ttl_ms: 600_000,
-};
+const RETENTION: TombstoneRetention = TombstoneRetention { ttl_ms: 60_000 };
 
 fn tombstone_state(engine: &Engine<u32, String>, key: u32) -> Option<Tombstone> {
     let kb = key_bytes(key);
@@ -173,8 +171,8 @@ fn tombstone_deadlines_saturate() {
 fn swept_tombstone_deadlines_are_never_earlier_than_the_sweep() {
     assert_eq!(
         swept_tombstone_deadlines(1_000, 5_000, RETENTION),
-        (61_000, 601_000),
-        "a prompt sweep counts from the expiry"
+        (61_000, 61_000),
+        "a prompt sweep counts from the expiry, with no retention past the ttl"
     );
     assert_eq!(
         swept_tombstone_deadlines(1_000, 700_000, RETENTION),
@@ -253,11 +251,47 @@ fn expiry_tombstone_retention_follows_the_mode_and_the_resolver() {
         (Mode::Local, true, false),
     ] {
         assert_eq!(
-            expiry_tombstone_retention(mode, merges, 60_000, 600_000),
+            expiry_tombstone_retention(mode, merges, 60_000),
             kept.then_some(RETENTION),
             "{mode:?} merges: {merges}"
         );
     }
+}
+
+#[test]
+fn a_delete_keeps_its_cap_while_deferring_and_an_expiry_tombstone_keeps_only_its_ttl() {
+    assert_eq!(deferred_retention_ms(false, 60_000, 600_000), 600_000);
+    assert_eq!(deferred_retention_ms(true, 60_000, 600_000), 60_000);
+    assert_eq!(deferred_retention_ms(true, 60_000, 0), 60_000);
+}
+
+#[test]
+fn a_swept_and_a_received_expiry_tombstone_get_the_same_deadlines() {
+    let retention = expiry_tombstone_retention(Mode::Replicated, false, 60_000).expect("kept");
+    let swept = swept_tombstone_deadlines(1_500, 2_000, retention);
+    assert_eq!(swept, (61_500, 61_500), "no retention past the ttl");
+    assert_eq!(
+        swept_tombstone_deadlines(1_500, 70_000, retention),
+        (70_000, 70_000),
+        "a late sweep keeps it to the sweep, and no further"
+    );
+
+    let engine = engine_u32_string(u64::MAX, None);
+    let _ = tombstone_of(
+        &engine,
+        1,
+        key_bytes(1),
+        hlc(1_000, 1),
+        Some(1_500),
+        2_000,
+        true,
+    );
+    let t = tombstone_state(&engine, 1).expect("stored within its ttl");
+    assert_eq!(
+        (t.ttl_deadline_ms, t.max_deadline_ms),
+        swept,
+        "a peer's tombstone of the same expiry, received while deferring, gets the sweep's deadlines"
+    );
 }
 
 #[test]
@@ -290,8 +324,8 @@ fn sweep_with_retention_turns_an_expired_entry_into_a_tombstone_at_its_version()
     assert_eq!(t.ver, hlc(1_000, 1), "at the entry's own version");
     assert_eq!(
         (t.ttl_deadline_ms, t.max_deadline_ms),
-        (61_500, 601_500),
-        "its retentions count from the expiry"
+        (61_500, 61_500),
+        "its retention counts from the expiry, with nothing past the ttl"
     );
     assert_eq!(t.expired_at_ms, Some(1_500));
     assert_eq!(engine.tombstone_count(), 1);
@@ -346,18 +380,16 @@ fn sweep_with_retention_keeps_the_digest_until_the_tombstone_is_collected() {
 }
 
 #[test]
-fn sweep_with_retention_holds_the_cap_while_collection_is_deferred() {
+fn sweep_with_retention_does_not_hold_past_its_ttl_while_collection_is_deferred() {
     let engine = engine_with_an_expiring_entry(Some(1_500));
     engine.sweep(2_000, Some(RETENTION));
-    engine.gc_tombstones(true, 100_000, RETENTION.ttl_ms);
-    assert_eq!(engine.tombstone_count(), 1, "an absent member holds it");
-    engine.gc_tombstones(true, 601_499, RETENTION.ttl_ms);
-    assert_eq!(engine.tombstone_count(), 1);
-    engine.gc_tombstones(true, 601_500, RETENTION.ttl_ms);
+    engine.gc_tombstones(true, 61_499, RETENTION.ttl_ms);
+    assert_eq!(engine.tombstone_count(), 1, "kept within its retention");
+    engine.gc_tombstones(true, 61_500, RETENTION.ttl_ms);
     assert_eq!(
         engine.tombstone_count(),
         0,
-        "the cap collects it regardless"
+        "an absent member does not hold it past its ttl"
     );
 }
 
@@ -533,7 +565,11 @@ fn an_expiry_tombstone_arrives_with_deadlines_anchored_on_its_expiry() {
     );
     assert!(matches!(outcome, ApplyOutcome::Tombstoned { .. }));
     let t = tombstone_state(&engine, 1).expect("stored within its retention");
-    assert_eq!((t.ttl_deadline_ms, t.max_deadline_ms), (61_500, 601_500));
+    assert_eq!(
+        (t.ttl_deadline_ms, t.max_deadline_ms),
+        (61_500, 61_500),
+        "no retention past the ttl"
+    );
     assert_eq!(t.expired_at_ms, Some(1_500));
     assert_eq!(engine.digests(), engine.recompute_digests_paired());
 }
@@ -591,7 +627,44 @@ fn a_lapsed_expiry_tombstone_leaves_the_older_entry_it_would_displace() {
 }
 
 #[test]
-fn a_lapsed_expiry_tombstone_within_its_cap_removes_the_older_entry_while_deferring() {
+fn a_lapsed_delete_within_its_cap_removes_the_older_entry_while_deferring() {
+    let engine = engine_u32_string(u64::MAX, None);
+    let _ = put(
+        &engine,
+        1,
+        key_bytes(1),
+        "old".into(),
+        hlc(500, 2),
+        None,
+        1_000,
+    );
+
+    let outcome = tombstone_arriving(
+        &engine,
+        1,
+        key_bytes(1),
+        hlc(1_000, 1),
+        None,
+        70_000,
+        true,
+        Arrival::Peer,
+    );
+
+    assert!(matches!(outcome, ApplyOutcome::Tombstoned { .. }));
+    assert_eq!(engine.get(&1, 70_000), None, "the older copy is deleted");
+    assert_eq!(engine.live_entry_count(), 0);
+    let t = tombstone_state(&engine, 1).expect("kept until the next collection");
+    assert!(
+        tombstone_lapsed(t.ttl_deadline_ms, t.max_deadline_ms, 70_000, false),
+        "already collectible once collection stops deferring"
+    );
+    engine.gc_tombstones(false, 70_000, RETENTION.ttl_ms);
+    assert_eq!(engine.tombstone_count(), 0);
+    assert_eq!(engine.digests(), engine.recompute_digests_paired());
+}
+
+#[test]
+fn a_lapsed_expiry_tombstone_leaves_the_older_entry_even_while_deferring() {
     let engine = engine_u32_string(u64::MAX, None);
     let _ = put(
         &engine,
@@ -613,17 +686,12 @@ fn a_lapsed_expiry_tombstone_within_its_cap_removes_the_older_entry_while_deferr
         true,
     );
 
-    assert!(matches!(outcome, ApplyOutcome::Tombstoned { .. }));
-    assert_eq!(engine.get(&1, 70_000), None, "the older copy is deleted");
-    assert_eq!(engine.live_entry_count(), 0);
-    let t = tombstone_state(&engine, 1).expect("kept until the next collection");
     assert!(
-        tombstone_lapsed(t.ttl_deadline_ms, t.max_deadline_ms, 70_000, false),
-        "already collectible once collection stops deferring"
+        matches!(outcome, ApplyOutcome::Rejected),
+        "an expiry tombstone keeps no retention past its ttl, deferral or not"
     );
-    engine.gc_tombstones(false, 70_000, RETENTION.ttl_ms);
+    assert_eq!(engine.get(&1, 70_000), Some("old".into()));
     assert_eq!(engine.tombstone_count(), 0);
-    assert_eq!(engine.digests(), engine.recompute_digests_paired());
 }
 
 #[test]
@@ -679,18 +747,19 @@ fn a_lapsed_expiry_tombstone_leaves_an_older_tombstone() {
 }
 
 #[test]
-fn a_lapsed_expiry_tombstone_within_its_cap_replaces_an_older_tombstone_while_deferring() {
+fn a_lapsed_delete_within_its_cap_replaces_an_older_tombstone_while_deferring() {
     let engine = engine_u32_string(u64::MAX, None);
     let _ = tombstone(&engine, 1, key_bytes(1), hlc(500, 2), 69_000);
 
-    let outcome = tombstone_of(
+    let outcome = tombstone_arriving(
         &engine,
         1,
         key_bytes(1),
         hlc(1_000, 1),
-        Some(1_500),
+        None,
         70_000,
         true,
+        Arrival::Peer,
     );
 
     assert!(matches!(outcome, ApplyOutcome::Tombstoned { .. }));
@@ -729,7 +798,25 @@ fn a_lapsed_local_delete_tombstone_is_always_stored() {
 }
 
 #[test]
-fn a_deferring_collection_keeps_an_expiry_tombstone_past_its_ttl_deadline() {
+fn a_deferring_collection_keeps_a_delete_past_its_ttl_deadline() {
+    let engine = engine_u32_string(u64::MAX, None);
+    let outcome = tombstone_arriving(
+        &engine,
+        1,
+        key_bytes(1),
+        hlc(1_000, 1),
+        None,
+        70_000,
+        true,
+        Arrival::Peer,
+    );
+    assert!(matches!(outcome, ApplyOutcome::Tombstoned { .. }));
+    let t = tombstone_state(&engine, 1).expect("the floor an absent member may need");
+    assert_eq!((t.ttl_deadline_ms, t.max_deadline_ms), (61_000, 601_000));
+}
+
+#[test]
+fn a_deferring_collection_does_not_keep_an_expiry_tombstone_past_its_ttl_deadline() {
     let engine = engine_u32_string(u64::MAX, None);
     let outcome = tombstone_of(
         &engine,
@@ -740,15 +827,14 @@ fn a_deferring_collection_keeps_an_expiry_tombstone_past_its_ttl_deadline() {
         70_000,
         true,
     );
-    assert!(matches!(outcome, ApplyOutcome::Tombstoned { .. }));
-    let t = tombstone_state(&engine, 1).expect("the floor an absent member may need");
-    assert_eq!((t.ttl_deadline_ms, t.max_deadline_ms), (61_500, 601_500));
+    assert!(matches!(outcome, ApplyOutcome::Rejected));
+    assert_eq!(engine.tombstone_count(), 0);
 }
 
-/// `engine.apply_many` of the tombstone of an entry that expired at 1,500,
-/// version `hlc(1_000, 1)`, for `key`, at 70,000: past its 60 s `ttl`
-/// deadline, within its 600 s cap.
-fn apply_expiry_tombstone(engine: &Engine<u32, String>, key: u32) -> ApplyOutcome<u32, String> {
+/// `engine.apply_many` of a peer's delete of `key` at version
+/// `hlc(1_000, 1)`, at 70,000: past its 60 s `ttl` deadline, within its
+/// 600 s cap.
+fn apply_lapsed_delete(engine: &Engine<u32, String>, key: u32) -> ApplyOutcome<u32, String> {
     let kb = key_bytes(key);
     let hash = hash_key_bytes(kb.as_ref());
     engine
@@ -761,7 +847,7 @@ fn apply_expiry_tombstone(engine: &Engine<u32, String>, key: u32) -> ApplyOutcom
                 kb,
                 hlc(1_000, 1),
                 Incoming::Tombstone {
-                    expired_at_ms: Some(1_500),
+                    expired_at_ms: None,
                 },
             )],
             &LwwResolver,
@@ -778,20 +864,20 @@ fn collection_tells_the_apply_path_whether_it_is_deferring() {
 
     engine.gc_tombstones(false, 70_000, RETENTION.ttl_ms);
     assert!(matches!(
-        apply_expiry_tombstone(&engine, 1),
+        apply_lapsed_delete(&engine, 1),
         ApplyOutcome::Rejected
     ));
     engine.gc_tombstones(true, 70_000, RETENTION.ttl_ms);
     assert!(
         matches!(
-            apply_expiry_tombstone(&engine, 2),
+            apply_lapsed_delete(&engine, 2),
             ApplyOutcome::Tombstoned { .. }
         ),
         "a deferred collection holds the tombstone to its cap"
     );
     engine.gc_tombstones(false, 70_000, RETENTION.ttl_ms);
     assert!(matches!(
-        apply_expiry_tombstone(&engine, 3),
+        apply_lapsed_delete(&engine, 3),
         ApplyOutcome::Rejected
     ));
 }
@@ -813,7 +899,7 @@ fn an_engine_built_to_start_deferred_judges_arrivals_against_the_cap_until_a_col
     let plain = engine_u32_string(u64::MAX, None);
     old(&plain);
     assert!(matches!(
-        apply_expiry_tombstone(&plain, 1),
+        apply_lapsed_delete(&plain, 1),
         ApplyOutcome::Rejected
     ));
     assert_eq!(
@@ -826,7 +912,7 @@ fn an_engine_built_to_start_deferred_judges_arrivals_against_the_cap_until_a_col
     old(&settling);
     assert!(
         matches!(
-            apply_expiry_tombstone(&settling, 1),
+            apply_lapsed_delete(&settling, 1),
             ApplyOutcome::Tombstoned { .. }
         ),
         "before any collection it keeps a tombstone lapsed by ttl alone"
@@ -849,7 +935,7 @@ fn an_engine_built_to_start_deferred_judges_arrivals_against_the_cap_until_a_col
         1_000,
     );
     assert!(
-        matches!(apply_expiry_tombstone(&settling, 2), ApplyOutcome::Rejected),
+        matches!(apply_lapsed_delete(&settling, 2), ApplyOutcome::Rejected),
         "the first collection ends the deferral"
     );
     assert_eq!(settling.get(&2, 70_000), Some("old".into()));

@@ -85,17 +85,18 @@ pub struct ClusterConfig {
     /// In a `Mode::Replicated` or `Mode::Distributed` cache whose resolver
     /// does not merge, the sweep also leaves a tombstone for an entry it
     /// removes for having expired, kept for this retention counted from the
-    /// entry's expiry. `sundog_tombstones{cache}` counts the tombstones a
-    /// node holds.
+    /// entry's expiry and never deferred past it, as Cassandra keeps a
+    /// tombstone for `gc_grace_seconds`. `sundog_tombstones{cache}` counts the
+    /// tombstones a node holds.
     pub tombstone_ttl: Duration,
     /// Hard cap on tombstone retention regardless of any member's absence.
     /// Bounds [`tombstone_ttl`](Self::tombstone_ttl)'s deferral against a
     /// member that never comes back. A node that defers, for an absent
-    /// member, after opening or after a pause, counts this cap from the same
-    /// instant as `tombstone_ttl`, the delete's version stamp or the entry's
-    /// expiry: it keeps its tombstones to it, and ignores a tombstone a peer
-    /// sends after it. While a member is absent, a cache holds one tombstone
-    /// per entry that expired in the last `tombstone_max_ttl`.
+    /// member, after opening or after a pause, counts this cap from a
+    /// delete's version stamp, as `tombstone_ttl`: it keeps its deletes to
+    /// it, and ignores a delete a peer sends after it. The tombstone of an
+    /// expired entry is not deferred and has no cap past `tombstone_ttl`. While a member is absent, a cache holds one tombstone
+    /// per delete made in the last `tombstone_max_ttl`.
     pub tombstone_max_ttl: Duration,
     /// How far ahead of this node's clock a remote write's version stamp
     /// may be. A replicated write, invalidation, anti-entropy repair or

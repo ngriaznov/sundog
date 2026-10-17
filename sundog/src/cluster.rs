@@ -1137,7 +1137,7 @@ fn gc_defers(mode: Mode, absent_defers: bool, uptime: Duration, settle: Duration
 /// round, the collector drops on arrival, so it lasts as long as that skew,
 /// not up to a whole period.
 /// `mode` and `absence` decide each tick whether collection past
-/// `tombstone_ttl` defers via [`gc_defers`]: a `Mode::Replicated` tombstone
+/// `tombstone_ttl` defers via [`gc_defers`]: a `Mode::Replicated` delete
 /// survives up to `tombstone_max_ttl` while any recently known member is
 /// absent ([`absence::should_defer_gc`]), and for another `tombstone_ttl`
 /// once it is back; `Mode::Distributed` narrows that to a member that
@@ -1148,7 +1148,8 @@ fn gc_defers(mode: Mode, absent_defers: bool, uptime: Duration, settle: Duration
 /// shard also defers on its own for `tombstone_ttl` after a pause, a wall-clock
 /// gap of more than twice this period between two ticks, and judges arrivals
 /// against that gap before the task wakes; the task only has to tick on
-/// [`gc_period_ms`], which the gap is measured against.
+/// [`gc_period_ms`], which the gap is measured against. The tombstone of an
+/// expired entry has its cap at its ttl deadline, so no deferral keeps it.
 /// `now_ms` reads the wall clock in epoch milliseconds that places the grid;
 /// the cache's tasks pass [`crate::store::now_ms`]. The uptime comes from
 /// the tokio clock.

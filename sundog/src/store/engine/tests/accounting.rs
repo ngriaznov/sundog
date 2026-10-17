@@ -87,15 +87,12 @@ fn digest_matches_full_recompute_after_random_ops_including_sweeps_and_evictions
 }
 
 /// The same mix with every sweep leaving the tombstone of an expired entry
-/// for 1s/10s: the digest, the live count and the weight stay exact as
+/// for 1 s: the digest, the live count and the weight stay exact as
 /// entries turn into tombstones and the collection drops them.
 #[test]
 fn digest_matches_full_recompute_after_random_ops_with_expiry_tombstoning_sweeps() {
     digest_matches_full_recompute_after_random_ops(Some(
-        crate::store::engine::TombstoneRetention {
-            ttl_ms: 1_000,
-            max_ttl_ms: 10_000,
-        },
+        crate::store::engine::TombstoneRetention { ttl_ms: 1_000 },
     ));
 }
 

@@ -138,26 +138,27 @@ fn a_lapsed_expiry_tombstone_and_an_older_value_converge_in_any_order() {
     }
 }
 
-/// An expiry tombstone past its `ttl` deadline but within its `max` one is
-/// kept by a new shard, which defers collection until a collection says
-/// otherwise: it deletes the older value in either order.
+/// An expiry tombstone past its `ttl` deadline is dropped by a new shard
+/// too, though it defers collection: an expiry tombstone keeps no retention
+/// past its ttl, so the older value stays in either order.
 #[test]
-fn an_expiry_tombstone_within_a_new_shards_deferral_is_kept_in_any_order() {
+fn an_expiry_tombstone_past_its_ttl_is_dropped_by_a_new_shard_in_any_order() {
     let records = expiry_tombstone_and_an_older_value(1_000);
     let (a, b) = converge(&records, 17, 0);
     for shard in [&a, &b] {
         assert_eq!(
             futures::executor::block_on(shard.get(&255)),
-            None,
-            "the tombstone is newer than the value and deletes it"
+            Some(255),
+            "the older value stays"
         );
-        assert_eq!(shard.tombstone_count(), 1);
+        assert_eq!(shard.tombstone_count(), 0);
     }
 }
 
 /// Every order of the pair, not just the target's two shuffles, converges
-/// for each retention state: lapsed past `max`, past `ttl` only, and within
-/// `ttl`.
+/// for each age of the expiry: past the deadlines a delete would have at
+/// `max` and at `ttl`, where the expiry tombstone is dropped either way, and
+/// within `ttl`, where it is kept.
 #[test]
 fn the_pair_converges_under_every_shuffle_for_each_retention_state() {
     for expired_ago_ms in [2_253, 1_000, 100] {

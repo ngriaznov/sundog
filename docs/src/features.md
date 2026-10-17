@@ -107,8 +107,9 @@ open with no clean close between is cold, and a node down longer than
 `tombstone_ttl` opens cold regardless, since a peer may already have
 collected a tombstone that would outvote a stale replayed entry. A node
 defers tombstone collection for its first `tombstone_ttl` after it opens, so a
-tombstone from a peer that is past `tombstone_ttl` but not `tombstone_max_ttl`
-of its stamp still removes an older replayed entry.
+delete from a peer that is past `tombstone_ttl` but not `tombstone_max_ttl` of
+its stamp still removes an older replayed entry. The tombstone of an expired
+entry gets no such deferral: one past `tombstone_ttl` of its expiry is ignored.
 `sundog_spill_reopen_total{outcome, reason}` records which path each open
 took.
 

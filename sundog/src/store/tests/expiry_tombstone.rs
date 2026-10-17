@@ -87,17 +87,74 @@ async fn a_swept_expired_entry_is_collected_by_the_delete_retention_counted_from
 }
 
 #[tokio::test]
-async fn a_member_absent_defers_collection_of_an_expiry_tombstone_to_the_cap() {
+async fn a_member_absent_does_not_defer_collection_of_an_expiry_tombstone() {
     let clock = manual_clock();
     let s = shard_with_an_expired_overwrite(&clock).await;
     ShardOps::run_pending_tasks(&s).await;
 
-    clock.store(EXPIRES_AT_MS + 120_000, Ordering::SeqCst);
+    let ttl_deadline = EXPIRES_AT_MS + 60_000;
+    clock.store(ttl_deadline - 1, Ordering::SeqCst);
+    ShardOps::gc_tombstones(&s, true).await;
+    assert_eq!(s.tombstone_count(), 1, "kept within its retention");
+    assert!(!takes_the_old_value(&s).await);
+
+    clock.store(ttl_deadline, Ordering::SeqCst);
+    ShardOps::gc_tombstones(&s, true).await;
+    assert_eq!(
+        s.tombstone_count(),
+        0,
+        "an absent member does not hold it past its retention"
+    );
+    assert!(
+        takes_the_old_value(&s).await,
+        "a copy older than the expired overwrite is accepted again"
+    );
+}
+
+#[tokio::test]
+async fn ttl_churn_with_a_member_absent_keeps_no_tombstone_past_its_ttl() {
+    const KEYS: u32 = 500;
+    let clock = manual_clock();
+    let s = clocked::<String>(Mode::Replicated, &clock);
+    ShardOps::gc_tombstones(&s, false).await;
+    for key in 0..KEYS {
+        let mut rec = wire_record(key, "v", writer(START_MS));
+        rec.expires_at_ms = Some(EXPIRES_AT_MS);
+        ShardOps::apply_remote(&s, rec).await;
+    }
+    clock.store(EXPIRES_AT_MS + 1, Ordering::SeqCst);
+    ShardOps::run_pending_tasks(&s).await;
+    ShardOps::gc_tombstones(&s, true).await;
+    assert_eq!(
+        s.tombstone_count(),
+        u64::from(KEYS),
+        "every expired entry leaves a tombstone"
+    );
+
+    clock.store(EXPIRES_AT_MS + 60_000, Ordering::SeqCst);
+    ShardOps::gc_tombstones(&s, true).await;
+    assert_eq!(
+        s.tombstone_count(),
+        0,
+        "an absent member does not keep them past tombstone_ttl"
+    );
+    assert_digest_matches_full_recompute(&s).await;
+}
+
+#[tokio::test]
+async fn a_member_absent_defers_collection_of_a_delete_to_the_cap() {
+    let clock = manual_clock();
+    let s = clocked::<String>(Mode::Replicated, &clock);
+    ShardOps::apply_remote(&s, wire_record(1, "old", writer(1_000))).await;
+    ShardOps::apply_remote(&s, delete_record(1)).await;
+    assert_eq!(s.tombstone_count(), 1);
+
+    clock.store(DELETED_AT_MS + 120_000, Ordering::SeqCst);
     ShardOps::gc_tombstones(&s, true).await;
     assert_eq!(s.tombstone_count(), 1, "an absent member holds it");
     assert!(!takes_the_old_value(&s).await);
 
-    clock.store(EXPIRES_AT_MS + 600_000, Ordering::SeqCst);
+    clock.store(DELETED_AT_MS + 600_000, Ordering::SeqCst);
     ShardOps::gc_tombstones(&s, true).await;
     assert_eq!(s.tombstone_count(), 0, "the cap collects it regardless");
 }
@@ -512,20 +569,40 @@ async fn the_older_copy_survives_the_expiry_tombstone(s: &Shard<u32, String>, ke
     s.get(&key).await.is_some()
 }
 
-/// Past the tombstone's `tombstone_ttl` deadline, within its cap.
+/// The stamp of the deletes below: the tombstone's agreed instant, as the
+/// expiry is for an expiry tombstone.
+const DELETED_AT_MS: u64 = EXPIRES_AT_MS;
+
+/// A peer's delete of `key` stamped at [`DELETED_AT_MS`].
+fn delete_record(key: u32) -> WireRecord {
+    let mut delete = wire_record(key, "", writer(DELETED_AT_MS));
+    delete.value = None;
+    delete
+}
+
+/// Key `key` holding an older copy, then a delete stamped at
+/// [`DELETED_AT_MS`] arriving from a peer: whether the older copy survives it.
+async fn the_older_copy_survives_the_delete(s: &Shard<u32, String>, key: u32) -> bool {
+    ShardOps::apply_remote(s, wire_record(key, "old", writer(1_000))).await;
+    ShardOps::apply_remote(s, delete_record(key)).await;
+    s.get(&key).await.is_some()
+}
+
+/// Past a tombstone's `tombstone_ttl` deadline: within a delete's
+/// `tombstone_max_ttl` cap, and past the only deadline of an expiry
+/// tombstone.
 const PAST_TTL: u64 = EXPIRES_AT_MS + 120_000;
-/// Past the tombstone's `tombstone_max_ttl` deadline too.
+/// Past a delete's `tombstone_max_ttl` cap too.
 const PAST_CAP: u64 = EXPIRES_AT_MS + 700_000;
 
 #[tokio::test]
-async fn a_new_shard_keeps_an_expiry_tombstone_lapsed_by_ttl_until_a_collection_ends_the_deferral()
-{
+async fn a_new_shard_keeps_a_delete_lapsed_by_ttl_until_a_collection_ends_the_deferral() {
     let clock = manual_clock();
     let s = clocked::<String>(Mode::Replicated, &clock);
     clock.store(PAST_TTL, Ordering::SeqCst);
 
     assert!(
-        !the_older_copy_survives_the_expiry_tombstone(&s, 1).await,
+        !the_older_copy_survives_the_delete(&s, 1).await,
         "a node that may hold a copy from before it went down takes the tombstone"
     );
     assert_eq!(s.tombstone_count(), 1);
@@ -534,8 +611,26 @@ async fn a_new_shard_keeps_an_expiry_tombstone_lapsed_by_ttl_until_a_collection_
     ShardOps::gc_tombstones(&s, false).await;
     assert_eq!(s.tombstone_count(), 0, "the first collection takes it");
     assert!(
-        the_older_copy_survives_the_expiry_tombstone(&s, 2).await,
+        the_older_copy_survives_the_delete(&s, 2).await,
         "once collection stops deferring, a lapsed tombstone is a no-op"
+    );
+    assert_eq!(s.tombstone_count(), 0);
+    assert_digest_matches_full_recompute(&s).await;
+}
+
+#[tokio::test]
+async fn a_new_shard_drops_an_expiry_tombstone_lapsed_by_ttl() {
+    let clock = manual_clock();
+    let s = clocked::<String>(Mode::Replicated, &clock);
+    assert!(
+        s.engine.gc_deferring(),
+        "the shard defers, as a new one does"
+    );
+    clock.store(PAST_TTL, Ordering::SeqCst);
+
+    assert!(
+        the_older_copy_survives_the_expiry_tombstone(&s, 1).await,
+        "an expiry tombstone keeps no retention past its ttl, deferral or not"
     );
     assert_eq!(s.tombstone_count(), 0);
     assert_digest_matches_full_recompute(&s).await;
@@ -549,9 +644,9 @@ async fn a_deferred_collection_keeps_a_tombstone_lapsed_by_ttl_until_one_that_do
 
     ShardOps::gc_tombstones(&s, true).await;
 
-    assert!(!the_older_copy_survives_the_expiry_tombstone(&s, 1).await);
+    assert!(!the_older_copy_survives_the_delete(&s, 1).await);
     ShardOps::gc_tombstones(&s, false).await;
-    assert!(the_older_copy_survives_the_expiry_tombstone(&s, 2).await);
+    assert!(the_older_copy_survives_the_delete(&s, 2).await);
 }
 
 #[tokio::test]
@@ -577,7 +672,7 @@ async fn a_new_shard_drops_an_expiry_tombstone_lapsed_past_its_cap_whatever_it_h
 
 #[tokio::test]
 async fn a_lapsed_expiry_tombstone_converges_in_either_order_with_the_older_copy() {
-    for (clock_ms, kept) in [(PAST_TTL, true), (PAST_CAP, false)] {
+    for (clock_ms, kept) in [(PAST_TTL, false), (PAST_CAP, false)] {
         let mut states = Vec::new();
         for tombstone_first in [true, false] {
             let clock = manual_clock();
@@ -591,6 +686,28 @@ async fn a_lapsed_expiry_tombstone_converges_in_either_order_with_the_older_copy
                 vec![tombstone, old]
             } else {
                 vec![old, tombstone]
+            };
+            ShardOps::apply_remote_batch(&s, batch).await;
+            assert_eq!(s.tombstone_count(), u64::from(kept), "clock {clock_ms}");
+            states.push((s.get(&1).await, ShardOps::digests(&s).await));
+        }
+        assert_eq!(states[0], states[1], "clock {clock_ms}");
+    }
+}
+
+#[tokio::test]
+async fn a_lapsed_delete_converges_in_either_order_with_the_older_copy() {
+    for (clock_ms, kept) in [(PAST_TTL, true), (PAST_CAP, false)] {
+        let mut states = Vec::new();
+        for delete_first in [true, false] {
+            let clock = manual_clock();
+            let s = clocked::<String>(Mode::Replicated, &clock);
+            clock.store(clock_ms, Ordering::SeqCst);
+            let old = wire_record(1, "old", writer(1_000));
+            let batch = if delete_first {
+                vec![delete_record(1), old]
+            } else {
+                vec![old, delete_record(1)]
             };
             ShardOps::apply_remote_batch(&s, batch).await;
             assert_eq!(s.tombstone_count(), u64::from(kept), "clock {clock_ms}");
@@ -632,9 +749,9 @@ async fn a_new_distributed_shard_defers_collection_too() {
         .collect();
     clock.store(PAST_TTL, Ordering::SeqCst);
 
-    assert!(!the_older_copy_survives_the_expiry_tombstone(&s, owned[0]).await);
+    assert!(!the_older_copy_survives_the_delete(&s, owned[0]).await);
     ShardOps::gc_tombstones(&s, false).await;
-    assert!(the_older_copy_survives_the_expiry_tombstone(&s, owned[1]).await);
+    assert!(the_older_copy_survives_the_delete(&s, owned[1]).await);
 }
 
 #[tokio::test]
@@ -654,7 +771,7 @@ async fn only_a_replicated_or_distributed_shard_starts_deferred() {
     let s = clocked::<String>(Mode::Local, &clock);
     clock.store(PAST_TTL, Ordering::SeqCst);
     assert!(
-        the_older_copy_survives_the_expiry_tombstone(&s, 1).await,
+        the_older_copy_survives_the_delete(&s, 1).await,
         "a lapsed tombstone is dropped at once"
     );
     assert_eq!(s.tombstone_count(), 0);
@@ -672,7 +789,7 @@ async fn every_engine_rebuild_keeps_the_start_deferral() {
     for (index, s) in shards.iter().enumerate() {
         assert!(s.engine.gc_deferring(), "rebuild {index}");
         assert!(
-            !the_older_copy_survives_the_expiry_tombstone(s, 1).await,
+            !the_older_copy_survives_the_delete(s, 1).await,
             "rebuild {index}"
         );
     }

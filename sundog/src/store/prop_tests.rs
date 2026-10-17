@@ -52,8 +52,9 @@ const TOMBSTONE_MAX_TTL_MS: u64 = 86_400_000;
 enum ExpiredAgo {
     /// Inside `tombstone_ttl`: kept whatever the node does about collection.
     Within,
-    /// Past `tombstone_ttl`, inside `tombstone_max_ttl`: kept while the
-    /// node defers collection, dropped once it does not.
+    /// Past `tombstone_ttl`, inside `tombstone_max_ttl`: a delete is kept
+    /// while the node defers collection and dropped once it does not; an
+    /// expiry tombstone is dropped either way.
     PastTtl,
     /// Past `tombstone_max_ttl`: dropped whatever the node does.
     PastCap,
@@ -294,7 +295,8 @@ proptest! {
     /// arrives inside its retention, lapsed past `tombstone_ttl` only or
     /// lapsed past `tombstone_max_ttl`, alongside older values of the same
     /// key, and the replicas either still defer collection, as a new shard
-    /// does, or have run a collection that does not (`settled`).
+    /// does, or have run a collection that does not (`settled`). Only a
+    /// delete is kept past `tombstone_ttl` while the replicas defer.
     #[test]
     fn permutation_convergence(
         ops in proptest::collection::vec(op_strategy(), 4..40),

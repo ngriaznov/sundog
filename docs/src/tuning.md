@@ -49,7 +49,7 @@ Cache-level settings, `mode`, `max_capacity`, `max_resident_bytes`, `ttl`,
 | Field | Default | Change it when |
 |---|---|---|
 | `tombstone_ttl` | 10 min | tombstones cost too much memory, deletes and, in the replicated modes without a merging resolver, expired entries alike, or a lagging peer needs longer to see a delete; a delete has to reach every replica within it of the delete's stamp, so keep it at least 3 × `ae_interval` and well above the clock error between nodes and the longest data-plane stall you tolerate; a quarter of it is the collection period and twice that the pause gap, half of it from 4 s up |
-| `tombstone_max_ttl` | 24 h | entries have no TTL and a member can be absent longer than this; a node that defers keeps its tombstones to it and judges an arriving one against it; lower it if a day of expired entries as tombstones (under a non-merging resolver) does not fit in memory |
+| `tombstone_max_ttl` | 24 h | entries have no TTL and a member can be absent longer than this; a node that defers keeps its deletes to it and judges an arriving one against it, while the tombstone of an expired entry keeps only `tombstone_ttl`; lower it if a day of deletes does not fit in memory |
 
 ## Distributed caches
 

@@ -71,17 +71,17 @@ A removed key keeps a tombstone for `tombstone_ttl`, 10 minutes by default,
 and for up to `tombstone_max_ttl` while a member is absent, in a
 `Distributed` cache a member that shares a part with this node. In a
 `Replicated` or `Distributed` cache whose resolver does not merge, an entry
-that expires keeps one too, counted from its expiry: the sweep turns the
-entry into a tombstone at its version, which holds the key and its version
-but no value. A workload that removes or expires many keys holds their
-tombstones for that long. Budget for the removal rate plus the expiry rate,
-times the retention. A TTL-heavy cache at the default holds ten minutes of
-expiries as tombstones, and while a member is absent, whether down, flapping
-or partitioned, up to `tombstone_max_ttl`: at the default 24 hours, a full day
-of expiries. Tombstones sit outside `max_capacity` and the memory ceiling.
-`sundog_tombstones{cache}` counts the ones this node holds; alert on it
-before an absent member makes it grow, and lower `tombstone_max_ttl` if a day
-of expiries does not fit.
+that expires keeps one too, for `tombstone_ttl` from its expiry and no
+longer, whoever is absent: the sweep turns the entry into a tombstone at its
+version, which holds the key and its version but no value. Budget for the
+expiry rate times `tombstone_ttl`, plus the removal rate times
+`tombstone_ttl`, and while a member is absent, whether down, flapping or
+partitioned, the removal rate times up to `tombstone_max_ttl`: at the default
+24 hours, a full day of deletes. A TTL-heavy cache at the default holds ten
+minutes of expiries as tombstones in every case. Tombstones sit outside
+`max_capacity` and the memory ceiling. `sundog_tombstones{cache}` counts the
+ones this node holds; alert on it before an absent member makes it grow, and
+lower `tombstone_max_ttl` if a day of deletes does not fit.
 
 Every node collects on a wall-clock grid, at each multiple of a quarter of
 `tombstone_ttl` (at least a second), and one rule gives every tombstone its
@@ -98,26 +98,28 @@ its next tick.
 
 A node defers collection for an absent member, for its first `tombstone_ttl`
 after opening, and for `tombstone_ttl` after a pause. While it defers, it keeps
-its tombstones to `tombstone_max_ttl` and judges an arriving one against that
-cap, so a tombstone lasts longer there than on a node that does not defer.
+its deletes to `tombstone_max_ttl` and judges an arriving one against that
+cap, so a delete lasts longer there than on a node that does not defer. The
+tombstone of an expired entry is collected `tombstone_ttl` after its expiry
+whether or not the node defers.
 
 A pause is a gap between a node's collections of more than twice the period
-(half of `tombstone_ttl` from 4 seconds up). The hold costs the tombstones the
+(half of `tombstone_ttl` from 4 seconds up). The hold costs the deletes the
 node would have collected during the `tombstone_ttl` after the pause: budget
-for the removal and expiry rate times that retention on top of the usual
-count, outside `max_capacity` and visible in `sundog_tombstones{cache}`. A
+for the removal rate times that retention on top of the usual count, outside
+`max_capacity` and visible in `sundog_tombstones{cache}`. A
 host that stalls a node for longer than the gap costs the hold each time; a
 longer `tombstone_ttl` widens the gap.
 
 In a `Distributed` cache the deferral is node-wide, while an absent member
 affects only the parts it shares with this node. A node that shares a part
-with the absent member defers and keeps offering its tombstones to a co-owner
+with the absent member defers and keeps offering its deletes to a co-owner
 that does not defer, which ignores them each anti-entropy round. The bucket
 digests of the two differ until the deferring node collects, up to
 `tombstone_max_ttl`, and each round lists and pulls the lapsed tombstones of
 the mismatched buckets again: about 23 bytes per listed entry and 40 bytes per
 pulled tombstone, per mismatched bucket per round. The cost grows with the
-delete and expiry rate, and `sundog_tombstones_ignored_total{cache}` counts
+delete rate, and `sundog_tombstones_ignored_total{cache}` counts
 what the non-deferring node ignores. A `Replicated` cache sees the same absent
 member on every node, so its nodes defer together.
 

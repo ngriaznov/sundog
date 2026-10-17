@@ -75,7 +75,8 @@ where
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
     /// Drops tombstones past `tombstone_ttl_ms`, or, while collection defers,
-    /// past the hard cap `tombstone_max_ttl`, correcting the digest.
+    /// past their cap, correcting the digest: `tombstone_max_ttl` for a
+    /// delete, the ttl deadline itself for the tombstone of an expired entry.
     ///
     /// Collection defers when the caller says so (`defer`), and, with the pause
     /// guard on ([`Engine::guarding_pauses`]), when the wall-clock gap since
@@ -85,9 +86,11 @@ where
     /// tombstones only so long. A later pause extends the hold.
     ///
     /// Remembers the decision for [`Engine::apply_many`]: while collection is
-    /// deferred, a tombstone a peer sends that arrives lapsed past its
+    /// deferred, a delete a peer sends that arrives lapsed past its
     /// `ttl_deadline_ms` but not its `max_deadline_ms` is still worth
     /// keeping, and one that arrives past its `max_deadline_ms` is ignored.
+    /// An expiry tombstone's two deadlines are equal, so it is never kept
+    /// past its ttl.
     ///
     /// Returns the gap in milliseconds when this call starts a pause hold,
     /// for the caller to report, and `None` otherwise.

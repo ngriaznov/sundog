@@ -21,8 +21,8 @@ use crate::store::{ConflictResolver, Incoming, Tombstone, Weigher, entry_fingerp
 #[cfg(feature = "spill")]
 use super::EntryState;
 use super::expiry::{
-    absent_at, decode_expiry, drops_lapsed_tombstone, encode_expiry, tombstone_anchor_ms,
-    tombstone_deadlines,
+    absent_at, decode_expiry, deferred_retention_ms, drops_lapsed_tombstone, encode_expiry,
+    tombstone_anchor_ms, tombstone_deadlines,
 };
 use super::keys::{digest_slot, hasher_for, part_index_from_hash, stripe_index_from_hash};
 use super::merge::resolve_and_rebind;
@@ -417,7 +417,9 @@ pub(super) struct ArrivalRule {
 impl ArrivalRule {
     /// The two GC deadlines `incoming` is kept under if it is stored, as
     /// `(ttl_deadline_ms, max_deadline_ms)`: `None` for a put, which carries
-    /// none. Anchored per [`tombstone_anchor_ms`]. Pure; unit tested directly.
+    /// none. Anchored per [`tombstone_anchor_ms`]; the tombstone of an
+    /// expired entry gets equal deadlines ([`deferred_retention_ms`]). Pure;
+    /// unit tested directly.
     pub(super) fn deadlines<V>(self, incoming: &Incoming<V>, ver: Hlc) -> Option<(u64, u64)> {
         let Incoming::Tombstone { expired_at_ms } = *incoming else {
             return None;
@@ -425,7 +427,7 @@ impl ArrivalRule {
         Some(tombstone_deadlines(
             tombstone_anchor_ms(expired_at_ms, ver.wall_ms, self.now_ms),
             self.ttl_ms,
-            self.max_ttl_ms,
+            deferred_retention_ms(expired_at_ms.is_some(), self.ttl_ms, self.max_ttl_ms),
         ))
     }
 

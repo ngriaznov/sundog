@@ -168,8 +168,8 @@ fn arrival_rule_deadlines_anchor_a_delete_on_its_stamp_and_a_put_has_none() {
             },
             hlc(1_000, 1),
         ),
-        Some((62_000, 602_000)),
-        "an expiry tombstone counts from the expiry"
+        Some((62_000, 62_000)),
+        "an expiry tombstone counts from the expiry and keeps no retention past the ttl"
     );
     assert_eq!(
         at_5_000.deadlines(&Incoming::<String>::DELETE, hlc(9_000, 1)),
@@ -261,7 +261,7 @@ fn an_expiry_tombstone_anchors_on_its_expiry_not_its_stamp() {
     );
     assert!(matches!(outcomes[0], ApplyOutcome::Tombstoned { .. }));
     let t = tombstone_state(&engine, 1).expect("stored");
-    assert_eq!((t.ttl_deadline_ms, t.max_deadline_ms), (62_000, 602_000));
+    assert_eq!((t.ttl_deadline_ms, t.max_deadline_ms), (62_000, 62_000));
 }
 
 /// A peer delete stamped at 1,000 has its `ttl` deadline at 61,000 and its
@@ -436,8 +436,9 @@ fn a_lapsed_expiry_tombstone_and_a_lapsed_delete_converge_in_all_orders_of_a_mix
     assert_eq!(all.len(), 24);
 
     // Not deferring, both tombstones are lapsed and ignored, so the newer
-    // value stands. Deferring, both are within their cap and stored, so the
-    // delete, the newest record, wins.
+    // value stands. Deferring, the delete is within its cap and stored and
+    // the expiry tombstone, which keeps nothing past its ttl, is ignored, so
+    // the delete, the newest record, wins.
     for (deferring, live, tombstone_ver) in [
         (false, Some("b".to_string()), None),
         (true, None, Some(hlc(2_000, 4))),

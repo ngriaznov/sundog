@@ -170,12 +170,12 @@ pub(super) fn lapse_cause(expires_at_ms: Option<u64>, now_ms: u64) -> Lapse {
 }
 
 /// How long [`Engine::sweep`](super::Engine::sweep) keeps the tombstone of an
-/// entry it removes for having expired: the same two retentions a delete's
-/// tombstone gets.
+/// entry it removes for having expired: `ttl_ms` from the expiry. No
+/// deferral extends it (see [`deferred_retention_ms`]), so it carries no
+/// second retention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TombstoneRetention {
     pub(crate) ttl_ms: u64,
-    pub(crate) max_ttl_ms: u64,
 }
 
 /// What a sweep does with one live entry.
@@ -227,6 +227,21 @@ pub(super) fn tombstone_anchor_ms(
     expired_at_ms.unwrap_or(ver_wall_ms).min(now_ms)
 }
 
+/// How long past its anchor a tombstone is kept while collection defers:
+/// `max_ttl_ms` for a delete, and `ttl_ms` for the tombstone of an entry
+/// that expired (`expired`), which collection deferral never extends. A
+/// delete is the only record of a removal, so a node that defers keeps it
+/// until a member that was away can learn it. An expiry tombstone only
+/// keeps a replica that missed an overwrite from bringing back the older
+/// version the expired one replaced; it is collected `tombstone_ttl` after
+/// the expiry on every replica, deferral or not, so its memory is bounded by
+/// the expiry rate times `tombstone_ttl`. A replica that stays away longer
+/// than that can bring the older version back, as a replica gone past
+/// Cassandra's `gc_grace_seconds` can. Pure; unit tested directly.
+pub(super) const fn deferred_retention_ms(expired: bool, ttl_ms: u64, max_ttl_ms: u64) -> u64 {
+    if expired { ttl_ms } else { max_ttl_ms }
+}
+
 /// The two GC deadlines of a tombstone anchored at `anchor_ms`, as
 /// `(ttl_deadline_ms, max_deadline_ms)`: the anchor plus the two
 /// retentions, saturating. Pure; unit tested directly.
@@ -238,21 +253,21 @@ pub(super) fn tombstone_deadlines(anchor_ms: u64, ttl_ms: u64, max_ttl_ms: u64) 
 }
 
 /// The deadlines of the tombstone a sweep at `now_ms` leaves for an entry
-/// that expired at `expired_at_ms`: [`tombstone_deadlines`] from the expiry
-/// capped at `now_ms`, and never earlier than `now_ms`, so the tombstone
-/// outlives the sweep that made it even when the sweep runs long after the
-/// expiry. Pure; unit tested directly.
+/// that expired at `expired_at_ms`: `retention.ttl_ms` from the expiry capped
+/// at `now_ms`, and never earlier than `now_ms`, so the tombstone outlives the
+/// sweep that made it even when the sweep runs long after the expiry. Both
+/// deadlines are that instant, as for the tombstone of an expired entry that
+/// arrives from a peer ([`deferred_retention_ms`]). Pure; unit tested
+/// directly.
 pub(super) fn swept_tombstone_deadlines(
     expired_at_ms: u64,
     now_ms: u64,
     retention: TombstoneRetention,
 ) -> (u64, u64) {
-    let (ttl, max) = tombstone_deadlines(
-        tombstone_anchor_ms(Some(expired_at_ms), 0, now_ms),
-        retention.ttl_ms,
-        retention.max_ttl_ms,
-    );
-    (ttl.max(now_ms), max.max(now_ms))
+    let deadline = tombstone_anchor_ms(Some(expired_at_ms), 0, now_ms)
+        .saturating_add(retention.ttl_ms)
+        .max(now_ms);
+    (deadline, deadline)
 }
 
 /// Whether a tombstone with these deadlines is already past the retention
@@ -361,10 +376,8 @@ pub(crate) fn expiry_tombstone_retention(
     mode: Mode,
     resolver_merges: bool,
     tombstone_ttl_ms: u64,
-    tombstone_max_ttl_ms: u64,
 ) -> Option<TombstoneRetention> {
     (mode.tombstones_expired_entries() && !resolver_merges).then_some(TombstoneRetention {
         ttl_ms: tombstone_ttl_ms,
-        max_ttl_ms: tombstone_max_ttl_ms,
     })
 }

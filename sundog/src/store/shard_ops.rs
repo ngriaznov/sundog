@@ -232,8 +232,10 @@ pub trait ShardOps: Send + Sync {
 
     /// Garbage-collects tombstones past `tombstone_ttl`, counted from an
     /// instant all replicas agree on: a delete's version stamp, an expired
-    /// entry's expiry. While `defer`, a tombstone past `tombstone_ttl` but not
-    /// `tombstone_max_ttl` is left in place instead. On a `Replicated` or
+    /// entry's expiry. While `defer`, a delete past `tombstone_ttl` but not
+    /// `tombstone_max_ttl` is left in place instead; the tombstone of an
+    /// expired entry has its cap at its ttl deadline, so no deferral keeps it.
+    /// On a `Replicated` or
     /// `Distributed` shard a call more than twice the gc period (a quarter of
     /// `tombstone_ttl`, at least a second) after the previous one defers too,
     /// as does every later call for `tombstone_ttl`: the shard did not run,

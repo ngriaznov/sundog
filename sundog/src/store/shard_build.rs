@@ -241,7 +241,6 @@ where
             self.mode,
             self.resolver.merges(),
             self.tombstone_ttl_ms,
-            self.tombstone_max_ttl_ms,
         )
     }
 

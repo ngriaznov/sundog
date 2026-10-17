@@ -43,17 +43,18 @@ All notable changes to this project are documented in this file. Format follows
 ### Fixed
 
 - **A delete's tombstone leaves every replica within `tombstone_ttl` of its
-  stamp.** Every tombstone counts `tombstone_ttl` and `tombstone_max_ttl` from
-  an instant all replicas agree on, capped at the receiving node's clock: the
-  delete's own version stamp for a delete, the expiry for the tombstone of an
-  expired entry. Replicas derive the same deadlines and collect a tombstone at
+  stamp.** Every tombstone counts `tombstone_ttl` from an instant all replicas
+  agree on, capped at the receiving node's clock: the delete's own version
+  stamp for a delete, the expiry for the tombstone of an expired entry. A
+  delete also counts its `tombstone_max_ttl` cap from its stamp. Replicas derive the same deadlines and collect a tombstone at
   the same grid tick, so a replica that collected it never takes it back from
   one that still holds it, with fresh deadlines, and it does not pass between
   replicas that collect at different ticks. A tombstone that arrives from a
   peer already past its retention is ignored, whatever the key holds: it is not
   stored, deletes nothing and counts in `sundog_tombstones_ignored_total`. A
   node's own `remove`, `remove_many` and `clear` are never ignored. A node that
-  defers collection judges an arrival against `tombstone_max_ttl`. A
+  defers collection judges an arriving delete against `tombstone_max_ttl`; the
+  tombstone of an expired entry keeps only `tombstone_ttl`, deferral or not. A
   `Replicated` or `Distributed` node defers for `tombstone_ttl` after a pause,
   a wall-clock gap of more than twice the collection period (a quarter of
   `tombstone_ttl`, at least a second) between two of its tombstone collections,
@@ -199,35 +200,34 @@ All notable changes to this project are documented in this file. Format follows
   through disown grace, and a read after the node regains the part asks for
   the reload again. A non-owner at the memory ceiling counts no
   `sundog_ceiling_refusals_total{kind="fill"}`.
-- **A swept expired entry keeps out the value it overwrote.** In a
-  `Replicated` or `Distributed` cache whose resolver does not merge, the sweep
-  turns an entry that reached its deadline into a tombstone at the entry's
-  version. A replica that missed the overwrite can no longer bring the older
-  value back through a write or anti-entropy, whether or not a sweep had run
-  when the older copy arrived, and anti-entropy removes that copy from the
-  replica that still holds it. The same holds for a lifetime shortened with
-  `expire`: a cut-off peer's longer-lived copy is deleted instead of bringing
-  the entry back. The tombstone follows the one retention rule of a delete's
-  tombstone, with the entry's expiry as the agreed instant: it counts its
-  `tombstone_ttl` (and, while a node defers, `tombstone_max_ttl`) from the
-  expiry, capped at the receiving node's clock, and every node collects on a
-  wall-clock grid of a quarter of `tombstone_ttl`, so every replica collects it
-  at the same instant, give or take their clock skew. One that arrives from a
-  peer already past that retention is ignored whatever the node holds for the
-  key, so replicas that receive the same records in any order hold the same
-  ones, and a replica that collected it never takes it back from one that has
-  not. A cache defers collection for its first
-  `tombstone_ttl` after it opens, whoever is absent, so a node that just opened
-  keeps a tombstone that is past `tombstone_ttl` but not `tombstone_max_ttl`
-  and deletes its older copy. The expiry travels as the tombstone record's
-  `expires_at_ms`; a peer on protocol 8 reads the record as an ordinary delete.
-  A sweep leaves a bucket's digest unchanged, and a `Distributed` owner of a
-  cold part answers a peer's fetch for a swept key with a miss, as for a
-  deleted one, instead of declining. Each expired entry of such a cache costs a
-  tombstone for the retention, and while a member is absent for up to
-  `tombstone_max_ttl`: a TTL-heavy cache holds that many tombstones, outside
-  `max_capacity` and the memory ceiling, so size for the expiry rate times the
-  retention. `LocalRecord` reports a swept key as `Tombstone` in these caches.
+- **A swept expired entry keeps out the value it overwrote.** In a `Replicated`
+  or `Distributed` cache whose resolver does not merge, the sweep turns an entry
+  that reached its deadline into a tombstone at the entry's version. A replica
+  that missed the overwrite can no longer bring the older value back through a
+  write or anti-entropy, whether or not a sweep had run when the older copy
+  arrived, and anti-entropy removes that copy from the replica that still holds
+  it. The same holds for a lifetime shortened with `expire`: a cut-off peer's
+  longer-lived copy is deleted instead of bringing the entry back. The tombstone
+  follows the one retention rule of a delete's tombstone, with the entry's
+  expiry as the agreed instant: it counts its `tombstone_ttl` from the expiry,
+  capped at the receiving node's clock, and every node collects on a wall-clock
+  grid of a quarter of `tombstone_ttl`, so every replica collects it at the same
+  instant, give or take their clock skew. Unlike a delete's, no deferral extends
+  it, for an absent member, a cache's first `tombstone_ttl` or a pause, as
+  Cassandra collects a tombstone after `gc_grace_seconds`: a replica that
+  catches up within `tombstone_ttl` of the expiry loses its older copy, and one
+  away longer can bring that copy back, limited by its own expiry. One that
+  arrives from a peer already past that retention is ignored whatever the node
+  holds for the key, so replicas that receive the same records in any order hold
+  the same ones, and a replica that collected it never takes it back from one
+  that has not. The expiry travels as the tombstone record's `expires_at_ms`; a
+  peer on protocol 8 reads the record as an ordinary delete. A sweep leaves a
+  bucket's digest unchanged, and a `Distributed` owner of a cold part answers a
+  peer's fetch for a swept key with a miss, as for a deleted one, instead of
+  declining. Each expired entry of such a cache costs a tombstone for
+  `tombstone_ttl`, whoever is absent: a TTL-heavy cache holds the expiry rate
+  times `tombstone_ttl` in tombstones, outside `max_capacity` and the memory
+  ceiling. `LocalRecord` reports a swept key as `Tombstone` in these caches.
   `Local`, `Invalidation` and merging caches keep nothing, and report it as
   `Absent`: a merging cache already reads an expired side as absent on every
   node.

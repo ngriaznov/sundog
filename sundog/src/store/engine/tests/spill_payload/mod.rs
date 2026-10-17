@@ -1376,10 +1376,7 @@ fn sweeping_an_expired_spilled_key_with_retention_leaves_a_tombstone_and_decreme
 
     engine.sweep(
         100,
-        Some(crate::store::engine::TombstoneRetention {
-            ttl_ms: 60_000,
-            max_ttl_ms: 600_000,
-        }),
+        Some(crate::store::engine::TombstoneRetention { ttl_ms: 60_000 }),
     );
 
     assert_eq!(engine.get(&key, 100), None);

@@ -867,8 +867,9 @@ where
     /// Starts this engine with tombstone collection counted as deferring
     /// (`deferred`), until the first [`Engine::gc_tombstones`] call says
     /// otherwise: a tombstone that arrives before that call is judged
-    /// against its `tombstone_max_ttl` deadline, not its `tombstone_ttl`
-    /// one. An engine built by [`Engine::new`] starts not deferring.
+    /// against its cap deadline, not its `tombstone_ttl` one: a delete's
+    /// `tombstone_max_ttl`, while an expiry tombstone's cap is its ttl
+    /// deadline. An engine built by [`Engine::new`] starts not deferring.
     #[must_use]
     pub(crate) fn starting_gc_deferred(mut self, deferred: bool) -> Self {
         *self.gc_deferring.get_mut() = deferred;
@@ -897,7 +898,8 @@ where
     }
 
     /// Whether an arrival at `now_ms` is judged against the cap deadline
-    /// rather than the `tombstone_ttl` one: the last collection decided to
+    /// rather than the `tombstone_ttl` one (the two are equal for the
+    /// tombstone of an expired entry): the last collection decided to
     /// defer, or the pause guard sees a gap since that collection longer than
     /// [`expiry::pause_gap_ms`] for `tombstone_ttl_ms`, or the hold a pause
     /// started still lasts. Read from the clock rather than from the last

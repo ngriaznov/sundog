@@ -208,13 +208,20 @@ impl Model {
     /// (`expired_at_ms` `Some`) for the tombstone of an expired entry. One
     /// that comes from a peer (`from_peer`) is dropped on arrival, whatever
     /// the key holds, when its retention has already lapsed: the `ttl`
-    /// deadline, or the `max` one while the last [`Model::gc`] deferred. A
-    /// local delete is always stored.
+    /// deadline, or the `max` one while the last [`Model::gc`] deferred. The
+    /// tombstone of an expired entry has its `max` deadline at its `ttl`
+    /// one. A local delete is always stored.
     pub fn remove(&mut self, key: u8, ver: Hlc, expired_at_ms: Option<u64>, from_peer: bool) {
         let now = self.now_ms();
         let anchor = expired_at_ms.unwrap_or(ver.wall_ms).min(now);
         let ttl_deadline_ms = anchor.saturating_add(self.tombstone_ttl_ms);
-        let max_deadline_ms = anchor.saturating_add(self.tombstone_max_ttl_ms);
+        // An expiry tombstone keeps nothing past its ttl deadline, deferral
+        // or not; a delete keeps to its max.
+        let max_deadline_ms = if expired_at_ms.is_some() {
+            ttl_deadline_ms
+        } else {
+            anchor.saturating_add(self.tombstone_max_ttl_ms)
+        };
         let horizon = if self.deferring_at(now) {
             max_deadline_ms
         } else {
@@ -328,11 +335,12 @@ impl Model {
 
     /// [`super::engine::Engine::sweep`]'s rule: a live entry past its own
     /// `expires_at_ms` is replaced by a tombstone at its version, anchored
-    /// on that expiry: its deadlines count a retention from the expiry and
-    /// are never earlier than now.
+    /// on that expiry: both its deadlines are `tombstone_ttl` after the
+    /// expiry, never earlier than now, so a deferring [`Model::gc`] keeps it
+    /// no longer than one that does not defer.
     pub fn sweep(&mut self) {
         let now = self.now_ms();
-        let (ttl, max) = (self.tombstone_ttl_ms, self.tombstone_max_ttl_ms);
+        let ttl = self.tombstone_ttl_ms;
         for entry in self.entries.values_mut() {
             if let ModelEntry::Live {
                 ver,
@@ -342,10 +350,11 @@ impl Model {
                 && now >= expired_at_ms
             {
                 let anchor = expired_at_ms.min(now);
+                let deadline = anchor.saturating_add(ttl).max(now);
                 *entry = ModelEntry::Tombstone {
                     ver,
-                    ttl_deadline_ms: anchor.saturating_add(ttl).max(now),
-                    max_deadline_ms: anchor.saturating_add(max).max(now),
+                    ttl_deadline_ms: deadline,
+                    max_deadline_ms: deadline,
                 };
             }
         }
@@ -467,8 +476,8 @@ pub enum Op {
     },
     /// [`ShardOps::gc_tombstones`].
     Gc {
-        /// Defers a past-`tombstone_ttl` tombstone until it is also
-        /// past-`tombstone_max_ttl`.
+        /// Defers a past-`tombstone_ttl` delete until it is also
+        /// past-`tombstone_max_ttl`; an expiry tombstone is not deferred.
         any_member_absent: bool,
     },
     /// [`ShardOps::run_pending_tasks`], the engine's explicit sweep.
@@ -793,14 +802,15 @@ mod tests {
         model.sweep();
 
         model.advance_clock(899);
-        model.gc(false);
+        model.gc(true);
         assert!(held(&model, 1).is_some(), "kept until the retention ends");
         model.advance_clock(1);
         model.gc(true);
-        assert!(held(&model, 1).is_some(), "an absent member defers it");
-        model.advance_clock(9_000);
-        model.gc(true);
-        assert_eq!(held(&model, 1), None, "the cap collects it");
+        assert_eq!(
+            held(&model, 1),
+            None,
+            "the retention collects it, though an absent member defers"
+        );
     }
 
     #[test]
@@ -903,22 +913,18 @@ mod tests {
     }
 
     #[test]
-    fn a_deferring_collection_keeps_a_lapsed_expiry_tombstone_to_its_cap() {
+    fn a_deferring_collection_drops_an_expiry_tombstone_lapsed_by_its_ttl() {
         let mut model = model();
         model.gc(true);
-        model.remove(1, ver(5), Some(START_CLOCK_MS - 20_000), true);
-        assert_eq!(held(&model, 1), None, "past its cap too");
-        model.remove(1, ver(5), Some(START_CLOCK_MS - 2_000), true);
-        assert_eq!(
-            held(&model, 1),
-            Some(ver(5)),
-            "within its cap, past its ttl"
-        );
-
-        model.apply(2, ver(4), 1, None);
+        model.remove(1, ver(5), Some(START_CLOCK_MS - 500), true);
+        assert_eq!(held(&model, 1), Some(ver(5)), "within its ttl");
         model.remove(2, ver(5), Some(START_CLOCK_MS - 2_000), true);
-        assert_eq!(model.visible(2), None, "it deletes the older copy");
-        assert_eq!(held(&model, 2), Some(ver(5)));
+        assert_eq!(held(&model, 2), None, "past its ttl, deferral or not");
+
+        model.apply(3, ver(4), 1, None);
+        model.remove(3, ver(5), Some(START_CLOCK_MS - 2_000), true);
+        assert_eq!(model.visible(3), Some(1), "the older copy stays");
+        assert_eq!(held(&model, 3), Some(ver(4)), "no tombstone replaced it");
     }
 
     #[test]
@@ -937,20 +943,20 @@ mod tests {
     #[test]
     fn a_new_model_defers_collection_until_its_first_gc() {
         let mut model = model();
-        let past_its_ttl = Some(START_CLOCK_MS - 2_000);
+        let past_its_ttl = ver(START_CLOCK_MS - 2_000);
         model.apply(1, ver(4), 1, None);
-        model.remove(1, ver(5), past_its_ttl, true);
+        model.remove(1, past_its_ttl, None, true);
         assert_eq!(
             model.visible(1),
             None,
             "a new model keeps it, as a new shard"
         );
-        assert_eq!(held(&model, 1), Some(ver(5)));
+        assert_eq!(held(&model, 1), Some(past_its_ttl));
 
         model.gc(false);
         assert_eq!(held(&model, 1), None, "the collection ends the deferral");
         model.apply(2, ver(4), 1, None);
-        model.remove(2, ver(5), past_its_ttl, true);
+        model.remove(2, past_its_ttl, None, true);
         assert_eq!(model.visible(2), Some(1), "and the next one is dropped");
     }
 

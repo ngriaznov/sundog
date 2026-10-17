@@ -167,7 +167,7 @@ plus one collection period plus the stamp's lead over the slowest clock;
 nothing bounds the lifetime.
 
 While a member that gossip remembers is absent, a
-cache keeps its tombstones longer, up to `tombstone_max_ttl`, 24 hours by
+cache keeps its deletes longer, up to `tombstone_max_ttl`, 24 hours by
 default, and for another `tombstone_ttl` once that member is back, so a
 node returning from a partition cannot bring a deleted key back. A
 `Replicated` cache counts every absent member. A `Distributed` cache
@@ -180,7 +180,9 @@ collection for the first `tombstone_ttl` after it opens, whoever is absent:
 a node that reopened warm can hold a copy that a peer's tombstone has to
 delete, and a node that just started has no memory of which members were
 away. A deferring node judges an arriving tombstone against its stamp plus
-`tombstone_max_ttl` and keeps its own tombstones to the same point.
+`tombstone_max_ttl` and keeps its own tombstones to the same point. Deferral
+covers deletes only: the tombstone of an expired entry is collected
+`tombstone_ttl` after its expiry either way (see [Expiry](#expiry)).
 
 A pause defers collection too. A process that was stopped, a virtual machine
 that was suspended and a starved gc task all miss the deletes their peers
@@ -227,8 +229,10 @@ collected, and those raise the counter without losing a delete.
 
 The tombstone an expired entry leaves in `Replicated` and `Distributed` under
 a non-merging resolver follows the same rules, counted from the entry's expiry
-instead of from the delete's stamp. `sundog_tombstones{cache}` reports how many
-a node holds.
+instead of from the delete's stamp, with one difference: no deferral extends
+it, so it is collected `tombstone_ttl` after the expiry on every node, as
+Cassandra collects a tombstone after `gc_grace_seconds`.
+`sundog_tombstones{cache}` reports how many a node holds.
 
 A member gone longer than `tombstone_max_ttl` returns after the tombstone
 is collected, and its stale copy can come back, limited by that copy's own
@@ -292,26 +296,30 @@ that missed the overwrite cannot bring the overwritten value back, whether or
 not the sweep had run when the older copy arrived, and anti-entropy removes
 that copy from the replica that still holds it. The tombstone counts its
 retention from the entry's expiry, so every replica that learns of it, by
-sweeping or from a peer, collects it at the same instant: `tombstone_ttl`, and
-up to `tombstone_max_ttl` while collection defers, as for a delete. A
-tombstone that arrives already past that retention is ignored, whatever the
-node holds for the key: it deletes nothing and is not stored. A replica that
-collected it never takes it back from one that has not, and the same records
-applied in any order leave the same state. Within its first `tombstone_ttl` a
-cache defers collection, so a tombstone past `tombstone_ttl` but not
-`tombstone_max_ttl` is kept there and removes an older copy the node holds.
-Shortening a lifetime takes the same path: once the shortened entry expires
-and is swept, a node cut off for the whole lifetime loses its longer-lived
-copy to anti-entropy instead of bringing the entry back. After the retention
-ends, a copy that was cut off longer is accepted again, limited by its own
-expiry, as after a delete. Nodes sweep on their own clocks, which differ by up
-to `max_clock_skew`, so a peer can take a tombstone that much before its own
-clock reaches the expiry.
+sweeping or from a peer, collects it at the same instant: `tombstone_ttl`
+after the expiry. Unlike a delete's, its retention does not grow while
+collection defers, for an absent member, a cache's first `tombstone_ttl` or a
+pause, so the memory expired entries hold stays the expiry rate times
+`tombstone_ttl` however long a member is away. A tombstone that arrives
+already past that retention is ignored, whatever the node holds for the key:
+it deletes nothing and is not stored. A replica that collected it never takes
+it back from one that has not, and the same records applied in any order
+leave the same state. Shortening a lifetime takes the same path: once the
+shortened entry expires and is swept, a node that missed the overwrite and
+catches up within `tombstone_ttl` of the expiry loses its longer-lived copy to
+anti-entropy instead of bringing the entry back. A node away longer than that,
+partitioned, down or paused, keeps its longer-lived copy and can bring it back
+to the others, limited by that copy's own expiry, as a Cassandra replica down
+past `gc_grace_seconds` can. `remove` is the delete that holds through an
+absence, up to `tombstone_max_ttl`. Nodes sweep on their own clocks, which
+differ by up to `max_clock_skew`, so a peer can take a tombstone that much
+before its own clock reaches the expiry.
 
 A `Distributed` owner of a part it has not yet verified declines a peer's
 fetch for a key it holds nothing for, and the peer asks the next owner. An
 owner that swept an expired entry under a non-merging resolver holds its
-tombstone, so it answers that fetch with a miss instead.
+tombstone until `tombstone_ttl` after the expiry, so within that time it
+answers that fetch with a miss instead.
 
 A cache with a merging resolver keeps no tombstone: it reads an expired side
 as absent on every node, swept or not, so a write older than the expired
