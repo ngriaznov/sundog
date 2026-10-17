@@ -103,7 +103,10 @@ caches have pulled their snapshot:
 ```
 
 With the `prometheus` feature, `ClusterBuilder::prometheus_listen` serves
-the same check at `GET /readyz`, with `GET /healthz` for liveness.
+the same check at `GET /readyz`, with `GET /healthz` for liveness. Open the
+telemetry port to scrapers and probes only: the listener serves at most 64
+connections at once and closes a connection over that, so a client that holds
+connections open takes the slots a scraper needs.
 
 On SIGTERM, leave the cluster after the HTTP server drains, so peers learn
 the node left on purpose:

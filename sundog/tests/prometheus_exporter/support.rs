@@ -41,6 +41,23 @@ pub(crate) async fn scrape_status(addr: SocketAddr, path: &str) -> Option<String
     Some(response.lines().next()?.to_string())
 }
 
+/// A minimal raw-socket request with `method` against `path`, returning the
+/// whole response, headers and body. `None` if the listener is not accepting
+/// connections yet.
+pub(crate) async fn raw_request(addr: SocketAddr, method: &str, path: &str) -> Option<String> {
+    let mut stream = TcpStream::connect(addr).await.ok()?;
+    stream
+        .write_all(
+            format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .ok()?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.ok()?;
+    Some(String::from_utf8_lossy(&response).into_owned())
+}
+
 /// Finds `metric{label1="value1",label2="value2",...} <number>` in
 /// Prometheus text-exposition `body`, tolerant of label ordering and
 /// integer-vs-float rendering. Every pair in `labels` must match the same

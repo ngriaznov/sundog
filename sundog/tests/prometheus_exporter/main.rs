@@ -35,7 +35,7 @@ use crate::spill::{
     spill_writes_and_promotes_pin_metrics,
 };
 use crate::support::{
-    node_config, reserve_tcp_addr, scrape_metrics, scrape_status, scraped_metric_value,
+    node_config, raw_request, reserve_tcp_addr, scrape_metrics, scrape_status, scraped_metric_value,
 };
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -847,6 +847,43 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     assert!(
         healthz_status.contains("200"),
         "expected /healthz to always answer 200 while the process serves; got {healthz_status}"
+    );
+    // The listener ignores a query string, answers `HEAD` with the headers of
+    // a `GET` and no body, and refuses any other method.
+    let readyz_with_query = scrape_status(metrics_addr, "/readyz?probe=1")
+        .await
+        .expect("readyz with a query string answers");
+    assert_eq!(
+        readyz_with_query, readyz_status,
+        "a query string does not change the route"
+    );
+    let head = raw_request(metrics_addr, "HEAD", "/metrics")
+        .await
+        .expect("a HEAD of /metrics answers");
+    let (head_headers, head_body) = head
+        .split_once("\r\n\r\n")
+        .expect("a HEAD response ends its headers");
+    assert!(
+        head_headers.starts_with("HTTP/1.1 200 OK"),
+        "expected HEAD /metrics to answer 200; got {head_headers}"
+    );
+    assert_eq!(head_body, "", "a HEAD response carries no body");
+    let advertised: usize = head_headers
+        .lines()
+        .find_map(|line| line.strip_prefix("Content-Length: "))
+        .and_then(|length| length.parse().ok())
+        .expect("a HEAD response advertises the length of the body a GET sends");
+    assert!(
+        advertised > 0,
+        "the recorder renders metrics by now; got {head_headers}"
+    );
+    let post = raw_request(metrics_addr, "POST", "/metrics")
+        .await
+        .expect("a POST to /metrics answers");
+    assert!(
+        post.starts_with("HTTP/1.1 405 Method Not Allowed")
+            && post.contains("\r\nAllow: GET, HEAD\r\n"),
+        "expected POST /metrics to answer 405 with Allow: GET, HEAD; got {post}"
     );
 
     peer.shutdown().await;

@@ -702,6 +702,12 @@ impl ClusterBuilder {
     /// and `GET /healthz` on `addr` for the life of the process, once
     /// [`build`](Self::build) succeeds.
     ///
+    /// The listener also answers `HEAD` with the headers of the `GET` and no
+    /// body, ignores a query string, and answers any other method with `405`.
+    /// A client has 5 seconds to send a request head of at most 8 KiB, and at
+    /// most 64 connections are served at once. Open `addr` to scrapers and
+    /// probes only.
+    ///
     /// `metrics`'s recorder is a single process-global slot: a second call to
     /// this, or mixing it with [`crate::telemetry::prometheus_handle`], fails
     /// `build()` with [`JoinError::Bind`] rather than panicking.
