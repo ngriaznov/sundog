@@ -18,12 +18,13 @@
 //! answers with the headers of the `GET` and no body, and any other method on
 //! those paths gets `405 Method Not Allowed` with `Allow: GET, HEAD`. Any
 //! other path gets `404 Not Found`, whatever the method. A client has
-//! `REQUEST_TIMEOUT` (5 seconds) for the whole exchange: to send its request
-//! head, the request line and the headers, of at most `MAX_REQUEST_HEAD`
-//! (8 KiB), and to take the response. A connection that has not finished by
-//! then is closed, and a head that has not arrived gets no response. A head
-//! over the size limit, or a request line that is not `METHOD target
-//! HTTP/version`, gets `400 Bad Request`. At most `MAX_CONNECTIONS` (64)
+//! `REQUEST_TIMEOUT` (5 seconds) to send its request head, the request line
+//! and the headers, of at most `MAX_REQUEST_HEAD` (8 KiB); a connection whose
+//! head has not arrived by then is closed with no response. The listener then
+//! spends at most `RESPONSE_TIMEOUT` (30 seconds) writing the response, and
+//! closes a client that has not taken it by then. A head over the size limit,
+//! or a request line that is not `METHOD target HTTP/version`, gets
+//! `400 Bad Request`. At most `MAX_CONNECTIONS` (64)
 //! connections are served at once, and a connection over that is closed at
 //! once.
 //!
@@ -107,10 +108,16 @@ pub(crate) trait ReadinessSource: Send + Sync + 'static {
     fn is_ready(&self) -> bool;
 }
 
-/// How long a client has to complete one request once it connects: send its
-/// whole request head, request line and headers, and take the response. The
-/// listener closes a connection that has not finished by then.
+/// How long a client has to send its whole request head, request line and
+/// headers, once it connects. The listener closes a connection whose head has
+/// not arrived by then, with no response.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the listener spends writing one response. It closes a client that
+/// has not taken the whole response by then. Longer than `REQUEST_TIMEOUT`, so
+/// a large `/metrics` body reaches a scraper on a slow link within the
+/// 10-second default scrape timeout of Prometheus and well past it.
+pub(crate) const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The most bytes of request line and headers the listener reads. A head
 /// that has not ended within them gets `400 Bad Request`.
@@ -127,9 +134,10 @@ const ALLOWED_METHODS: &str = "GET, HEAD";
 /// the tests pass smaller ones.
 #[derive(Clone, Copy, Debug)]
 struct Limits {
-    /// How long a client has to complete its exchange: send its whole request
-    /// head and take the response.
+    /// How long a client has to send its whole request head.
     request_timeout: Duration,
+    /// How long the listener spends writing one response.
+    response_timeout: Duration,
     /// The most bytes of request line and headers read from a client.
     max_request_head: usize,
     /// The most connections served at once.
@@ -137,10 +145,11 @@ struct Limits {
 }
 
 impl Limits {
-    /// `REQUEST_TIMEOUT`, `MAX_REQUEST_HEAD` and `MAX_CONNECTIONS`: the bounds
-    /// the listener runs under.
+    /// `REQUEST_TIMEOUT`, `RESPONSE_TIMEOUT`, `MAX_REQUEST_HEAD` and
+    /// `MAX_CONNECTIONS`: the bounds the listener runs under.
     const SERVED: Self = Self {
         request_timeout: REQUEST_TIMEOUT,
+        response_timeout: RESPONSE_TIMEOUT,
         max_request_head: MAX_REQUEST_HEAD,
         max_connections: MAX_CONNECTIONS,
     };
@@ -149,7 +158,8 @@ impl Limits {
 /// Installs a Prometheus recorder and serves `GET` and `HEAD` for
 /// `/metrics`, `/readyz` (200 once `readiness` reports ready, 503 otherwise),
 /// and `/healthz` on `addr`. Each request is bounded by `REQUEST_TIMEOUT`,
-/// `MAX_REQUEST_HEAD` and `MAX_CONNECTIONS`; see the module docs.
+/// `RESPONSE_TIMEOUT`, `MAX_REQUEST_HEAD` and `MAX_CONNECTIONS`; see the module
+/// docs.
 ///
 /// # Errors
 ///
@@ -188,7 +198,7 @@ const UPKEEP_INTERVAL: Duration = Duration::from_secs(5);
 /// A connection that arrives while `limits.max_connections` are being served
 /// is dropped before anything is read from it. A connection's slot is held by
 /// its task until the connection is closed, at the latest
-/// `limits.request_timeout` after it arrives.
+/// `limits.request_timeout` plus `limits.response_timeout` after it arrives.
 async fn serve(
     listener: TcpListener,
     handle: PrometheusHandle,
@@ -220,34 +230,24 @@ async fn serve(
     }
 }
 
-/// Answers one request on `stream`, then closes it. The whole exchange, the
-/// request head and the response, must finish within `limits.request_timeout`:
-/// a connection that has not is closed, with no response if the head had not
-/// arrived. A head the client abandons is closed without a response, and a head
-/// over `limits.max_request_head` or with a malformed request line gets `400`.
+/// Answers one request on `stream`, then closes it. The request head must
+/// arrive within `limits.request_timeout`: a connection whose head has not is
+/// closed with no response, and so is a head the client abandons. A head over
+/// `limits.max_request_head` or with a malformed request line gets `400`. The
+/// response must be taken within `limits.response_timeout`, or the connection
+/// is closed.
 async fn respond(
     mut stream: TcpStream,
     handle: &PrometheusHandle,
     readiness: &dyn ReadinessSource,
     limits: Limits,
 ) -> io::Result<()> {
-    tokio::time::timeout(
+    let head = tokio::time::timeout(
         limits.request_timeout,
-        answer(&mut stream, handle, readiness, limits.max_request_head),
+        read_head(&mut stream, limits.max_request_head),
     )
     .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "request not finished in time"))?
-}
-
-/// Reads one request head from `stream` and writes the response to it. The
-/// caller bounds the time.
-async fn answer(
-    stream: &mut TcpStream,
-    handle: &PrometheusHandle,
-    readiness: &dyn ReadinessSource,
-    max_request_head: usize,
-) -> io::Result<()> {
-    let head = read_head(&mut *stream, max_request_head).await?;
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "request head not received in time"))??;
     let reply = match head {
         Head::Complete(line) => match parse_request_line(&line) {
             Some((method, target)) => {
@@ -258,8 +258,12 @@ async fn answer(
         Head::TooLong => Reply::empty("400 Bad Request"),
         Head::Incomplete => return Err(io::ErrorKind::UnexpectedEof.into()),
     };
-    stream.write_all(reply.render().as_bytes()).await?;
-    stream.shutdown().await
+    tokio::time::timeout(limits.response_timeout, async {
+        stream.write_all(reply.render().as_bytes()).await?;
+        stream.shutdown().await
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "response not taken in time"))?
 }
 
 /// What `read_head` found in the bytes a client sent.
@@ -671,12 +675,14 @@ mod tests {
     }
 
     #[test]
-    fn the_limits_are_five_seconds_eight_kib_and_sixty_four_connections() {
+    fn the_limits_are_five_and_thirty_seconds_eight_kib_and_sixty_four_connections() {
         assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(RESPONSE_TIMEOUT, Duration::from_secs(30));
         assert_eq!(MAX_REQUEST_HEAD, 8192);
         assert_eq!(MAX_CONNECTIONS, 64);
         let served = Limits::SERVED;
         assert_eq!(served.request_timeout, Duration::from_secs(5));
+        assert_eq!(served.response_timeout, Duration::from_secs(30));
         assert_eq!(served.max_request_head, 8192);
         assert_eq!(served.max_connections, 64);
     }
@@ -1164,9 +1170,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_client_that_does_not_read_its_response_loses_its_slot_at_the_deadline() {
+    async fn a_client_that_does_not_read_its_response_loses_its_slot_at_the_response_deadline() {
         let limits = Limits {
-            request_timeout: SHORT,
+            response_timeout: SHORT,
             max_connections: 1,
             ..Limits::SERVED
         };
@@ -1200,11 +1206,46 @@ mod tests {
                 break;
             }
         }
-        let served_at = served_at.expect("the unread response held the slot past the deadline");
+        let served_at =
+            served_at.expect("the unread response held the slot past the response deadline");
         assert!(
             served_at >= SHORT_FLOOR,
             "the slot freed after {served_at:?}, before the {SHORT:?} deadline"
         );
+    }
+
+    #[tokio::test]
+    async fn a_response_slower_than_the_head_deadline_is_sent_whole() {
+        let limits = Limits {
+            request_timeout: SHORT,
+            ..Limits::SERVED
+        };
+        let addr = start_listener_recording(limits, true, || {
+            metrics::counter!("telemetry_test_padded_total", "padding" => "x".repeat(LARGE_METRICS))
+                .increment(1);
+        })
+        .await;
+        let socket = TcpSocket::new_v4().expect("socket");
+        socket.set_recv_buffer_size(4096).expect("receive buffer");
+        let started = Instant::now();
+        let mut stream = socket.connect(addr).await.expect("connect");
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\n\r\n")
+            .await
+            .expect("write");
+        // The response outgrows the socket buffers, so the listener is still
+        // writing it when the head deadline passes.
+        tokio::time::sleep(SHORT * 3).await;
+        let seen = read_until_closed(stream, started).await;
+        assert!(seen.closed, "the response did not finish within {GUARD:?}");
+        assert!(seen.text.starts_with("HTTP/1.1 200 OK"), "{}", seen.head());
+        let length: usize = seen
+            .header("Content-Length")
+            .expect("a Content-Length header")
+            .parse()
+            .expect("a length");
+        assert!(length > LARGE_METRICS, "{length}");
+        assert_eq!(seen.body().len(), length, "the body arrived whole");
     }
 
     #[tokio::test]

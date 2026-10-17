@@ -707,9 +707,9 @@ impl ClusterBuilder {
     /// answers `HEAD` with the headers of the `GET` and no body, ignores a
     /// query string, and answers any other method on those paths with `405`
     /// and an unknown path with `404` whatever the method. A client has 5
-    /// seconds for the whole exchange, to send a request head of at most
-    /// 8 KiB and to take the response, and at most 64 connections are served
-    /// at once. Open `addr` to scrapers and probes only.
+    /// seconds to send a request head of at most 8 KiB and 30 seconds to take
+    /// the response, and at most 64 connections are served at once. Open
+    /// `addr` to scrapers and probes only.
     ///
     /// `metrics`'s recorder is a single process-global slot: a second call to
     /// this, or mixing it with [`crate::telemetry::prometheus_handle`], fails
