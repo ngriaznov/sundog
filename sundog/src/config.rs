@@ -229,6 +229,11 @@ pub struct ClusterConfig {
     /// [`Mode::Distributed`] part this node owns alone because the failure
     /// detector dropped its other owners: the part stays cold until they
     /// return or this long has passed, then serves what this node holds.
+    /// A graceful [`Cluster::shutdown`](crate::Cluster::shutdown) of a node
+    /// with [`Mode::Distributed`] caches also runs on it: the node
+    /// reconciles its parts with each live co-owner first, every co-owner of
+    /// every cache gets an equal share of the time left, and a round that
+    /// fails is retried within the share.
     ///
     /// [`Mode::Replicated`]: crate::Mode::Replicated
     /// [`Mode::Distributed`]: crate::Mode::Distributed

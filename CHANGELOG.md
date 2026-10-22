@@ -17,14 +17,14 @@ All notable changes to this project are documented in this file. Format follows
   the groups after it, so one unreachable co-owner that is still live does not
   use up the budget of the others. A co-owner that leaves the live set ends
   its retries. A group that ends with parts still diverging logs a warning
-  with the cache, the co-owner and the number of parts.
+  with the cache, the co-owner, the number of parts and why the group ended.
 - **A graceful shutdown waits for the invalidations it has queued.** The data
   plane's shutdown waited for a peer's queued replicate frames only, so the
   invalidations and merged records still queued for a peer whose link was slow
   or redialing were discarded, and that peer served the value the leaving node
   replaced until its TTL. Shutdown waits, up to 500 ms, until no peer has a
-  frame queued in either outbox, and logs at `warn`, once per peer, the frames
-  it still discards when the wait ends. They are not counted in
+  frame queued in either outbox, and logs at `warn`, once per peer, the queued
+  frames it still discards when the wait ends. They are not counted in
   `sundog_backlog_dropped_total`.
 
 ## [0.6.8] – 2026-10-17

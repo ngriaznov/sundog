@@ -415,7 +415,11 @@ async fn invalidation_mode_drops_a_stale_remote_copy() {
 }
 
 /// The invalidations node A queued for node B go out before A leaves, so B
-/// serves none of the values A replaced.
+/// serves none of the values A replaced. An end-to-end check of the
+/// contract: a loopback pair drains the backlog within the departure notice
+/// alone, so the `Mesh`-layer test
+/// `shutdown_flushes_invalidate_frames_queued_behind_a_slow_receiver`, which
+/// holds the receiver slow, is the one that pins the flush.
 #[tokio::test]
 async fn shutdown_sends_the_invalidations_queued_for_a_peer_before_the_node_leaves() {
     const KEYS: u32 = 200;

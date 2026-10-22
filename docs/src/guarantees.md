@@ -363,7 +363,9 @@ resolver merges, so a TTL is its bound on staleness. Set one on every
 and merged records still queued for each peer before the node leaves, within a
 500 ms flush deadline. A peer whose link is slow or redialing for that whole
 time misses the frames still queued, which the shutdown logs at `warn`, and
-serves the value the leaving node replaced until its TTL.
+serves the value the leaving node replaced until its TTL. A burst the node's
+writer has already taken, in flight or held for a redial, is outside the wait
+and the log.
 
 A `Distributed` cache has no quorum. During a partition each side computes
 its own owners and accepts writes, and the two sides settle by version
@@ -376,10 +378,11 @@ first reconciles every part it owns with each live co-owner, within
 at the announcement. Each co-owner of each cache gets an equal share of the
 time left in the budget, and the time a quick co-owner leaves unused passes to
 the ones after it. A round that fails or answers `Stale`, as one does right
-after a membership change, is retried every 100 ms until the co-owner's share
-ends or it leaves the live set; only completed rounds count against the three
-a co-owner gets. Parts still diverging when a co-owner's share ends are logged
-at `warn`.
+after a membership change, is retried 100 ms after it ends until the
+co-owner's share ends or it leaves the live set; only completed rounds count
+against the three a co-owner gets. A group that ends with parts still
+diverging, whether its share ran out, its three completed rounds were spent or
+the co-owner left the live set, is logged at `warn` with the cause.
 
 ### Reads while ownership moves
 

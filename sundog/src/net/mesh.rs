@@ -427,7 +427,7 @@ impl Mesh {
     }
 
     /// Waits, up to `deadline`, until every peer's replicate and invalidate
-    /// outboxes have been handed to its writer ([`outboxes_pending`]), then
+    /// outboxes have been handed to its writer ([`super::outboxes_pending`]), then
     /// a moment more for the writer's last frames to leave: what
     /// [`Mesh::shutdown`] runs before cancelling the writers, so a frame
     /// accepted right before shutdown still goes out.
@@ -506,8 +506,10 @@ impl Mesh {
     /// Shuts down the mesh: stops accepting, waits up to half a second for
     /// the replicate and invalidate frames queued for each peer to reach its
     /// writer, then cancels every per-peer writer. A frame still queued then
-    /// is discarded, and a `warn` per peer logs how many. Signals the
-    /// spawned background work to stop without waiting on sockets.
+    /// is discarded, and a `warn` per peer logs how many. A burst a writer
+    /// has already taken, in flight or held for a redial, is outside both the
+    /// wait and the count. Signals the spawned background work to stop
+    /// without waiting on sockets.
     ///
     /// # Panics
     ///

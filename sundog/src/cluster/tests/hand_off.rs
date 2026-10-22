@@ -116,6 +116,37 @@ async fn hand_off(peer: &ScriptedPeer, parts: Vec<PartId>, deadline: Instant) ->
     .await
 }
 
+/// The co-owner `peers[index]` stands for.
+fn co_owner(index: usize) -> NodeId {
+    NodeId::from(2 + u64::try_from(index).expect("a few peers"))
+}
+
+/// A group of two parts for `co_owner(index)`, whose shard is `index`.
+fn group(index: usize) -> HandOffGroup<usize> {
+    HandOffGroup {
+        cache: SmolStr::new("prices"),
+        shard: index,
+        peer: co_owner(index),
+        parts: parts(2),
+    }
+}
+
+/// [`hand_off_in_shares`] over `groups`, each round answered by the scripted
+/// peer its shard indexes, every co-owner in the live set.
+async fn hand_off_all(
+    peers: &[ScriptedPeer],
+    groups: Vec<HandOffGroup<usize>>,
+    overall: Instant,
+) -> usize {
+    hand_off_in_shares(
+        groups,
+        overall,
+        |index, _cache, _peer, requested| peers[index].round(requested),
+        |_| true,
+    )
+    .await
+}
+
 #[test]
 fn group_deadline_gives_each_group_an_equal_share_of_the_time_left() {
     let base = Instant::now();
@@ -168,21 +199,26 @@ fn group_deadline_passes_the_time_a_quick_group_leaves_to_the_groups_after_it() 
     assert_eq!(group_deadline(base + ms(100), overall, 1), overall);
 }
 
+/// A round that completed with two parts left and one round completed, the
+/// co-owner live and the deadline ahead.
+const COMPLETED: RoundEnd = RoundEnd {
+    failed: false,
+    diverging: 2,
+    completed_rounds: 1,
+    deadline_passed: false,
+    peer_live: true,
+};
+
+/// A round that failed, with the same state otherwise and no completed round.
+const FAILED: RoundEnd = RoundEnd {
+    failed: true,
+    completed_rounds: 0,
+    ..COMPLETED
+};
+
 #[test]
 fn hand_off_step_retries_a_failed_round_and_counts_only_completed_ones() {
-    let live_round = RoundEnd {
-        failed: false,
-        diverging: 2,
-        completed_rounds: 1,
-        deadline_passed: false,
-        peer_live: true,
-    };
-    let failed = RoundEnd {
-        failed: true,
-        completed_rounds: 0,
-        ..live_round
-    };
-    let spent = LEAVE_HAND_OFF_ROUNDS;
+    let (failed, spent) = (FAILED, LEAVE_HAND_OFF_ROUNDS);
     let table = [
         (
             failed,
@@ -202,7 +238,7 @@ fn hand_off_step_retries_a_failed_round_and_counts_only_completed_ones() {
                 deadline_passed: true,
                 ..failed
             },
-            HandOffStep::Done,
+            HandOffStep::Done(HandOffEnd::DeadlinePassed),
             "a failed round past the deadline ends the group",
         ),
         (
@@ -210,7 +246,7 @@ fn hand_off_step_retries_a_failed_round_and_counts_only_completed_ones() {
                 peer_live: false,
                 ..failed
             },
-            HandOffStep::Done,
+            HandOffStep::Done(HandOffEnd::PeerLeft),
             "a co-owner that left the live set is not retried",
         ),
         (
@@ -218,9 +254,38 @@ fn hand_off_step_retries_a_failed_round_and_counts_only_completed_ones() {
                 diverging: 0,
                 ..failed
             },
-            HandOffStep::Done,
+            HandOffStep::Done(HandOffEnd::Matched),
             "nothing diverging needs no retry",
         ),
+        (
+            RoundEnd {
+                deadline_passed: true,
+                peer_live: false,
+                ..failed
+            },
+            HandOffStep::Done(HandOffEnd::DeadlinePassed),
+            "the deadline is named before a co-owner that left",
+        ),
+        (
+            RoundEnd {
+                diverging: 0,
+                deadline_passed: true,
+                peer_live: false,
+                ..failed
+            },
+            HandOffStep::Done(HandOffEnd::Matched),
+            "matching is named before anything else",
+        ),
+    ];
+    for (end, expected, why) in table {
+        assert_eq!(hand_off_step(end), expected, "{why}: {end:?}");
+    }
+}
+
+#[test]
+fn hand_off_step_runs_the_next_round_until_the_completed_rounds_are_spent() {
+    let (live_round, spent) = (COMPLETED, LEAVE_HAND_OFF_ROUNDS);
+    let table = [
         (
             live_round,
             HandOffStep::NextRound,
@@ -239,7 +304,7 @@ fn hand_off_step_retries_a_failed_round_and_counts_only_completed_ones() {
                 completed_rounds: spent,
                 ..live_round
             },
-            HandOffStep::Done,
+            HandOffStep::Done(HandOffEnd::RoundsSpent),
             "the completed rounds are spent",
         ),
         (
@@ -247,7 +312,7 @@ fn hand_off_step_retries_a_failed_round_and_counts_only_completed_ones() {
                 diverging: 0,
                 ..live_round
             },
-            HandOffStep::Done,
+            HandOffStep::Done(HandOffEnd::Matched),
             "every part matches",
         ),
         (
@@ -255,7 +320,7 @@ fn hand_off_step_retries_a_failed_round_and_counts_only_completed_ones() {
                 deadline_passed: true,
                 ..live_round
             },
-            HandOffStep::Done,
+            HandOffStep::Done(HandOffEnd::DeadlinePassed),
             "the deadline passed after a completed round",
         ),
         (
@@ -263,12 +328,28 @@ fn hand_off_step_retries_a_failed_round_and_counts_only_completed_ones() {
                 peer_live: false,
                 ..live_round
             },
-            HandOffStep::Done,
+            HandOffStep::Done(HandOffEnd::PeerLeft),
             "a co-owner that left the live set is done",
         ),
     ];
     for (end, expected, why) in table {
         assert_eq!(hand_off_step(end), expected, "{why}: {end:?}");
+    }
+}
+
+#[test]
+fn every_way_a_group_ends_names_its_cause() {
+    let table = [
+        (HandOffEnd::Matched, "every part matches"),
+        (
+            HandOffEnd::DeadlinePassed,
+            "the group's share of state_transfer_budget ran out",
+        ),
+        (HandOffEnd::PeerLeft, "the co-owner left the live set"),
+        (HandOffEnd::RoundsSpent, "the completed rounds were spent"),
+    ];
+    for (end, expected) in table {
+        assert_eq!(end.to_string(), expected, "{end:?}");
     }
 }
 
@@ -461,20 +542,12 @@ async fn a_co_owner_whose_every_round_fails_stops_at_its_share_and_the_next_grou
         ScriptedPeer::new([Answer::Fail]),
         ScriptedPeer::new([Answer::MatchAll]),
     ];
-    let left = Mutex::new(Vec::new());
     let start = Instant::now();
-    let skipped = hand_off_in_shares(vec![0_usize, 1], start + ms(1_000), |index, deadline| {
-        let (peer, left) = (&peers[index], &left);
-        async move {
-            let diverging = hand_off(peer, parts(2), deadline).await;
-            left.lock().expect("lock").push(diverging.len());
-        }
-    })
-    .await;
+    let skipped = hand_off_all(&peers, vec![group(0), group(1)], start + ms(1_000)).await;
 
     assert_eq!(skipped, 0, "every group started");
-    assert_eq!(*left.lock().expect("lock"), [2, 0]);
     let first = peers[0].times();
+    assert!(!first.is_empty(), "the unreachable co-owner is asked");
     assert!(
         first.iter().all(|&at| at < start + ms(500)),
         "the unreachable co-owner stops at its half: {first:?}"
@@ -487,6 +560,114 @@ async fn a_co_owner_whose_every_round_fails_stops_at_its_share_and_the_next_grou
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_group_whose_round_hangs_is_dropped_at_its_share_and_the_next_group_still_runs() {
+    let peers = [ScriptedPeer::new([Answer::MatchAll])];
+    let start = Instant::now();
+    let skipped = hand_off_in_shares(
+        vec![group(0), group(0)],
+        start + ms(1_000),
+        |index, _cache, peer, requested| {
+            let hangs = peer == co_owner(0) && peers[index].asked().is_empty();
+            let answer = peers[index].round(requested);
+            async move {
+                if hangs {
+                    std::future::pending().await
+                } else {
+                    answer.await
+                }
+            }
+        },
+        |_| true,
+    )
+    .await;
+
+    assert_eq!(skipped, 0);
+    assert_eq!(
+        peers[0].times(),
+        [start, start + ms(500)],
+        "the second group starts at the first one's share, not at the overall deadline"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_co_owner_that_leaves_the_live_set_ends_its_group_and_the_next_one_still_runs() {
+    let peers = [
+        ScriptedPeer::new([Answer::Fail]),
+        ScriptedPeer::new([Answer::MatchAll]),
+    ];
+    let asked = Mutex::new(Vec::new());
+    let start = Instant::now();
+    let skipped = hand_off_in_shares(
+        vec![group(0), group(1)],
+        start + ms(1_000),
+        |index, _cache, _peer, requested| peers[index].round(requested),
+        |peer| {
+            asked.lock().expect("lock").push(peer);
+            peer != co_owner(0)
+        },
+    )
+    .await;
+
+    assert_eq!(skipped, 0);
+    assert_eq!(
+        peers[0].asked().len(),
+        1,
+        "the co-owner that left is not retried"
+    );
+    assert_eq!(
+        *asked.lock().expect("lock"),
+        [co_owner(0)],
+        "the live set is read for the group's own co-owner, after its failed round only"
+    );
+    assert_eq!(
+        peers[1].times(),
+        [start],
+        "the next group starts at once, not when the first one's share ends"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn each_round_runs_for_its_own_groups_shard_cache_and_co_owner() {
+    let peer = ScriptedPeer::new([Answer::MatchAll]);
+    let seen = Mutex::new(Vec::new());
+    let groups = vec![
+        HandOffGroup {
+            cache: SmolStr::new("prices"),
+            shard: 7_u8,
+            peer: NodeId::from(2),
+            parts: parts(1),
+        },
+        HandOffGroup {
+            cache: SmolStr::new("users"),
+            shard: 9_u8,
+            peer: NodeId::from(3),
+            parts: parts(3),
+        },
+    ];
+    let skipped = hand_off_in_shares(
+        groups,
+        Instant::now() + ms(1_000),
+        |shard, cache, peer_id, requested| {
+            seen.lock()
+                .expect("lock")
+                .push((shard, cache, peer_id, requested.len()));
+            peer.round(requested)
+        },
+        |_| true,
+    )
+    .await;
+
+    assert_eq!(skipped, 0);
+    assert_eq!(
+        *seen.lock().expect("lock"),
+        [
+            (7, SmolStr::new("prices"), NodeId::from(2), 1),
+            (9, SmolStr::new("users"), NodeId::from(3), 3),
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn the_time_a_quick_group_leaves_unused_passes_to_the_groups_after_it() {
     let peers = [
         ScriptedPeer::new([Answer::MatchAll]),
@@ -495,13 +676,7 @@ async fn the_time_a_quick_group_leaves_unused_passes_to_the_groups_after_it() {
     ];
     let start = Instant::now();
     let overall = start + ms(900);
-    let skipped = hand_off_in_shares(vec![0_usize, 1, 2], overall, |index, deadline| {
-        let peer = &peers[index];
-        async move {
-            hand_off(peer, parts(2), deadline).await;
-        }
-    })
-    .await;
+    let skipped = hand_off_all(&peers, vec![group(0), group(1), group(2)], overall).await;
 
     assert_eq!(skipped, 0);
     assert_eq!(
@@ -513,23 +688,25 @@ async fn the_time_a_quick_group_leaves_unused_passes_to_the_groups_after_it() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn groups_not_started_when_the_overall_budget_has_passed_are_counted() {
-    let start = Instant::now();
-    let started = AtomicUsize::new(0);
-    let skipped = hand_off_in_shares(vec![0, 1, 2], start + ms(1_000), |_, _| {
-        started.fetch_add(1, Ordering::SeqCst);
-        // A group that overruns its deadline uses the whole budget.
-        tokio::time::sleep(ms(1_500))
-    })
-    .await;
-    assert_eq!(started.load(Ordering::SeqCst), 1);
-    assert_eq!(skipped, 2, "the groups after the overrun never start");
+async fn groups_not_started_when_the_overall_budget_has_passed_are_counted_and_logged() {
+    let (events, _guard) = Events::capture();
+    let peers = [
+        ScriptedPeer::new([Answer::MatchAll]),
+        ScriptedPeer::new([Answer::MatchAll]),
+    ];
+    let skipped = hand_off_all(&peers, vec![group(0), group(1)], Instant::now()).await;
 
-    let skipped = hand_off_in_shares(vec![0, 1], Instant::now(), |_, _| async {
-        unreachable!("no group starts with no budget");
-    })
-    .await;
     assert_eq!(skipped, 2, "a budget of zero starts nothing");
+    assert!(peers.iter().all(|peer| peer.asked().is_empty()));
+    let logged = events.at(tracing::Level::DEBUG, "skips a group");
+    assert_eq!(logged.len(), 2, "one line per skipped group: {logged:?}");
+    for (line, index) in logged.iter().zip(0..) {
+        assert!(line.contains("cache=prices"), "{line}");
+        assert!(
+            line.contains(&format!("peer={}", co_owner(index))),
+            "{line}"
+        );
+    }
 }
 
 /// Every tracing event of the tests below as `(level, fields)`.
@@ -595,11 +772,61 @@ async fn a_group_that_ends_with_parts_still_diverging_warns_with_the_cache_the_c
     let warned = events.at(tracing::Level::WARN, "parts still diverging");
     assert_eq!(warned.len(), 1, "{warned:?}");
     for field in [
-        "cache=\"prices\"".to_owned(),
+        "cache=prices".to_owned(),
         format!("peer={}", NodeId::from(2)),
         "diverging=7".to_owned(),
     ] {
         assert!(warned[0].contains(&field), "{field} missing: {warned:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_warning_for_a_group_with_parts_still_diverging_names_why_the_group_ended() {
+    let (events, _guard) = Events::capture();
+    let all = parts(2);
+    let start = Instant::now();
+
+    // The completed rounds are spent.
+    let spent = ScriptedPeer::new([Answer::MatchNone]);
+    hand_off(&spent, all.clone(), start + ms(5_000)).await;
+    // The share runs out on a co-owner that never answers.
+    let silent = ScriptedPeer::new([Answer::Fail]);
+    hand_off(&silent, all.clone(), Instant::now() + ms(250)).await;
+    // The share runs out on a round that never ends.
+    hand_off_with_peer(
+        "prices",
+        NodeId::from(2),
+        |_| std::future::pending::<PartRoundOutcome>(),
+        || true,
+        all.clone(),
+        Instant::now() + ms(250),
+    )
+    .await;
+    // The co-owner leaves the live set.
+    let gone = ScriptedPeer::new([Answer::Fail]);
+    hand_off_with_peer(
+        "prices",
+        NodeId::from(2),
+        |requested| gone.round(requested),
+        || false,
+        all,
+        Instant::now() + ms(5_000),
+    )
+    .await;
+
+    let warned = events.at(tracing::Level::WARN, "parts still diverging");
+    assert_eq!(warned.len(), 4, "{warned:?}");
+    let reasons = [
+        ("reason=the completed rounds were spent", 1),
+        (
+            "reason=the group's share of state_transfer_budget ran out",
+            2,
+        ),
+        ("reason=the co-owner left the live set", 1),
+    ];
+    for (reason, count) in reasons {
+        let seen = warned.iter().filter(|line| line.contains(reason)).count();
+        assert_eq!(seen, count, "{reason}: {warned:?}");
     }
 }
 
@@ -612,7 +839,7 @@ async fn a_retry_after_a_failed_round_logs_at_debug_and_a_matched_group_does_not
 
     let retries = events.at(tracing::Level::DEBUG, "retrying");
     assert_eq!(retries.len(), 1, "{retries:?}");
-    assert!(retries[0].contains("cache=\"prices\""), "{retries:?}");
+    assert!(retries[0].contains("cache=prices"), "{retries:?}");
     assert!(retries[0].contains("diverging=2"), "{retries:?}");
     assert!(
         events.at(tracing::Level::WARN, "").is_empty(),
@@ -802,4 +1029,48 @@ async fn a_leave_with_no_budget_skips_its_groups_warns_once_and_still_departs() 
     assert_eq!(warned.len(), 1, "{warned:?}");
     assert!(warned[0].contains("skipped_groups=1"), "{warned:?}");
     cluster_b.shutdown().await;
+}
+
+/// A co-owner that stops answering and leaves the live set ends the retries:
+/// the leave neither gives up on it at its first failed round nor holds
+/// shutdown for the whole `state_transfer_budget`. The co-owner crashes, so
+/// the leaving node's rounds fail until its failure detector drops the
+/// co-owner, and the leave then warns that the group ended for that reason.
+#[tokio::test]
+async fn a_leave_stops_retrying_a_co_owner_that_crashed_once_the_failure_detector_drops_it() {
+    let owners = NonZeroU8::new(2).expect("nonzero");
+    let name = SmolStr::new("prices");
+    // A budget the failure detector's verdict beats by a wide margin.
+    let config = ClusterConfig {
+        ae_interval: Duration::from_secs(3600),
+        state_transfer_budget: Duration::from_secs(120),
+        ..loopback_config()
+    };
+    let (cluster_a, cluster_b) =
+        two_node_cluster_with_config("cluster-it-leave-hand-off-crashed", config).await;
+    let (a, b) = (cluster_a.node_id(), cluster_b.node_id());
+    let both = Arc::new(OwnershipView::compute_at(
+        a,
+        vec![a, b],
+        owners,
+        Granularity::Part,
+    ));
+    let (_shard, _view_tx) = register_leaver_shard(&cluster_a, &name, owners, both);
+    cluster_b.crash().await;
+    assert!(
+        cluster_a.live_peer_ids().contains(&b),
+        "a still counts b live when it starts to leave"
+    );
+
+    let (events, _guard) = Events::capture();
+    tokio::time::timeout(Duration::from_secs(60), cluster_a.shutdown())
+        .await
+        .expect("a leaves long before its state_transfer_budget");
+
+    let warned = events.at(tracing::Level::WARN, "parts still diverging");
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert!(
+        warned[0].contains("reason=the co-owner left the live set"),
+        "{warned:?}"
+    );
 }

@@ -328,11 +328,23 @@ when the files on disk do not match the configuration.
 Call `Cluster::shutdown` on the way out. It gossips that the node is
 leaving on purpose, so `Replicated` caches on the other nodes do not hold
 tombstones back waiting for it to return, and a spill tier writes its
-checkpoint. It also sends the writes and invalidations still queued for each
+checkpoint. A node with `Distributed` caches first reconciles the parts it
+owns with each live co-owner, so a write only it held reaches them. Each
+co-owner of each cache gets an equal share of `state_transfer_budget`
+(20 s by default), and a round that fails or answers `Stale` is retried within
+the share. A live co-owner that does not answer holds the shutdown for its
+whole share, and several of them for up to the whole budget. Size a
+termination grace period for the budget plus the departure and the flush
+below. A group that ends with parts still diverging logs a `warn` with the
+cache, the co-owner, the count and the cause.
+
+The shutdown also sends the writes and invalidations still queued for each
 peer before the node leaves, waiting up to 500 ms for the queues to reach the
 peer's connection. A peer whose link is down for that whole time does not
 hold the shutdown longer: the frames still queued then are discarded, and a
-`warn` per peer logs how many. They are not counted in
+`warn` per peer logs how many. The wait and the count cover the frames
+queued for the peer; a burst its writer has already taken, in flight or held
+for a redial, is outside both. The discarded frames are not counted in
 `sundog_backlog_dropped_total`. Roll a cluster one node at a time;
 [Deployment](deployment.md#rolling-upgrades) has the order.
 

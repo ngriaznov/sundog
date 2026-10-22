@@ -538,12 +538,17 @@ impl Cluster {
         self.inner.tracker.spawn(tasks.track_future(fut));
     }
 
-    /// Leaves the cluster gracefully: background loops are cancelled and
-    /// joined, every still-registered cache has its spill tier closed (see
-    /// [`ShardOps::close_spill_checkpointed`], a no-op if already closed), then chitchat
-    /// departs and the data plane sends the invalidations and writes still
-    /// queued for each peer, waiting up to 500 ms for them, and closes its
-    /// connections. A frame still queued then is discarded and logged at
+    /// Leaves the cluster gracefully: a node with [`Mode::Distributed`]
+    /// caches first reconciles the parts it owns with each live co-owner,
+    /// retrying a round that fails or answers `Stale` within that co-owner's
+    /// share of [`ClusterConfig::state_transfer_budget`], so the shutdown can
+    /// take that long and logs at `warn` the parts still diverging when a
+    /// group ends. Then background loops are cancelled and joined, every
+    /// still-registered cache has its spill tier closed (see
+    /// [`ShardOps::close_spill_checkpointed`], a no-op if already closed),
+    /// chitchat departs and the data plane sends the invalidations and writes
+    /// still queued for each peer, waiting up to 500 ms for them, and closes
+    /// its connections. A frame still queued then is discarded and logged at
     /// `warn`. No further calls on any clone of this handle; cache handles
     /// opened before this call keep working for local reads/writes.
     ///
@@ -599,7 +604,7 @@ impl Cluster {
             .iter()
             .map(|(name, shard)| (name.clone(), Arc::clone(shard)))
             .collect();
-        let mut groups: Vec<HandOffGroup> = Vec::new();
+        let mut groups: Vec<HandOffGroup<Arc<dyn ShardOps>>> = Vec::new();
         for (cache, shard) in shards {
             let Some(view) = shard.ownership_view() else {
                 continue;
@@ -613,35 +618,15 @@ impl Cluster {
                 });
             }
         }
-        let skipped = hand_off_in_shares(groups, overall, |group, deadline| async move {
-            let HandOffGroup {
-                cache,
-                shard,
-                peer,
-                parts,
-            } = group;
-            hand_off_with_peer(
-                &cache,
-                peer,
-                |diverging: Vec<PartId>| {
-                    let (shard, cache) = (&shard, &cache);
-                    async move {
-                        anti_entropy::run_round_for_parts(
-                            self.mesh(),
-                            shard,
-                            cache,
-                            peer,
-                            &diverging,
-                        )
-                        .await
-                    }
-                },
-                || self.live_peer_ids().contains(&peer),
-                parts,
-                deadline,
-            )
-            .await;
-        })
+        let skipped = hand_off_in_shares(
+            groups,
+            overall,
+            |shard, cache, peer, diverging| async move {
+                anti_entropy::run_round_for_parts(self.mesh(), &shard, &cache, peer, &diverging)
+                    .await
+            },
+            |peer| self.live_peer_ids().contains(&peer),
+        )
         .await;
         if skipped > 0 {
             tracing::warn!(
@@ -675,9 +660,11 @@ const LEAVE_HAND_OFF_ROUNDS: u32 = 3;
 
 /// The parts one cache shares with one live co-owner: a unit of
 /// [`Cluster::hand_off_before_leaving`], collected before its first round.
-struct HandOffGroup {
+struct HandOffGroup<S> {
     cache: SmolStr,
-    shard: Arc<dyn ShardOps>,
+    /// What a round needs besides the cache and the co-owner: the cache's
+    /// shard.
+    shard: S,
     peer: NodeId,
     parts: Vec<PartId>,
 }
@@ -714,6 +701,31 @@ struct RoundEnd {
     peer_live: bool,
 }
 
+/// Why a group's hand-off ended: the cause a `warn` names when parts are left
+/// diverging, so an operator sees which knob to turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandOffEnd {
+    /// Every part matches.
+    Matched,
+    /// The group's share of `state_transfer_budget` ran out.
+    DeadlinePassed,
+    /// The co-owner left the live set.
+    PeerLeft,
+    /// The completed rounds are spent.
+    RoundsSpent,
+}
+
+impl std::fmt::Display for HandOffEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Matched => "every part matches",
+            Self::DeadlinePassed => "the group's share of state_transfer_budget ran out",
+            Self::PeerLeft => "the co-owner left the live set",
+            Self::RoundsSpent => "the completed rounds were spent",
+        })
+    }
+}
+
 /// What a group does after a round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HandOffStep {
@@ -722,19 +734,22 @@ enum HandOffStep {
     RetryAfterBackoff,
     /// Run the next round over the parts still diverging.
     NextRound,
-    /// Nothing is left to do: every part matches, the deadline has passed,
-    /// the co-owner left the live set, or the completed rounds are spent.
-    Done,
+    /// Nothing is left to do, for the reason given.
+    Done(HandOffEnd),
 }
 
 /// The step after a round: pure, so a table pins every case.
 fn hand_off_step(end: RoundEnd) -> HandOffStep {
-    if end.diverging == 0 || end.deadline_passed || !end.peer_live {
-        HandOffStep::Done
+    if end.diverging == 0 {
+        HandOffStep::Done(HandOffEnd::Matched)
+    } else if end.deadline_passed {
+        HandOffStep::Done(HandOffEnd::DeadlinePassed)
+    } else if !end.peer_live {
+        HandOffStep::Done(HandOffEnd::PeerLeft)
     } else if end.failed {
         HandOffStep::RetryAfterBackoff
     } else if end.completed_rounds >= LEAVE_HAND_OFF_ROUNDS {
-        HandOffStep::Done
+        HandOffStep::Done(HandOffEnd::RoundsSpent)
     } else {
         HandOffStep::NextRound
     }
@@ -744,7 +759,8 @@ fn hand_off_step(end: RoundEnd) -> HandOffStep {
 /// they match, `deadline` passes, `peer_live` answers `false` before a retry,
 /// or [`LEAVE_HAND_OFF_ROUNDS`] rounds complete ([`hand_off_step`]). A round
 /// still running at `deadline` is dropped. Returns the parts still
-/// diverging, and logs them at `warn` when there are any.
+/// diverging, and logs them at `warn`, with why the group ended, when there
+/// are any.
 async fn hand_off_with_peer<F, Fut, L>(
     cache: &str,
     peer: NodeId,
@@ -760,6 +776,9 @@ where
 {
     let mut diverging = parts;
     let mut completed_rounds = 0;
+    // A loop that stops on its condition or on a dropped round ran into the
+    // deadline.
+    let mut ended = HandOffEnd::DeadlinePassed;
     while !diverging.is_empty() && tokio::time::Instant::now() < deadline {
         let Ok(outcome) = tokio::time::timeout_at(deadline, run_round(diverging.clone())).await
         else {
@@ -777,11 +796,14 @@ where
             peer_live: !outcome.failed || peer_live(),
         });
         match step {
-            HandOffStep::Done => break,
+            HandOffStep::Done(why) => {
+                ended = why;
+                break;
+            }
             HandOffStep::NextRound => {}
             HandOffStep::RetryAfterBackoff => {
                 tracing::debug!(
-                    cache,
+                    cache = %cache,
                     %peer,
                     diverging = diverging.len(),
                     "leave hand-off round failed; retrying after the backoff"
@@ -792,39 +814,67 @@ where
         }
     }
     if diverging.is_empty() {
-        tracing::debug!(cache, %peer, "leave hand-off with co-owner done");
+        tracing::debug!(cache = %cache, %peer, "leave hand-off with co-owner done");
     } else {
         tracing::warn!(
-            cache,
+            cache = %cache,
             %peer,
             diverging = diverging.len(),
+            reason = %ended,
             "leave hand-off ended with parts still diverging"
         );
     }
     diverging
 }
 
-/// Runs `hand_off` for each of `groups` in order, each with the deadline
-/// [`group_deadline`] gives it. Stops once `overall` has passed and answers
-/// how many groups it never started.
-async fn hand_off_in_shares<G, F, Fut>(
-    groups: Vec<G>,
+/// Runs [`hand_off_with_peer`] for each of `groups` in order, each with the
+/// deadline [`group_deadline`] gives it. `run_round` runs one round for a
+/// group's shard, cache and co-owner over the parts it is handed, and
+/// `peer_live` answers whether a co-owner is in the live set. A group that
+/// would start after `overall` has passed is skipped, logged at `debug`, and
+/// counted in the answer.
+async fn hand_off_in_shares<S, F, Fut, L>(
+    groups: Vec<HandOffGroup<S>>,
     overall: tokio::time::Instant,
-    mut hand_off: F,
+    mut run_round: F,
+    mut peer_live: L,
 ) -> usize
 where
-    F: FnMut(G, tokio::time::Instant) -> Fut,
-    Fut: Future<Output = ()>,
+    S: Clone,
+    F: FnMut(S, SmolStr, NodeId, Vec<PartId>) -> Fut,
+    Fut: Future<Output = anti_entropy::PartRoundOutcome>,
+    L: FnMut(NodeId) -> bool,
 {
     let total = groups.len();
+    let mut skipped = 0;
     for (index, group) in groups.into_iter().enumerate() {
+        let HandOffGroup {
+            cache,
+            shard,
+            peer,
+            parts,
+        } = group;
         let now = tokio::time::Instant::now();
         if now >= overall {
-            return total - index;
+            tracing::debug!(
+                cache = %cache,
+                %peer,
+                "leave hand-off skips a group: state_transfer_budget ran out before it started"
+            );
+            skipped += 1;
+            continue;
         }
-        hand_off(group, group_deadline(now, overall, total - index)).await;
+        hand_off_with_peer(
+            &cache,
+            peer,
+            |diverging| run_round(shard.clone(), cache.clone(), peer, diverging),
+            || peer_live(peer),
+            parts,
+            group_deadline(now, overall, total - index),
+        )
+        .await;
     }
-    0
+    skipped
 }
 
 /// The parts `view` owns, grouped by each co-owner in `live`, in node order:
