@@ -3,6 +3,22 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **A graceful leave retries a co-owner that does not answer.** A node that
+  shuts down reconciles every part it owns with each live co-owner. A failed
+  round or a `Stale` reply, which a membership change causes, no longer ends
+  the hand-off with that co-owner: the node waits 100 ms and runs the round
+  again, and only completed rounds count against the three each co-owner
+  gets. Each (cache, co-owner) group has an equal share of the time left in
+  `state_transfer_budget`, and the time a quick group leaves unused passes to
+  the groups after it, so one unreachable co-owner that is still live does not
+  use up the budget of the others. A co-owner that leaves the live set ends
+  its retries. A group that ends with parts still diverging logs a warning
+  with the cache, the co-owner and the number of parts.
+
 ## [0.6.8] – 2026-10-17
 
 ### Added

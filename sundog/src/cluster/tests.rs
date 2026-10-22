@@ -11,6 +11,7 @@ mod builder;
 mod distributed;
 mod forget_cache;
 mod gc_task;
+mod hand_off;
 mod inbound;
 mod invalidation_fold;
 mod modes;

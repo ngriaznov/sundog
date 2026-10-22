@@ -369,7 +369,13 @@ that matters. A crash counts as a failure until the failure detector drops
 the node from the live set. A graceful shutdown does not: the leaving node
 first reconciles every part it owns with each live co-owner, within
 `state_transfer_budget`, then announces its departure, and ownership moves
-at the announcement.
+at the announcement. Each co-owner of each cache gets an equal share of the
+time left in the budget, and the time a quick co-owner leaves unused passes to
+the ones after it. A round that fails or answers `Stale`, as one does right
+after a membership change, is retried every 100 ms until the co-owner's share
+ends or it leaves the live set; only completed rounds count against the three
+a co-owner gets. Parts still diverging when a co-owner's share ends are logged
+at `warn`.
 
 ### Reads while ownership moves
 

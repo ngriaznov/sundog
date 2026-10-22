@@ -235,8 +235,9 @@ fn cold_round(
 /// Delay between retry passes over a group's whole donor list once every
 /// candidate has declined or failed once: long enough for both sides'
 /// `refresh_task`s to have a real chance at converging their views before
-/// trying again.
-const GROUP_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+/// trying again. A leaving node waits the same delay between a failed
+/// hand-off round and its retry.
+pub(super) const GROUP_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
 /// How one donor group's pull ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
