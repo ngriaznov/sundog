@@ -541,9 +541,11 @@ impl Cluster {
     /// Leaves the cluster gracefully: background loops are cancelled and
     /// joined, every still-registered cache has its spill tier closed (see
     /// [`ShardOps::close_spill_checkpointed`], a no-op if already closed), then chitchat
-    /// departs and the data plane closes its connections. No further calls
-    /// on any clone of this handle; cache handles opened before this call
-    /// keep working for local reads/writes.
+    /// departs and the data plane sends the invalidations and writes still
+    /// queued for each peer, waiting up to 500 ms for them, and closes its
+    /// connections. A frame still queued then is discarded and logged at
+    /// `warn`. No further calls on any clone of this handle; cache handles
+    /// opened before this call keep working for local reads/writes.
     ///
     /// # Panics
     ///

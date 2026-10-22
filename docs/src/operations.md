@@ -328,8 +328,13 @@ when the files on disk do not match the configuration.
 Call `Cluster::shutdown` on the way out. It gossips that the node is
 leaving on purpose, so `Replicated` caches on the other nodes do not hold
 tombstones back waiting for it to return, and a spill tier writes its
-checkpoint. Roll a cluster one node at a time; [Deployment](deployment.md#rolling-upgrades)
-has the order.
+checkpoint. It also sends the writes and invalidations still queued for each
+peer before the node leaves, waiting up to 500 ms for the queues to reach the
+peer's connection. A peer whose link is down for that whole time does not
+hold the shutdown longer: the frames still queued then are discarded, and a
+`warn` per peer logs how many. They are not counted in
+`sundog_backlog_dropped_total`. Roll a cluster one node at a time;
+[Deployment](deployment.md#rolling-upgrades) has the order.
 
 ## Watching a cluster: sundog-lens
 

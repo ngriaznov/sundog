@@ -359,7 +359,11 @@ span: an entry that sat unswept for longer is not guaranteed to stay deleted.
 
 An `Invalidation` cache runs no anti-entropy and sends a value only when its
 resolver merges, so a TTL is its bound on staleness. Set one on every
-`Invalidation` cache.
+`Invalidation` cache. A graceful `Cluster::shutdown` sends the invalidations
+and merged records still queued for each peer before the node leaves, within a
+500 ms flush deadline. A peer whose link is slow or redialing for that whole
+time misses the frames still queued, which the shutdown logs at `warn`, and
+serves the value the leaving node replaced until its TTL.
 
 A `Distributed` cache has no quorum. During a partition each side computes
 its own owners and accepts writes, and the two sides settle by version

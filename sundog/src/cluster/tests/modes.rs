@@ -414,6 +414,57 @@ async fn invalidation_mode_drops_a_stale_remote_copy() {
     cluster_b.shutdown().await;
 }
 
+/// The invalidations node A queued for node B go out before A leaves, so B
+/// serves none of the values A replaced.
+#[tokio::test]
+async fn shutdown_sends_the_invalidations_queued_for_a_peer_before_the_node_leaves() {
+    const KEYS: u32 = 200;
+    let (cluster_a, cluster_b) = two_node_cluster("cluster-it-invalidate-shutdown").await;
+    let cache_a = cluster_a
+        .cache::<u32, String>("users")
+        .mode(Mode::Invalidation)
+        .open()
+        .await
+        .expect("a opens");
+    let cache_b = cluster_b
+        .cache::<u32, String>("users")
+        .mode(Mode::Invalidation)
+        .open()
+        .await
+        .expect("b opens");
+
+    for key in 0..KEYS {
+        cache_b
+            .insert(key, "stale".into())
+            .await
+            .expect("b holds a copy");
+    }
+    // The sleep guarantees A's stamps are later than B's.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    for key in 0..KEYS {
+        cache_a
+            .insert(key, "fresh".into())
+            .await
+            .expect("a replaces the value");
+    }
+    cluster_a.shutdown().await;
+
+    wait_until(
+        Duration::from_secs(10),
+        "b drops every copy a replaced before it left",
+        async || {
+            for key in 0..KEYS {
+                if cache_b.get(&key).await.is_some() {
+                    return false;
+                }
+            }
+            true
+        },
+    )
+    .await;
+    cluster_b.shutdown().await;
+}
+
 #[tokio::test]
 async fn invalidation_fills_on_two_nodes_keep_both_copies() {
     let (cluster_a, cluster_b) = two_node_cluster("cluster-it-invalidate-fill").await;

@@ -188,6 +188,218 @@ async fn shutdown_flushes_replicate_frames_queued_just_before_it() {
     receiver.shutdown().await;
 }
 
+/// `count` invalidations of `key_len`-byte keys, versions `first..first + count`.
+fn invalidate_msgs(first: usize, count: usize, key_len: usize) -> Vec<Msg> {
+    (first..first + count)
+        .map(|i| Msg::Invalidate {
+            cache: SmolStr::new("users"),
+            key: Bytes::from(vec![0u8; key_len]),
+            ver: Hlc {
+                wall_ms: 1,
+                logical: u32::try_from(i).expect("small"),
+                node: NodeId::from(1),
+            },
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn shutdown_flushes_invalidate_frames_queued_behind_a_slow_receiver() {
+    const FRAMES: usize = 64;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("listener has a local addr");
+    // A slow receiver: accepts, then reads nothing for 100 ms, so the
+    // sender's socket buffers fill and its writer blocks mid-send.
+    let reader = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut framed = LengthDelimitedCodec::builder()
+            .max_frame_length(MAX_FRAME)
+            .new_framed(stream);
+        let _hello = framed.next().await.expect("hello arrives");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut got = 0usize;
+        while let Ok(Some(Ok(_))) =
+            tokio::time::timeout(Duration::from_secs(2), framed.next()).await
+        {
+            got += 1;
+        }
+        got
+    });
+
+    let (sender, _sender_inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+    sender.update_peers(vec![peer_at(NodeId::from(2), addr)]);
+    // The first batch is popped whole by the writer and blocks mid-send
+    // against the slow receiver; the second waits in the queue.
+    sender.send_many(
+        NodeId::from(2),
+        MsgClass::Invalidate,
+        invalidate_msgs(0, FRAMES / 2, 512 * 1024),
+    );
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    sender.send_many(
+        NodeId::from(2),
+        MsgClass::Invalidate,
+        invalidate_msgs(FRAMES / 2, FRAMES / 2, 512 * 1024),
+    );
+    sender.shutdown().await;
+
+    let got = reader.await.expect("reader finishes");
+    assert_eq!(
+        got, FRAMES,
+        "every invalidate frame queued before shutdown reaches the peer, as a replicate frame does"
+    );
+}
+
+/// One `WARN` event: its message and fields, rendered as text.
+struct Warned {
+    message: String,
+    fields: HashMap<&'static str, String>,
+}
+
+/// Collects one event's fields.
+struct EventFields(HashMap<&'static str, String>);
+
+impl tracing::field::Visit for EventFields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(field.name(), format!("{value:?}"));
+    }
+}
+
+/// A tracing layer that keeps every `WARN` event.
+#[derive(Clone, Default)]
+struct WarnLog(Arc<Mutex<Vec<Warned>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnLog {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if *event.metadata().level() != tracing::Level::WARN {
+            return;
+        }
+        let mut fields = EventFields(HashMap::new());
+        event.record(&mut fields);
+        let message = fields.0.remove("message").unwrap_or_default();
+        self.0.lock().expect("lock").push(Warned {
+            message,
+            fields: fields.0,
+        });
+    }
+}
+
+impl WarnLog {
+    /// Installs the layer as this thread's subscriber while the guard lives.
+    fn capture() -> (Self, crate::cluster::test_support::ScopedSubscriber) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let log = Self::default();
+        let guard = crate::cluster::test_support::scoped_subscriber(
+            tracing_subscriber::registry().with(log.clone()),
+        );
+        (log, guard)
+    }
+
+    /// The warnings of shutdown discarding queued frames, since the last call.
+    fn taken_discards(&self) -> Vec<Warned> {
+        std::mem::take(&mut *self.0.lock().expect("lock"))
+            .into_iter()
+            .filter(|warned| warned.message.contains("discards"))
+            .collect()
+    }
+}
+
+/// Shuts down a mesh whose only peer never connects, a writer in its
+/// reconnect backoff, after `invalidate` invalidation frames and `replicate`
+/// replicate frames were queued for it. Answers how long shutdown took and
+/// the discard warnings it logged.
+async fn shutdown_toward_a_peer_that_never_connects(
+    invalidate: usize,
+    replicate: usize,
+) -> (Duration, Vec<Warned>) {
+    let (warned, _log) = WarnLog::capture();
+    let (sender, _sender_inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+    // Nothing listens here, so the writer redials every `RECONNECT_BACKOFF`
+    // and takes nothing from either outbox.
+    let nobody: SocketAddr = "127.0.0.1:1".parse().expect("valid unroutable addr");
+    sender.update_peers(vec![peer_at(NodeId::from(2), nobody)]);
+    sender.send_many(
+        NodeId::from(2),
+        MsgClass::Invalidate,
+        invalidate_msgs(0, invalidate, 16),
+    );
+    sender.send_many(
+        NodeId::from(2),
+        MsgClass::Replicate,
+        replicate_msgs(replicate),
+    );
+
+    let started = tokio::time::Instant::now();
+    tokio::time::timeout(OUTBOX_FLUSH_DEADLINE * 4, sender.shutdown())
+        .await
+        .expect("shutdown returns within its flush deadline plus slack");
+    (started.elapsed(), warned.taken_discards())
+}
+
+/// A peer whose link is down for the whole wait holds shutdown to its
+/// deadline and no longer, whichever outbox its frames wait in. The frames it
+/// never took are discarded, and shutdown logs their count, once, for that
+/// peer.
+#[tokio::test]
+async fn shutdown_gives_up_at_its_deadline_on_a_peer_that_never_connects_and_logs_the_discards() {
+    for (invalidate, replicate) in [(5, 0), (0, 3), (5, 3)] {
+        let (waited, discards) =
+            shutdown_toward_a_peer_that_never_connects(invalidate, replicate).await;
+        assert!(
+            waited >= OUTBOX_FLUSH_DEADLINE,
+            "{invalidate} invalidate and {replicate} replicate frames hold shutdown for its \
+             whole deadline: {waited:?}"
+        );
+        assert_eq!(
+            discards.len(),
+            1,
+            "one warning for the one peer: {invalidate} and {replicate}"
+        );
+        assert_eq!(
+            discards[0].fields.get("peer"),
+            Some(&NodeId::from(2).to_string())
+        );
+        assert_eq!(
+            discards[0].fields.get("frames"),
+            Some(&(invalidate + replicate).to_string()),
+            "the warning counts frames, not bytes: {invalidate} and {replicate}"
+        );
+    }
+}
+
+/// Shutdown warns about discarded frames only for a peer that left some:
+/// a peer that took every frame draws no warning.
+#[tokio::test]
+async fn shutdown_logs_no_discards_when_the_peer_took_every_frame() {
+    let (warned, _log) = WarnLog::capture();
+    let (receiver, mut inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+    let (sender, _sender_inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+    sender.update_peers(vec![peer_at(NodeId::from(2), receiver.local_addr())]);
+    sender.send_many(NodeId::from(2), MsgClass::Replicate, replicate_msgs(20));
+    sender.send_many(
+        NodeId::from(2),
+        MsgClass::Invalidate,
+        invalidate_msgs(0, 20, 16),
+    );
+    sender.shutdown().await;
+
+    assert_eq!(
+        count_replicated(&mut inbound, Duration::from_secs(3)).await,
+        20
+    );
+    assert!(
+        warned.taken_discards().is_empty(),
+        "nothing was left in either outbox"
+    );
+    receiver.shutdown().await;
+}
+
 /// A mesh that names `cluster` in its `Hello` and checks every accepted
 /// one against it, as `Cluster::build` spawns it.
 async fn spawn_named_mesh(node: NodeId, cluster: &str) -> (Mesh, mpsc::Receiver<InboundMsg>) {
@@ -282,6 +494,55 @@ fn fan_out_keep_waiting_only_for_a_live_peer() {
         !fan_out_keep_waiting(false),
         "a peer gone from the table falls back to today's drop-and-count path"
     );
+}
+
+#[test]
+fn outboxes_pending_while_either_outbox_holds_a_frame() {
+    // (replicate free slots, replicate capacity, invalidate length, pending)
+    let table = [
+        (8192, 8192, 0, false),
+        (8191, 8192, 0, true),
+        (0, 8192, 0, true),
+        (8192, 8192, 1, true),
+        (8191, 8192, 5, true),
+        (0, 8192, 8192, true),
+        (1, 1, 0, false),
+        (0, 1, 0, true),
+    ];
+    for (free, cap, invalidate, pending) in table {
+        assert_eq!(
+            outboxes_pending(free, cap, invalidate),
+            pending,
+            "free {free} of {cap}, {invalidate} invalidations queued"
+        );
+    }
+}
+
+#[test]
+fn queued_frames_counts_the_replicate_slots_in_use_and_the_invalidations() {
+    // (replicate free slots, replicate capacity, invalidate length, frames)
+    let table = [
+        (8192, 8192, 0, 0),
+        (8190, 8192, 0, 2),
+        (8192, 8192, 7, 7),
+        (8190, 8192, 7, 9),
+        (0, 8192, 0, 8192),
+        (0, 8192, 8192, 16384),
+        // More free slots than capacity cannot happen; it counts as none in use.
+        (10, 4, 3, 3),
+    ];
+    for (free, cap, invalidate, frames) in table {
+        assert_eq!(
+            queued_frames(free, cap, invalidate),
+            frames,
+            "free {free} of {cap}, {invalidate} invalidations queued"
+        );
+        assert_eq!(
+            outboxes_pending(free, cap, invalidate),
+            frames > 0,
+            "pending exactly when a frame is queued: free {free} of {cap}, {invalidate} queued"
+        );
+    }
 }
 
 /// Pins that a live peer's stalled outbox keeps `send_frames_awaiting`

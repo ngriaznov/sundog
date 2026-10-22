@@ -139,9 +139,9 @@ fn build_tls_ctx(_config: &ClusterConfig) -> TlsCtx {
 /// [`ClusterConfig::outbox_capacity`]'s default.
 const DEFAULT_CHANNEL_CAPACITY: usize = 8_192;
 
-/// How long [`Mesh::shutdown`] waits for queued replicate frames to reach
-/// their writers before cancelling them, and the moment it then leaves for
-/// the writers' last frames to go out.
+/// How long [`Mesh::shutdown`] waits for queued frames, replicate and
+/// invalidate, to reach their writers before cancelling them, and the moment
+/// it then leaves for the writers' last frames to go out.
 const OUTBOX_FLUSH_DEADLINE: Duration = Duration::from_millis(500);
 const OUTBOX_FLUSH_TAIL: Duration = Duration::from_millis(20);
 
@@ -231,6 +231,50 @@ fn defer_ae_digest(queued: usize, deferred_so_far: u32) -> bool {
 /// live peer's frame is never dropped.
 const fn fan_out_keep_waiting(peer_live: bool) -> bool {
     peer_live
+}
+
+/// Whether a peer's outboxes still hold a frame its writer has not taken:
+/// the replicate channel has fewer free slots than its capacity, or the
+/// invalidate queue is not empty. [`Mesh::shutdown`] waits while any peer's
+/// outboxes are pending.
+const fn outboxes_pending(
+    replicate_free: usize,
+    replicate_cap: usize,
+    invalidate_len: usize,
+) -> bool {
+    replicate_free < replicate_cap || invalidate_len > 0
+}
+
+/// The frames queued in a peer's two outboxes, which cancelling its writer
+/// discards: the replicate slots in use plus the invalidate queue's length.
+const fn queued_frames(
+    replicate_free: usize,
+    replicate_cap: usize,
+    invalidate_len: usize,
+) -> usize {
+    replicate_cap
+        .saturating_sub(replicate_free)
+        .saturating_add(invalidate_len)
+}
+
+impl PeerHandle {
+    /// Whether this peer's outboxes hold a frame its writer has not taken.
+    fn outboxes_pending(&self) -> bool {
+        outboxes_pending(
+            self.replicate_tx.capacity(),
+            self.replicate_tx.max_capacity(),
+            self.invalidate.len(),
+        )
+    }
+
+    /// The frames queued in this peer's two outboxes.
+    fn queued_frames(&self) -> usize {
+        queued_frames(
+            self.replicate_tx.capacity(),
+            self.replicate_tx.max_capacity(),
+            self.invalidate.len(),
+        )
+    }
 }
 
 impl MeshInner {

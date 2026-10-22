@@ -426,10 +426,11 @@ impl Mesh {
             .contains_key(&peer)
     }
 
-    /// Waits, up to `deadline`, until every peer's replicate outbox has been
-    /// handed to its writer, then a moment more for the writer's last
-    /// frames to leave: what [`Mesh::shutdown`] runs before cancelling the
-    /// writers, so a frame accepted right before shutdown still goes out.
+    /// Waits, up to `deadline`, until every peer's replicate and invalidate
+    /// outboxes have been handed to its writer ([`outboxes_pending`]), then
+    /// a moment more for the writer's last frames to leave: what
+    /// [`Mesh::shutdown`] runs before cancelling the writers, so a frame
+    /// accepted right before shutdown still goes out.
     async fn flush_outboxes(&self, deadline: tokio::time::Instant) {
         loop {
             let pending = {
@@ -438,9 +439,7 @@ impl Mesh {
                     .peers
                     .read()
                     .expect("invariant: peers lock is never poisoned");
-                table
-                    .values()
-                    .any(|h| h.replicate_tx.capacity() < h.replicate_tx.max_capacity())
+                table.values().any(PeerHandle::outboxes_pending)
             };
             if !pending || tokio::time::Instant::now() >= deadline {
                 break;
@@ -504,8 +503,11 @@ impl Mesh {
             .collect()
     }
 
-    /// Shuts down the mesh: stops accepting, cancels every per-peer writer.
-    /// Signals the spawned background work to stop without waiting on sockets.
+    /// Shuts down the mesh: stops accepting, waits up to half a second for
+    /// the replicate and invalidate frames queued for each peer to reach its
+    /// writer, then cancels every per-peer writer. A frame still queued then
+    /// is discarded, and a `warn` per peer logs how many. Signals the
+    /// spawned background work to stop without waiting on sockets.
     ///
     /// # Panics
     ///
@@ -521,7 +523,15 @@ impl Mesh {
                 .write()
                 .expect("invariant: peers lock is never poisoned"),
         );
-        for handle in table.into_values() {
+        for (peer, handle) in table {
+            let discarded = handle.queued_frames();
+            if discarded > 0 {
+                tracing::warn!(
+                    %peer,
+                    frames = discarded,
+                    "shutdown discards the frames still queued for the peer"
+                );
+            }
             handle.cancel.cancel();
         }
         // Yield once so cancelled tasks observe the token before this handle

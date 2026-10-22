@@ -57,6 +57,14 @@ impl<T> DropOldestQueue<T> {
             .pop_front()
     }
 
+    /// The number of entries queued, which never exceeds the capacity.
+    pub(super) fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("invariant: outbox mutex is never held across a panic")
+            .len()
+    }
+
     /// Waits for and removes the oldest queued entry.
     pub(super) async fn pop(&self) -> T {
         loop {
@@ -99,6 +107,26 @@ mod tests {
         assert_eq!(queue.try_pop().expect("first queued"), 1);
         assert_eq!(queue.try_pop().expect("second queued"), 2);
         assert!(queue.try_pop().is_none());
+    }
+
+    #[test]
+    fn len_counts_the_queued_entries_and_stops_at_the_capacity() {
+        let queue = DropOldestQueue::new(3);
+        assert_eq!(queue.len(), 0, "a new queue is empty");
+        queue.push(1u64);
+        queue.push(2u64);
+        assert_eq!(queue.len(), 2);
+        queue.push(3u64);
+        queue.push(4u64); // drops 1
+        assert_eq!(
+            queue.len(),
+            3,
+            "an overflowing push replaces, it does not grow"
+        );
+        assert_eq!(queue.try_pop(), Some(2));
+        assert_eq!(queue.len(), 2, "a pop shrinks it");
+        while queue.try_pop().is_some() {}
+        assert_eq!(queue.len(), 0);
     }
 
     #[tokio::test]
