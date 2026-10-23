@@ -600,8 +600,10 @@ where
     /// The last sequence number [`Shard::merge_sequenced`] drew; the next call
     /// draws one more. Drawn under the lock of the key's stripe in
     /// [`Self::pending_merges`], so the numbers drawn for one key rise in the
-    /// order they apply or fold.
-    merge_seq: AtomicU64,
+    /// order they apply or fold. A cache's shard shares the counter with every
+    /// shard its cluster ever opened under the cache's name
+    /// ([`Shard::with_merge_seq_counter`]).
+    merge_seq: Arc<AtomicU64>,
     /// Test-only: runs between a flush's take and its apply, so a test can
     /// park the flush there.
     #[cfg(test)]

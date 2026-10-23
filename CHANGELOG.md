@@ -11,8 +11,9 @@ All notable changes to this project are documented in this file. Format follows
   draw this cache's next sequence number and call a closure with it and
   `Cache::writer_id`, which builds the value to merge, as in
   `cache.merge_sequenced(key, |w, seq| OrSet::add(w, seq, element))`. The
-  numbers start at 1 in each run of the process, rise by one per call and
-  never repeat. The number is drawn and the closure runs under the lock that
+  numbers start at 1 for each cache name when the cluster starts, rise by one
+  per call and never repeat; a cache that closes and opens again carries on
+  the count. The number is drawn and the closure runs under the lock that
   orders the merges of the key, so a writer's numbers apply, or fold into a
   `merge_coalesce_window`, in the order they were drawn. The closure runs once
   with the lock held: it must be cheap and must not call into the cache.
@@ -20,10 +21,13 @@ All notable changes to this project are documented in this file. Format follows
   shard-level forms and take the writer as an argument.
 - **`sundog_merge_refused_total{cache, reason}` and
   `sundog_sync_skipped_total{cache, reason}`.** The first counts merges
-  refused for passing the frame limit, with `reason="too_large"`; the second
-  counts records that anti-entropy, state transfer and rebalance leave out
-  because one frame cannot hold them. Each comes with a `warn`, at most once a
-  minute for each cache.
+  refused for passing the frame limit, with `reason="too_large"`, whether the
+  caller got the error or not, and CRDT compaction rewrites refused for the
+  same reason; the second counts records that anti-entropy, state transfer and
+  rebalance leave out because one frame cannot hold them. Each logs a `warn`,
+  at most once a minute for each cache. The first warns for a merge from a
+  peer, a flushed fold and a compaction pass, since a local caller gets
+  `ValueTooLarge` instead.
 - **`ShardOps::skip_unframeable`.** It drops from the records a sync is about
   to send the ones that do not fit a frame, and counts them. The default
   returns its records unchanged.
@@ -32,35 +36,45 @@ All notable changes to this project are documented in this file. Format follows
 
 - **`Cache::merge` can fail with `CacheError::ValueTooLarge` for a value that
   grew past a frame.** A merged value stays within `ClusterConfig::max_frame`,
-  4 MiB by default. A `merge`, `merge_with_ttl`, `merge_sequenced`,
-  `merge_sequenced_with_ttl` or `insert` under a merging resolver whose result
-  would pass that limit and be larger than the value it replaces fails with
-  `ValueTooLarge` and changes nothing. A merge that leaves the value no larger
-  is always accepted, so a remove can shrink a value that is already over the
-  limit. A merge from a peer follows the same rule and is refused, counted and
-  logged. With a `merge_coalesce_window`, the call that would overflow its
+  4 MiB by default, counted as the forward an owner sends its co-owners. A
+  `merge`, `merge_with_ttl`, `merge_sequenced`, `merge_sequenced_with_ttl` or
+  `insert` under a merging resolver whose result would pass that limit and be
+  larger than the value it replaces fails with `ValueTooLarge` and changes
+  nothing. A merge whose own value fits a frame and that leaves the value no
+  larger is accepted, so a merge can shrink a value that is already over the
+  limit. The remove an `OrSet` builds carries the remaining tags of every
+  writer it touches, so a set one writer filled cannot be shrunk with it once
+  it is over the limit, and `Cache::remove` is the way. A merge from a peer
+  follows the same rule and is refused, counted and logged. With a `merge_coalesce_window`, the call that would overflow its
   own pending fold gets the error, and a fold that overflows the stored value
   at its flush is refused there, counted and logged. An `OrSet` that is only
   added to reaches the limit; the resolver guide says how to bound one.
 - **A responder leaves out a record that does not fit a frame.** A record
-  larger than one frame stays on its node and out of state transfer,
-  anti-entropy and rebalance chunks, which carry every other key as usual,
-  where the record failed the exchange it was part of. Such a value can exist
-  when it was stored under a larger `max_frame` or by a release without the
-  limit; it keeps serving reads and cannot grow. A merge that removes content,
-  or `Cache::remove`, brings it back under the limit.
+  larger than one wire frame, 4 MiB, stays on its node and out of state
+  transfer, anti-entropy and rebalance chunks, which carry every other key as
+  usual, where the record failed the exchange it was part of. A merge never
+  builds such a value and an upgrade can leave one behind; it keeps serving
+  reads, a `Distributed` fetch of it fails, and it cannot grow. A merge that
+  removes content and fits a frame, or `Cache::remove`, brings it back under
+  the limit. A value past a lowered `max_frame` fits a frame and syncs
+  as any other.
 - **A listing of large keys goes in several frames on the digest path.** The
   `AeBucket` reply to a digest exchange for a bucket of at most
-  `ae_sketch_min_bucket` entries is cut into frames of about 2 MiB, as the
-  full-listing fallback already is, for a peer on protocol 9. The requester
-  joins the messages of a bucket. A listing that fits one frame is sent as
-  before. The wire protocol does not change; a peer on a release that does not
-  join the messages of a digest reply treats each message as the whole bucket
-  and pushes the records it holds that the message lacks, where the exchange
-  failed.
+  `ae_sketch_min_bucket` entries whose listing no frame holds is cut into
+  frames of about 2 MiB, as the full-listing fallback is, for a peer on
+  protocol 9. The requester joins the messages of a bucket. A listing that
+  fits one frame is one message to every peer. The wire protocol does not
+  change; a peer on a release that does not join the messages of a digest
+  reply treats each message as the whole bucket and pushes the records it
+  holds that the message lacks, where the exchange failed. The listing of a
+  mismatched part is one message, so a part of at most
+  `ae_sketch_min_bucket` entries whose keys average past about 10 KiB fails to
+  send.
 - **A round of anti-entropy goes on after a failed pull.** `pull_repairs`
   asks for the next batch after one fails, and stops after two failures in a
-  row. A pull batch holds at most 512 KiB of keys beside its 4,096 keys.
+  row. A pull batch holds at most 512 KiB of keys beside its 4,096 keys, and a
+  pull reply carries at most 16 MiB of records, the leading ones in the order
+  asked; a record left out is pulled in a later round.
 
 ### Fixed
 
@@ -76,7 +90,7 @@ All notable changes to this project are documented in this file. Format follows
   adds keeps the order itself. Two flushes of one key's folds, the background
   sweep and an inbound invalidation or a close, could also apply a later fold
   ahead of an earlier one; a flush holds a per-stripe order lock from its take
-  through its last apply. Four cases can still put a higher number on a
+  through its last apply. Four cases put a higher number on a
   replica ahead of a lower one, and are named in the guide: an ownership
   change while a `Distributed` writer's forwards are in flight, a forward an
   owner holds for clock skew (overtaken as the clock crosses the bound, or
@@ -93,10 +107,10 @@ All notable changes to this project are documented in this file. Format follows
   after two disown grace periods with the only copy dropped. A merge refuses to
   grow a value past the frame, a responder leaves out a record it cannot send,
   and a failed pull batch does not discard the batches after it. A value
-  stored before the limit applied that is over it is still dropped when its
-  part leaves a `Distributed` node, since no frame can carry it to the new
-  owners; the warning names it, and a remove that shrinks it, or
-  `Cache::remove`, keeps it from reaching that point.
+  larger than a wire frame is dropped when its part leaves a `Distributed`
+  node, since no frame can carry it to the new owners; the warning names it,
+  and a remove that fits a frame and shrinks it, or `Cache::remove`, keeps it
+  from reaching that point.
 - **An `Invalidation` copy made through `load` expires at the source's
   instant.** `Cache::load` and `Cache::load_many` stored a value copied from
   the node a key's loads gather on with a fresh lifetime: the cache's default

@@ -12,11 +12,13 @@
 //! out of a coalesce window, also logs at `warn`, at most once per
 //! [`OVERSIZE_WARN_SPACING_MS`].
 //!
-//! A value stored before the limit applied can still be over it. It keeps
-//! serving local reads and can only shrink; anti-entropy and state transfer
-//! cannot ship it, so [`Shard::skip_unframeable`] leaves it out of what they
-//! send, counted in `sundog_sync_skipped_total{cache, reason="too_large"}`
-//! and logged at `warn` under the same spacing.
+//! A value larger than [`wire::MAX_FRAME`] can be in the store, which a merge
+//! never builds. It keeps serving local reads and can only shrink;
+//! anti-entropy and state transfer cannot ship it, so
+//! [`Shard::skip_unframeable`] leaves it out of what they send, counted in
+//! `sundog_sync_skipped_total{cache, reason="too_large"}` and logged at
+//! `warn` under the same spacing. A value past a lowered `max_frame` that
+//! fits a wire frame syncs as any other and cannot grow.
 
 use std::hash::Hash;
 use std::sync::Arc;
@@ -69,6 +71,8 @@ pub(super) enum Refused {
     Peer,
     /// A coalesced fold flushing on its own, whose callers returned long ago.
     Fold,
+    /// A CRDT compaction pass, whose rewrite of a record would grow it.
+    Compaction,
 }
 
 impl Refused {
@@ -77,6 +81,7 @@ impl Refused {
         match self {
             Self::Peer => "a record from a peer",
             Self::Fold => "a coalesced fold",
+            Self::Compaction => "a compaction pass",
         }
     }
 }
@@ -160,10 +165,10 @@ where
         .increment(1);
     }
 
-    /// Logs a merge `from` refused for leaving the value `size` bytes long,
+    /// Logs a change `from` refused for leaving the value `size` bytes long,
     /// at `warn` when the last warning is old enough, else at `debug`. Nobody
-    /// gets the error, so the stored value stays as it is and the
-    /// contribution is lost.
+    /// gets the error, so the stored value stays as it is and the change is
+    /// lost.
     pub(super) fn warn_merge_refused(&self, key: &[u8], size: usize, from: Refused) {
         let limit = self.max_frame;
         let key = key_for_log(key);
@@ -174,9 +179,9 @@ where
                 key,
                 size,
                 limit,
-                "refused a merge that would leave the value past the frame limit: the stored \
-                 value stays as it is and the contribution is lost. A value that keeps growing \
-                 needs a bound of its own. sundog_merge_refused_total counts every one"
+                "refused a change that would leave the value past the frame limit: the stored \
+                 value stays as it is and the change is lost. A value that keeps growing needs \
+                 a bound of its own. sundog_merge_refused_total counts every one"
             );
         } else {
             tracing::debug!(
@@ -185,7 +190,7 @@ where
                 key,
                 size,
                 limit,
-                "refused a merge that would leave the value past the frame limit"
+                "refused a change that would leave the value past the frame limit"
             );
         }
     }
@@ -236,9 +241,8 @@ impl SyncSkips {
                 largest_frame = largest,
                 limit = wire::MAX_FRAME,
                 "left records out of a sync because each is larger than one frame: they stay \
-                 here and are not replicated. A merge never grows a value past the frame limit, \
-                 so these were stored before it applied. Shrink or remove them. \
-                 sundog_sync_skipped_total counts every one"
+                 here and are not replicated. A merge never builds a value this large. Shrink \
+                 or remove them. sundog_sync_skipped_total counts every one"
             );
         } else {
             tracing::debug!(

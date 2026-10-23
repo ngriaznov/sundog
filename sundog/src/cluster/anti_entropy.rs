@@ -965,9 +965,9 @@ fn pull_batches(keys: &[Bytes], max_keys: usize, max_bytes: usize) -> Vec<&[Byte
 }
 
 /// Pull requests in a row that may fail before a round gives up on the rest
-/// of its pulls. One failed batch costs only itself, a later one may well
-/// arrive, but a peer that stalls costs a request timeout per batch, so the
-/// round does not try them all.
+/// of its pulls. A failed batch costs only its own records, and a peer that
+/// stalls costs a request timeout per batch, so the round stops after two
+/// failures in a row.
 const MAX_CONSECUTIVE_PULL_FAILURES: u32 = 2;
 
 /// Whether a round stops pulling after `consecutive_failures` failed requests

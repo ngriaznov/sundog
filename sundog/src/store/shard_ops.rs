@@ -230,8 +230,9 @@ pub trait ShardOps: Send + Sync {
     /// [`crate::wire::MAX_FRAME`] bytes, and a record that does not fit
     /// fails the whole exchange it is part of. The record stays in the store,
     /// and the skip is counted in `sundog_sync_skipped_total` and logged. A
-    /// merge never grows a value past the frame limit, so only a value stored
-    /// before that limit applied, or under a larger one, is skipped. Default:
+    /// merge never grows a value past the frame limit, so only a value larger
+    /// than [`crate::wire::MAX_FRAME`] is skipped; one past a lowered
+    /// `max_frame` fits a frame and syncs. Default:
     /// `records` unchanged, for a shard that holds nothing. Anti-entropy
     /// pushes and pulls, state transfer and rebalance chunks pass their
     /// records through this; a [`Msg::Fetch`](crate::wire::Msg::Fetch) reply

@@ -1113,11 +1113,11 @@ mod tests {
         ) {
             let writer_a = wid(node_a, inc_a);
             let writer_b = wid(node_b, inc_b);
-            // Genuinely different writers: a single writer's own sequence
-            // numbers are causally ordered (never issued out of order), so
-            // "the same writer, a lower sequence" is not a real concurrent
-            // scenario at all, only a malformed input this property is not
-            // about.
+            // Genuinely different writers: one writer's adds apply in
+            // sequence order (`Cache::merge_sequenced`), so "the same
+            // writer, a lower sequence" applied after a higher one is not
+            // a concurrent scenario this property is about. The
+            // `sequence_tests` module covers the ordered same-writer case.
             prop_assume!(writer_a != writer_b);
             let element = "x".to_string();
 

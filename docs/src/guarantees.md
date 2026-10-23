@@ -100,8 +100,8 @@ A merged value stays within one frame: a merge that would grow it past
 
 `Cache::merge` writes through the resolver without a read.
 `CacheBuilder::merge_coalesce_window` folds a writer's consecutive merges
-(`merge`, `merge_with_ttl` and `merge_sequenced`) to one key into one applied
-record per window, and a read does not see a fold still pending inside its
+(`merge`, `merge_with_ttl`, `merge_sequenced` and `merge_sequenced_with_ttl`)
+to one key into one applied record per window, and a read does not see a fold still pending inside its
 window. A graceful `Cache::close` or `Cluster::shutdown` applies and sends the
 folds still pending; a crash loses them.
 

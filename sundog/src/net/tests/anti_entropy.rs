@@ -649,6 +649,72 @@ async fn a_protocol_nine_peer_gets_a_large_bucket_in_several_ae_bucket_messages(
     assert_eq!(total, 300_000);
 }
 
+/// Twenty records with 1 MiB values under one-byte keys: more than a pull
+/// reply carries, from a few small keys.
+fn large_value_records() -> Vec<WireRecord> {
+    (0..20u8)
+        .map(|n| WireRecord {
+            key: Bytes::copy_from_slice(&[n]),
+            value: Some(Bytes::from(vec![n; 1024 * 1024])),
+            ver: Hlc {
+                wall_ms: 5,
+                logical: 0,
+                node: NodeId::from(1),
+            },
+            expires_at_ms: None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn an_ae_pull_for_small_keys_with_large_values_gets_a_reply_cut_at_its_byte_budget() {
+    let records = large_value_records();
+    let handler = Arc::new(FixtureHandler {
+        records: records.clone(),
+        ..Default::default()
+    });
+    let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+    let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+    client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+
+    let keys: Vec<Bytes> = records.iter().map(|rec| rec.key.clone()).collect();
+    let got = client
+        .ae_pull(NodeId::from(1), SmolStr::new("users"), keys)
+        .await
+        .expect("the pull completes");
+
+    assert_eq!(
+        got.len(),
+        15,
+        "sixteen of these frames pass the 16 MiB budget; {} records arrived",
+        got.len()
+    );
+    assert_eq!(got, records[..15], "the leading records arrive, in order");
+}
+
+#[tokio::test]
+async fn an_ae_pull_by_hash_for_large_values_gets_a_reply_cut_at_its_byte_budget() {
+    let records = large_value_records();
+    let ver = records[0].ver;
+    let handler = Arc::new(FixtureHandler {
+        records: records.clone(),
+        bucket_entries: records.iter().map(|rec| (rec.key.clone(), ver)).collect(),
+        ..Default::default()
+    });
+    let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+    let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+    client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+
+    let hashes: Vec<u64> = records.iter().map(|rec| xxh3_64(&rec.key)).collect();
+    let got = client
+        .ae_pull_hashes(NodeId::from(1), SmolStr::new("users"), 3, hashes)
+        .await
+        .expect("the pull completes");
+
+    assert_eq!(got.len(), 15, "{} records arrived", got.len());
+    assert_eq!(got, records[..15]);
+}
+
 #[tokio::test]
 async fn ae_pull_hashes_resolves_only_the_requested_hash_to_records() {
     // Two entries, one hash requested: the default `records_for_hashes`

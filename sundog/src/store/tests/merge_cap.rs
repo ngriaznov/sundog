@@ -11,7 +11,7 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use super::*;
 #[cfg(not(feature = "sim"))]
 use crate::cluster::test_support::{ScopedSubscriber, scoped_subscriber};
-use crate::store::crdt::WriterId;
+use crate::store::crdt::{OrSet, OrSetResolver, WriterId};
 use crate::store::shard_oversize::{
     OVERSIZE_WARN_SPACING_MS, key_for_log, oversize_warn_due, split_unframeable,
 };
@@ -52,7 +52,7 @@ impl ConflictResolver for ConcatResolver {
 /// The frame cap that admits a value of `value_bytes` encoded bytes under a
 /// one-byte key in the cache `shard` names, `test`.
 fn cap_for(value_bytes: usize) -> usize {
-    wire::replicate_frame_len("test".len(), 1, value_bytes)
+    wire::forward_frame_len("test".len(), 1, value_bytes)
 }
 
 /// A shard whose values stay within `value_bytes` encoded bytes. A vector of
@@ -312,6 +312,24 @@ async fn a_growing_merge_past_the_cap_fails_with_value_too_large_and_changes_not
         "nothing queued to replicate"
     );
     assert_digest_matches_full_recompute(&s).await;
+}
+
+#[tokio::test]
+async fn a_contribution_only_a_replicate_frame_holds_is_refused_since_a_forward_is_wider() {
+    // A forward is nine bytes wider than a replicate of the same record, and a
+    // `Distributed` owner fans a record out as one.
+    let s = shard::<u32, Vec<u8>>(1)
+        .with_resolver(Arc::new(ConcatResolver))
+        .with_max_frame(wire::replicate_frame_len("test".len(), 1, 10));
+
+    s.merge(1, vec![])
+        .await
+        .expect("a one-byte value is the widest a forward holds");
+    let (size, limit) = too_large(s.merge(2, vec![7]).await);
+
+    assert_eq!(size, 2, "the value is two bytes");
+    assert_eq!(limit, wire::replicate_frame_len("test".len(), 1, 10));
+    assert_eq!(s.get(&2).await, None, "and nothing is stored");
 }
 
 #[tokio::test]
@@ -612,4 +630,177 @@ async fn a_record_too_large_for_a_frame_stays_here_and_out_of_every_sync() {
     );
     assert_eq!(counted.skipped(), 2, "each skip counts");
     warnings.assert_one(&["larger than one frame", "largest_key=\"02\""]);
+}
+
+/// A set of `count` adds by `writer`, numbered from 1.
+fn set_of(writer: WriterId, count: u32) -> OrSet<u32> {
+    (2..=count).fold(OrSet::add(writer, 1, 1), |set, n| {
+        set.merge(&OrSet::add(writer, u64::from(n), n))
+    })
+}
+
+/// A shard of `OrSet`s that holds `set` under key 1 and keeps values to
+/// exactly that size, so no merge has room to add a byte.
+async fn shard_full_of(set: &OrSet<u32>) -> Shard<u32, OrSet<u32>> {
+    let encoded = set.encode().expect("encodes");
+    let s = shard::<u32, OrSet<u32>>(1)
+        .with_resolver(Arc::new(OrSetResolver::<u32>::new()))
+        .with_max_frame(wire::forward_frame_len("test".len(), 1, encoded.len()));
+    s.merge(1, set.clone()).await.expect("the set fits exactly");
+    s
+}
+
+#[tokio::test]
+async fn a_compaction_that_would_grow_a_value_past_the_cap_is_refused_counted_and_logged() {
+    let recorder = DebuggingRecorder::new();
+    let counted = Counted::new(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let (warnings, _log) = Warnings::capture();
+    let dead = WriterId::new(NodeId::from(11), 1);
+    let retire = move |w: WriterId| w == dead;
+    let bounds = CompactionBounds::three_bounds(1_000_000_000);
+    let set = set_of(dead, 12);
+    let grown = set
+        .compact(1_000, bounds, &retire, Quiescence::Settled)
+        .expect("a dead writer's first stage adds a retirement");
+    assert!(
+        grown.encode().expect("encodes").len() > set.encode().expect("encodes").len(),
+        "the premise: a first stage grows the value"
+    );
+    let s = shard_full_of(&set).await;
+    let before = ShardOps::records_for(&s, vec![key_bytes(&1u32)]).await;
+
+    let outcome =
+        ShardOps::compact_pass(&s, 1_000, &retire, Quiescence::Settled, bounds, 100).await;
+
+    assert_eq!(outcome.compacted, 0, "nothing is rewritten");
+    assert_eq!(
+        ShardOps::records_for(&s, vec![key_bytes(&1u32)]).await,
+        before,
+        "the stored record keeps its bytes and its version"
+    );
+    assert_eq!(
+        counted.refused(),
+        1,
+        "the refusal counts as a refused merge"
+    );
+    warnings.assert_one(&["a compaction pass", "frame limit", "key=\"01\""]);
+
+    ShardOps::compact_pass(&s, 2_000, &retire, Quiescence::Settled, bounds, 100).await;
+    assert_eq!(counted.refused(), 2, "each pass that meets it counts again");
+    assert!(
+        warnings.logged().len() <= 1,
+        "and logs at most once a minute: {:?}",
+        warnings.logged()
+    );
+}
+
+#[tokio::test]
+async fn a_compaction_that_shrinks_a_value_at_the_cap_is_applied() {
+    let dead = WriterId::new(NodeId::from(11), 1);
+    let retire = move |w: WriterId| w == dead;
+    let bounds = CompactionBounds::three_bounds(1_000);
+    // A remove leaves a watermark for the writer, which the second stage drops.
+    let base = set_of(dead, 12);
+    let base = base.merge(&OrSet::remove(&base, &12));
+    let retired = base
+        .compact(1_000, bounds, &retire, Quiescence::Churning)
+        .expect("the first stage");
+    let folded = retired
+        .compact(3_001, bounds, &retire, Quiescence::Settled)
+        .expect("the second stage");
+    assert!(
+        folded.encode().expect("encodes").len() < retired.encode().expect("encodes").len(),
+        "the premise: the second stage leaves the value smaller"
+    );
+    let s = shard_full_of(&retired).await;
+
+    let outcome =
+        ShardOps::compact_pass(&s, 3_001, &retire, Quiescence::Settled, bounds, 100).await;
+
+    assert_eq!(outcome.compacted, 1, "a rewrite that fits is applied");
+    assert_eq!(
+        s.get(&1).await.map(|set| set.iter().count()),
+        Some(11),
+        "and the elements stay"
+    );
+}
+
+/// A record for key 1 of `set`, as a peer sends it.
+fn set_record(set: &OrSet<u32>) -> WireRecord {
+    WireRecord {
+        key: key_bytes(&1u32),
+        value: Some(Bytes::from(set.encode().expect("encodes"))),
+        ver: hlc(ahead_ms(), 2),
+        expires_at_ms: None,
+    }
+}
+
+/// Shards of `OrSet`s that keep values to `cap` bytes under a one-byte key.
+fn set_shard(cap: usize) -> Shard<u32, OrSet<u32>> {
+    shard::<u32, OrSet<u32>>(1)
+        .with_resolver(Arc::new(OrSetResolver::<u32>::new()))
+        .with_max_frame(cap)
+}
+
+/// The value bytes the `OrSet` shards below hold at most.
+const SET_CAP: usize = 256;
+
+#[tokio::test]
+async fn a_remove_fits_a_frame_when_the_writers_it_touches_hold_few_tags() {
+    // A hundred writers, one element each: a set past the cap whose remove
+    // carries one writer's tags and so fits a frame.
+    let many_writers = (0..100u64)
+        .map(|n| {
+            let writer = WriterId::new(NodeId::from(100 + n), 1);
+            OrSet::add(writer, 1, u32::try_from(n).expect("small"))
+        })
+        .reduce(|set, add| set.merge(&add))
+        .expect("a hundred adds");
+    let stored_len = many_writers.encode().expect("encodes").len();
+    assert!(
+        stored_len > SET_CAP,
+        "the premise: the set is over the cap: {stored_len}"
+    );
+    let s = set_shard(wire::forward_frame_len("test".len(), 1, SET_CAP));
+    ShardOps::apply_remote(&s, set_record(&many_writers)).await;
+
+    s.merge(1, OrSet::remove(&many_writers, &7))
+        .await
+        .expect("a remove that fits a frame shrinks a set past the cap");
+
+    let set = s.get(&1).await.expect("stored");
+    assert_eq!(set.iter().count(), 99, "one element out");
+    assert!(!set.contains(&7));
+}
+
+#[tokio::test]
+async fn a_remove_against_a_set_one_writer_filled_is_as_large_as_the_set_and_is_refused() {
+    let writer = WriterId::new(NodeId::from(11), 1);
+    let one_writer = set_of(writer, 300);
+    let stored_len = one_writer.encode().expect("encodes").len();
+    assert!(
+        stored_len > SET_CAP,
+        "the premise: the set is over the cap: {stored_len}"
+    );
+    let cap = wire::forward_frame_len("test".len(), 1, SET_CAP);
+    let s = set_shard(cap);
+    ShardOps::apply_remote(&s, set_record(&one_writer)).await;
+    let remove = OrSet::remove(&one_writer, &7);
+    assert!(
+        remove.encode().expect("encodes").len() > SET_CAP,
+        "the remove carries the writer's 299 other tags"
+    );
+
+    let (size, limit) = too_large(s.merge(1, remove).await);
+
+    assert!(size > SET_CAP);
+    assert_eq!(limit, cap);
+    assert_eq!(
+        s.get(&1).await.map(|set| set.iter().count()),
+        Some(300),
+        "nothing changed"
+    );
+    s.remove(&1).await.expect("Cache::remove is the way");
+    assert_eq!(s.get(&1).await, None);
 }

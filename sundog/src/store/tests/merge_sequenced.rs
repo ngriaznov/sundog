@@ -3,7 +3,7 @@
 //! leave the node in.
 
 use std::sync::Mutex;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
 use crate::store::crdt::WriterId;
@@ -149,8 +149,37 @@ async fn each_shard_numbers_its_own_calls_and_a_new_writer_starts_again_at_one()
 }
 
 #[tokio::test]
+async fn shards_given_one_counter_draw_distinct_numbers_from_it() {
+    let counter = Arc::new(AtomicU64::new(0));
+    let first = shard::<u32, u64>(1).with_merge_seq_counter(Arc::clone(&counter));
+    let second = shard::<u32, u64>(1).with_merge_seq_counter(Arc::clone(&counter));
+    let handed = Mutex::new(Vec::new());
+    let draw = async |s: &Shard<u32, u64>| {
+        s.merge_sequenced(1, writer(), |_, seq| {
+            handed.lock().expect("lock").push(seq);
+            seq
+        })
+        .await
+        .expect("merge_sequenced");
+    };
+
+    draw(&first).await;
+    draw(&first).await;
+    draw(&second).await;
+    draw(&first).await;
+    draw(&second).await;
+
+    assert_eq!(
+        *handed.lock().expect("lock"),
+        [1, 2, 3, 4, 5],
+        "a shard that replaces another under one cache name carries on its count"
+    );
+    assert_eq!(counter.load(Ordering::Relaxed), 5, "the counter is shared");
+}
+
+#[tokio::test]
 async fn a_value_over_the_frame_cap_fails_after_its_draw_and_its_number_is_not_given_back() {
-    let cap = wire::replicate_frame_len("test".len(), 1, 8);
+    let cap = wire::forward_frame_len("test".len(), 1, 8);
     let s = shard::<u32, String>(1).with_max_frame(cap);
     let handed = Mutex::new(Vec::new());
     for big in [false, true, false] {

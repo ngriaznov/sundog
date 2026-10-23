@@ -260,10 +260,13 @@ pub struct ClusterConfig {
     /// [`ae_part_min_bucket`](Self::ae_part_min_bucket) has narrowed a
     /// bucket to it. A sketch costs a fixed ~9 KB at the default
     /// `ae_sketch_cells`; a listing costs ~23 bytes per entry, so 384 is the
-    /// crossover for small keys. A listing sent in place of a sketch goes in
-    /// frames of about 2 MiB, several when the keys are large, which a
+    /// crossover for small keys. A bucket listing sent in place of a sketch
+    /// is one message when a frame holds it, and goes in frames of about
+    /// 2 MiB, several when the keys are large, when none does, which a
     /// requester on [`wire::PROTOCOL_AE_LISTING_CHUNKS`](crate::wire::PROTOCOL_AE_LISTING_CHUNKS)
-    /// joins.
+    /// joins. The listing of a mismatched part is always one message, so a
+    /// part of at most this many entries whose keys average past about
+    /// 10 KiB cannot be sent.
     pub ae_sketch_min_bucket: usize,
     /// Cell count of the IBLT sketch built for a bucket past
     /// [`ae_sketch_min_bucket`](Self::ae_sketch_min_bucket). The default of

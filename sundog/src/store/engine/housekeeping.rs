@@ -37,13 +37,25 @@ pub(crate) struct CompactCandidate<K> {
     pub(crate) new_encoded: Bytes,
 }
 
+/// A record whose compacted form [`Engine::compact`] left out because it would
+/// pass the engine's [`MergeCap`](super::MergeCap) and be larger than the
+/// record it replaces. A first stage of retirement adds an entry to a set, so a
+/// set at the cap has no room for it.
+pub(crate) struct CompactRefusal {
+    pub(crate) key_bytes: Bytes,
+    /// The byte length of the compacted value that did not fit.
+    pub(crate) size: usize,
+}
+
 /// One [`Engine::compact`] call's result: the records whose resolver
-/// produced a compacted form, each with the version it is read at, and
+/// produced a compacted form that stays within the engine's cap, each with
+/// the version it is read at, the records whose form did not, and
 /// how many stripes the call walked before its entry budget ran out. A
 /// caller that wants the whole keyspace examined keeps calling until the
 /// visited stripes add up to [`BUCKET_COUNT`](crate::store::BUCKET_COUNT).
 pub(crate) struct CompactScan<K> {
     pub(crate) candidates: Vec<CompactCandidate<K>>,
+    pub(crate) refused: Vec<CompactRefusal>,
     pub(crate) stripes_visited: usize,
 }
 
@@ -248,6 +260,12 @@ where
     /// `capacity_hint` or a stripe drained by rebalancing): if so, this
     /// pass takes a separate write lock and calls [`Slab::shrink_to_fit`].
     ///
+    /// A compacted form that passes the engine's [`MergeCap`](super::MergeCap)
+    /// and is larger than the record it replaces ([`merge_fits`](super::merge_fits))
+    /// is no candidate: it is reported in [`CompactScan::refused`] and the
+    /// record stays as it is, so a compaction never pushes a value past a
+    /// frame. A form that shrinks the record always stays a candidate.
+    ///
     /// `max_entries` bounds entries examined, not entries eligible; a
     /// stripe already in progress always finishes. The cursor advances past
     /// every visited stripe, wrapping at `BUCKET_COUNT`; `max_entries == 0`
@@ -265,11 +283,14 @@ where
         if max_entries == 0 {
             return CompactScan {
                 candidates: Vec::new(),
+                refused: Vec::new(),
                 stripes_visited: 0,
             };
         }
+        let cap = self.merge_cap();
         let start = stripe_index_from_hash(self.compact_cursor.load(Ordering::Relaxed));
         let mut out = Vec::new();
+        let mut refused = Vec::new();
         let mut examined = 0usize;
         let mut visited = 0usize;
         let mut next_start = start;
@@ -295,9 +316,19 @@ where
                     quiet,
                     bounds,
                 ) {
+                    let key_bytes = record_key_bytes(&live.record);
+                    if cap.is_some_and(|cap| {
+                        !cap.admits(key_bytes.len(), new_encoded.len(), Some(encoded.len()))
+                    }) {
+                        refused.push(CompactRefusal {
+                            key_bytes,
+                            size: new_encoded.len(),
+                        });
+                        continue;
+                    }
                     out.push(CompactCandidate {
                         key: decode_key(record_key(&live.record)),
-                        key_bytes: record_key_bytes(&live.record),
+                        key_bytes,
                         stale_ver: live.ver(),
                         new_encoded,
                     });
@@ -318,6 +349,7 @@ where
             .store(next_start as u64, Ordering::Relaxed);
         CompactScan {
             candidates: out,
+            refused,
             stripes_visited: visited,
         }
     }

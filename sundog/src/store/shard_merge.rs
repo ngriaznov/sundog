@@ -168,9 +168,10 @@ where
     /// A merged value stays within one frame. A merge whose result would
     /// pass the configured frame cap ([`Shard::with_max_frame`],
     /// [`wire::MAX_FRAME`] by default) and be larger than the value it
-    /// replaces is refused and changes nothing, so a merge that shrinks a
-    /// value, or leaves it as it is, always succeeds, even for a value that
-    /// already passes the cap. The same rule refuses a merge arriving from a
+    /// replaces is refused and changes nothing, so a merge whose own value
+    /// fits a frame and that shrinks the stored value, or leaves it as it is,
+    /// succeeds, even for a value that already passes the cap. The same rule
+    /// refuses a merge arriving from a
     /// peer, which leaves the stored value as it is and is counted in
     /// `sundog_merge_refused_total`. With a coalescing window, the call that
     /// would leave its own pending fold past the cap gets the error. A fold
@@ -211,7 +212,10 @@ where
     /// writer identity every call on this shard writes under, as
     /// [`Cache::merge_sequenced`](crate::cache::Cache::merge_sequenced) passes
     /// [`Cache::writer_id`](crate::cache::Cache::writer_id). The numbers start
-    /// at 1 and rise by one per call, and none repeats. A call that fails
+    /// at 1 and rise by one per call, and none repeats. A shard of a cache
+    /// draws from the counter its cluster keeps for the cache's name, so the
+    /// count carries on when the cache closes and opens again; a shard built
+    /// on its own has a counter of its own. A call that fails
     /// after it drew its number, for a value over the frame cap, does not
     /// give the number back, so the next number skips it.
     ///
@@ -371,10 +375,11 @@ where
     }
 
     /// `Err(CacheError::ValueTooLarge)` when a value of `value_len` encoded
-    /// bytes under a key of `key_len` bytes would replicate as a frame over
-    /// the cap.
+    /// bytes under a key of `key_len` bytes would travel as a frame over the
+    /// cap. The frame counted is the widest one a record takes, a forward
+    /// ([`wire::forward_frame_len`]), as the cap on a merged result counts it.
     fn check_value_frame(&self, key_len: usize, value_len: usize) -> Result<(), CacheError> {
-        let wire_size = wire::replicate_frame_len(self.name.len(), key_len, value_len);
+        let wire_size = wire::forward_frame_len(self.name.len(), key_len, value_len);
         if wire_size > self.max_frame {
             return Err(CacheError::ValueTooLarge {
                 cache: self.name.clone(),

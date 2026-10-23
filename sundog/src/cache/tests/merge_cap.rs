@@ -115,6 +115,74 @@ async fn a_set_that_keeps_growing_is_refused_at_a_frame_and_every_merge_call_say
 }
 
 #[tokio::test]
+async fn an_insert_that_merges_into_a_full_set_is_refused_by_every_insert_call() {
+    let (cluster, cache) = tag_cache("cache-it-cap-insert", Duration::ZERO).await;
+    let held = fill(&cache).await;
+    let writer = cache.writer_id();
+    let add = |seq: u64, n: usize| OrSet::add(writer, seq, element(n));
+
+    too_large(cache.insert(1, add(1_000, 900)).await);
+    too_large(cache.insert_sync(1, add(1_001, 901)));
+    too_large(
+        cache
+            .insert_with_ttl(1, add(1_002, 902), Duration::from_secs(60))
+            .await,
+    );
+    too_large(cache.insert_many([(1, add(1_003, 903))]).await);
+    too_large(
+        cache
+            .insert_many_with_ttl([(1, add(1_004, 904))], Duration::from_secs(60))
+            .await,
+    );
+
+    assert_eq!(
+        cache.get(&1).await.expect("stored").iter().count(),
+        held,
+        "five refusals later it is as it was"
+    );
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_insert_many_applies_the_entries_around_a_refused_one_and_returns_the_refusal() {
+    let (cluster, cache) = tag_cache("cache-it-cap-insert-many", Duration::ZERO).await;
+    let held = fill(&cache).await;
+    let writer = cache.writer_id();
+    let add = |seq: u64, n: usize| OrSet::add(writer, seq, element(n));
+
+    too_large(
+        cache
+            .insert_many([
+                (2, add(2_000, 800)),
+                (1, add(2_001, 801)),
+                (3, add(2_002, 802)),
+            ])
+            .await,
+    );
+
+    assert_eq!(
+        cache.get(&1).await.expect("stored").iter().count(),
+        held,
+        "the refused entry changed nothing"
+    );
+    assert!(
+        cache
+            .get(&2)
+            .await
+            .is_some_and(|set| set.contains(&element(800))),
+        "the entry before it applied"
+    );
+    assert!(
+        cache
+            .get(&3)
+            .await
+            .is_some_and(|set| set.contains(&element(802))),
+        "and so did the entry after it"
+    );
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_remove_shrinks_a_full_set_and_the_next_add_fits() {
     let (cluster, cache) = tag_cache("cache-it-cap-shrink", Duration::ZERO).await;
     let held = fill(&cache).await;

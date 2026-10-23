@@ -135,8 +135,9 @@ run of 4 million keys the demo settles at 1.7 GiB under jemalloc against
 
 `CacheBuilder::max_resident_bytes(n)` caps a cache's memory on each node,
 in every mode and without a spill tier. A local write, `insert`,
-`insert_with_ttl`, `insert_many`, `merge` or `merge_with_ttl`, that finds
-`Cache::resident_bytes()` at `n` or over fails with
+`insert_with_ttl`, `insert_many`, `merge`, `merge_with_ttl`, `merge_sequenced`
+or `merge_sequenced_with_ttl`, that finds `Cache::resident_bytes()` at `n` or
+over fails with
 `CacheError::OverMemoryCeiling`, and a `get_or_load` fill returns its value
 to every waiting caller without storing it. A batch that starts under the
 ceiling applies whole.

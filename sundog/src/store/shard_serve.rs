@@ -15,6 +15,7 @@ use serde::de::DeserializeOwned;
 use super::SpillRead;
 use super::resolver::exchanges_both_records;
 use super::shard_ops::MaskedDigest;
+use super::shard_oversize::Refused;
 #[cfg(feature = "spill")]
 use super::spilled_needs_read;
 use super::{
@@ -944,6 +945,7 @@ where
         };
         let engine::CompactScan {
             candidates,
+            refused,
             stripes_visited,
         } = self.engine.compact(
             self.resolver.as_ref(),
@@ -953,6 +955,16 @@ where
             bounds,
             max_entries,
         );
+        // A compacted form that would push a value past the frame limit is
+        // left out like a merge that would: the record keeps its retired
+        // writers until a remove shrinks it, and each pass counts and logs
+        // the refusal again.
+        for engine::CompactRefusal { key_bytes, size } in refused {
+            if self.owns_key(key_bytes.as_ref()) {
+                self.count_merge_refused();
+                self.warn_merge_refused(key_bytes.as_ref(), size, Refused::Compaction);
+            }
+        }
         let mut compacted = 0usize;
         for engine::CompactCandidate {
             key,

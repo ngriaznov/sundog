@@ -64,8 +64,9 @@ pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 /// - 8: A merging `Mode::Invalidation` cache sends [`Msg::Replicate`] and
 ///   [`Msg::ReplicateBatch`] records in place of [`Msg::Invalidate`]. See
 ///   [`PROTOCOL_INVALIDATION_FOLD`].
-/// - 9: A reply to [`Msg::AeEntries`] may carry one bucket's listing across
-///   several [`Msg::AeBucket`] messages. See [`PROTOCOL_AE_LISTING_CHUNKS`].
+/// - 9: A reply to [`Msg::AeEntries`] or [`Msg::AeDigest`] may carry one
+///   bucket's listing across several [`Msg::AeBucket`] messages. See
+///   [`PROTOCOL_AE_LISTING_CHUNKS`].
 pub const PROTOCOL_VERSION: u16 = 9;
 
 /// The oldest peer protocol this build still serves in full.
@@ -133,10 +134,14 @@ pub const PROTOCOL_INVALIDATION_FOLD: u16 = 8;
 /// The protocol under which a responder may answer one bucket of an
 /// [`Msg::AeEntries`] request with several [`Msg::AeBucket`] messages, each
 /// holding a slice of the bucket's listing, which the requester concatenates
-/// in arrival order. A requester joins the messages of a bucket whatever the
-/// responder's protocol; a responder sends a peer on an older protocol one
-/// message per bucket, since that peer would read each message as the whole
-/// bucket.
+/// in arrival order. A reply to an [`Msg::AeDigest`] does the same, but only
+/// for a listing that does not fit one frame: a release on this protocol
+/// that joins the slices of an `AeEntries` reply and not those of a digest
+/// reply reads each digest message as the whole bucket, so a listing that
+/// fits a frame is one message. A requester joins the messages of a bucket
+/// whatever the responder's protocol; a responder sends a peer on an older
+/// protocol one message per bucket, since that peer would read each message
+/// as the whole bucket.
 pub const PROTOCOL_AE_LISTING_CHUNKS: u16 = 9;
 
 /// The `cluster` a [`Msg::Hello`] carries when its sender names none: a
@@ -254,7 +259,8 @@ pub enum Msg {
         buckets: Vec<(u16, u64)>,
     },
     /// Anti-entropy round, step 2: `(key, version)` pairs live in the
-    /// mismatched `bucket` on the sender. A reply to [`Msg::AeEntries`] may
+    /// mismatched `bucket` on the sender. A reply to [`Msg::AeEntries`], or
+    /// to an [`Msg::AeDigest`] whose listing does not fit one frame, may
     /// repeat it for one bucket, each message holding the next slice of the
     /// listing, and the receiver concatenates them; see
     /// [`PROTOCOL_AE_LISTING_CHUNKS`].
@@ -567,6 +573,16 @@ pub(crate) const RECORD_HEADER_LEN: usize = size_of::<RecordHeader>();
 #[must_use]
 pub(crate) fn replicate_frame_len(cache_len: usize, key_len: usize, value_len: usize) -> usize {
     1 + size_of::<RawFrameHeader>() + cache_len + RECORD_HEADER_LEN + key_len + value_len
+}
+
+/// Exact byte length a [`Msg::ForwardBatch`] of one record encodes to, given
+/// the cache-name/key/value lengths: [`replicate_frame_len`] plus the
+/// [`ForwardHeader`]. A `Distributed` owner fans a record out to its
+/// co-owners as a forward, so this is the widest frame one record travels
+/// in, and the one a merged value is held within.
+#[must_use]
+pub(crate) fn forward_frame_len(cache_len: usize, key_len: usize, value_len: usize) -> usize {
+    replicate_frame_len(cache_len, key_len, value_len) + size_of::<ForwardHeader>()
 }
 
 /// The widest postcard encoding of one [`Cell`]: each of its six integer
@@ -1817,6 +1833,72 @@ mod tests {
             .expect("encodes")
             .len();
         assert_eq!(predicted, actual);
+    }
+
+    #[test]
+    fn forward_frame_len_matches_a_real_encode_and_is_one_header_wider_than_a_replicate() {
+        let rec = sample_record(Some("v1"));
+        let cache = SmolStr::new("users");
+        let (key_len, value_len) = (rec.key.len(), rec.value.as_ref().map_or(0, Bytes::len));
+        let predicted = forward_frame_len(cache.len(), key_len, value_len);
+        let actual = encode(&Msg::ForwardBatch {
+            cache: cache.clone(),
+            view_hash: 7,
+            hops: 1,
+            recs: vec![rec],
+        })
+        .expect("encodes")
+        .len();
+        assert_eq!(predicted, actual);
+        assert_eq!(
+            predicted - replicate_frame_len(cache.len(), key_len, value_len),
+            9,
+            "a view hash of eight bytes and a hop count of one"
+        );
+    }
+
+    #[test]
+    fn a_record_within_nine_bytes_of_the_limit_fits_a_replicate_and_not_a_forward() {
+        let cache = SmolStr::new("users");
+        let key = Bytes::from_static(b"k");
+        let fixed = replicate_frame_len(cache.len(), key.len(), 0);
+        let rec = |value_len: usize| WireRecord {
+            key: key.clone(),
+            value: Some(Bytes::from(vec![0u8; value_len])),
+            ver: sample_hlc(),
+            expires_at_ms: None,
+        };
+        let forward = |value_len: usize| Msg::ForwardBatch {
+            cache: cache.clone(),
+            view_hash: 7,
+            hops: 1,
+            recs: vec![rec(value_len)],
+        };
+        let widest = MAX_FRAME - fixed;
+
+        assert_eq!(
+            encode(&Msg::Replicate {
+                cache: cache.clone(),
+                rec: rec(widest),
+            })
+            .expect("a replicate of the widest value")
+            .len(),
+            MAX_FRAME
+        );
+        assert!(matches!(
+            encode(&forward(widest)),
+            Err(CodecError::FrameTooLarge { .. })
+        ));
+        assert_eq!(
+            encode(&forward(widest - 9))
+                .expect("a forward of the widest value that fits")
+                .len(),
+            MAX_FRAME
+        );
+        assert_eq!(
+            forward_frame_len(cache.len(), key.len(), widest - 9),
+            MAX_FRAME
+        );
     }
 }
 

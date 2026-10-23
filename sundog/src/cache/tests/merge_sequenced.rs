@@ -145,6 +145,124 @@ async fn a_restarted_node_numbers_from_one_under_a_new_incarnation() {
 }
 
 #[tokio::test]
+async fn a_cache_that_closes_and_opens_again_carries_on_its_count() {
+    let cluster = solo_cluster("cache-it-seq-reopen-local").await;
+    let open = async || {
+        cluster
+            .cache::<u32, u64>("numbers")
+            .mode(Mode::Local)
+            .open()
+            .await
+            .expect("opens")
+    };
+    let handed = Mutex::new(Vec::new());
+    let draw = async |cache: &Cache<u32, u64>| {
+        cache
+            .merge_sequenced(1, |writer, seq| {
+                handed.lock().expect("lock").push((writer, seq));
+                seq
+            })
+            .await
+            .expect("merge_sequenced");
+    };
+
+    let first = open().await;
+    let stale = first.clone();
+    draw(&first).await;
+    draw(&first).await;
+    first.close().await;
+    let second = open().await;
+    draw(&second).await;
+    draw(&stale).await;
+    draw(&second).await;
+
+    let writer = second.writer_id();
+    assert_eq!(
+        *handed.lock().expect("lock"),
+        [
+            (writer, 1),
+            (writer, 2),
+            (writer, 3),
+            (writer, 4),
+            (writer, 5)
+        ],
+        "a reopened cache, and a clone kept past the close, draw on from where the first open stopped"
+    );
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_add_made_after_the_cache_reopens_survives_a_remove_that_observed_the_adds_before_it() {
+    let name = "cache-it-seq-reopen";
+    let mut nodes = set_nodes(name, Mode::Replicated, 2, Duration::ZERO).await;
+    let (cluster_b, cache_b) = nodes.pop().expect("node b");
+    let (cluster_a, cache_a) = nodes.pop().expect("node a");
+    for element in [10, 20] {
+        cache_a
+            .merge_sequenced(SET_KEY, |writer, seq| OrSet::add(writer, seq, element))
+            .await
+            .expect("add");
+    }
+    wait_until(
+        Duration::from_secs(30),
+        "node b holds both adds",
+        async || members(&cache_b).await == Some(BTreeSet::from([10, 20])),
+    )
+    .await;
+    let observed = cache_b.get(&SET_KEY).await.expect("node b holds the set");
+    cache_b
+        .merge(SET_KEY, OrSet::remove(&observed, &20))
+        .await
+        .expect("remove");
+    wait_until(
+        Duration::from_secs(30),
+        "node a holds the set without the removed element",
+        async || members(&cache_a).await == Some(BTreeSet::from([10])),
+    )
+    .await;
+
+    cache_a.close().await;
+    let reopened = cluster_a
+        .cache::<u32, OrSet<u32>>(name)
+        .mode(Mode::Replicated)
+        .resolver(Arc::new(OrSetResolver::<u32>::new()))
+        .open()
+        .await
+        .expect("opens again");
+    wait_until(
+        Duration::from_secs(30),
+        "the reopened cache receives the set",
+        async || members(&reopened).await == Some(BTreeSet::from([10])),
+    )
+    .await;
+    let drawn = Mutex::new(Vec::new());
+    reopened
+        .merge_sequenced(SET_KEY, |writer, seq| {
+            drawn.lock().expect("lock").push(seq);
+            OrSet::add(writer, seq, 30)
+        })
+        .await
+        .expect("add");
+
+    assert_eq!(
+        *drawn.lock().expect("lock"),
+        [3],
+        "the add takes the number after the two the first open drew"
+    );
+    wait_until(
+        Duration::from_secs(30),
+        "both nodes hold the acknowledged add",
+        async || {
+            members(&reopened).await == Some(BTreeSet::from([10, 30]))
+                && members(&cache_b).await == Some(BTreeSet::from([10, 30]))
+        },
+    )
+    .await;
+    cluster_b.shutdown().await;
+    cluster_a.shutdown().await;
+}
+
+#[tokio::test]
 async fn merge_sequenced_with_ttl_carries_the_calls_lifespan() {
     let cluster = solo_cluster("cache-it-seq-ttl").await;
     let cache = cluster
@@ -350,13 +468,34 @@ struct Workload {
     removed: BTreeSet<u32>,
 }
 
+/// How long an adder waits between two adds, and a remover between two
+/// passes. A real timer lets every worker park, so a task that waits to run
+/// again is woken within the interval however busy the machine is. A task
+/// that only yields is woken after the driver next polls, which a worker that
+/// never idles does not reach for tens of seconds.
+const ADD_PACE: Duration = Duration::from_millis(1);
+const REMOVE_PACE: Duration = Duration::from_millis(2);
+
+/// Removals a remover makes at least, beyond the adders' last add if it must.
+const MIN_REMOVALS: usize = 3;
+
+/// Passes a remover makes after the adders finish while it has fewer than
+/// [`MIN_REMOVALS`] removals.
+const MAX_CLOSING_PASSES: u32 = 50;
+
+/// Elements added once the removers have stopped, which no remover can have
+/// read.
+const CLOSING_ADDS: u32 = 5;
+
 /// Runs `adders` tasks that each add `per_task` unique elements to
 /// [`SET_KEY`] through `source.merge_sequenced`, while one remover per cache of
 /// `removers` reads the set and removes the element with the highest tag it
 /// observed, as long as an adder runs. The highest tag is the one a lower
 /// sequence number applied after it would fall under. A remover that has
-/// removed fewer than three elements by then removes more, so the workload
-/// always removes something.
+/// removed fewer than [`MIN_REMOVALS`] elements by then makes up to
+/// [`MAX_CLOSING_PASSES`] more passes, so the workload removes something.
+/// Once the removers have stopped, [`CLOSING_ADDS`] more elements are added,
+/// which no remover observed, so the workload also always keeps something.
 async fn run_workload(
     source: &SetCache,
     removers: &[SetCache],
@@ -376,7 +515,7 @@ async fn run_workload(
                     .await
                     .expect("add");
                 inserted.insert(element);
-                tokio::task::yield_now().await;
+                tokio::time::sleep(ADD_PACE).await;
             }
             running.fetch_sub(1, Ordering::SeqCst);
             inserted
@@ -387,7 +526,14 @@ async fn run_workload(
         let (cache, running) = (remover.clone(), Arc::clone(&running));
         removing.push(tokio::spawn(async move {
             let mut deleted = BTreeSet::new();
-            while running.load(Ordering::SeqCst) > 0 || deleted.len() < 3 {
+            let mut closing_passes = 0;
+            loop {
+                if running.load(Ordering::SeqCst) == 0 {
+                    if deleted.len() >= MIN_REMOVALS || closing_passes >= MAX_CLOSING_PASSES {
+                        break;
+                    }
+                    closing_passes += 1;
+                }
                 if let Ok(Some(observed)) = cache.fetch(&SET_KEY).await
                     && let Some(&element) = observed.iter().last()
                 {
@@ -397,7 +543,7 @@ async fn run_workload(
                         .expect("remove");
                     deleted.insert(element);
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(REMOVE_PACE).await;
             }
             deleted
         }));
@@ -411,6 +557,14 @@ async fn run_workload(
     }
     for task in removing {
         workload.removed.extend(task.await.expect("remover task"));
+    }
+    for index in 0..CLOSING_ADDS {
+        let element = 1_000_000 + index;
+        source
+            .merge_sequenced(SET_KEY, |writer, seq| OrSet::add(writer, seq, element))
+            .await
+            .expect("closing add");
+        workload.added.insert(element);
     }
     workload
 }

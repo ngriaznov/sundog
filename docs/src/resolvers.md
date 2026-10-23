@@ -96,9 +96,11 @@ writer and the writer's next sequence number:
 
 The cache draws the number and runs the closure under the lock that orders
 writes to the key, so one writer's numbers apply in the order they were
-drawn. The numbers start at 1 in each run of the process. The closure runs
-once, with the lock held: keep it cheap and do not call into the cache from
-it. `Cache::merge_sequenced_with_ttl` gives the add a lifetime of its own.
+drawn. The numbers start at 1 for each cache name when the cluster starts,
+and a cache that closes and opens again under its name carries on the count.
+The closure runs once, with the lock held: keep it cheap and do not call into
+the cache from it. `Cache::merge_sequenced_with_ttl` gives the add a lifetime
+of its own.
 
 One writer's sequence numbers must apply in order. A remove records the
 highest number it observed from each writer and covers every lower number of
@@ -127,7 +129,7 @@ they were made and applies the folds in that order. A `Distributed` node that
 does not own the key forwards its adds to the owners in the order it drew the
 numbers, over one ordered link per owner.
 
-Four cases still put a higher number on a replica ahead of a lower one, and a
+Four cases put a higher number on a replica ahead of a lower one, and a
 remove built from a read of that replica then covers the lower number when it
 arrives:
 
@@ -148,8 +150,9 @@ arrives:
 
 ## Expiry and deletes
 
-`CacheBuilder::ttl`, `Cache::merge_with_ttl` and `Cache::insert_with_ttl`
-give merged values a lifetime as they give any other value one:
+`CacheBuilder::ttl`, `Cache::merge_with_ttl`,
+`Cache::merge_sequenced_with_ttl` and `Cache::insert_with_ttl` give merged
+values a lifetime as they give any other value one:
 
 - **A merge keeps the later deadline.** Folding two values keeps the later
   of their two deadlines, and a value with no deadline takes the other
@@ -188,12 +191,21 @@ give merged values a lifetime as they give any other value one:
 
 A record travels as one message, and a message is at most `max_frame` bytes:
 4 MiB by default, and never more than `wire::MAX_FRAME`. A merged value is
-held to that, the frame it takes with its key and the cache's name. A
-`Cache::merge`, `merge_with_ttl`, `merge_sequenced` or `insert` that would
-leave a value past the limit and larger than it was fails with
-`CacheError::ValueTooLarge` and changes nothing. A merge that leaves the
-value no larger always succeeds, so a remove can shrink a value that already
-passes the limit.
+held to that, the frame it takes with its key and the cache's name, counted at
+the widest a record travels in: the forward an owner sends its co-owners, nine
+bytes wider than a replicate. A `Cache::merge`, `merge_with_ttl`,
+`merge_sequenced`, `merge_sequenced_with_ttl` or `insert` that would leave a
+value past the limit and larger than it was fails with
+`CacheError::ValueTooLarge` and changes nothing. A merge whose own value fits
+a frame and that leaves the stored value no larger succeeds, so a merge can
+shrink a value that already passes the limit.
+
+The remove an `OrSet` builds carries the remaining tags of every writer it
+touches, so for a set that one writer filled it is nearly as large as the set,
+and a frame does not hold it when the set is past the limit. Such a set cannot
+be shrunk with `OrSet::remove`; delete the key with `Cache::remove`. A remove
+fits a frame, and shrinks a set past the limit, when the tags of the writers
+it touches are few, as in a set that many writers filled.
 
 An `OrSet` that is only ever added to reaches it: each add leaves a tag in the
 value until a remove observes it. Bound a set before it gets there. Remove the
@@ -208,9 +220,9 @@ that names the key, at most once a minute for each cache. The contribution is
 lost, since no caller waits for it. Two replicas that each hold half of a set
 too large to merge refuse each other's state and stay apart, and a
 `Distributed` non-owner's call returns before the owner applies it, so only
-the owner sees its refusal. One remove that shrinks the value on any node
-brings the replicas back together, because a state that fits merges
-everywhere.
+the owner sees its refusal. A merge that shrinks the value on any node, a
+remove small enough to fit a frame for example, brings the replicas back
+together, because a state that fits merges everywhere.
 
 With a `merge_coalesce_window`, the call that would leave its own pending fold
 past the limit gets the error. A fold that fits while it is pending but would
@@ -218,19 +230,21 @@ push the stored value past the limit when the window closes is refused at that
 flush, where no caller waits: it is counted and logged like a merge from a
 peer, and its contributions are lost. Give a windowed set room below the limit.
 
-A value over the limit can exist: one stored under a larger `max_frame`, or by
-a release that set no limit. It keeps serving reads on its node and cannot
-grow. It cannot travel in one frame, so anti-entropy, state transfer and
-rebalance leave it out. The nodes that lack it do not receive it, and every
-other key syncs as usual. Each record left out counts in
-`sundog_sync_skipped_total{cache, reason="too_large"}`, and a warning that
-names the largest key follows, at most once a minute for each cache. In a
-`Distributed` cache, a node that stops owning the part of such a value cannot
-hand it to the new owners, and drops it when the part releases. To bring a
-value back under the limit, merge a remove that shrinks it, which every merge
-accepts, or delete the key with `Cache::remove`; the tombstone replicates, and
-the next writes build a value that fits. Do it before a membership change
-moves the part.
+A value over the limit can exist. One past a lowered `max_frame` was built
+under a larger one; it fits a wire frame and syncs as any other value.
+One past `wire::MAX_FRAME`, which a merge never builds and only an upgrade can
+leave behind, cannot travel in one frame. Both keep serving reads on their node
+and cannot grow. For the second, anti-entropy, state transfer and rebalance
+leave the value out. The nodes that lack it do not receive it, a
+`Distributed` fetch of it fails, and every other key syncs as usual. Each
+record left out counts in `sundog_sync_skipped_total{cache,
+reason="too_large"}`, and a warning that names the largest key follows, at
+most once a minute for each cache. In a `Distributed` cache, a node that stops
+owning the part of such a value cannot hand it to the new owners, and drops
+it when the part releases. To bring a value back under the limit, merge a
+remove that fits a frame and shrinks it, or delete the key with
+`Cache::remove`; the tombstone replicates, and the next writes build a value
+that fits. Do it before a membership change moves the part.
 
 ## What a CRDT costs
 
@@ -240,8 +254,9 @@ moves the part.
   reads values pays the same, and `needs_value_bytes() == false` avoids it.
 - **Every write that meets a stored value decodes both, merges them and
   encodes the result.** `CacheBuilder::merge_coalesce_window` folds a key's
-  consecutive `Cache::merge`, `Cache::merge_with_ttl` and
-  `Cache::merge_sequenced` calls in memory and applies them once per window.
+  consecutive `Cache::merge`, `Cache::merge_with_ttl`,
+  `Cache::merge_sequenced` and `Cache::merge_sequenced_with_ttl` calls in
+  memory and applies them once per window.
   A read does not see a fold still waiting in its window, a remove discards
   it, a crash loses it, a graceful `Cache::close` or `Cluster::shutdown`
   sends it, and the flushed record carries the version of its last call.

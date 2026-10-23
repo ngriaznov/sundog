@@ -14,6 +14,7 @@ mod gc_task;
 mod hand_off;
 mod inbound;
 mod invalidation_fold;
+mod merge_seq;
 mod modes;
 mod oversize_sync;
 mod request_handler;

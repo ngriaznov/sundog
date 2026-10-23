@@ -40,7 +40,7 @@ Cache-level settings, `mode`, `max_capacity`, `max_resident_bytes`, `ttl`,
 | `state_transfer_budget` | 20 s | a joining node's snapshot takes longer to pull; `open` waits this long before opening with a partial copy that anti-entropy completes; a `Distributed` cache on a fixed seed list also waits up to 5 s of it for a first peer before it computes ownership; a graceful `Cluster::shutdown` of a `Distributed` node spends up to this long reconciling with its live co-owners, each getting an equal share, before it leaves |
 | `fan_out_backlog_capacity` | 262,144 keys | write bursts outrun the network for longer than the backlog absorbs |
 | `fan_out_wait_timeout` | 30 s | a writer waiting for backlog room should give up sooner and write over capacity |
-| `ae_sketch_min_bucket` | 384 entries | a bucket past this answers a mismatch with a fixed-size sketch instead of a listing; a listing of large keys is sent in frames of about 2 MiB |
+| `ae_sketch_min_bucket` | 384 entries | a bucket past this answers a mismatch with a fixed-size sketch instead of a listing; a bucket listing no frame holds, from large keys, is sent in frames of about 2 MiB, and the listing of a mismatched part is one message |
 | `ae_part_min_bucket` | 4,096 entries | a bucket past this narrows a mismatch to 64 part digests first |
 | `ae_sketch_cells` | 240 | differences per round regularly exceed the 100 elements a default sketch decodes; a difference past that falls back to a full listing of the bucket, streamed in frames of about 2 MiB |
 

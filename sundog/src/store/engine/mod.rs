@@ -120,7 +120,9 @@ pub(crate) use self::expiry::{
     Lapsed, TombstoneRetention, expiry_tombstone_retention, gc_period_ms,
 };
 use self::expiry::{absent_at, absent_under, clamp_tti_ms, touch_stamp};
-pub(crate) use self::housekeeping::{CompactCandidate, CompactReplace, CompactScan};
+pub(crate) use self::housekeeping::{
+    CompactCandidate, CompactRefusal, CompactReplace, CompactScan,
+};
 pub(crate) use self::inflight::{FillOutcome, FreshLoad, JoinOutcome};
 #[cfg(any(test, kani, doc))]
 pub(crate) use self::keys::part_index_from_hash;

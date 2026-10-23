@@ -26,7 +26,8 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::hash::Hash;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -137,6 +138,10 @@ struct ClusterInner {
     has_seeds: bool,
     mesh: Mesh,
     shards: ShardRegistry,
+    /// The sequence counter of each cache name that ever opened on this
+    /// cluster ([`Cluster::merge_seq_counter`]). Nothing removes an entry, so
+    /// a name that closes and opens again keeps counting.
+    merge_seqs: Mutex<HashMap<SmolStr, Arc<AtomicU64>>>,
     /// The [`Mode`] each open cache opens under; [`mode_conflict_task`]'s
     /// local half, shared with the `prometheus` feature's `/readyz` route.
     local_modes: Arc<RwLock<HashMap<SmolStr, Mode>>>,
@@ -319,6 +324,25 @@ impl Cluster {
     /// resuming one a compaction sweep may already have retired.
     pub(crate) fn local_incarnation(&self) -> u64 {
         self.inner.membership.local_peer().incarnation
+    }
+
+    /// The counter `Cache::merge_sequenced` draws its numbers from for the
+    /// cache `name`: the same one for every open of the name on this cluster.
+    /// Its numbers go to the cache's writer, [`Cluster::local_incarnation`]
+    /// under this node, which is fixed for the cluster's life, so a number
+    /// drawn once under that writer is never drawn again, however often the
+    /// cache closes and opens, or a clone kept past a close keeps writing.
+    pub(crate) fn merge_seq_counter(&self, name: &str) -> Arc<AtomicU64> {
+        let mut counters = self
+            .inner
+            .merge_seqs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(
+            counters
+                .entry(SmolStr::new(name))
+                .or_insert_with(|| Arc::new(AtomicU64::new(0))),
+        )
     }
 
     /// The instant this cluster's build began: the earliest moment this
@@ -1069,6 +1093,7 @@ impl ClusterBuilder {
                 has_seeds,
                 mesh,
                 shards,
+                merge_seqs: Mutex::new(HashMap::new()),
                 local_modes,
                 config,
                 absence,

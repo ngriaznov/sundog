@@ -74,9 +74,9 @@ pub(super) async fn serve_state_transfer(
 /// materializing its listing; a smaller mismatched bucket falls back to the
 /// existing rule, an IBLT sketch past `handler.ae_sketch_min_bucket()`
 /// entries or else the full [`Msg::AeBucket`] listing, which a bucket of
-/// large keys sends as several messages, as [`ae_entries_replies`] cuts them
-/// for a peer on [`wire::PROTOCOL_AE_LISTING_CHUNKS`]. Does not append the
-/// trailing [`Msg::ReqDone`]; callers add it.
+/// keys too large for one frame sends as several messages
+/// ([`digest_listing_replies`]). Does not append the trailing
+/// [`Msg::ReqDone`]; callers add it.
 async fn ae_mismatch_replies(
     cache: &SmolStr,
     local: &std::collections::HashMap<u16, u64>,
@@ -148,12 +148,9 @@ async fn ae_mismatch_replies(
                             // A listing too large for one frame, which keys
                             // of several KiB each reach well under the
                             // sketch threshold, goes out in slices.
-                            ListingOrSketch::Listing(entries) => ae_entries_replies(
-                                cache,
-                                vec![(bucket, entries)],
-                                chunked,
-                                AE_LISTING_BUDGET,
-                            ),
+                            ListingOrSketch::Listing(entries) => {
+                                digest_listing_replies(cache, bucket, entries, chunked)
+                            }
                         }
                     }),
             );
@@ -704,6 +701,20 @@ pub(super) fn listing_or_sketch(
 /// half a frame, leaving room for the cache name and the bucket.
 pub(super) const AE_LISTING_BUDGET: usize = MAX_FRAME / 2;
 
+/// An upper bound on the encoded bytes one listing entry takes: its key and
+/// the widest encoding of the rest.
+fn ae_entry_cost(entry: &KeyVersion) -> usize {
+    entry.key.len() + AE_ENTRY_MAX_WIRE_LEN
+}
+
+/// An upper bound on the encoded bytes a listing's entries take, as
+/// [`chunk_ae_listing`] charges them.
+fn ae_listing_cost(entries: &[KeyVersion]) -> usize {
+    entries
+        .iter()
+        .fold(0usize, |sum, kv| sum.saturating_add(ae_entry_cost(kv)))
+}
+
 /// Splits one bucket's `entries` into slices whose encoded size stays within
 /// `budget`, in order: a slice holds an entry only while its keys' bytes plus
 /// [`AE_ENTRY_MAX_WIRE_LEN`] each fit, and a slice larger than `budget` is a
@@ -714,18 +725,14 @@ pub(super) const AE_LISTING_BUDGET: usize = MAX_FRAME / 2;
 /// A key within a few hundred bytes of [`MAX_FRAME`] fits in no frame, so a
 /// listing that holds one still fails to send.
 pub(super) fn chunk_ae_listing(entries: Vec<KeyVersion>, budget: usize) -> Vec<Vec<KeyVersion>> {
-    let cost = |kv: &KeyVersion| kv.key.len() + AE_ENTRY_MAX_WIRE_LEN;
-    let total = entries
-        .iter()
-        .fold(0usize, |sum, kv| sum.saturating_add(cost(kv)));
-    if total <= budget {
+    if ae_listing_cost(&entries) <= budget {
         return vec![entries];
     }
     let mut chunks = Vec::new();
     let mut current = Vec::new();
     let mut used = 0usize;
     for kv in entries {
-        let len = cost(&kv);
+        let len = ae_entry_cost(&kv);
         if used > 0 && used + len > budget {
             chunks.push(std::mem::take(&mut current));
             used = 0;
@@ -766,6 +773,34 @@ pub(super) fn ae_entries_replies(
         .collect()
 }
 
+/// The [`Msg::AeBucket`] replies to a digest exchange for one bucket's
+/// `entries`: one message when the listing fits a frame, whatever the peer's
+/// protocol, and slices of [`AE_LISTING_BUDGET`] when it does not and the peer
+/// is on [`wire::PROTOCOL_AE_LISTING_CHUNKS`]. A listing that fits one frame
+/// goes out whole because a release on that protocol that joins the slices of
+/// an `AeEntries` reply only reads each message of a digest reply as the
+/// whole bucket, and a listing that fits reads correctly there. A listing
+/// past a frame failed to send before slices existed. The estimate
+/// [`chunk_ae_listing`] charges settles a listing of at most
+/// [`AE_LISTING_BUDGET`] without an encode; only a larger one encodes to
+/// learn whether a frame holds it. Unit tested directly.
+pub(super) fn digest_listing_replies(
+    cache: &SmolStr,
+    bucket: u16,
+    entries: Vec<KeyVersion>,
+    chunked: bool,
+) -> Vec<Msg> {
+    let whole = |entries| ae_entries_replies(cache, vec![(bucket, entries)], false, usize::MAX);
+    if !chunked || ae_listing_cost(&entries) <= AE_LISTING_BUDGET {
+        return whole(entries);
+    }
+    let single = whole(entries.clone());
+    if single.iter().all(|msg| wire::encode(msg).is_ok()) {
+        return single;
+    }
+    ae_entries_replies(cache, vec![(bucket, entries)], true, AE_LISTING_BUDGET)
+}
+
 /// Serves an `AeEntries` request: the sketch fallback, full listings for the
 /// named `buckets`, requested explicitly rather than chosen by the responder.
 /// A bucket larger than [`AE_LISTING_BUDGET`] arrives as several
@@ -795,6 +830,52 @@ pub(super) async fn serve_ae_entries(
     send_batch_or_cancelled(framed, &replies, cancel).await
 }
 
+/// The record bytes one `AePull` or `AePullHashes` reply carries at most. The
+/// requester's whole exchange, replies included, runs under one request
+/// timeout, so a reply it cannot take in that time is discarded whole and
+/// asked for again unchanged by the next round. 16 MiB is four frames, which
+/// even a slow link takes in well inside the timeout.
+pub(super) const AE_PULL_REPLY_BUDGET: usize = 16 * 1024 * 1024;
+
+/// The leading records of `records`, in order, whose frames under a cache
+/// name of `cache_len` bytes add up to at most `budget`, and at least the
+/// first record, so a reply always makes progress. Records left out stay
+/// different on the requester, which asks for them again in a later round,
+/// as it does for a key the responder does not hold. Pure; unit tested
+/// directly.
+pub(super) fn within_pull_budget(
+    cache_len: usize,
+    mut records: Vec<WireRecord>,
+    budget: usize,
+) -> Vec<WireRecord> {
+    let mut used = 0usize;
+    let mut kept = 0usize;
+    for rec in &records {
+        let len = wire::replicate_frame_len(
+            cache_len,
+            rec.key.len(),
+            rec.value.as_ref().map_or(0, Bytes::len),
+        );
+        if kept > 0 && used.saturating_add(len) > budget {
+            break;
+        }
+        used = used.saturating_add(len);
+        kept += 1;
+    }
+    if kept < records.len() {
+        tracing::debug!(
+            sent = kept,
+            left = records.len() - kept,
+            budget,
+            "cut a pull reply at its byte budget; the records left out are pulled in a later round"
+        );
+        records.truncate(kept);
+    }
+    records
+}
+
+/// Serves an `AePull` request: the records for `keys`, cut at
+/// [`AE_PULL_REPLY_BUDGET`] bytes.
 pub(super) async fn serve_ae_pull(
     framed: &mut PeerFramed,
     cache: SmolStr,
@@ -802,14 +883,19 @@ pub(super) async fn serve_ae_pull(
     handler: &dyn RequestHandler,
     cancel: &CancellationToken,
 ) -> bool {
-    let records = handler.records_for(cache.clone(), keys).await;
+    let records = within_pull_budget(
+        cache.len(),
+        handler.records_for(cache.clone(), keys).await,
+        AE_PULL_REPLY_BUDGET,
+    );
     let mut replies = crate::net::batch_replicate(&cache, records);
     replies.push(Msg::ReqDone);
     send_batch_or_cancelled(framed, &replies, cancel).await
 }
 
 /// Serves an `AePullHashes` request, the sketch-decoded counterpart to
-/// [`serve_ae_pull`]: records for `bucket`'s entries whose key hash is in `hashes`.
+/// [`serve_ae_pull`]: records for `bucket`'s entries whose key hash is in `hashes`,
+/// cut at the same byte budget.
 pub(super) async fn serve_ae_pull_hashes(
     framed: &mut PeerFramed,
     cache: SmolStr,
@@ -818,9 +904,13 @@ pub(super) async fn serve_ae_pull_hashes(
     handler: &dyn RequestHandler,
     cancel: &CancellationToken,
 ) -> bool {
-    let records = handler
-        .records_for_hashes(cache.clone(), bucket, hashes)
-        .await;
+    let records = within_pull_budget(
+        cache.len(),
+        handler
+            .records_for_hashes(cache.clone(), bucket, hashes)
+            .await,
+        AE_PULL_REPLY_BUDGET,
+    );
     let mut replies = crate::net::batch_replicate(&cache, records);
     replies.push(Msg::ReqDone);
     send_batch_or_cancelled(framed, &replies, cancel).await

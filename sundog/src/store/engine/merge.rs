@@ -326,15 +326,16 @@ pub(super) fn mint_stamp(sv: Hlc, ver: Hlc, node: NodeId) -> Hlc {
 /// replaces. A merge never grows a record past the limit, and one that
 /// shrinks a record, or leaves it as it is, is always accepted, so a value
 /// that already passes the limit can still lose content. All three lengths
-/// are frame lengths, as [`wire::replicate_frame_len`] counts them. Pure;
+/// are frame lengths, as [`wire::forward_frame_len`] counts them. Pure;
 /// unit tested directly.
 pub(crate) const fn merge_fits(merged_len: usize, stored_len: usize, limit: usize) -> bool {
     merged_len <= limit || merged_len <= stored_len
 }
 
 /// The frame limit a merge keeps a value within, as the frame a
-/// `Msg::Replicate` of the record would take under a cache name of
-/// `cache_len` bytes. [`Shard::with_max_frame`](crate::store::Shard::with_max_frame)
+/// `Msg::ForwardBatch` of the record would take under a cache name of
+/// `cache_len` bytes: the widest frame one record travels in
+/// ([`wire::forward_frame_len`]). [`Shard::with_max_frame`](crate::store::Shard::with_max_frame)
 /// sets it on the engine of a shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MergeCap {
@@ -355,7 +356,7 @@ impl MergeCap {
         merged_len: usize,
         stored_len: Option<usize>,
     ) -> bool {
-        let frame = |value_len| wire::replicate_frame_len(self.cache_len, key_len, value_len);
+        let frame = |value_len| wire::forward_frame_len(self.cache_len, key_len, value_len);
         merge_fits(frame(merged_len), stored_len.map_or(0, frame), self.limit)
     }
 }

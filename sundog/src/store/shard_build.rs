@@ -199,7 +199,7 @@ where
                 .map(|_| StdMutex::new(()))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
-            merge_seq: AtomicU64::new(0),
+            merge_seq: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             after_take_hook: std::sync::Mutex::new(None),
             merge_wake: Notify::new(),
@@ -367,9 +367,9 @@ where
         self
     }
 
-    /// Sets the window [`Shard::merge`], [`Shard::merge_with_ttl`] and
-    /// [`Shard::merge_sequenced`] coalesce consecutive calls to one key
-    /// within: they fold in memory instead of each applying on its own, and
+    /// Sets the window [`Shard::merge`], [`Shard::merge_with_ttl`],
+    /// [`Shard::merge_sequenced`] and [`Shard::merge_sequenced_with_ttl`]
+    /// coalesce consecutive calls to one key within: they fold in memory instead of each applying on its own, and
     /// the fold applies once, when the window elapses. Zero, the
     /// default, applies every `merge` call at once. A raw setter that
     /// trusts the caller to have already checked the resolver merges;
@@ -378,6 +378,17 @@ where
     #[must_use]
     pub fn with_merge_coalesce_window(mut self, window: Duration) -> Self {
         self.merge_window = window;
+        self
+    }
+
+    /// Draws [`Shard::merge_sequenced`]'s numbers from `counter` instead of a
+    /// counter of this shard's own. A cache's shards share one counter per
+    /// cache name on a cluster, so the numbers of a writer stay unique
+    /// when the cache closes and opens again, and when a clone of the closed
+    /// cache writes beside the reopened one.
+    #[must_use]
+    pub(crate) fn with_merge_seq_counter(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.merge_seq = counter;
         self
     }
 

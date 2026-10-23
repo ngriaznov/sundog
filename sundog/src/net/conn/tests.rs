@@ -281,6 +281,127 @@ fn ae_entries_replies_encode_under_max_frame_when_chunked_at_the_real_budget() {
     }
 }
 
+/// The listing and the messages [`super::serve::digest_listing_replies`]
+/// makes of `count` entries with `key_len`-byte keys for a chunk-capable
+/// or an older peer.
+fn digest_replies(count: u64, key_len: usize, chunked: bool) -> Vec<Msg> {
+    let entries: Vec<_> = (0..count).map(|n| listing_entry(n, key_len)).collect();
+    super::serve::digest_listing_replies(&SmolStr::new("users"), 3, entries, chunked)
+}
+
+#[test]
+fn a_digest_listing_that_fits_a_frame_is_one_message_whatever_the_peers_protocol() {
+    // 300 keys of 8 KiB: 2.4 MB, past the half frame a slice holds and within
+    // the frame a whole listing needs. A release that joins slices of an
+    // `AeEntries` reply only reads each digest message as the whole bucket.
+    for chunked in [true, false] {
+        let replies = digest_replies(300, 8 * 1_024, chunked);
+        assert_eq!(replies.len(), 1, "chunked {chunked}");
+        wire::encode(&replies[0]).expect("and the frame holds it");
+    }
+    let small = digest_replies(100, 32, true);
+    assert_eq!(small.len(), 1, "a small listing is one message");
+}
+
+#[test]
+fn a_digest_listing_close_to_a_frame_is_one_message_when_the_frame_holds_it() {
+    // 59 keys of 70,000 bytes: 4.13 MB, a little under the 4.19 MB frame. The
+    // estimate charges every entry the widest encoding of its version, so this
+    // listing is checked against the frame itself rather than the estimate.
+    let key_len = 70_000;
+    let fits = (MAX_FRAME / key_len) as u64 - 1;
+    let replies = digest_replies(fits, key_len, true);
+    assert_eq!(replies.len(), 1, "{fits} entries");
+    wire::encode(&replies[0]).expect("the frame holds it");
+}
+
+#[test]
+fn a_digest_listing_past_a_frame_is_cut_for_a_chunk_capable_peer_and_not_for_an_older_one() {
+    // 300 keys of 16 KiB: 4.9 MB.
+    let cut = digest_replies(300, 16 * 1_024, true);
+    assert!(cut.len() > 1, "{} messages", cut.len());
+    let mut held = 0;
+    for msg in &cut {
+        wire::encode(msg).expect("each slice fits a frame");
+        let Msg::AeBucket { entries, .. } = msg else {
+            panic!("only AeBucket replies");
+        };
+        held += entries.len();
+    }
+    assert_eq!(held, 300, "and the slices hold every entry");
+
+    let whole = digest_replies(300, 16 * 1_024, false);
+    assert_eq!(
+        whole.len(),
+        1,
+        "an older peer reads one message as the bucket"
+    );
+    assert!(
+        wire::encode(&whole[0]).is_err(),
+        "which no frame holds, as before"
+    );
+}
+
+#[test]
+fn an_empty_digest_listing_is_one_empty_message() {
+    for chunked in [true, false] {
+        let replies = digest_replies(0, 32, chunked);
+        assert!(
+            matches!(&replies[..], [Msg::AeBucket { entries, .. }] if entries.is_empty()),
+            "{replies:?}"
+        );
+    }
+}
+
+/// A record with a `value_len`-byte value under the key `n`.
+fn pull_record(n: u8, value_len: usize) -> WireRecord {
+    WireRecord {
+        key: Bytes::copy_from_slice(&[n]),
+        value: Some(Bytes::from(vec![n; value_len])),
+        ver: Hlc {
+            wall_ms: 5,
+            logical: 0,
+            node: NodeId::from(1),
+        },
+        expires_at_ms: None,
+    }
+}
+
+#[test]
+fn a_pull_reply_keeps_the_leading_records_that_fit_its_budget() {
+    let record_len = wire::replicate_frame_len(5, 1, 1_000);
+    let records: Vec<_> = (0..10).map(|n| pull_record(n, 1_000)).collect();
+
+    let cut = super::serve::within_pull_budget(5, records.clone(), 4 * record_len);
+    assert_eq!(
+        cut,
+        records[..4],
+        "four frames fill four records' worth, in order"
+    );
+
+    let short = super::serve::within_pull_budget(5, records.clone(), 4 * record_len - 1);
+    assert_eq!(short, records[..3], "a byte less drops the fourth");
+
+    let all = super::serve::within_pull_budget(5, records.clone(), 10 * record_len);
+    assert_eq!(all, records, "a reply that fits is not touched");
+}
+
+#[test]
+fn a_pull_reply_always_carries_its_first_record() {
+    let records = vec![pull_record(1, 5_000), pull_record(2, 10)];
+
+    let cut = super::serve::within_pull_budget(5, records.clone(), 100);
+    assert_eq!(cut, records[..1], "one record past the budget still goes");
+    assert_eq!(
+        super::serve::within_pull_budget(5, records.clone(), 0),
+        records[..1]
+    );
+    assert_eq!(
+        super::serve::within_pull_budget(5, Vec::new(), 0),
+        Vec::<WireRecord>::new()
+    );
+}
+
 #[test]
 fn merge_bucket_chunk_concatenates_chunks_of_one_bucket() {
     let mut out = Vec::new();

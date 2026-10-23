@@ -100,6 +100,22 @@ async fn a_peer_on_protocol_eight_gets_the_digest_listing_as_one_message() {
 }
 
 #[tokio::test]
+async fn a_peer_on_the_chunking_protocol_gets_a_digest_listing_that_fits_a_frame_as_one_message() {
+    // 2.4 MB, as above. The previous release speaks this protocol and reads
+    // each message of a digest reply as the whole bucket, so a listing it
+    // received whole before is still sent whole.
+    let entries = long_key_entries(300, 8 * 1_024);
+    let (server, _inbound) = spawn_mesh(NodeId::from(1), listing_server(entries.clone())).await;
+
+    let replies = digest_replies_for_protocol(&server, wire::PROTOCOL_AE_LISTING_CHUNKS).await;
+
+    let [Msg::AeBucket { entries: got, .. }] = &replies[..] else {
+        panic!("one AeBucket for a listing a frame holds: {replies:?}");
+    };
+    assert_eq!(*got, entries);
+}
+
+#[tokio::test]
 async fn a_digest_listing_that_fits_a_frame_is_one_message() {
     let entries = long_key_entries(100, 32);
     let (server, _inbound) = spawn_mesh(NodeId::from(1), listing_server(entries.clone())).await;

@@ -7,8 +7,9 @@
 //!
 //! [`Cache::merge`] folds a value into the configured
 //! [`ConflictResolver`] without a read; [`CacheBuilder::merge_coalesce_window`]
-//! coalesces consecutive `merge`, `merge_with_ttl` and `merge_sequenced` calls
-//! to one key into a single record per window instead of one per call.
+//! coalesces consecutive `merge`, `merge_with_ttl`, `merge_sequenced` and
+//! `merge_sequenced_with_ttl` calls to one key into a single record per window
+//! instead of one per call.
 
 // The owner read path: asking the owners of a key and decoding their answers.
 mod fetch;
@@ -199,9 +200,9 @@ where
         self
     }
 
-    /// Sets the window [`Cache::merge`], [`Cache::merge_with_ttl`] and
-    /// [`Cache::merge_sequenced`] coalesce consecutive calls to one key
-    /// within: instead of each call
+    /// Sets the window [`Cache::merge`], [`Cache::merge_with_ttl`],
+    /// [`Cache::merge_sequenced`] and [`Cache::merge_sequenced_with_ttl`]
+    /// coalesce consecutive calls to one key within: instead of each call
     /// applying (and replicating) on its own, they fold in memory through
     /// the configured [`CacheBuilder::resolver`], each call carrying its own
     /// deadline, and apply once, when the window that opened at the first of
@@ -436,6 +437,7 @@ where
         )
         .with_cluster_config(cluster.config())
         .with_resolver(resolver)
+        .with_merge_seq_counter(cluster.merge_seq_counter(&name))
         .with_merge_coalesce_window(merge_coalesce_window)
         .with_prefold_enabled(prefold_enabled)
         .with_max_resident_bytes(max_resident_bytes);
@@ -974,7 +976,9 @@ where
     /// Writes many entries under one acquisition of the store's apply lock,
     /// emitting one [`Event`] per entry as [`Cache::insert`] would. **Not a
     /// transaction**: an entry that fails partway through still leaves the
-    /// entries before it applied.
+    /// entries before it applied. An entry that merges past the frame limit
+    /// into a stored value is refused and the entries after it apply as well;
+    /// the first such refusal is the error returned.
     ///
     /// # Errors
     ///
@@ -1020,9 +1024,14 @@ where
     /// [`ClusterConfig::max_frame`](crate::config::ClusterConfig::max_frame),
     /// 4 MiB by default. A merge whose result would pass it and be larger
     /// than the value it replaces fails with [`CacheError::ValueTooLarge`]
-    /// and changes nothing. A merge that leaves the value no larger always
-    /// succeeds, so a remove can shrink a value that already passes the
-    /// limit. A merge that reaches this node from a peer follows the same
+    /// and changes nothing. A merge whose own value fits a frame and that
+    /// leaves the stored value no larger succeeds, so a merge can shrink a
+    /// value that already passes the limit. The remove an
+    /// [`OrSet`](crate::crdt::OrSet) builds carries the remaining tags of
+    /// every writer it touches, so against a set one writer filled it is
+    /// nearly as large as the set, and a set past the limit cannot be shrunk
+    /// with it: delete the key with [`Cache::remove`]. A merge that reaches
+    /// this node from a peer follows the same
     /// rule: it is refused, counted in `sundog_merge_refused_total` and
     /// logged, and the contribution is lost. With a window, the call that
     /// would leave its own pending fold past the limit gets the error; a
@@ -1058,8 +1067,10 @@ where
 
     /// Folds into `key` the value `make` builds from this cache's
     /// [`Cache::writer_id`] and the next of its sequence numbers, as
-    /// [`Cache::merge`] folds a value it is given. The numbers start at 1 in
-    /// each run of the process, rise by one per call, and none repeats. A call
+    /// [`Cache::merge`] folds a value it is given. The numbers start at 1 for
+    /// each cache name when the cluster starts, rise by one per call, and
+    /// none repeats: a cache that closes and opens again under its name, and
+    /// a clone kept past the close, carry on the count. A call
     /// that fails after it drew its number, for a value over the frame cap,
     /// does not give the number back, so the next number skips it.
     ///
@@ -1077,9 +1088,9 @@ where
     /// number applied before the one it carries. In `Mode::Distributed`, a
     /// call for a key this node does not own forwards its contribution to the
     /// owners in the order the numbers were drawn, over one ordered link per
-    /// owner. Four cases can still put a higher number on a replica ahead of
-    /// a lower one, and a remove built from a read of that replica then covers
-    /// the lower number when it arrives:
+    /// owner. Four cases put a higher number on a replica ahead of a lower
+    /// one, and a remove built from a read of that replica then covers the
+    /// lower number when it arrives:
     ///
     /// - an ownership change while forwards are in flight, which can send two
     ///   forwards of one writer to different owners, or one of them through a

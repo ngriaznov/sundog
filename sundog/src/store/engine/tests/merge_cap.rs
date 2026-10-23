@@ -28,7 +28,7 @@ fn capped_engine(elems: usize) -> SetEngine {
     let engine: SetEngine = Engine::new(u64::MAX, None, None, None);
     engine.set_merge_cap(
         CACHE_LEN,
-        wire::replicate_frame_len(CACHE_LEN, 1, set_len(elems)),
+        wire::forward_frame_len(CACHE_LEN, 1, set_len(elems)),
     );
     engine
 }
@@ -126,7 +126,7 @@ proptest! {
 
 #[test]
 fn the_cap_counts_frames_so_the_cache_name_and_the_key_take_their_share() {
-    let limit = wire::replicate_frame_len(CACHE_LEN, 1, 10);
+    let limit = wire::forward_frame_len(CACHE_LEN, 1, 10);
     let cap = MergeCap {
         cache_len: CACHE_LEN,
         limit,
@@ -154,6 +154,30 @@ fn the_cap_counts_frames_so_the_cache_name_and_the_key_take_their_share() {
     assert!(
         !cap.admits(1, 11, Some(0)),
         "a replaced record of no bytes is not larger than the result"
+    );
+}
+
+#[test]
+fn the_cap_counts_the_forward_header_so_a_value_only_a_replicate_holds_is_refused() {
+    // A `Distributed` owner fans a record out to its co-owners as a forward,
+    // which is nine bytes wider than a replicate of the same record.
+    let limit = wire::replicate_frame_len(CACHE_LEN, 1, 10);
+    let cap = MergeCap {
+        cache_len: CACHE_LEN,
+        limit,
+    };
+    assert!(cap.admits(1, 1, None), "the widest value a forward holds");
+    assert!(
+        !cap.admits(1, 2, None),
+        "one byte more fits a replicate only"
+    );
+    assert!(
+        !cap.admits(1, 10, None),
+        "and so does the replicate's limit"
+    );
+    assert!(
+        cap.admits(1, 10, Some(10)),
+        "a record no larger is still accepted"
     );
 }
 
@@ -321,7 +345,7 @@ fn the_first_store_of_a_key_is_not_a_merge_and_meets_no_cap() {
 #[test]
 fn a_resolver_that_does_not_merge_is_not_capped() {
     let engine: Engine<u32, String> = Engine::new(u64::MAX, None, None, None);
-    engine.set_merge_cap(CACHE_LEN, wire::replicate_frame_len(CACHE_LEN, 1, 4));
+    engine.set_merge_cap(CACHE_LEN, wire::forward_frame_len(CACHE_LEN, 1, 4));
     let bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(1).as_ref()));
     let put_of = |value: &str, ver: Hlc| -> BatchEntry<u32, String> {
         let kb = key_bytes(1);
