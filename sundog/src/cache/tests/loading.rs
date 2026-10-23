@@ -410,6 +410,11 @@ fn key_gathering_on(requester: &(Cluster, Cache<u32, String>), winner: NodeId) -
         .expect("a key whose loads gather on the winner")
 }
 
+/// The TTL the source entries of the copy-expiry tests carry: far above any
+/// stall of a loaded runner, so the entry is live when the reader loads, and
+/// below the 3600 s default TTL the unfixed copy would take.
+const SOURCE_TTL: Duration = Duration::from_secs(600);
+
 /// Has `source` write `key` for `ttl` and waits until the invalidation that
 /// write sends has dropped the copy `reader` held, so a load `reader` starts
 /// next cannot be discarded by it. The write is stamped a millisecond after
@@ -459,7 +464,7 @@ async fn an_invalidation_load_copy_expires_at_the_sources_instant() {
     let (a, cache_a) = &nodes[0];
     let cache_b = &nodes[1].1;
     let key = key_gathering_on(&nodes[1], a.node_id());
-    source_writes_and_reader_drops_its_copy(cache_a, cache_b, key, Duration::from_secs(5)).await;
+    source_writes_and_reader_drops_its_copy(cache_a, cache_b, key, SOURCE_TTL).await;
 
     let got = cache_b.load(&key).await.expect("load");
 
@@ -471,8 +476,8 @@ async fn an_invalidation_load_copy_expires_at_the_sources_instant() {
     );
     match cache_b.ttl_of(&key) {
         Some(Ttl::Remaining(left)) => assert!(
-            left <= Duration::from_secs(5),
-            "b's copy of a 5s record must not outlive a's expiry, but has {left:?} left"
+            left <= SOURCE_TTL,
+            "b's copy of a {SOURCE_TTL:?} record must not outlive a's expiry, but has {left:?} left"
         ),
         other => panic!("b holds the copy with a finite ttl, got {other:?}"),
     }
@@ -536,7 +541,7 @@ async fn an_invalidation_load_many_copy_of_a_ttl_entry_expires_in_a_cache_with_n
     let (a, cache_a) = &nodes[0];
     let cache_b = &nodes[1].1;
     let key = key_gathering_on(&nodes[1], a.node_id());
-    source_writes_and_reader_drops_its_copy(cache_a, cache_b, key, Duration::from_secs(5)).await;
+    source_writes_and_reader_drops_its_copy(cache_a, cache_b, key, SOURCE_TTL).await;
     let source_left = cache_a.ttl_of(&key);
 
     let got = cache_b.load_many([key]).await.expect("load_many");
