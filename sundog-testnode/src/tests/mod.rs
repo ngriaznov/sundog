@@ -659,6 +659,51 @@ async fn dispatch_through_test_node_reports_an_unknown_command() {
     node.cluster.clone().shutdown().await;
 }
 
+#[tokio::test]
+async fn dispatch_through_test_node_osadd_osremove_and_osmembers_round_trip() {
+    let node = test_node("testnode-dispatch-os-round-trip").await;
+    for elem in ["b", "a", "c"] {
+        assert_eq!(
+            reply_line(node.dispatch(&format!("osadd k {elem}")).await),
+            "ok"
+        );
+    }
+    assert_eq!(reply_line(node.dispatch("osmembers k").await), "a b c");
+
+    assert_eq!(reply_line(node.dispatch("osremove k b").await), "ok");
+    assert_eq!(reply_line(node.dispatch("osadd k d").await), "ok");
+
+    assert_eq!(
+        reply_line(node.dispatch("osmembers k").await),
+        "a c d",
+        "the remove takes out the element it read and the later add lands"
+    );
+    node.cluster.clone().shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dispatch_through_test_node_concurrent_osadds_all_land() {
+    let node = Arc::new(test_node("testnode-dispatch-os-concurrent").await);
+    let tasks: Vec<_> = (0..8)
+        .map(|task| {
+            let node = Arc::clone(&node);
+            tokio::spawn(async move {
+                for index in 0..15 {
+                    let reply = node.dispatch(&format!("osadd k t{task}-{index}")).await;
+                    assert_eq!(reply_line(reply), "ok");
+                }
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.await.expect("osadd task");
+    }
+
+    let members = reply_line(node.dispatch("osmembers k").await);
+    assert_eq!(members.split(' ').count(), 8 * 15, "every add lands");
+    node.cluster.clone().shutdown().await;
+}
+
 /// A single-node [`TestNode`] on loopback whose `"it"` has a loader, as
 /// `SUNDOG_TESTNODE_LOADER_DELAY_MS` registers one. No other test
 /// registers a loader, so only this node moves `loads`.

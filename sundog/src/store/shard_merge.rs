@@ -8,13 +8,14 @@ use std::hash::Hash;
 #[cfg(test)]
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::{Mutex as StdMutex, PoisonError, RwLockReadGuard};
+use std::sync::{MutexGuard, PoisonError, RwLockReadGuard};
 use std::time::Duration;
 
 use bytes::Bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use super::crdt::WriterId;
 use super::engine::{Fold, fold_sides};
 use super::{
     Incoming, Merged, PendingMerge, PendingMergeStripe, RecordView, Shard, Winner, duration_ms,
@@ -25,7 +26,7 @@ use crate::hlc::Hlc;
 use crate::wire;
 
 #[cfg(doc)]
-use super::{BUCKET_COUNT, ConflictResolver, Event};
+use super::{BUCKET_COUNT, ConflictResolver, Event, Mode};
 
 /// The epoch millisecond at which a [`Shard::merge`] coalescing window
 /// opened at `started_at_ms` must flush. Pure so the scheduling math behind
@@ -77,6 +78,28 @@ pub(super) fn split_pending_for_clear<K>(
 /// stops the earlier one from lowering the version the flush applies at.
 pub(super) fn folded_pending_ver(pending_ver: Hlc, call_ver: Hlc) -> Hlc {
     pending_ver.max(call_ver)
+}
+
+/// One merge call's contribution on its way into a stripe's pending fold: the
+/// value, its encoding, the version the call stamped and the deadline it
+/// carries.
+struct Contribution<V> {
+    /// `K`'s encoded bytes.
+    key_bytes: Bytes,
+    value: V,
+    /// `value`'s postcard-encoded bytes.
+    encoded: Bytes,
+    ver: Hlc,
+    expires_at_ms: Option<u64>,
+}
+
+/// What a flush holds from its take through its last apply
+/// ([`Shard::begin_flush`]): the shared side of the flush gate and the order
+/// lock of the stripe it flushes. Fields drop in declaration order, so the
+/// order lock goes first.
+struct FlushGuard<'a> {
+    _order: MutexGuard<'a, ()>,
+    _gate: RwLockReadGuard<'a, ()>,
 }
 
 /// Pops every `(deadline_ms, seq) -> key` entry from `by_deadline` whose
@@ -166,6 +189,70 @@ where
         self.merge_expiring(key, value, Some(ttl)).await
     }
 
+    /// Folds into `key` the value `make` builds from `writer` and the next
+    /// sequence number this shard draws, as [`Shard::merge`] folds a value it
+    /// is given. A shard numbers its calls, not its writers: pass the one
+    /// writer identity every call on this shard writes under, as
+    /// [`Cache::merge_sequenced`](crate::cache::Cache::merge_sequenced) passes
+    /// [`Cache::writer_id`](crate::cache::Cache::writer_id). The numbers start
+    /// at 1 and rise by one per call, and none repeats. A call that fails
+    /// after it drew its number, for a value over the frame cap, does not
+    /// give the number back, so the next number skips it.
+    ///
+    /// The number is drawn and `make` runs under the lock of the key's stripe
+    /// of pending folds, which is held until the contribution has applied or
+    /// folded: the lock a pending fold is made under with
+    /// [`Shard::with_merge_coalesce_window`], and without one the same lock,
+    /// taken for this call alone and held across the apply. The numbers drawn
+    /// for one key therefore apply, or fold, in the order they were drawn: a
+    /// higher number never reaches the stored value, or a pending fold, ahead
+    /// of a lower one on this node. A flush applies the folds of one key in
+    /// the order they were made. A writer's sequence numbers need this order
+    /// where they must apply in order, as an [`OrSet`](crate::crdt::OrSet)
+    /// add's do. Code that numbers its own contributions and calls
+    /// [`Shard::merge`] has no such order.
+    ///
+    /// `make` runs once, with the lock held. Keep it cheap, and do not call
+    /// into this shard or its cache from it: a merge, insert, remove or clear
+    /// from `make` can wait on the lock `make` holds. A `make` that panics
+    /// leaves the shard usable, and its number is not reused.
+    ///
+    /// The folded record carries the shard's default TTL, if any, and
+    /// coalesces, replicates and orders against other writes as
+    /// [`Shard::merge`] does. A [`Mode::Distributed`] call for a key this node
+    /// does not own forwards the contribution to the key's owners, and the
+    /// forwards leave this node in the order the numbers were drawn.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shard::merge`], for the value `make` returns.
+    pub async fn merge_sequenced(
+        &self,
+        key: K,
+        writer: WriterId,
+        make: impl FnOnce(WriterId, u64) -> V,
+    ) -> Result<(), CacheError> {
+        self.merge_sequenced_expiring(key, writer, make, None).await
+    }
+
+    /// [`Shard::merge_sequenced`] with a lifespan for this contribution
+    /// alone, overriding the shard's default TTL, as [`Shard::merge_with_ttl`]
+    /// does for [`Shard::merge`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Shard::merge_sequenced`].
+    pub async fn merge_sequenced_with_ttl(
+        &self,
+        key: K,
+        writer: WriterId,
+        make: impl FnOnce(WriterId, u64) -> V,
+        ttl: Duration,
+    ) -> Result<(), CacheError> {
+        self.merge_sequenced_expiring(key, writer, make, Some(ttl))
+            .await
+    }
+
     /// The path [`Shard::merge`] and [`Shard::merge_with_ttl`] share; `ttl`
     /// overrides the shard's default when given.
     async fn merge_expiring(
@@ -177,14 +264,7 @@ where
         self.check_ceiling()?;
         let key_bytes = encode_key(&key)?;
         let encoded = Bytes::from(postcard::to_stdvec(&value).map_err(CodecError::from)?);
-        let wire_size = wire::replicate_frame_len(self.name.len(), key_bytes.len(), encoded.len());
-        if wire_size > self.max_frame {
-            return Err(CacheError::ValueTooLarge {
-                cache: self.name.clone(),
-                size: encoded.len(),
-                limit: self.max_frame,
-            });
-        }
+        self.check_value_frame(key_bytes.len(), encoded.len())?;
         let ver = self.stamp_local();
         if self.merge_window.is_zero() {
             self.wait_for_fan_out_room().await;
@@ -201,10 +281,119 @@ where
             );
         }
         let expires_at_ms = self.expiry_for(ver.wall_ms, ttl);
-        let hash = engine::hash_key_bytes(key_bytes.as_ref());
-        let mut stripe = self.pending_merges[engine::stripe_index_from_hash(hash)]
+        let stripe = self.lock_pending_stripe(&key_bytes);
+        self.fold_pending(
+            stripe,
+            key,
+            Contribution {
+                key_bytes,
+                value,
+                encoded,
+                ver,
+                expires_at_ms,
+            },
+        )
+    }
+
+    /// The path [`Shard::merge_sequenced`] and
+    /// [`Shard::merge_sequenced_with_ttl`] share. The stripe lock of the key
+    /// is taken after the wait for fan-out room, which is the only await, and
+    /// held through the draw, `make`, the stamp and the apply or the fold, so
+    /// nothing that applies or folds a contribution of this key lands between
+    /// the draw and the apply. A dropped call has drawn nothing before the
+    /// lock.
+    async fn merge_sequenced_expiring(
+        &self,
+        key: K,
+        writer: WriterId,
+        make: impl FnOnce(WriterId, u64) -> V,
+        ttl: Option<Duration>,
+    ) -> Result<(), CacheError> {
+        self.check_ceiling()?;
+        let key_bytes = encode_key(&key)?;
+        let windowed = !self.merge_window.is_zero();
+        if !windowed {
+            self.wait_for_fan_out_room().await;
+        }
+        let stripe = self.lock_pending_stripe(&key_bytes);
+        let value = make(writer, self.draw_merge_seq());
+        let encoded = Bytes::from(postcard::to_stdvec(&value).map_err(CodecError::from)?);
+        self.check_value_frame(key_bytes.len(), encoded.len())?;
+        let ver = self.stamp_local();
+        let expires_at_ms = self.expiry_for(ver.wall_ms, ttl);
+        if windowed {
+            return self.fold_pending(
+                stripe,
+                key,
+                Contribution {
+                    key_bytes,
+                    value,
+                    encoded,
+                    ver,
+                    expires_at_ms,
+                },
+            );
+        }
+        let applied = self.apply_or_forward(
+            key,
+            key_bytes,
+            ver,
+            Incoming::Put {
+                value,
+                expires_at_ms,
+                encoded,
+            },
+        );
+        drop(stripe);
+        applied
+    }
+
+    /// The next number [`Shard::merge_sequenced`] hands to `make`: 1 for the
+    /// first call, then one more each time.
+    fn draw_merge_seq(&self) -> u64 {
+        self.merge_seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// `Err(CacheError::ValueTooLarge)` when a value of `value_len` encoded
+    /// bytes under a key of `key_len` bytes would replicate as a frame over
+    /// the cap.
+    fn check_value_frame(&self, key_len: usize, value_len: usize) -> Result<(), CacheError> {
+        let wire_size = wire::replicate_frame_len(self.name.len(), key_len, value_len);
+        if wire_size > self.max_frame {
+            return Err(CacheError::ValueTooLarge {
+                cache: self.name.clone(),
+                size: value_len,
+                limit: self.max_frame,
+            });
+        }
+        Ok(())
+    }
+
+    /// Locks the stripe of [`Shard::pending_merges`] that `key_bytes` hashes
+    /// into.
+    fn lock_pending_stripe(&self, key_bytes: &[u8]) -> MutexGuard<'_, PendingMergeStripe<K, V>> {
+        let hash = engine::hash_key_bytes(key_bytes);
+        self.pending_merges[engine::stripe_index_from_hash(hash)]
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Folds `contribution` into `key`'s pending fold in `stripe`, which the
+    /// caller locked, or opens a fold for it. Wakes the coalesce sweep when it
+    /// opens a window, after it has released the stripe.
+    fn fold_pending(
+        &self,
+        mut stripe: MutexGuard<'_, PendingMergeStripe<K, V>>,
+        key: K,
+        contribution: Contribution<V>,
+    ) -> Result<(), CacheError> {
+        let Contribution {
+            key_bytes,
+            value,
+            encoded,
+            ver,
+            expires_at_ms,
+        } = contribution;
         let PendingMergeStripe {
             entries,
             by_deadline,
@@ -452,7 +641,7 @@ where
         if !self.has_pending_merges() {
             return;
         }
-        let _flushing = self.begin_flush();
+        let _flushing = self.begin_flush(engine::stripe_index_from_hash(hash));
         if let Some(pending) = self.take_pending_merge_if(key, hash, |pending_ver| {
             pending_merge_superseded(pending_ver, ver)
         }) {
@@ -462,16 +651,28 @@ where
         }
     }
 
-    /// Marks a flush in flight until the returned guard drops. Every path that
-    /// takes a fold out of its stripe holds it from the take through the last
-    /// apply of what it took, so a key is always either pending or stored,
-    /// never between the two, to [`Shard::clear`]'s split of the pending keys,
-    /// which waits for the guards to drop. A guard is never held across an
-    /// await.
-    fn begin_flush(&self) -> RwLockReadGuard<'_, ()> {
-        self.merge_flush_gate
+    /// Marks a flush of `stripe` in flight until the returned guard drops.
+    /// Every path that takes a fold out of its stripe holds it from the take
+    /// through the last apply of what it took, so a key is always either
+    /// pending or stored, never between the two, to [`Shard::clear`]'s split
+    /// of the pending keys, which waits for the guards to drop. The guard also
+    /// holds the stripe's order lock, so a second flush of the stripe takes
+    /// its fold only after the first has applied its own: two folds of one
+    /// key apply in the order they were made, which a sequence number drawn
+    /// by [`Shard::merge_sequenced`] relies on. A guard is never held across
+    /// an await.
+    fn begin_flush(&self, stripe: usize) -> FlushGuard<'_> {
+        let gate = self
+            .merge_flush_gate
             .read()
-            .unwrap_or_else(PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner);
+        let order = self.flush_order[stripe]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        FlushGuard {
+            _order: order,
+            _gate: gate,
+        }
     }
 
     /// Returns once every flush in flight has applied what it took. A flush
@@ -489,16 +690,18 @@ where
         );
     }
 
-    /// Takes `select`'s pick out of one stripe and applies it, holding
-    /// [`Shard::begin_flush`]'s guard across both.
+    /// Takes `select`'s pick out of the stripe at `index` and applies it,
+    /// holding [`Shard::begin_flush`]'s guard across both.
     fn flush_stripe(
         &self,
-        stripe_lock: &StdMutex<PendingMergeStripe<K, V>>,
+        index: usize,
         select: impl FnOnce(&mut PendingMergeStripe<K, V>) -> Vec<(K, PendingMerge<V>)>,
     ) {
-        let _flushing = self.begin_flush();
+        let _flushing = self.begin_flush(index);
         let due = {
-            let mut stripe = stripe_lock.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut stripe = self.pending_merges[index]
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             let due = select(&mut stripe);
             self.pending_merge_count
                 .fetch_sub(due.len(), Ordering::AcqRel);
@@ -570,8 +773,8 @@ where
     /// caller; `pub(crate)` so `crate::cache` can drive it without owning
     /// the pending map itself.
     pub(crate) fn flush_due_pending_merges(&self, now_ms: u64) {
-        for stripe_lock in &*self.pending_merges {
-            self.flush_stripe(stripe_lock, |stripe| {
+        for index in 0..self.pending_merges.len() {
+            self.flush_stripe(index, |stripe| {
                 drain_due_deadlines(&mut stripe.by_deadline, now_ms)
                     .into_iter()
                     .filter_map(|key| stripe.entries.remove(&key).map(|entry| (key, entry)))
@@ -589,8 +792,8 @@ where
     /// Drains each stripe in turn, the same one-stripe-at-a-time locking
     /// [`Shard::flush_due_pending_merges`] uses.
     pub(crate) fn flush_all_pending_merges(&self) {
-        for stripe_lock in &*self.pending_merges {
-            self.flush_stripe(stripe_lock, |stripe| {
+        for index in 0..self.pending_merges.len() {
+            self.flush_stripe(index, |stripe| {
                 stripe.by_deadline.clear();
                 std::mem::take(&mut stripe.entries).into_iter().collect()
             });

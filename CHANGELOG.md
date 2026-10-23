@@ -5,8 +5,41 @@ All notable changes to this project are documented in this file. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`Cache::merge_sequenced` and `Cache::merge_sequenced_with_ttl`.** They
+  draw this cache's next sequence number and call a closure with it and
+  `Cache::writer_id`, which builds the value to merge, as in
+  `cache.merge_sequenced(key, |w, seq| OrSet::add(w, seq, element))`. The
+  numbers start at 1 in each run of the process, rise by one per call and
+  never repeat. The number is drawn and the closure runs under the lock that
+  orders the merges of the key, so a writer's numbers apply, or fold into a
+  `merge_coalesce_window`, in the order they were drawn. The closure runs once
+  with the lock held: it must be cheap and must not call into the cache.
+  `Shard::merge_sequenced` and `Shard::merge_sequenced_with_ttl` are the
+  shard-level forms and take the writer as an argument.
+
 ### Fixed
 
+- **An `OrSet` add could be lost to a remove that had not observed it.**
+  `OrSet::remove` raises a writer's watermark to the highest sequence number
+  it observed, which covers every lower number of that writer too. Two tasks
+  that shared a counter and called `Cache::merge` could apply number 2 before
+  number 1, and a remove that read only number 2 then dropped number 1 on
+  every replica it reached, with nothing to repair it.
+  `Cache::merge_sequenced` draws the number under the lock that applies it.
+  `OrSet::add`, `OrSet::remove` and the resolver guide state the rule: one
+  writer's sequence numbers must apply in order, and code that numbers its own
+  adds keeps the order itself. Two flushes of one key's folds, the background
+  sweep and an inbound invalidation or a close, could also apply a later fold
+  ahead of an earlier one; a flush holds a per-stripe order lock from its take
+  through its last apply. Four cases can still put a higher number on a
+  replica ahead of a lower one, and are named in the guide: an ownership
+  change while a `Distributed` writer's forwards are in flight, a forward an
+  owner holds for clock skew (overtaken as the clock crosses the bound, or
+  dropped when the hold is full), an entry evicted or expired between two
+  adds, and a copy that has not caught up, such as a new owner's part that is
+  still being pulled.
 - **An `Invalidation` copy made through `load` expires at the source's
   instant.** `Cache::load` and `Cache::load_many` stored a value copied from
   the node a key's loads gather on with a fresh lifetime: the cache's default

@@ -13,6 +13,7 @@ mod lifecycle;
 mod load_next_owner;
 mod loading;
 mod merge_expiry;
+mod merge_sequenced;
 mod merge_shutdown;
 mod nonowner_fill;
 mod nonowner_read_through;

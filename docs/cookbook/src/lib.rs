@@ -11,6 +11,7 @@ pub mod deploy;
 pub mod http_cache;
 pub mod read_through;
 pub mod sessions;
+pub mod tags;
 
 #[cfg(test)]
 mod test_support;

@@ -190,6 +190,11 @@ where
                 .into_boxed_slice(),
             pending_merge_count: AtomicUsize::new(0),
             merge_flush_gate: std::sync::RwLock::new(()),
+            flush_order: (0..BUCKET_COUNT)
+                .map(|_| StdMutex::new(()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            merge_seq: AtomicU64::new(0),
             #[cfg(test)]
             after_take_hook: std::sync::Mutex::new(None),
             merge_wake: Notify::new(),
@@ -352,9 +357,10 @@ where
         self
     }
 
-    /// Sets the window [`Shard::merge`] and [`Shard::merge_with_ttl`]
-    /// coalesce consecutive calls to one key within: they fold in memory instead of each applying on its own,
-    /// and the fold applies once, when the window elapses. Zero, the
+    /// Sets the window [`Shard::merge`], [`Shard::merge_with_ttl`] and
+    /// [`Shard::merge_sequenced`] coalesce consecutive calls to one key
+    /// within: they fold in memory instead of each applying on its own, and
+    /// the fold applies once, when the window elapses. Zero, the
     /// default, applies every `merge` call at once. A raw setter that
     /// trusts the caller to have already checked the resolver merges;
     /// [`crate::cache::CacheBuilder::merge_coalesce_window`] is the

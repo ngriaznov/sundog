@@ -88,6 +88,8 @@ order, as long as no deadline lapses between the writes. `sundog::crdt`
 ships two: `PnCounter` with `PnCounterResolver` and `OrSet` with
 `OrSetResolver`. Every mode merges. [Choosing a resolver](resolvers.md) says
 when a merging resolver fits, how to write its values, and how they expire.
+An `OrSet` needs one writer's adds to apply in sequence order, which
+`Cache::merge_sequenced` keeps ([Writing a set](resolvers.md#writing-a-set)).
 
 ```rust
 {{#include ../cookbook/src/counters.rs:counter}}
@@ -95,10 +97,10 @@ when a merging resolver fits, how to write its values, and how they expire.
 
 `Cache::merge` writes through the resolver without a read.
 `CacheBuilder::merge_coalesce_window` folds a writer's consecutive merges
-(`merge` and `merge_with_ttl`) to one key into one applied record per
-window, and a read does not see a fold still pending inside its window. A
-graceful `Cache::close` or `Cluster::shutdown` applies and sends the folds
-still pending; a crash loses them.
+(`merge`, `merge_with_ttl` and `merge_sequenced`) to one key into one applied
+record per window, and a read does not see a fold still pending inside its
+window. A graceful `Cache::close` or `Cluster::shutdown` applies and sends the
+folds still pending; a crash loses them.
 
 Each writer owns a slot in a merged value. A background sweep retires the
 slot of a writer whose node has been absent longer than

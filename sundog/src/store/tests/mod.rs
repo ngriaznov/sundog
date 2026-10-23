@@ -35,6 +35,7 @@ mod fan_out_view;
 mod gc_digests;
 mod invalidation_fold;
 mod merge_expiry;
+mod merge_sequenced;
 mod merging;
 mod ownership;
 mod pause_guard;

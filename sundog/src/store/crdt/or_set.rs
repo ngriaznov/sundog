@@ -25,6 +25,14 @@
 //! treated as an implicit watermark of `0`, since sequences legitimately
 //! start there too.
 //!
+//! The watermark is exact while one writer's adds apply in sequence order.
+//! A remove that observed sequence 2 of a writer and not its sequence 1 also
+//! covers sequence 1, so a sequence 1 that applies after the remove is
+//! dropped on every replica and nothing repairs it.
+//! [`Cache::merge_sequenced`](crate::cache::Cache::merge_sequenced) draws a
+//! writer's sequence numbers under the lock that applies them, which keeps
+//! the order.
+//!
 //! [`OrSet::encode`]/[`OrSet::decode`] are thin postcard wrappers around
 //! this type's one wire layout; a future change to it is versioned.
 
@@ -51,6 +59,10 @@ type Tag = (WriterId, u64);
 /// observed, since a remove only marks dead the tags it has seen. Use
 /// [`OrSet::remove`] through `Cache::insert`, never `Cache::remove`'s
 /// whole-key tombstone; see the module doc for two-stage retirement.
+///
+/// One writer's sequence numbers must apply in order. Build every add with
+/// `Cache::merge_sequenced`, which draws the number and applies the add in
+/// that order; see [`OrSet::add`] for code that numbers its own adds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrSet<T>
 where
@@ -100,11 +112,20 @@ where
 
     /// A blind add: `writer` tags `element` with its own next sequence
     /// number (`seq`), unique across every add its incarnation has ever
-    /// made. The caller tracks its own running sequence counter (an
-    /// `AtomicU64` is typical, reset on every fresh incarnation); no read
-    /// of the shard is needed. A retired `writer` can still call this, but
-    /// the tag never becomes live wherever it merges into a replica that
-    /// has retired `writer`; see the module doc's deadness rule.
+    /// made; no read of the shard is needed. A retired `writer` can still
+    /// call this, but the tag never becomes live wherever it merges into a
+    /// replica that has retired `writer`; see the module doc's deadness rule.
+    ///
+    /// One writer's adds must apply in sequence order. A remove covers every
+    /// lower sequence of a writer it touched, so a remove that observed
+    /// sequence 2 and not sequence 1 takes sequence 1 out wherever it
+    /// arrives later. `Cache::merge_sequenced` draws `seq` and applies the
+    /// add in one ordered step, which is the way to build an add:
+    /// `cache.merge_sequenced(key, |writer, seq| OrSet::add(writer, seq,
+    /// element))`. Code that draws its own `seq`, from an `AtomicU64` for
+    /// example, must apply its adds in the order it drew the numbers, with
+    /// one task per writer for instance; two tasks that share a counter and
+    /// call `Cache::merge` can apply number 2 before number 1.
     #[must_use]
     pub fn add(writer: WriterId, seq: u64, element: T) -> Self {
         Self {
@@ -119,7 +140,10 @@ where
     /// cover every tag in `observed` backing `element`, so only an
     /// observed tag is marked dead, and re-asserts that writer's other
     /// tags as live adds, since a watermark cannot spare a lower sequence.
-    /// Write back via `Cache::insert`, never `Cache::remove`.
+    /// The watermark also covers a lower sequence that `observed` lacks, so
+    /// the remove is exact only while each writer's adds apply in sequence
+    /// order; see [`OrSet::add`]. Write back via `Cache::insert` or
+    /// `Cache::merge`, never `Cache::remove`.
     #[must_use]
     pub fn remove(observed: &Self, element: &T) -> Self {
         let touched: BTreeSet<WriterId> = observed
@@ -463,6 +487,9 @@ where
 
 #[cfg(test)]
 mod receipt_tests;
+
+#[cfg(test)]
+mod sequence_tests;
 
 #[cfg(test)]
 mod tests {

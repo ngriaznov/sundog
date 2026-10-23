@@ -87,15 +87,63 @@ merged value, and `PnCounter::value` reads the count. A
 
 ## Writing a set
 
-`OrSet::add(writer, seq, element)` adds `element` under a sequence number
-unique to the writer, a running counter in the process. To remove an
-element, read the set, then write `OrSet::remove(&observed, &element)`
-with `Cache::merge`. The remove takes out the adds the read observed; an add
-of the same element made concurrently elsewhere survives. Never use
-`Cache::remove` for one element: it deletes the whole set. Every add
-creates a tag that stays until a remove observes it, so re-adding an
-element that is already present, on every heartbeat for example, grows the
-value with each write. `OrSet::contains` and `OrSet::iter` read the members.
+Add with `Cache::merge_sequenced`, which hands a closure this process's
+writer and the writer's next sequence number:
+
+```rust
+{{#include ../cookbook/src/tags.rs:tags}}
+```
+
+The cache draws the number and runs the closure under the lock that orders
+writes to the key, so one writer's numbers apply in the order they were
+drawn. The numbers start at 1 in each run of the process. The closure runs
+once, with the lock held: keep it cheap and do not call into the cache from
+it. `Cache::merge_sequenced_with_ttl` gives the add a lifetime of its own.
+
+One writer's sequence numbers must apply in order. A remove records the
+highest number it observed from each writer and covers every lower number of
+that writer, observed or not. A remove that observed number 2 and not number
+1 takes number 1 out on every replica it reaches later, and nothing brings it
+back. `merge_sequenced` keeps the order on the node that draws the numbers.
+Code that calls `OrSet::add` with a counter of its own must apply its adds in
+the order it drew the numbers, with one task per writer for example: two
+tasks that share an `AtomicU64` and call `Cache::merge` can apply number 2
+before number 1.
+
+To remove an element, read the set, then write
+`OrSet::remove(&observed, &element)` with `Cache::merge`. The remove takes
+out the adds the read observed; an add of the same element made concurrently
+elsewhere survives. Never use `Cache::remove` for one element: it deletes the
+whole set. Every add creates a tag that stays until a remove observes it, so
+re-adding an element that is already present, on every heartbeat for
+example, grows the value with each write. `OrSet::contains` and
+`OrSet::iter` read the members.
+
+The order holds past the node that draws it. A `Replicated` or `Invalidation`
+peer receives the stored value, which holds every number applied before the
+one it carries. A `merge_coalesce_window` folds a writer's calls in the order
+they were made and applies the folds in that order. A `Distributed` node that
+does not own the key forwards its adds to the owners in the order it drew the
+numbers, over one ordered link per owner.
+
+Four cases still put a higher number on a replica ahead of a lower one, and a
+remove built from a read of that replica then covers the lower number when it
+arrives:
+
+- **An ownership change while forwards are in flight.** Two forwards of one
+  writer can reach different owners, or one can take an extra hop through a
+  node whose view differs.
+- **A forward an owner holds for clock skew.** A later forward of the writer
+  that arrives as the owner's clock crosses the bound applies first, and a
+  held forward is dropped when the hold is full or its stamp is past the
+  hold's horizon. `sundog_clock_skew_hold_dropped_total` counts the drops.
+- **An entry that a node evicts or lets expire between two adds.** The next
+  add starts a value without the lower numbers, and a remove built from it
+  covers copies that peers still hold.
+- **A copy that has not caught up.** A new owner serves its local copy of a
+  part before its co-owners' state arrives, and an owner that missed a forward
+  while its link to the writer was down serves a copy without it until a
+  co-owner or anti-entropy delivers it.
 
 ## Expiry and deletes
 
@@ -143,12 +191,13 @@ give merged values a lifetime as they give any other value one:
   reads values pays the same, and `needs_value_bytes() == false` avoids it.
 - **Every write that meets a stored value decodes both, merges them and
   encodes the result.** `CacheBuilder::merge_coalesce_window` folds a key's
-  consecutive `Cache::merge` and `Cache::merge_with_ttl` calls in memory and
-  applies them once per window. A read does not see a fold still waiting in
-  its window, a remove discards it, a crash loses it, a graceful
-  `Cache::close` or `Cluster::shutdown` sends it, and the flushed record
-  carries the version of its last call. `insert` never waits in a window, and
-  `open` refuses a nonzero window for a resolver that does not merge.
+  consecutive `Cache::merge`, `Cache::merge_with_ttl` and
+  `Cache::merge_sequenced` calls in memory and applies them once per window.
+  A read does not see a fold still waiting in its window, a remove discards
+  it, a crash loses it, a graceful `Cache::close` or `Cluster::shutdown`
+  sends it, and the flushed record carries the version of its last call.
+  `insert` never waits in a window, and `open` refuses a nonzero window for a
+  resolver that does not merge.
 - **The value grows with its writers.** Each writer, one run of one node,
   owns a slot, so every restart adds one. The slots of writers whose node is
   gone longer than `ClusterConfig::crdt_retire_after`, 24 hours by default,

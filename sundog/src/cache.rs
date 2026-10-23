@@ -7,8 +7,8 @@
 //!
 //! [`Cache::merge`] folds a value into the configured
 //! [`ConflictResolver`] without a read; [`CacheBuilder::merge_coalesce_window`]
-//! coalesces consecutive `merge` and `merge_with_ttl` calls to one key into a
-//! single record per window instead of one per call.
+//! coalesces consecutive `merge`, `merge_with_ttl` and `merge_sequenced` calls
+//! to one key into a single record per window instead of one per call.
 
 // The owner read path: asking the owners of a key and decoding their answers.
 mod fetch;
@@ -199,8 +199,9 @@ where
         self
     }
 
-    /// Sets the window [`Cache::merge`] and [`Cache::merge_with_ttl`]
-    /// coalesce consecutive calls to one key within: instead of each call
+    /// Sets the window [`Cache::merge`], [`Cache::merge_with_ttl`] and
+    /// [`Cache::merge_sequenced`] coalesce consecutive calls to one key
+    /// within: instead of each call
     /// applying (and replicating) on its own, they fold in memory through
     /// the configured [`CacheBuilder::resolver`], each call carrying its own
     /// deadline, and apply once, when the window that opened at the first of
@@ -1030,6 +1031,85 @@ where
     /// As [`Cache::insert`].
     pub async fn merge_with_ttl(&self, key: K, value: V, ttl: Duration) -> Result<(), CacheError> {
         self.shard.merge_with_ttl(key, value, ttl).await
+    }
+
+    /// Folds into `key` the value `make` builds from this cache's
+    /// [`Cache::writer_id`] and the next of its sequence numbers, as
+    /// [`Cache::merge`] folds a value it is given. The numbers start at 1 in
+    /// each run of the process, rise by one per call, and none repeats. A call
+    /// that fails after it drew its number, for a value over the frame cap,
+    /// does not give the number back, so the next number skips it.
+    ///
+    /// The number is drawn and `make` runs under the lock that orders the
+    /// merges of `key` on this node, so the numbers drawn for one key apply,
+    /// or fold into a [`CacheBuilder::merge_coalesce_window`], in the order
+    /// they were drawn. A [`crate::crdt::OrSet`] needs that order: a remove
+    /// that observed a writer's number 2 and not its number 1 takes number 1
+    /// out wherever it arrives later. Build every add with this method, as in
+    /// `cache.merge_sequenced(key, |writer, seq| OrSet::add(writer, seq,
+    /// element))`.
+    ///
+    /// The order holds past this node. A peer of a `Replicated` or
+    /// `Invalidation` cache receives the stored value, which holds every
+    /// number applied before the one it carries. In `Mode::Distributed`, a
+    /// call for a key this node does not own forwards its contribution to the
+    /// owners in the order the numbers were drawn, over one ordered link per
+    /// owner. Four cases can still put a higher number on a replica ahead of
+    /// a lower one, and a remove built from a read of that replica then covers
+    /// the lower number when it arrives:
+    ///
+    /// - an ownership change while forwards are in flight, which can send two
+    ///   forwards of one writer to different owners, or one of them through a
+    ///   node that re-forwards it;
+    /// - a forward an owner holds for clock skew, which a later forward of the
+    ///   writer overtakes as the owner's clock crosses the bound, and which
+    ///   the owner drops when its hold is full or the stamp is past the
+    ///   hold's horizon;
+    /// - an entry that this node evicts or lets expire between two calls,
+    ///   which the next call starts again without the lower numbers;
+    /// - a copy that has not caught up: a new owner that has not finished
+    ///   pulling its part, or an owner that missed a forward while its link to
+    ///   the writer was down.
+    ///
+    /// `make` runs once, with the lock held. Keep it cheap, and do not call
+    /// into this cache from it: a merge, insert, remove or clear from `make`
+    /// can wait on the lock `make` holds. Code that calls [`OrSet::add`] with
+    /// a counter of its own must apply its adds in the order it drew the
+    /// numbers, with one task per writer for example; two tasks that share a
+    /// counter and call [`Cache::merge`] can apply out of order.
+    ///
+    /// # Errors
+    ///
+    /// As [`Cache::merge`], for the value `make` returns.
+    ///
+    /// [`OrSet`]: crate::crdt::OrSet
+    /// [`OrSet::add`]: crate::crdt::OrSet::add
+    pub async fn merge_sequenced(
+        &self,
+        key: K,
+        make: impl FnOnce(WriterId, u64) -> V,
+    ) -> Result<(), CacheError> {
+        self.shard
+            .merge_sequenced(key, self.writer_id(), make)
+            .await
+    }
+
+    /// [`Cache::merge_sequenced`] with a lifespan for this contribution
+    /// alone; `ttl` overrides the cache's default and travels with the
+    /// record, as [`Cache::merge_with_ttl`] does for [`Cache::merge`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Cache::merge_sequenced`].
+    pub async fn merge_sequenced_with_ttl(
+        &self,
+        key: K,
+        make: impl FnOnce(WriterId, u64) -> V,
+        ttl: Duration,
+    ) -> Result<(), CacheError> {
+        self.shard
+            .merge_sequenced_with_ttl(key, self.writer_id(), make, ttl)
+            .await
     }
 
     /// [`Cache::insert_many`] with one lifespan applied to every entry,

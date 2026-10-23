@@ -582,6 +582,18 @@ where
     /// split and the seal wait it out. Only held in synchronous sections,
     /// never across an await.
     merge_flush_gate: StdRwLock<()>,
+    /// One lock per stripe of [`Self::pending_merges`], held by every flush of
+    /// the stripe from the take through the last apply of what it took
+    /// ([`Shard::begin_flush`]). Two folds of one key reach the engine, or the
+    /// fan-out queue, in the order they were folded, however many flushes run
+    /// at once. Taken after `merge_flush_gate` and before the stripe's own
+    /// lock; only held in synchronous sections.
+    flush_order: Box<[StdMutex<()>]>,
+    /// The last sequence number [`Shard::merge_sequenced`] drew; the next call
+    /// draws one more. Drawn under the lock of the key's stripe in
+    /// [`Self::pending_merges`], so the numbers drawn for one key rise in the
+    /// order they apply or fold.
+    merge_seq: AtomicU64,
     /// Test-only: runs between a flush's take and its apply, so a test can
     /// park the flush there.
     #[cfg(test)]

@@ -908,7 +908,6 @@ struct SideCaches {
     churn: Cache<String, String>,
     pn: Cache<String, PnCounter>,
     os: Cache<String, OrSet<String>>,
-    os_seq: Arc<AtomicU64>,
 }
 
 impl SideCaches {
@@ -931,17 +930,7 @@ impl SideCaches {
             .resolver(Arc::new(OrSetResolver::<String>::new()))
             .open()
             .await?;
-        // This process's next `OrSet::add` sequence number: shared across
-        // every control connection and every key, since it only has to be
-        // unique per writer incarnation, not per key. Starts at zero every
-        // process start, matching a fresh incarnation's fresh tag space.
-        let os_seq = Arc::new(AtomicU64::new(0));
-        Ok(Self {
-            churn,
-            pn,
-            os,
-            os_seq,
-        })
+        Ok(Self { churn, pn, os })
     }
 
     /// Runs one side-cache command: `churn`, `ccount`, `pn*` or `os*`.
@@ -970,17 +959,7 @@ impl SideCaches {
             "pnfill" | "pncount" | "pnget" | "pnbytes" | "pndump" => {
                 pn_command(&self.pn, self.pn.writer_id(), command, parts.next()).await
             }
-            _ => {
-                os_command(
-                    &self.os,
-                    self.os.writer_id(),
-                    &self.os_seq,
-                    command,
-                    parts.next(),
-                    parts.next(),
-                )
-                .await
-            }
+            _ => os_command(&self.os, command, parts.next(), parts.next()).await,
         }
     }
 }
@@ -1273,26 +1252,29 @@ fn os_members_reply(set: Option<&OrSet<String>>) -> String {
     }
 }
 
-/// The `os*` command family on `"os"`, `next_seq` being `writer`'s own next
-/// per-process sequence number; each variant's contract is on its match arm.
+/// The `os*` command family on `"os"`; each variant's contract is on its
+/// match arm.
 async fn os_command(
     os: &Cache<String, OrSet<String>>,
-    writer: WriterId,
-    next_seq: &AtomicU64,
     command: &str,
     key: Option<&str>,
     elem: Option<&str>,
 ) -> Reply {
     match command {
         // osadd k e -> ok | err <e>, merging a blind OrSet::add into key k.
+        // Control connections run concurrently, so the cache draws the
+        // sequence number under the lock that applies the add.
         "osadd" => {
             let (key, elem) = match parse_key_and_element(command, key, elem) {
                 Ok(pair) => pair,
                 Err(error) => return Reply::Line(error),
             };
-            let seq = next_seq.fetch_add(1, Ordering::Relaxed);
-            let delta = osadd_delta(writer, seq, elem);
-            Reply::Line(ok_reply(os.merge(key.to_string(), delta).await))
+            Reply::Line(ok_reply(
+                os.merge_sequenced(key.to_string(), |writer, seq| {
+                    osadd_delta(writer, seq, elem)
+                })
+                .await,
+            ))
         }
         // osremove k e -> ok | err <e>, merging OrSet::remove against the observed set.
         "osremove" => {
