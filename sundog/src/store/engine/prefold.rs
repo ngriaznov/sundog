@@ -219,7 +219,20 @@ pub(super) fn reaches_deadline<V>(incoming: &Incoming<V>, now_ms: u64) -> bool {
 /// rather than relying on that guard alone. Shared by [`prefold_batch`] and
 /// [`Engine::apply_many`]'s seed lookup so both agree on exactly which runs
 /// are long enough to fold.
-pub(super) fn group_prefold_runs<K, V>(entries: &[BatchEntry<K, V>]) -> Vec<Vec<usize>> {
+///
+/// `leading_run_only` cuts a key at its first tombstone: the tombstone and
+/// every entry after it is a singleton run, which nothing folds. A later run
+/// would fold from the record stored before the batch, but by the time it
+/// applies, the key's earlier entries have changed that record, and a delete
+/// among them has removed content the fold would put back. A cap decides each
+/// merge against the record it meets, so that fold is refused at other steps
+/// than sequential application refuses it. A key's leading run starts from
+/// the stored record itself and folds exactly. [`Engine::apply_many`] sets it
+/// when a cap is in force.
+pub(super) fn group_prefold_runs<K, V>(
+    entries: &[BatchEntry<K, V>],
+    leading_run_only: bool,
+) -> Vec<Vec<usize>> {
     let mut by_key: HashMap<Bytes, Vec<usize>> = HashMap::new();
     for (i, entry) in entries.iter().enumerate() {
         by_key.entry(entry.2.clone()).or_default().push(i);
@@ -227,7 +240,12 @@ pub(super) fn group_prefold_runs<K, V>(entries: &[BatchEntry<K, V>]) -> Vec<Vec<
     let mut runs: Vec<Vec<usize>> = Vec::new();
     for indices in by_key.into_values() {
         let mut current: Vec<usize> = Vec::new();
+        let mut past_leading_run = false;
         for idx in indices {
+            if past_leading_run {
+                runs.push(vec![idx]);
+                continue;
+            }
             match &entries[idx].4 {
                 Incoming::Put { .. } => current.push(idx),
                 Incoming::Tombstone { .. } => {
@@ -235,6 +253,7 @@ pub(super) fn group_prefold_runs<K, V>(entries: &[BatchEntry<K, V>]) -> Vec<Vec<
                         runs.push(std::mem::take(&mut current));
                     }
                     runs.push(vec![idx]);
+                    past_leading_run = leading_run_only;
                 }
             }
         }
@@ -345,6 +364,49 @@ pub(super) fn peek_prefold_seeds<K, V>(
     seeds
 }
 
+/// What one entry of a folded run becomes; see [`plan_run`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RunSlot {
+    /// Absorbed into the run's survivor.
+    Absorbed,
+    /// The run's survivor, which [`apply_locked`] still applies.
+    Survivor,
+    /// A merge the cap refused, which would have left this many value bytes.
+    Refused(usize),
+    /// An entry the fold stopped before, left for sequential application.
+    Unconsumed,
+}
+
+/// What each of a run's `len` entries becomes once [`fold_run`] has consumed
+/// the first `consumed` of them. `refused` is [`FoldedRun::refused`], whose
+/// positions count from the first entry [`fold_run`] merged. That entry is
+/// the run's first when a stored record seeds the accumulator (`first_step`
+/// 0), and its second when the run's own first entry does (`first_step` 1).
+/// The survivor takes the last consumed position no refusal took, and none
+/// when the cap refused every step of a run against a stored record, which
+/// leaves that record as the survivor and needs no apply. One pass over the
+/// run, so a run of many refused steps costs no more than the fold that
+/// refused them.
+pub(super) fn plan_run(
+    len: usize,
+    consumed: usize,
+    first_step: usize,
+    refused: &[(usize, usize)],
+) -> Vec<RunSlot> {
+    let mut plan = vec![RunSlot::Absorbed; len];
+    plan[consumed..].fill(RunSlot::Unconsumed);
+    for &(step, size) in refused {
+        plan[step + first_step] = RunSlot::Refused(size);
+    }
+    if let Some(last) = plan[..consumed]
+        .iter()
+        .rposition(|slot| *slot == RunSlot::Absorbed)
+    {
+        plan[last] = RunSlot::Survivor;
+    }
+    plan
+}
+
 /// [`Engine::apply_many`]'s pre-fold: run only when the resolver's
 /// [`ConflictResolver::merges`] is `true` and pre-folding is on, folds
 /// every maximal run [`group_prefold_runs`] found into one survivor with
@@ -366,6 +428,12 @@ pub(super) fn peek_prefold_seeds<K, V>(
 /// consumed prefix that no refusal took; a run whose steps the cap all
 /// refused against a stored record leaves that record as the survivor, which
 /// needs no apply.
+///
+/// Each run folds from the record its key holds when the batch starts, which
+/// only a key's leading run meets in sequential application. Under a cap
+/// [`group_prefold_runs`] leaves the rest of a key's entries after its first
+/// tombstone unfolded, so the folded batch refuses the same entries as
+/// sequential application and stores the same record.
 pub(super) fn prefold_batch<K, V: DeserializeOwned>(
     entries: Vec<BatchEntry<K, V>>,
     runs: Vec<Vec<usize>>,
@@ -444,28 +512,24 @@ pub(super) fn prefold_batch<K, V: DeserializeOwned>(
         // The run's entries consumed so far, counting the unseeded fold's
         // own first entry, which seeds the accumulator.
         let consumed = run.len() - folded.remaining.len();
-        let refusals: Vec<(usize, usize)> = folded
-            .refused
-            .iter()
-            .map(|&(step, size)| (step + first_step, size))
-            .collect();
-        let survivor_at = (0..consumed)
-            .rev()
-            .find(|position| !refusals.iter().any(|(at, _)| at == position));
+        let plan = plan_run(run.len(), consumed, first_step, &folded.refused);
         let mut survivor = Some((folded.ver, folded.incoming));
         let mut remaining = folded.remaining.into_iter();
-        for (position, (&idx, (hash, key, key_bytes))) in run.iter().zip(parts).enumerate() {
-            if position >= consumed {
-                let (ver, incoming) = remaining
-                    .next()
-                    .expect("one remaining entry for each unconsumed index");
-                slots[idx] = Slot::Apply((hash, key, key_bytes, ver, incoming));
-            } else if let Some(&(_, size)) = refusals.iter().find(|(at, _)| *at == position) {
-                slots[idx] = Slot::Refused { key_bytes, size };
-            } else if Some(position) == survivor_at
-                && let Some((ver, incoming)) = survivor.take()
-            {
-                slots[idx] = Slot::Apply((hash, key, key_bytes, ver, incoming));
+        for ((&idx, (hash, key, key_bytes)), planned) in run.iter().zip(parts).zip(plan) {
+            match planned {
+                // The slot `take` emptied already reads absorbed.
+                RunSlot::Absorbed => {}
+                RunSlot::Survivor => {
+                    let (ver, incoming) = survivor.take().expect("a run has one survivor");
+                    slots[idx] = Slot::Apply((hash, key, key_bytes, ver, incoming));
+                }
+                RunSlot::Refused(size) => slots[idx] = Slot::Refused { key_bytes, size },
+                RunSlot::Unconsumed => {
+                    let (ver, incoming) = remaining
+                        .next()
+                        .expect("one remaining entry for each unconsumed index");
+                    slots[idx] = Slot::Apply((hash, key, key_bytes, ver, incoming));
+                }
             }
         }
     }

@@ -27,8 +27,10 @@ All notable changes to this project are documented in this file. Format follows
   rebalance leave out because one frame cannot hold them. Each logs a `warn`,
   at most once a minute for each cache. The first warns for a merge from a
   peer, a flushed fold and a compaction pass, since a local caller gets
-  `ValueTooLarge` instead. A warning identifies a key by `key_hash`, the xxh3
-  of its encoded bytes, and `key_len`, and never carries the key.
+  `ValueTooLarge` instead. The merge warning identifies a key by `key_hash`,
+  the xxh3 of its encoded bytes, and `key_len`; the sync warning identifies
+  the largest key left out by `largest_key_hash` and `largest_key_len`. Neither
+  carries the key.
 - **`ShardOps::skip_unframeable`.** It drops from the records a sync is about
   to send the ones that do not fit a frame, and counts them. The default
   returns its records unchanged.

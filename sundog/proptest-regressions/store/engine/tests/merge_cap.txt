@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc d4cad6a9b72f5400112a1c6fb09aaf214eac8baf2bf1e1fb15a01e0f8b01a151 # shrinks to setup = [], main = [(2, 0, 1, "e3"), (2, 0, 2, "e1"), (2, 0, 1, "e4"), (2, 0, 1, "e0"), (2, 0, 1, "e2")]
+cc 131d66409f4118aeb0e11b470966f35d8c93f75e703dc3a1168df33c140011a9 # shrinks to setup = [], main = [(2, 0, 1, "e0", None, false), (2, 1, 1, "e5", Some(41), false), (2, 0, 1, "e1", None, false), (2, 0, 1, "e2", None, false), (2, 0, 1, "e3", None, false)]

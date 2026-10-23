@@ -649,7 +649,9 @@ where
     /// except a merge the cap refuses while its run folds, which is reported
     /// [`ApplyOutcome::TooLarge`] at its own index and costs the stripe lock
     /// nothing; see [`prefold_batch`]'s doc for why the result matches
-    /// sequential application exactly, version and all.
+    /// sequential application exactly, version and all. With a cap in force
+    /// only the entries of a key before its first tombstone fold: the rest of
+    /// the key's entries apply one by one.
     ///
     /// [`prefetch_spilled_conflict_bytes`] reads back any currently-spilled
     /// stored sides off-lock first, before the write lock this call holds
@@ -871,7 +873,8 @@ where
         now_ms: u64,
         #[cfg(feature = "spill")] prefetched_spilled: &HashMap<SpillLoc, Bytes>,
     ) -> Vec<Slot<K, V>> {
-        let runs = group_prefold_runs(&entries);
+        let cap = self.merge_cap();
+        let runs = group_prefold_runs(&entries, cap.is_some());
         let stored_seeds = {
             let stripe = self.stripes[bucket].read();
             peek_prefold_seeds(
@@ -884,14 +887,7 @@ where
                 prefetched_spilled,
             )
         };
-        prefold_batch(
-            entries,
-            runs,
-            resolver,
-            self.merge_cap(),
-            &stored_seeds,
-            now_ms,
-        )
+        prefold_batch(entries, runs, resolver, cap, &stored_seeds, now_ms)
     }
 
     /// [`Engine::apply_many`] for one entry, applied only while the key's

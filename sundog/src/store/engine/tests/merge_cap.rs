@@ -2,13 +2,15 @@
 //! refusing a merge that grows a value past it, with and without the
 //! pre-fold.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicUsize;
+use std::time::Instant;
 
 use proptest::prelude::*;
 
 use super::merge::merge_fits;
+use super::prefold::{RunSlot, group_prefold_runs, plan_run};
 use super::*;
 use crate::wire::{self, WireRecord};
 
@@ -55,6 +57,31 @@ fn entry_of(key: u32, ver: Hlc, value: &BTreeSet<String>) -> SetEntry {
             encoded,
         },
     )
+}
+
+/// A `Put` batch entry for `key` of `value` at `ver` that lapses at `deadline`.
+fn expiring_entry_of(
+    key: u32,
+    ver: Hlc,
+    value: &BTreeSet<String>,
+    deadline: Option<u64>,
+) -> SetEntry {
+    let mut entry = entry_of(key, ver, value);
+    if let Incoming::Put { expires_at_ms, .. } = &mut entry.4 {
+        *expires_at_ms = deadline;
+    }
+    entry
+}
+
+/// A delete of `key` at `ver`.
+fn delete_of(key: u32, ver: Hlc) -> SetEntry {
+    let kb = key_bytes(key);
+    (hash_key_bytes(kb.as_ref()), key, kb, ver, Incoming::DELETE)
+}
+
+/// The size each batch index was refused at, in batch order.
+fn refusals(outcomes: &[ApplyOutcome<u32, BTreeSet<String>>]) -> Vec<Option<usize>> {
+    outcomes.iter().map(ApplyOutcome::too_large).collect()
 }
 
 /// Applies `entries` of one key's stripe through `engine`, as a peer batch
@@ -768,17 +795,234 @@ fn a_current_only_apply_meets_the_cap_too() {
     assert_eq!(stored(&engine, 1), Some(elems(0, 3)));
 }
 
+#[test]
+fn an_unseeded_run_refuses_a_step_at_the_index_of_its_entry() {
+    let batch = || {
+        vec![
+            entry_of(1, hlc(10, 1), &elems(0, 2)),
+            entry_of(1, hlc(11, 1), &elems(2, 2)),
+            entry_of(1, hlc(12, 1), &elems(2, 1)),
+            entry_of(1, hlc(13, 1), &elems(4, 1)),
+        ]
+    };
+    let on = capped_engine(3);
+    let off = capped_engine(3);
+    off.set_prefold_enabled(false);
+
+    let on_outcomes = apply(&on, batch(), 0);
+    let off_outcomes = apply(&off, batch(), 0);
+
+    // Nothing is stored, so the first entry is the run's own seed. The second
+    // would make four elements: refused. The third makes three: it fits. The
+    // fourth would make four again.
+    let expected = [None, Some(set_len(4)), None, Some(set_len(4))];
+    assert_eq!(refusals(&off_outcomes), expected);
+    assert_eq!(refusals(&on_outcomes), expected, "each at its own index");
+    assert_eq!(record(&on, 1), record(&off, 1));
+    assert_eq!(stored(&on, 1), Some(elems(0, 3)));
+}
+
+#[test]
+fn a_run_plan_gives_each_entry_one_fate() {
+    use RunSlot::{Absorbed, Refused, Survivor, Unconsumed};
+
+    // A fold seeded by a stored record merges from the run's first entry.
+    assert_eq!(plan_run(2, 2, 0, &[]), [Absorbed, Survivor]);
+    assert_eq!(
+        plan_run(3, 3, 0, &[(1, 9)]),
+        [Absorbed, Refused(9), Survivor]
+    );
+    assert_eq!(
+        plan_run(3, 3, 0, &[(2, 9)]),
+        [Absorbed, Survivor, Refused(9)]
+    );
+    assert_eq!(
+        plan_run(3, 3, 0, &[(0, 7), (1, 8), (2, 9)]),
+        [Refused(7), Refused(8), Refused(9)],
+        "every step refused against the stored record leaves no survivor"
+    );
+
+    // An unseeded fold merges from the run's second entry on.
+    assert_eq!(plan_run(3, 3, 1, &[]), [Absorbed, Absorbed, Survivor]);
+    assert_eq!(
+        plan_run(3, 3, 1, &[(0, 9)]),
+        [Absorbed, Refused(9), Survivor]
+    );
+    assert_eq!(
+        plan_run(3, 3, 1, &[(1, 9)]),
+        [Absorbed, Survivor, Refused(9)]
+    );
+    assert_eq!(
+        plan_run(3, 3, 1, &[(0, 7), (1, 8)]),
+        [Survivor, Refused(7), Refused(8)],
+        "the run's own first entry survives when every merge is refused"
+    );
+
+    // A fold that stopped early leaves the rest for sequential application.
+    assert_eq!(
+        plan_run(4, 2, 0, &[(1, 9)]),
+        [Survivor, Refused(9), Unconsumed, Unconsumed]
+    );
+    assert_eq!(
+        plan_run(4, 2, 1, &[]),
+        [Absorbed, Survivor, Unconsumed, Unconsumed]
+    );
+    assert_eq!(plan_run(0, 0, 0, &[]), []);
+}
+
+#[test]
+fn a_run_plan_of_many_refused_steps_takes_one_pass() {
+    // A pass that looked a refusal up for each position would compare about
+    // five billion pairs here, tens of seconds.
+    let len = 100_000;
+    let refused: Vec<(usize, usize)> = (0..len).map(|step| (step, 9)).collect();
+    let started = Instant::now();
+
+    let plan = plan_run(len, len, 0, &refused);
+
+    assert!(plan.iter().all(|slot| *slot == RunSlot::Refused(9)));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "planned in {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn under_a_cap_a_key_folds_only_up_to_its_first_tombstone() {
+    let ver = hlc(10, 1);
+    let one = elems(0, 1);
+    let entries = vec![
+        entry_of(1, ver, &one),
+        entry_of(1, ver, &one),
+        delete_of(1, ver),
+        entry_of(1, ver, &one),
+        entry_of(1, ver, &one),
+        entry_of(2, ver, &one),
+        entry_of(2, ver, &one),
+        delete_of(3, ver),
+        entry_of(3, ver, &one),
+        entry_of(3, ver, &one),
+    ];
+    let sorted = |mut runs: Vec<Vec<usize>>| {
+        runs.sort();
+        runs
+    };
+
+    assert_eq!(
+        sorted(group_prefold_runs(&entries, false)),
+        [
+            vec![0, 1],
+            vec![2],
+            vec![3, 4],
+            vec![5, 6],
+            vec![7],
+            vec![8, 9]
+        ],
+        "without a cap every run between tombstones folds"
+    );
+    assert_eq!(
+        sorted(group_prefold_runs(&entries, true)),
+        [
+            vec![0, 1],
+            vec![2],
+            vec![3],
+            vec![4],
+            vec![5, 6],
+            vec![7],
+            vec![8],
+            vec![9]
+        ],
+        "under one only the entries before the key's first tombstone do"
+    );
+}
+
+#[test]
+fn a_tombstone_in_a_keys_batch_leaves_the_puts_after_it_to_sequential_application_under_a_cap() {
+    let batch = || {
+        vec![
+            entry_of(1, hlc(15, 1), &elems(0, 3)),
+            delete_of(1, hlc(0, 1)),
+            entry_of(1, hlc(1, 1), &elems(3, 2)),
+            entry_of(1, hlc(2, 1), &elems(3, 1)),
+        ]
+    };
+    let on = capped_engine(4);
+    let off = capped_engine(4);
+    off.set_prefold_enabled(false);
+
+    let on_outcomes = apply(&on, batch(), 0);
+    let off_outcomes = apply(&off, batch(), 0);
+
+    // The stored three elements meet the third entry's two, which make five:
+    // refused. The fourth entry's one makes four.
+    for outcomes in [&on_outcomes, &off_outcomes] {
+        assert!(
+            matches!(
+                outcomes[..],
+                [
+                    ApplyOutcome::Put { .. },
+                    ApplyOutcome::Rejected,
+                    ApplyOutcome::TooLarge { size, .. },
+                    ApplyOutcome::Put { .. },
+                ] if size == set_len(5)
+            ),
+            "{:?}",
+            refusals(outcomes)
+        );
+    }
+    assert_eq!(record(&on, 1), record(&off, 1));
+    assert_eq!(stored(&on, 1), Some(elems(0, 4)));
+}
+
+#[test]
+fn a_put_after_a_newer_delete_folds_nothing_the_delete_removed_under_a_cap() {
+    let batch = || {
+        vec![
+            delete_of(1, hlc(30, 1)),
+            entry_of(1, hlc(31, 1), &elems(2, 3)),
+            entry_of(1, hlc(32, 1), &elems(5, 1)),
+        ]
+    };
+    let on = capped_engine(4);
+    let off = capped_engine(4);
+    off.set_prefold_enabled(false);
+    for engine in [&on, &off] {
+        apply(engine, vec![entry_of(1, hlc(10, 1), &elems(0, 2))], 0);
+    }
+
+    let on_outcomes = apply(&on, batch(), 0);
+    let off_outcomes = apply(&off, batch(), 0);
+
+    assert_eq!(refusals(&on_outcomes), refusals(&off_outcomes));
+    assert_eq!(refusals(&on_outcomes), [None, None, None]);
+    assert_eq!(record(&on, 1), record(&off, 1));
+    assert_eq!(
+        stored(&on, 1),
+        Some(elems(2, 4)),
+        "the elements stored before the delete stay deleted"
+    );
+}
+
 /// An element from a small alphabet: batches of them overflow a small cap and
 /// still collide often.
 fn arb_elem() -> impl Strategy<Value = String> {
     (0u8..8).prop_map(|n| format!("e{n}"))
 }
 
-/// A key, a version and a one-element value.
-type Spec = (u32, u64, u64, String);
+/// A key, a version, a one-element value, the deadline the put lapses at and
+/// whether the entry is a delete of the key instead.
+type Spec = (u32, u64, u64, String, Option<u64>, bool);
 
 fn arb_spec() -> impl Strategy<Value = Spec> {
-    (0u32..3, 0u64..12, 1u64..4, arb_elem())
+    (
+        0u32..3,
+        0u64..12,
+        1u64..4,
+        arb_elem(),
+        prop_oneof![3 => Just(None), 1 => (0u64..80).prop_map(Some)],
+        prop::bool::weighted(0.15),
+    )
 }
 
 proptest! {
@@ -786,9 +1030,11 @@ proptest! {
 
     /// The pre-fold changes only how many applies a batch costs, with a cap
     /// as without one: the same `(version, bytes)` per key is stored, the
-    /// same keys report a real outcome and the same keys have a contribution
-    /// refused. Four elements is the cap, so a batch of up to eight
-    /// elements crosses it.
+    /// same keys report a real outcome and the same batch index has its
+    /// contribution refused, at the same size. Four elements is the cap, so
+    /// a batch of up to eight elements crosses it. Deletes split a key's
+    /// puts, and deadlines lapse the records of the batch and the ones
+    /// stored before it, which the second batch meets at 40 ms.
     #[test]
     fn prefold_on_and_off_store_the_same_under_a_cap(
         setup in proptest::collection::vec(arb_spec(), 0..6),
@@ -797,38 +1043,49 @@ proptest! {
         let build = |specs: &[Spec]| -> Vec<SetEntry> {
             specs
                 .iter()
-                .map(|(key, wall_ms, node, elem)| {
-                    entry_of(*key, hlc(*wall_ms, *node), &BTreeSet::from([elem.clone()]))
+                .map(|(key, wall_ms, node, elem, deadline, delete)| {
+                    let ver = hlc(*wall_ms, *node);
+                    if *delete {
+                        delete_of(*key, ver)
+                    } else {
+                        expiring_entry_of(*key, ver, &BTreeSet::from([elem.clone()]), *deadline)
+                    }
                 })
                 .collect()
         };
-        let apply_all = |engine: &SetEngine, entries: Vec<SetEntry>| {
-            let mut by_bucket: HashMap<usize, Vec<SetEntry>> = HashMap::new();
-            for entry in entries {
-                by_bucket.entry(stripe_index_from_hash(entry.0)).or_default().push(entry);
+        // The outcome of each entry in the order the batch gave them.
+        let apply_all = |engine: &SetEngine, entries: Vec<SetEntry>, now_ms: u64| {
+            let mut outcomes: Vec<Option<ApplyOutcome<u32, BTreeSet<String>>>> =
+                entries.iter().map(|_| None).collect();
+            let mut by_bucket: BTreeMap<usize, Vec<(usize, SetEntry)>> = BTreeMap::new();
+            for (index, entry) in entries.into_iter().enumerate() {
+                by_bucket.entry(stripe_index_from_hash(entry.0)).or_default().push((index, entry));
             }
-            let mut outcomes = Vec::new();
             for (bucket, group) in by_bucket {
-                outcomes.extend(engine.apply_many(
+                let (indices, group): (Vec<usize>, Vec<SetEntry>) = group.into_iter().unzip();
+                let applied = engine.apply_many(
                     Arrival::Peer,
                     bucket,
                     group,
                     &UnionSetResolver,
                     60_000,
                     600_000,
-                    0,
-                ));
+                    now_ms,
+                );
+                for (index, outcome) in indices.into_iter().zip(applied) {
+                    outcomes[index] = Some(outcome);
+                }
             }
-            outcomes
+            outcomes.into_iter().flatten().collect::<Vec<_>>()
         };
         let on = capped_engine(4);
         let off = capped_engine(4);
         off.set_prefold_enabled(false);
-        apply_all(&on, build(&setup));
-        apply_all(&off, build(&setup));
+        apply_all(&on, build(&setup), 0);
+        apply_all(&off, build(&setup), 0);
 
-        let on_outcomes = apply_all(&on, build(&main));
-        let off_outcomes = apply_all(&off, build(&main));
+        let on_outcomes = apply_all(&on, build(&main), 40);
+        let off_outcomes = apply_all(&off, build(&main), 40);
 
         for key in 0u32..3 {
             prop_assert_eq!(record(&on, key), record(&off, key));
@@ -839,9 +1096,6 @@ proptest! {
         let on_keys: BTreeSet<u32> = on_outcomes.iter().filter_map(ApplyOutcome::key).copied().collect();
         let off_keys: BTreeSet<u32> = off_outcomes.iter().filter_map(ApplyOutcome::key).copied().collect();
         prop_assert_eq!(on_keys, off_keys);
-        let refused = |outcomes: &[ApplyOutcome<u32, BTreeSet<String>>]| {
-            outcomes.iter().filter(|o| o.too_large().is_some()).count()
-        };
-        prop_assert_eq!(refused(&on_outcomes), refused(&off_outcomes));
+        prop_assert_eq!(refusals(&on_outcomes), refusals(&off_outcomes));
     }
 }
