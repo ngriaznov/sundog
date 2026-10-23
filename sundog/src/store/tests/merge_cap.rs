@@ -13,7 +13,8 @@ use super::*;
 use crate::cluster::test_support::{ScopedSubscriber, scoped_subscriber};
 use crate::store::crdt::{OrSet, OrSetResolver, WriterId};
 use crate::store::shard_oversize::{
-    OVERSIZE_WARN_SPACING_MS, key_for_log, oversize_warn_due, split_unframeable,
+    OVERSIZE_WARN_SPACING_MS, first_refusal_in_call_order, key_for_log, oversize_warn_due,
+    split_unframeable,
 };
 use crate::wire;
 
@@ -251,6 +252,31 @@ fn a_key_shows_in_a_log_as_the_hash_and_length_of_its_encoded_bytes() {
         key_for_log(&long[..999]).0,
         "it covers every byte"
     );
+}
+
+#[test]
+fn a_batch_reports_the_refusal_of_the_entry_given_first_whatever_stripe_applies_first() {
+    // The stripe of each entry in the order given, each refusing stripe's
+    // first refused entry as (stripe, index in its group, size), and the size
+    // reported.
+    type Case<'a> = (&'a [usize], &'a [(usize, usize, usize)], Option<usize>);
+    let cases: &[Case<'_>] = &[
+        (&[], &[], None),
+        (&[4, 9, 4], &[], None),
+        (&[5, 3, 5], &[(5, 1, 40)], Some(40)),
+        // Stripe 2 applies before stripe 7; stripe 7's entry was given first.
+        (&[7, 2], &[(2, 0, 10), (7, 0, 20)], Some(20)),
+        (&[7, 2, 7, 2], &[(2, 0, 10), (7, 1, 20)], Some(10)),
+        // The second entry of stripe 3 comes before the only one of stripe 8.
+        (&[3, 3, 8], &[(3, 1, 30), (8, 0, 50)], Some(30)),
+    ];
+    for (stripe_of, first_refused, want) in cases {
+        assert_eq!(
+            first_refusal_in_call_order(stripe_of, first_refused),
+            *want,
+            "stripes {stripe_of:?}, refusals {first_refused:?}"
+        );
+    }
 }
 
 /// The two fields a log line holds for key `key` under `name`, as

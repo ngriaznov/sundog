@@ -788,6 +788,7 @@ where
                 bucket,
                 entries,
                 resolver,
+                merge_cap,
                 now_ms,
                 #[cfg(feature = "spill")]
                 &prefetched_spilled,
@@ -804,12 +805,9 @@ where
                 // call: one absorbed into its run's survivor, whose own call
                 // elsewhere in this loop is its only real contribution, or
                 // one the cap refused while its run folded.
-                let (hash, key, key_bytes, ver, incoming) = match slot.into_entry() {
-                    Ok(entry) => entry,
-                    Err(settled) => {
-                        outcomes.push(settled);
-                        continue;
-                    }
+                let Some((hash, key, key_bytes, ver, incoming)) = slot.into_entry(&mut outcomes)
+                else {
+                    continue;
                 };
                 let ctx = ApplyCtx {
                     digest_bucket: &self.digest[digest_slot(bucket, part_index_from_hash(hash))],
@@ -864,16 +862,16 @@ where
     /// The pre-fold stage of [`Engine::apply_many_in`]: reads the stored
     /// record of each key that has a run to fold under a brief read lock of
     /// `bucket`'s stripe, then folds every run outside any lock with
-    /// [`prefold_batch`].
+    /// [`prefold_batch`], under the `cap` the batch applies under.
     fn prefold_slots(
         &self,
         bucket: usize,
         entries: Vec<BatchEntry<K, V>>,
         resolver: &dyn ConflictResolver,
+        cap: Option<MergeCap>,
         now_ms: u64,
         #[cfg(feature = "spill")] prefetched_spilled: &HashMap<SpillLoc, Bytes>,
     ) -> Vec<Slot<K, V>> {
-        let cap = self.merge_cap();
         let runs = group_prefold_runs(&entries);
         let stored_seeds = {
             let stripe = self.stripes[bucket].read();

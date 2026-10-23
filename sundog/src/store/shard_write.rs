@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use tokio::sync::broadcast;
 
 use super::engine::{ApplyOutcome, Reservation};
-use super::shard_oversize::Refused;
+use super::shard_oversize::{Refused, first_refusal_in_call_order};
 use super::{
     BUCKET_COUNT, Event, FanOutItem, FanOutQueue, Incoming, Origin, PartId, Shard, encode_key,
     engine,
@@ -697,11 +697,16 @@ where
             )
             .await;
 
-        // Each entry keeps its position in the call, so the refusal returned
-        // is the first in call order however the stripes are visited.
+        // The stripe of each entry in the order given: a refusal is found again
+        // by its stripe and its place in the stripe's group, so the one
+        // returned is the first in the order given however the stripes are
+        // visited.
         let mut by_stripe: Vec<Vec<_>> = (0..BUCKET_COUNT).map(|_| Vec::new()).collect();
-        for (position, batch_entry) in batch_entries.into_iter().enumerate() {
-            by_stripe[engine::stripe_index_from_hash(batch_entry.0)].push((position, batch_entry));
+        let mut stripe_of: Vec<usize> = Vec::with_capacity(batch_entries.len());
+        for batch_entry in batch_entries {
+            let stripe = engine::stripe_index_from_hash(batch_entry.0);
+            stripe_of.push(stripe);
+            by_stripe[stripe].push(batch_entry);
         }
         let now = self.now_ms();
         let mut applied_keys: Vec<(K, Hlc)> = Vec::new();
@@ -710,7 +715,7 @@ where
         // is back with the tier before `retry_reservation_deficit` asks for
         // a fresh one: a retry clamped to the whole flush queue can never be
         // granted while this call still holds part of it.
-        let mut refused: Option<(usize, usize)> = None;
+        let mut first_refused: Vec<(usize, usize, usize)> = Vec::new();
         let deficit = {
             let mut reservation = reservation;
             let mut deficit = 0u64;
@@ -718,7 +723,6 @@ where
                 if group.is_empty() {
                     continue;
                 }
-                let (positions, group): (Vec<usize>, Vec<_>) = group.into_iter().unzip();
                 let (outcomes, bucket_deficit) = self.engine.apply_many_with_reservation(
                     engine::Arrival::Local,
                     bucket,
@@ -731,12 +735,14 @@ where
                     &mut written,
                 );
                 deficit += bucket_deficit;
-                for (position, outcome) in positions.into_iter().zip(outcomes) {
+                for (index, outcome) in outcomes.into_iter().enumerate() {
                     applied_keys.extend(outcome.key().cloned().zip(outcome.version()));
                     if let Some(size) = outcome.too_large()
-                        && refused.is_none_or(|(first, _)| position < first)
+                        && first_refused
+                            .last()
+                            .is_none_or(|&(stripe, ..)| stripe != bucket)
                     {
-                        refused = Some((position, size));
+                        first_refused.push((bucket, index, size));
                     }
                     self.handle_apply_outcome(outcome, Origin::Local, false);
                 }
@@ -747,7 +753,8 @@ where
         self.hand_off_bulk(&mut applied_keys, true);
         self.retry_reservation_deficit(0, deficit, deadline, &mut written)
             .await;
-        refused.map_or(Ok(()), |(_, size)| Err(self.merge_too_large(size)))
+        first_refusal_in_call_order(&stripe_of, &first_refused)
+            .map_or(Ok(()), |size| Err(self.merge_too_large(size)))
     }
 
     /// Stamps and applies a local tombstone, then fans it out per [`Mode`], as

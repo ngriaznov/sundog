@@ -51,13 +51,23 @@ pub(super) enum Slot<K, V> {
 }
 
 impl<K, V> Slot<K, V> {
-    /// The entry [`apply_locked`] runs, or for an entry [`prefold_batch`]
-    /// settled, the outcome [`Engine::apply_many`] reports for it.
-    pub(super) fn into_entry(self) -> Result<BatchEntry<K, V>, ApplyOutcome<K, V>> {
+    /// The entry [`apply_locked`] runs. An entry [`prefold_batch`] settled
+    /// runs none: the outcome [`Engine::apply_many`] reports for it goes to
+    /// `outcomes`, and this is `None`.
+    pub(super) fn into_entry(
+        self,
+        outcomes: &mut Vec<ApplyOutcome<K, V>>,
+    ) -> Option<BatchEntry<K, V>> {
         match self {
-            Self::Apply(entry) => Ok(entry),
-            Self::Absorbed => Err(ApplyOutcome::Rejected),
-            Self::Refused { key_bytes, size } => Err(ApplyOutcome::TooLarge { key_bytes, size }),
+            Self::Apply(entry) => Some(entry),
+            Self::Absorbed => {
+                outcomes.push(ApplyOutcome::Rejected);
+                None
+            }
+            Self::Refused { key_bytes, size } => {
+                outcomes.push(ApplyOutcome::TooLarge { key_bytes, size });
+                None
+            }
         }
     }
 

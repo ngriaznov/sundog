@@ -26,6 +26,7 @@
 //! length. A value past a lowered `max_frame` that fits a wire frame syncs as
 //! any other and cannot grow.
 
+use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -99,6 +100,37 @@ impl Refused {
 /// Pure; unit tested directly.
 pub(super) fn key_for_log(key: &[u8]) -> (String, usize) {
     (format!("{:016x}", hash_key_bytes(key)), key.len())
+}
+
+/// Of a batch applied stripe by stripe, the size of the refused entry that
+/// comes first in the order the batch was given; `None` without a refusal.
+/// `stripe_of` is the stripe of each entry in that order. `first_refused`
+/// holds, for each stripe with a refusal, the stripe, the index in the
+/// stripe's group of its first refused entry, and the size that entry was
+/// refused at. A stripe's group keeps the order given, so only a stripe's
+/// first refusal can come first. Pure; unit tested directly.
+pub(super) fn first_refusal_in_call_order(
+    stripe_of: &[usize],
+    first_refused: &[(usize, usize, usize)],
+) -> Option<usize> {
+    if first_refused.is_empty() {
+        return None;
+    }
+    let first: HashMap<usize, (usize, usize)> = first_refused
+        .iter()
+        .map(|&(stripe, index, size)| (stripe, (index, size)))
+        .collect();
+    let mut seen: HashMap<usize, usize> = HashMap::new();
+    for &stripe in stripe_of {
+        let index = seen.entry(stripe).or_default();
+        if let Some(&(refused, size)) = first.get(&stripe)
+            && refused == *index
+        {
+            return Some(size);
+        }
+        *index += 1;
+    }
+    None
 }
 
 /// The records of `records` that fit one frame under a cache name of
