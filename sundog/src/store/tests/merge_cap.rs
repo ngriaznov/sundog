@@ -314,22 +314,112 @@ async fn a_growing_merge_past_the_cap_fails_with_value_too_large_and_changes_not
     assert_digest_matches_full_recompute(&s).await;
 }
 
+/// A resolver over byte vectors whose merge keeps the longer side whole: a
+/// merge whose result is one of its two inputs, the incoming one when that is
+/// the longer.
+#[derive(Debug, Clone, Copy, Default)]
+struct LongerResolver;
+
+impl ConflictResolver for LongerResolver {
+    fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
+        if a.ver >= b.ver { Winner::A } else { Winner::B }
+    }
+
+    fn merges(&self) -> bool {
+        true
+    }
+
+    fn merge(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Option<Merged> {
+        let (a_bytes, b_bytes) = (a.value?, b.value?);
+        let longer = if b_bytes.len() > a_bytes.len() {
+            b_bytes
+        } else {
+            a_bytes
+        };
+        Some(Merged {
+            value: Bytes::copy_from_slice(longer),
+            expires_at_ms: later_deadline(a.expires_at_ms, b.expires_at_ms),
+        })
+    }
+}
+
+/// The frame cap that admits a value of ten encoded bytes under a one-byte
+/// key as a replicate frame: a forward of the same record is nine bytes wider
+/// and does not fit it.
+fn replicate_cap() -> usize {
+    wire::replicate_frame_len("test".len(), 1, 10)
+}
+
+/// Nine bytes, which encode to ten.
+fn widest() -> Vec<u8> {
+    vec![7; 9]
+}
+
 #[tokio::test]
-async fn a_contribution_only_a_replicate_frame_holds_is_refused_since_a_forward_is_wider() {
-    // A forward is nine bytes wider than a replicate of the same record, and a
-    // `Distributed` owner fans a record out as one.
-    let s = shard::<u32, Vec<u8>>(1)
-        .with_resolver(Arc::new(ConcatResolver))
-        .with_max_frame(wire::replicate_frame_len("test".len(), 1, 10));
+async fn every_merge_call_accepts_the_value_a_replicate_frame_holds_as_insert_does() {
+    // The default resolver does not merge, and nothing in a `Local` or
+    // `Replicated` cache forwards a record.
+    let s = shard::<u32, Vec<u8>>(1).with_max_frame(replicate_cap());
+    s.insert(1, widest()).await.expect("insert");
+    s.insert_sync(2, widest()).expect("insert_sync");
+    s.insert_many([(3, widest())]).await.expect("insert_many");
 
-    s.merge(1, vec![])
+    s.merge(4, widest()).await.expect("merge");
+    s.merge_with_ttl(5, widest(), Duration::from_secs(60))
         .await
-        .expect("a one-byte value is the widest a forward holds");
-    let (size, limit) = too_large(s.merge(2, vec![7]).await);
+        .expect("merge_with_ttl");
+    let writer = WriterId::new(NodeId::from(1), 1);
+    s.merge_sequenced(6, writer, |_, _| widest())
+        .await
+        .expect("merge_sequenced");
+    s.merge_sequenced_with_ttl(7, writer, |_, _| widest(), Duration::from_secs(60))
+        .await
+        .expect("merge_sequenced_with_ttl");
 
-    assert_eq!(size, 2, "the value is two bytes");
-    assert_eq!(limit, wire::replicate_frame_len("test".len(), 1, 10));
-    assert_eq!(s.get(&2).await, None, "and nothing is stored");
+    for key in 1..=7 {
+        assert_eq!(s.get(&key).await, Some(widest()), "key {key}");
+    }
+    let one_more = vec![7u8; 10];
+    too_large(s.insert(8, one_more.clone()).await);
+    too_large(s.merge(8, one_more).await);
+}
+
+#[tokio::test]
+async fn a_merging_resolver_that_keeps_the_contribution_stores_it_as_an_empty_key_would() {
+    let s = shard::<u32, Vec<u8>>(1)
+        .with_resolver(Arc::new(LongerResolver))
+        .with_max_frame(replicate_cap());
+    s.insert(1, vec![1]).await.expect("a small value");
+    s.insert(2, vec![1]).await.expect("another");
+    s.merge(3, vec![1]).await.expect("and another");
+
+    s.insert(1, widest())
+        .await
+        .expect("insert over a smaller value stores the longer, as at an empty key");
+    s.merge(2, widest())
+        .await
+        .expect("merge keeps the call's value");
+    s.merge(3, widest()).await.expect("and so does the third");
+
+    for key in 1..=3 {
+        assert_eq!(s.get(&key).await, Some(widest()), "key {key}");
+    }
+}
+
+#[tokio::test]
+async fn a_windowed_fold_that_is_the_calls_own_value_meets_no_cap_beyond_the_one_on_the_call() {
+    let s = shard::<u32, Vec<u8>>(1)
+        .with_resolver(Arc::new(LongerResolver))
+        .with_merge_coalesce_window(WINDOW)
+        .with_max_frame(replicate_cap());
+
+    s.merge(1, vec![1]).await.expect("opens the fold");
+    s.merge(1, widest())
+        .await
+        .expect("the fold is the call's own value, which fits as a replicate");
+    s.flush_all_pending_merges();
+
+    assert_eq!(s.get(&1).await, Some(widest()));
 }
 
 #[tokio::test]

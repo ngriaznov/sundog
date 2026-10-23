@@ -229,3 +229,57 @@ async fn a_windowed_add_that_overflows_its_own_pending_fold_gets_the_error() {
     // The fold stays pending for a minute; a close applies it.
     cluster.shutdown().await;
 }
+
+#[tokio::test]
+async fn every_merge_call_of_a_cache_accepts_the_widest_value_insert_accepts() {
+    let cluster = Cluster::builder("cache-it-cap-widest")
+        .seeds(std::iter::empty())
+        .config(loopback_config().with(|config| config.max_frame = MAX_FRAME))
+        .build()
+        .await
+        .expect("node builds");
+    let cache = cluster
+        .cache::<u32, Vec<u8>>("widest")
+        .mode(Mode::Local)
+        .open()
+        .await
+        .expect("opens");
+    // The value whose replicate frame is exactly the cap: its forward is nine
+    // bytes wider, which only a merged result is counted as. A byte vector
+    // past 127 bytes encodes with a two-byte length.
+    let room = MAX_FRAME - crate::wire::replicate_frame_len("widest".len(), 1, 0);
+    let widest = vec![3u8; room - 2];
+    assert_eq!(
+        postcard::to_stdvec(&widest).expect("encodes").len(),
+        room,
+        "the value's replicate frame is the cap"
+    );
+
+    cache.insert(1, widest.clone()).await.expect("insert");
+    cache.insert_sync(2, widest.clone()).expect("insert_sync");
+    cache
+        .insert_many([(3, widest.clone())])
+        .await
+        .expect("insert_many");
+    cache.merge(4, widest.clone()).await.expect("merge");
+    cache
+        .merge_with_ttl(5, widest.clone(), Duration::from_secs(60))
+        .await
+        .expect("merge_with_ttl");
+    cache
+        .merge_sequenced(6, |_, _| widest.clone())
+        .await
+        .expect("merge_sequenced");
+    cache
+        .merge_sequenced_with_ttl(7, |_, _| widest.clone(), Duration::from_secs(60))
+        .await
+        .expect("merge_sequenced_with_ttl");
+
+    for key in 1..=7 {
+        assert_eq!(cache.get(&key).await.as_ref(), Some(&widest), "key {key}");
+    }
+    let one_more = vec![3u8; room - 1];
+    too_large(cache.insert(8, one_more.clone()).await);
+    too_large(cache.merge(8, one_more).await);
+    cluster.shutdown().await;
+}

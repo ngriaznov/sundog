@@ -3,10 +3,14 @@
 //!
 //! A record travels as one frame, at most [`wire::MAX_FRAME`] bytes, so a
 //! value must stay within one. A write checks its own contribution against
-//! the shard's `max_frame` ([`Shard::with_max_frame`]). A merge builds a
-//! value larger than either side, so the apply checks the merged result:
+//! the shard's `max_frame` ([`Shard::with_max_frame`]), as the replicate frame
+//! it travels in. A merge builds a value larger than either side, so the apply
+//! checks the merged result, as the widest frame a record takes, a forward:
 //! it refuses one that passes the limit and is larger than the value it
-//! replaces ([`merge_fits`](super::engine::merge_fits)). A refused merge
+//! replaces ([`merge_fits`](super::engine::merge_fits)). A result that is the
+//! contribution itself, as over a lapsed value or under a resolver that keeps
+//! the contribution, is counted as the replicate frame it was checked as or
+//! arrived in. A refused merge
 //! counts in `sundog_merge_refused_total{cache, reason="too_large"}`. A caller
 //! gets [`CacheError::ValueTooLarge`]; a merge nobody waits on, from a peer or
 //! out of a coalesce window, also logs at `warn`, at most once per

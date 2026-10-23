@@ -36,7 +36,10 @@ All notable changes to this project are documented in this file. Format follows
 
 - **`Cache::merge` can fail with `CacheError::ValueTooLarge` for a value that
   grew past a frame.** A merged value stays within `ClusterConfig::max_frame`,
-  4 MiB by default, counted as the forward an owner sends its co-owners. A
+  4 MiB by default. A value the resolver builds is counted as the forward an
+  owner sends its co-owners; the value a call passes, and a merge result that
+  is that value, over a lapsed stored value or under a resolver that keeps
+  it, is counted as the replicate frame `insert` counts. A
   `merge`, `merge_with_ttl`, `merge_sequenced`, `merge_sequenced_with_ttl` or
   `insert` under a merging resolver whose result would pass that limit and be
   larger than the value it replaces fails with `ValueTooLarge` and changes

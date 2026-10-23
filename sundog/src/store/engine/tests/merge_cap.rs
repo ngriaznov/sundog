@@ -182,6 +182,34 @@ fn the_cap_counts_the_forward_header_so_a_value_only_a_replicate_holds_is_refuse
 }
 
 #[test]
+fn a_contribution_is_counted_as_the_replicate_frame_it_travelled_in() {
+    let limit = wire::replicate_frame_len(CACHE_LEN, 1, 10);
+    let cap = MergeCap {
+        cache_len: CACHE_LEN,
+        limit,
+    };
+    assert!(cap.admits_contribution(1, 10, None), "exactly the limit");
+    assert!(!cap.admits_contribution(1, 11, None), "one byte past it");
+    assert!(
+        !cap.admits_contribution(2, 10, None),
+        "a longer key takes a byte of the frame"
+    );
+    assert!(
+        !cap.admits(1, 10, None),
+        "a built value of the same length is a forward, nine bytes wider"
+    );
+    assert!(cap.admits(1, 1, None) && cap.admits_contribution(1, 1, None));
+    assert!(
+        cap.admits_contribution(1, 11, Some(11)),
+        "no larger than the record it replaces"
+    );
+    assert!(
+        !cap.admits_contribution(1, 12, Some(11)),
+        "one byte larger than it"
+    );
+}
+
+#[test]
 fn an_engine_has_no_cap_until_one_is_set() {
     let engine: SetEngine = Engine::new(u64::MAX, None, None, None);
     assert_eq!(engine.merge_cap(), None);
@@ -397,15 +425,91 @@ fn an_expired_stored_record_is_displaced_so_the_contribution_alone_meets_the_cap
     }
     apply(&engine, vec![expiring], 0);
 
-    // At 500 the stored record reads as absent. A four-element contribution
-    // replaces it, and four elements pass the cap with nothing to be
-    // larger than.
-    let outcomes = apply(&engine, vec![entry_of(1, hlc(500, 2), &elems(2, 4))], 500);
+    // At 500 the stored record reads as absent. The contribution replaces
+    // it, with nothing to be larger than, and is counted as the replicate
+    // frame its writer checked, which is nine bytes narrower than the forward
+    // the cap counts a built value as: the three elements those bytes hold
+    // fit, a fourth does not.
+    let outcomes = apply(&engine, vec![entry_of(1, hlc(500, 2), &elems(2, 7))], 500);
+    assert!(matches!(outcomes[..], [ApplyOutcome::TooLarge { size, .. }] if size == set_len(7)));
+
+    let outcomes = apply(&engine, vec![entry_of(1, hlc(600, 2), &elems(2, 6))], 600);
+    assert!(matches!(outcomes[..], [ApplyOutcome::Put { .. }]));
+    assert_eq!(stored(&engine, 1), Some(elems(2, 6)));
+}
+
+/// A resolver whose merge keeps the longer side's bytes whole, so that a
+/// merge's result is one of its two inputs.
+struct LongerResolver;
+
+impl ConflictResolver for LongerResolver {
+    fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
+        if a.ver >= b.ver { Winner::A } else { Winner::B }
+    }
+
+    fn merges(&self) -> bool {
+        true
+    }
+
+    fn merge(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Option<Merged> {
+        let (a_bytes, b_bytes) = (a.value?, b.value?);
+        let kept = if b_bytes.len() > a_bytes.len() {
+            b_bytes
+        } else {
+            a_bytes
+        };
+        Some(Merged {
+            value: Bytes::copy_from_slice(kept),
+            expires_at_ms: later_deadline(a.expires_at_ms, b.expires_at_ms),
+        })
+    }
+}
+
+#[test]
+fn a_merge_whose_result_is_the_contribution_is_held_to_the_replicate_frame_it_travelled_in() {
+    // A cap that admits ten bytes of value as a replicate frame: a forward of
+    // the same record is nine bytes wider.
+    let engine: SetEngine = Engine::new(u64::MAX, None, None, None);
+    engine.set_merge_cap(
+        CACHE_LEN,
+        wire::replicate_frame_len(CACHE_LEN, 1, set_len(3)),
+    );
+    let apply_with = |resolver: &dyn ConflictResolver, value: &BTreeSet<String>, ver: Hlc| {
+        let bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(1).as_ref()));
+        engine.apply_many(
+            Arrival::Peer,
+            bucket,
+            vec![entry_of(1, ver, value)],
+            resolver,
+            60_000,
+            600_000,
+            0,
+        )
+    };
+    apply_with(&LongerResolver, &elems(0, 1), hlc(10, 1));
+
+    // Three elements fit the cap as the replicate they arrived in, and the
+    // resolver keeps them whole: they are stored, though they are larger than
+    // the stored value and a forward of them would not fit.
+    let outcomes = apply_with(&LongerResolver, &elems(0, 3), hlc(20, 2));
+    assert!(matches!(outcomes[..], [ApplyOutcome::Put { .. }]));
+    assert_eq!(stored(&engine, 1), Some(elems(0, 3)));
+
+    // Four are past the cap as a replicate, and larger than the stored value.
+    let outcomes = apply_with(&LongerResolver, &elems(0, 4), hlc(30, 3));
     assert!(matches!(outcomes[..], [ApplyOutcome::TooLarge { size, .. }] if size == set_len(4)));
 
-    // A contribution that fits replaces it.
-    let outcomes = apply(&engine, vec![entry_of(1, hlc(600, 2), &elems(2, 3))], 600);
-    assert!(matches!(outcomes[..], [ApplyOutcome::Put { .. }]));
+    // A union the resolver builds is counted as a forward. Two elements fit a
+    // cap of two elements' replicate frame, and their forward does not.
+    let engine: SetEngine = Engine::new(u64::MAX, None, None, None);
+    engine.set_merge_cap(
+        CACHE_LEN,
+        wire::replicate_frame_len(CACHE_LEN, 1, set_len(2)),
+    );
+    apply(&engine, vec![entry_of(1, hlc(10, 1), &elems(0, 1))], 0);
+    let outcomes = apply(&engine, vec![entry_of(1, hlc(20, 2), &elems(1, 1))], 0);
+    assert!(matches!(outcomes[..], [ApplyOutcome::TooLarge { size, .. }] if size == set_len(2)));
+    assert_eq!(stored(&engine, 1), Some(elems(0, 1)));
 }
 
 #[test]

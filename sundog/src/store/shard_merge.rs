@@ -165,14 +165,19 @@ where
     /// the fold whole, including contributions folded in before the
     /// tombstone's version.
     ///
-    /// A merged value stays within one frame. A merge whose result would
-    /// pass the configured frame cap ([`Shard::with_max_frame`],
-    /// [`wire::MAX_FRAME`] by default) and be larger than the value it
-    /// replaces is refused and changes nothing, so a merge whose own value
-    /// fits a frame and that shrinks the stored value, or leaves it as it is,
-    /// succeeds, even for a value that already passes the cap. The same rule
-    /// refuses a merge arriving from a
-    /// peer, which leaves the stored value as it is and is counted in
+    /// A merged value stays within one frame. The value a call passes must
+    /// fit the configured frame cap ([`Shard::with_max_frame`],
+    /// [`wire::MAX_FRAME`] by default) as a replicate frame, as it must for
+    /// [`Shard::insert`]. A merge whose result would pass the cap, counted as
+    /// the forward an owner sends its co-owners, and be larger than the value
+    /// it replaces is refused and changes nothing. A result that is the
+    /// call's own value, as over a lapsed value or under a resolver that
+    /// keeps the call's value, is counted as the replicate frame the call was
+    /// checked as, so a call whose value fits is stored. A merge whose own
+    /// value fits a frame and that shrinks the stored value, or
+    /// leaves it as it is, succeeds, even for a value that already passes the
+    /// cap. The same rule refuses a merge arriving from a peer, which leaves
+    /// the stored value as it is and is counted in
     /// `sundog_merge_refused_total`. With a coalescing window, the call that
     /// would leave its own pending fold past the cap gets the error. A fold
     /// that flushes into a stored value it would push past the cap is
@@ -375,11 +380,12 @@ where
     }
 
     /// `Err(CacheError::ValueTooLarge)` when a value of `value_len` encoded
-    /// bytes under a key of `key_len` bytes would travel as a frame over the
-    /// cap. The frame counted is the widest one a record takes, a forward
-    /// ([`wire::forward_frame_len`]), as the cap on a merged result counts it.
+    /// bytes under a key of `key_len` bytes would travel as a replicate frame
+    /// over the cap, the frame [`Shard::insert`] counts for the value it is
+    /// given. Only a merged result is counted as the wider forward frame
+    /// ([`wire::forward_frame_len`]); see [`MergeCap`](super::engine::MergeCap).
     fn check_value_frame(&self, key_len: usize, value_len: usize) -> Result<(), CacheError> {
-        let wire_size = wire::forward_frame_len(self.name.len(), key_len, value_len);
+        let wire_size = wire::replicate_frame_len(self.name.len(), key_len, value_len);
         if wire_size > self.max_frame {
             return Err(CacheError::ValueTooLarge {
                 cache: self.name.clone(),
@@ -514,9 +520,16 @@ where
                 }),
             ) => {
                 let pending_len = slot.get().encoded.len();
-                if !self
-                    .merge_cap()
-                    .admits(key_bytes.len(), merged_bytes.len(), Some(pending_len))
+                // A fold that is the new call's own value and deadline is that
+                // call, which `check_value_frame` has checked; only a value
+                // the resolver built meets the cap.
+                let is_the_call = merged_bytes == encoded && merged_expires_at_ms == expires_at_ms;
+                if !is_the_call
+                    && !self.merge_cap().admits(
+                        key_bytes.len(),
+                        merged_bytes.len(),
+                        Some(pending_len),
+                    )
                 {
                     self.count_merge_refused();
                     return Err(self.merge_too_large(merged_bytes.len()));

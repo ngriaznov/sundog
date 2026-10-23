@@ -332,11 +332,14 @@ pub(crate) const fn merge_fits(merged_len: usize, stored_len: usize, limit: usiz
     merged_len <= limit || merged_len <= stored_len
 }
 
-/// The frame limit a merge keeps a value within, as the frame a
-/// `Msg::ForwardBatch` of the record would take under a cache name of
-/// `cache_len` bytes: the widest frame one record travels in
-/// ([`wire::forward_frame_len`]). [`Shard::with_max_frame`](crate::store::Shard::with_max_frame)
-/// sets it on the engine of a shard.
+/// The frame limit a merge keeps a value within. A value the resolver builds
+/// is counted as the frame a `Msg::ForwardBatch` of the record would take
+/// under a cache name of `cache_len` bytes: the widest frame one record
+/// travels in ([`wire::forward_frame_len`]). A value that is the merge's own
+/// contribution is counted as the replicate frame it was checked as, or
+/// arrived in ([`wire::replicate_frame_len`]).
+/// [`Shard::with_max_frame`](crate::store::Shard::with_max_frame) sets the
+/// cap on the engine of a shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MergeCap {
     /// The byte length of the cache's name.
@@ -347,16 +350,47 @@ pub(crate) struct MergeCap {
 
 impl MergeCap {
     /// Whether a merge of the record under a key of `key_len` bytes into a
-    /// value of `merged_len` bytes stays within the cap, where it replaces a
-    /// value of `stored_len` bytes, or nothing live (`None`). See
-    /// [`merge_fits`]. Pure; unit tested directly.
+    /// value of `merged_len` bytes that the resolver built stays within the
+    /// cap, where it replaces a value of `stored_len` bytes, or nothing live
+    /// (`None`). Frames are counted as forwards. See [`merge_fits`]. Pure;
+    /// unit tested directly.
     pub(crate) fn admits(
         self,
         key_len: usize,
         merged_len: usize,
         stored_len: Option<usize>,
     ) -> bool {
-        let frame = |value_len| wire::forward_frame_len(self.cache_len, key_len, value_len);
+        self.admits_by(wire::forward_frame_len, key_len, merged_len, stored_len)
+    }
+
+    /// [`MergeCap::admits`] for a merge whose result is the contribution
+    /// itself, which its writer checked as a replicate frame, or which
+    /// arrived as one: the frames are counted as replicates, so a value the
+    /// writer was allowed to store is stored over a smaller one. A
+    /// contribution that arrives from a node under a larger cap and passes
+    /// this one is refused. Pure; unit tested directly.
+    pub(crate) fn admits_contribution(
+        self,
+        key_len: usize,
+        contribution_len: usize,
+        stored_len: Option<usize>,
+    ) -> bool {
+        self.admits_by(
+            wire::replicate_frame_len,
+            key_len,
+            contribution_len,
+            stored_len,
+        )
+    }
+
+    fn admits_by(
+        self,
+        frame_len: fn(usize, usize, usize) -> usize,
+        key_len: usize,
+        merged_len: usize,
+        stored_len: Option<usize>,
+    ) -> bool {
+        let frame = |value_len| frame_len(self.cache_len, key_len, value_len);
         merge_fits(frame(merged_len), stored_len.map_or(0, frame), self.limit)
     }
 }
@@ -384,8 +418,12 @@ pub(super) enum Rebound<V> {
 /// merge, or bytes that fail to decode as `V`) and [`Rebound::Store`]
 /// otherwise: unchanged for an outright win, rebound for a merge. Only a
 /// merge meets `cap`; an outright win is the contribution itself, which the
-/// writer checked. `stored_absent` and `stored_tombstone` are
-/// [`resolve_conflict`]'s.
+/// writer checked. A merge whose result is the contribution, as when the
+/// stored side has lapsed or the resolver keeps the contribution, is held to
+/// the replicate frame the contribution was checked as
+/// ([`MergeCap::admits_contribution`]), and a value the resolver built to the
+/// forward frame ([`MergeCap::admits`]). `stored_absent` and
+/// `stored_tombstone` are [`resolve_conflict`]'s.
 #[allow(
     clippy::too_many_arguments,
     reason = "the two sides of a collision, each with its version, bytes and deadline, plus the resolver, key and cap"
@@ -448,11 +486,12 @@ pub(super) fn resolve_and_rebind<V: DeserializeOwned>(
                 MergedVersion::NoOp => Rebound::Lost,
                 MergedVersion::Store(_)
                     if cap.is_some_and(|cap| {
-                        !cap.admits(
-                            key_bytes.len(),
-                            value.len(),
-                            stored.map(|(bytes, _)| bytes.len()),
-                        )
+                        let stored_len = stored.map(|(bytes, _)| bytes.len());
+                        !if result_is_incoming {
+                            cap.admits_contribution(key_bytes.len(), value.len(), stored_len)
+                        } else {
+                            cap.admits(key_bytes.len(), value.len(), stored_len)
+                        }
                     }) =>
                 {
                     Rebound::TooLarge {

@@ -1024,9 +1024,12 @@ where
     /// [`ClusterConfig::max_frame`](crate::config::ClusterConfig::max_frame),
     /// 4 MiB by default. A merge whose result would pass it and be larger
     /// than the value it replaces fails with [`CacheError::ValueTooLarge`]
-    /// and changes nothing. A merge whose own value fits a frame and that
-    /// leaves the stored value no larger succeeds, so a merge can shrink a
-    /// value that already passes the limit. The remove an
+    /// and changes nothing. A merge whose result is `value` itself, over a
+    /// stored value that has lapsed or under a resolver that keeps `value`,
+    /// is counted as a replicate frame like `value`, so a call whose value
+    /// fits is stored. A merge whose own value fits a frame and that leaves
+    /// the stored value no larger succeeds, so a merge can shrink a value
+    /// that already passes the limit. The remove an
     /// [`OrSet`](crate::crdt::OrSet) builds carries the remaining tags of
     /// every writer it touches, so against a set one writer filled it is
     /// nearly as large as the set, and a set past the limit cannot be shrunk

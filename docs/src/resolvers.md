@@ -190,15 +190,19 @@ values a lifetime as they give any other value one:
 ## A merged value stays within a frame
 
 A record travels as one message, and a message is at most `max_frame` bytes:
-4 MiB by default, and never more than `wire::MAX_FRAME`. A merged value is
-held to that, the frame it takes with its key and the cache's name, counted at
-the widest a record travels in: the forward an owner sends its co-owners, nine
-bytes wider than a replicate. A `Cache::merge`, `merge_with_ttl`,
-`merge_sequenced`, `merge_sequenced_with_ttl` or `insert` that would leave a
-value past the limit and larger than it was fails with
-`CacheError::ValueTooLarge` and changes nothing. A merge whose own value fits
-a frame and that leaves the stored value no larger succeeds, so a merge can
-shrink a value that already passes the limit.
+4 MiB by default, and never more than `wire::MAX_FRAME`. The value a call
+passes is held to that as a replicate frame, the frame it takes with its key
+and the cache's name, as for `Cache::insert`. A merged value is held to it
+counted at the widest a record travels in: the forward an owner sends its
+co-owners, nine bytes wider than a replicate. A `Cache::merge`,
+`merge_with_ttl`, `merge_sequenced`, `merge_sequenced_with_ttl` or `insert`
+that would leave a value past the limit and larger than it was fails with
+`CacheError::ValueTooLarge` and changes nothing. A merge whose result is the
+call's own value, over a stored value that has lapsed or under a resolver that
+keeps the call's value, is counted as a replicate frame like the call, so a
+call whose value fits is stored. A merge whose own value fits a frame and that
+leaves the stored value no larger succeeds, so a merge can shrink a value that
+already passes the limit.
 
 The remove an `OrSet` builds carries the remaining tags of every writer it
 touches, so for a set that one writer filled it is nearly as large as the set,
