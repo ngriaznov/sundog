@@ -330,17 +330,17 @@ leaving on purpose, so `Replicated` caches on the other nodes do not hold
 tombstones back waiting for it to return, and a spill tier writes its
 checkpoint. It first applies the folds that each cache's
 `merge_coalesce_window` still holds and sends them with the writes already
-queued. A graceful `Cluster::shutdown` or `Cache::close` sends the folds
-pending in a window; a crash loses them, up to one window of merges per key.
-A node with `Distributed` caches then reconciles the parts it owns, those
-folds included, with each live co-owner, so a write only it held reaches them. Each
-co-owner of each cache gets an equal share of `state_transfer_budget`
-(20 s by default), and a round that fails or answers `Stale` is retried within
-the share. A live co-owner that does not answer holds the shutdown for its
-whole share, and several of them for up to the whole budget. Size a
-termination grace period for the budget plus the departure and the flush
-below. A group that ends with parts still diverging logs a `warn` with the
-cache, the co-owner, the count and the cause.
+queued; a crash loses them, up to one window of merges per key. A graceful
+`Cache::close` sends them the same way. A node with `Distributed` caches then
+reconciles the parts it owns, those folds included, with each live co-owner,
+so a write only it held reaches them. Each co-owner of each cache gets an
+equal share of `state_transfer_budget` (20 s by default), and a round that
+fails or answers `Stale` is retried within the share. A live co-owner that
+does not answer holds the shutdown for its whole share, and several of them
+for up to the whole budget. Size a termination grace period for the budget
+plus the departure and the flush below. A group that ends with parts still
+diverging logs a `warn` with the cache, the co-owner, the count and the
+cause.
 
 The shutdown also sends the writes and invalidations still queued for each
 peer before the node leaves, waiting up to 500 ms for the queues to reach the

@@ -25,8 +25,10 @@ All notable changes to this project are documented in this file. Format follows
   the node applied them locally when its last handle dropped and no peer
   received them, and a `Distributed` fold for a key the node does not own was
   discarded. Sealing the queue, whether for `Cluster::shutdown` or
-  `Cache::close`, now applies the pending folds first, so they join the final
-  drain and the leave hand-off. A crash still loses them.
+  `Cache::close`, now applies the pending folds first, and waits for a fold
+  the background sweep or an inbound invalidation has taken and not yet
+  applied, so they join the final drain and the leave hand-off. A crash still
+  loses them.
 - **A graceful leave retries a co-owner that does not answer.** A node that
   shuts down reconciles every part it owns with each live co-owner. A failed
   round or a `Stale` reply, which a membership change causes, no longer ends

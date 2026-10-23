@@ -576,9 +576,11 @@ where
     /// Held shared by every path that takes a pending fold out of its stripe,
     /// from the take through the last apply of what it took
     /// ([`Shard::begin_flush`]), and exclusively by [`Shard::clear`] around its
-    /// split of the pending keys. A key a flush has taken is then in neither
-    /// the stripes nor the engine for no longer than the flush, and the split
-    /// waits it out. Only held in synchronous sections, never across an await.
+    /// split of the pending keys and by [`Shard::seal_for_close`] while it
+    /// waits for the flushes in flight. A key a flush has taken is then in
+    /// neither the stripes nor the engine for no longer than the flush, and the
+    /// split and the seal wait it out. Only held in synchronous sections,
+    /// never across an await.
     merge_flush_gate: StdRwLock<()>,
     /// Test-only: runs between a flush's take and its apply, so a test can
     /// park the flush there.

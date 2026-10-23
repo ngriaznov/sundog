@@ -1221,10 +1221,11 @@ where
     pub async fn close(self) {
         // Sealed before the tasks are cancelled: a write accepted until
         // now is in the backlog the fan-out task drains on its way out,
-        // and a write from now on fails with `CacheError::Closed`. The
-        // seal applies the folds still pending in a merge-coalesce window
-        // first, so they join that backlog, and then the forwards held for
-        // clock skew, so the other owners take them over.
+        // and a write that must be forwarded to another owner fails with
+        // `CacheError::Closed`. The seal applies the folds still pending
+        // in a merge-coalesce window first, so they join that backlog,
+        // then hands it the forwards held for clock skew, so the other
+        // owners take them over.
         self.shard.seal_for_close();
         self.cancel.cancel();
         self.tasks.close();

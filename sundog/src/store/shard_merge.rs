@@ -474,6 +474,21 @@ where
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Returns once every flush in flight has applied what it took. A flush
+    /// that starts afterwards finds the stripes as they are then. The seal
+    /// for a close waits here after its own flush, so a fold the background
+    /// sweep or an inbound invalidation took before the seal reaches the
+    /// fan-out backlog, not the sealed queue. Waiting takes the gate's
+    /// exclusive side, the order [`Shard::keys_to_clear`] uses: gate, then
+    /// stripe.
+    pub(super) fn wait_for_flushes_in_flight(&self) {
+        drop(
+            self.merge_flush_gate
+                .write()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+    }
+
     /// Takes `select`'s pick out of one stripe and applies it, holding
     /// [`Shard::begin_flush`]'s guard across both.
     fn flush_stripe(

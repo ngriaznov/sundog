@@ -314,9 +314,10 @@ pub trait ShardOps: Send + Sync {
     /// Stops accepting writes while keeping the fan-out backlog for the
     /// fan-out task's final drain: the first step of a cluster shutdown,
     /// before its tasks are cancelled. The folds still pending in a
-    /// merge-coalesce window apply first, so they join that backlog. A write
-    /// from here on fails with [`CacheError::Closed`] instead of being
-    /// accepted and never sent.
+    /// merge-coalesce window apply first, so they join that backlog. From
+    /// here on a write that must be forwarded to another owner fails with
+    /// [`CacheError::Closed`] instead of being accepted and never sent, and a
+    /// write this node applies itself lands locally, detached.
     fn seal_fan_out(&self) {}
 
     /// This shard's current bucket-ownership view, for a `Mode::Distributed`

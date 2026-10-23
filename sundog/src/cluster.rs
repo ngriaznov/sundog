@@ -542,8 +542,10 @@ impl Cluster {
     /// applies the folds still pending in its
     /// [`merge_coalesce_window`](crate::cache::CacheBuilder::merge_coalesce_window)
     /// (a crash loses them) and seals its fan-out queue, so those folds and
-    /// every write accepted until now are sent, and a write from then on
-    /// fails with [`CacheError::Closed`](crate::error::CacheError::Closed).
+    /// every write accepted until now are sent. From then on a write that
+    /// must be forwarded to another owner fails with
+    /// [`CacheError::Closed`](crate::error::CacheError::Closed), and a write
+    /// this node applies itself lands locally, detached, and is not sent.
     /// A node with [`Mode::Distributed`] caches then reconciles the parts it
     /// owns, folds included, with each live co-owner, retrying a round that
     /// fails or answers `Stale` within that co-owner's share of
@@ -564,9 +566,10 @@ impl Cluster {
     pub async fn shutdown(self) {
         // Every cache's fan-out queue is sealed before any task is
         // cancelled: a write accepted until now stays in the backlog its
-        // fan-out task drains on the way out, and a write from now on
-        // fails with `CacheError::Closed` instead of being accepted and
-        // never sent. Each seal applies the folds still pending in a
+        // fan-out task drains on the way out, a write that must be
+        // forwarded to another owner fails with `CacheError::Closed`
+        // instead of being accepted and never sent, and a write this node
+        // applies itself lands locally, detached. Each seal applies the folds still pending in a
         // merge-coalesce window first, so they join the backlog, and the
         // leave hand-off below sees the keys they changed.
         for shard in self.inner.shards.read_shards().values() {

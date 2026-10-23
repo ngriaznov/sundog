@@ -737,6 +737,92 @@ async fn sealing_for_close_forwards_a_non_owners_pending_fold_into_the_backlog()
     }
 }
 
+/// Seals `s` for a close on its own thread while `flush` is parked between
+/// taking a fold and applying it, then releases the flush. Returns the fan-out
+/// backlog once both finished. The seal waits for the flush, so the fold the
+/// flush took is in the backlog before the queue seals.
+fn seal_while_a_flush_is_parked(
+    s: &Arc<Shard<u32, u32>>,
+    flush: impl FnOnce(&Shard<u32, u32>) + Send + 'static,
+) -> Vec<FanOutItem<u32>> {
+    let (release, flusher) = park_a_flush(s, flush);
+    let sealer = {
+        let s = Arc::clone(s);
+        std::thread::spawn(move || s.seal_for_close())
+    };
+    // Long enough that a seal which does not wait for the flush has sealed
+    // the queue.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !sealer.is_finished(),
+        "the seal waits for the flush that holds a fold"
+    );
+    release.send(()).expect("release the flush");
+    flusher.join().expect("the flush finishes");
+    sealer.join().expect("the seal finishes");
+    s.fan_out_queue().drain()
+}
+
+/// A background sweep that has taken a fold when the seal runs applies it
+/// behind the seal's flush, which found the stripe empty: the seal waits for
+/// the sweep, so the fold lands in the backlog the final drain sends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sealing_for_close_waits_for_a_sweep_that_holds_a_fold() {
+    let s = Arc::new(coalescing_shard());
+    s.merge(1, 5).await.expect("merge");
+
+    let backlog = seal_while_a_flush_is_parked(&s, |s| s.flush_due_pending_merges(u64::MAX));
+
+    assert_eq!(s.get(&1).await, Some(5), "the sweep applied the fold here");
+    assert_eq!(
+        applied_keys(backlog),
+        [1],
+        "the sweep's fold is in the backlog, not behind the seal"
+    );
+}
+
+/// A peer's invalidation applies the fold it follows before it invalidates;
+/// that flush is in flight under the same gate, so the seal waits for it too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sealing_for_close_waits_for_an_invalidation_flush_that_holds_a_fold() {
+    let s = Arc::new(coalescing_shard());
+    s.merge(2, 5).await.expect("merge");
+    let key_hash = engine::hash_key_bytes(key_bytes(&2u32).as_ref());
+    let newer = hlc(ahead_ms(), 2);
+
+    let backlog = seal_while_a_flush_is_parked(&s, move |s| {
+        s.flush_pending_merge_before(&2, key_hash, newer);
+    });
+
+    assert_eq!(s.get(&2).await, Some(5), "the flush applied the fold here");
+    assert_eq!(applied_keys(backlog), [2]);
+}
+
+/// A non-owner's fold has no copy to apply to: a sweep that has taken it when
+/// the seal runs forwards it behind the seal, which the sealed queue refuses,
+/// so the fold is lost unless the seal waits for the sweep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sealing_for_close_waits_for_a_sweep_that_holds_a_non_owners_fold() {
+    let (s, _owned, unowned) = distributed_coalescing_shard();
+    let s = Arc::new(s);
+    s.merge(unowned, 3).await.expect("merge an unowned key");
+
+    let backlog = seal_while_a_flush_is_parked(&s, |s| s.flush_due_pending_merges(u64::MAX));
+
+    let forwards = forwarded(backlog);
+    assert_eq!(
+        forwards.len(),
+        1,
+        "the fold is forwarded once: {forwards:?}"
+    );
+    assert_eq!(forwards[0].key, key_bytes(&unowned));
+    assert_eq!(
+        forwards[0].value.as_deref(),
+        Some(postcard::to_stdvec(&3u32).expect("encode").as_slice()),
+        "the owners receive the fold as the merge call made it"
+    );
+}
+
 /// A close after a cluster shutdown seals again: the second seal finds nothing
 /// pending, so the backlog holds the fold once.
 #[tokio::test]
