@@ -281,55 +281,6 @@ fn ae_entries_replies_encode_under_max_frame_when_chunked_at_the_real_budget() {
     }
 }
 
-/// A record with a `value_len`-byte value under the key `n`.
-fn pull_record(n: u8, value_len: usize) -> WireRecord {
-    WireRecord {
-        key: Bytes::copy_from_slice(&[n]),
-        value: Some(Bytes::from(vec![n; value_len])),
-        ver: Hlc {
-            wall_ms: 5,
-            logical: 0,
-            node: NodeId::from(1),
-        },
-        expires_at_ms: None,
-    }
-}
-
-#[test]
-fn a_pull_reply_keeps_the_leading_records_that_fit_its_budget() {
-    let record_len = wire::replicate_frame_len(5, 1, 1_000);
-    let records: Vec<_> = (0..10).map(|n| pull_record(n, 1_000)).collect();
-
-    let cut = super::serve::within_pull_budget(5, records.clone(), 4 * record_len);
-    assert_eq!(
-        cut,
-        records[..4],
-        "four frames fill four records' worth, in order"
-    );
-
-    let short = super::serve::within_pull_budget(5, records.clone(), 4 * record_len - 1);
-    assert_eq!(short, records[..3], "a byte less drops the fourth");
-
-    let all = super::serve::within_pull_budget(5, records.clone(), 10 * record_len);
-    assert_eq!(all, records, "a reply that fits is not touched");
-}
-
-#[test]
-fn a_pull_reply_always_carries_its_first_record() {
-    let records = vec![pull_record(1, 5_000), pull_record(2, 10)];
-
-    let cut = super::serve::within_pull_budget(5, records.clone(), 100);
-    assert_eq!(cut, records[..1], "one record past the budget still goes");
-    assert_eq!(
-        super::serve::within_pull_budget(5, records.clone(), 0),
-        records[..1]
-    );
-    assert_eq!(
-        super::serve::within_pull_budget(5, Vec::new(), 0),
-        Vec::<WireRecord>::new()
-    );
-}
-
 #[test]
 fn merge_bucket_chunk_concatenates_chunks_of_one_bucket() {
     let mut out = Vec::new();

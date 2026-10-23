@@ -649,8 +649,8 @@ async fn a_protocol_nine_peer_gets_a_large_bucket_in_several_ae_bucket_messages(
     assert_eq!(total, 300_000);
 }
 
-/// Twenty records with 1 MiB values under one-byte keys: more than a pull
-/// reply carries, from a few small keys.
+/// Twenty records with 1 MiB values under one-byte keys: a pull reply of
+/// 20 MiB from a few small keys.
 fn large_value_records() -> Vec<WireRecord> {
     (0..20u8)
         .map(|n| WireRecord {
@@ -666,8 +666,11 @@ fn large_value_records() -> Vec<WireRecord> {
         .collect()
 }
 
+/// A pull reply is whole. The requester reads every message up to `ReqDone`
+/// as the complete answer, so a reply cut short would read as keys the
+/// responder does not hold.
 #[tokio::test]
-async fn an_ae_pull_for_small_keys_with_large_values_gets_a_reply_cut_at_its_byte_budget() {
+async fn an_ae_pull_for_small_keys_with_large_values_gets_every_record() {
     let records = large_value_records();
     let handler = Arc::new(FixtureHandler {
         records: records.clone(),
@@ -683,17 +686,11 @@ async fn an_ae_pull_for_small_keys_with_large_values_gets_a_reply_cut_at_its_byt
         .await
         .expect("the pull completes");
 
-    assert_eq!(
-        got.len(),
-        15,
-        "sixteen of these frames pass the 16 MiB budget; {} records arrived",
-        got.len()
-    );
-    assert_eq!(got, records[..15], "the leading records arrive, in order");
+    assert_eq!(got, records, "every record arrives, in order");
 }
 
 #[tokio::test]
-async fn an_ae_pull_by_hash_for_large_values_gets_a_reply_cut_at_its_byte_budget() {
+async fn an_ae_pull_by_hash_for_large_values_gets_every_record() {
     let records = large_value_records();
     let ver = records[0].ver;
     let handler = Arc::new(FixtureHandler {
@@ -711,8 +708,7 @@ async fn an_ae_pull_by_hash_for_large_values_gets_a_reply_cut_at_its_byte_budget
         .await
         .expect("the pull completes");
 
-    assert_eq!(got.len(), 15, "{} records arrived", got.len());
-    assert_eq!(got, records[..15]);
+    assert_eq!(got, records, "every record arrives, in order");
 }
 
 #[tokio::test]

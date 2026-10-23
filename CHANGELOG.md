@@ -60,9 +60,10 @@ All notable changes to this project are documented in this file. Format follows
   as any other.
 - **A round of anti-entropy goes on after a failed pull.** `pull_repairs`
   asks for the next batch after one fails, and stops after two failures in a
-  row. A pull batch holds at most 512 KiB of keys beside its 4,096 keys, and a
-  pull reply carries at most 16 MiB of records, the leading ones in the order
-  asked; a record left out is pulled in a later round.
+  row. A pull batch holds at most 512 KiB of keys beside its 4,096 keys, so a
+  request of long keys fits one frame. A responder never cuts a pull reply,
+  so a reply too large to arrive within the request timeout still fails its
+  batch.
 
 ### Fixed
 

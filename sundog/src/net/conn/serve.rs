@@ -788,52 +788,6 @@ pub(super) async fn serve_ae_entries(
     send_batch_or_cancelled(framed, &replies, cancel).await
 }
 
-/// The record bytes one `AePull` or `AePullHashes` reply carries at most. The
-/// requester's whole exchange, replies included, runs under one request
-/// timeout, so a reply it cannot take in that time is discarded whole and
-/// asked for again unchanged by the next round. 16 MiB is four frames, which
-/// even a slow link takes in well inside the timeout.
-pub(super) const AE_PULL_REPLY_BUDGET: usize = 16 * 1024 * 1024;
-
-/// The leading records of `records`, in order, whose frames under a cache
-/// name of `cache_len` bytes add up to at most `budget`, and at least the
-/// first record, so a reply always makes progress. Records left out stay
-/// different on the requester, which asks for them again in a later round,
-/// as it does for a key the responder does not hold. Pure; unit tested
-/// directly.
-pub(super) fn within_pull_budget(
-    cache_len: usize,
-    mut records: Vec<WireRecord>,
-    budget: usize,
-) -> Vec<WireRecord> {
-    let mut used = 0usize;
-    let mut kept = 0usize;
-    for rec in &records {
-        let len = wire::replicate_frame_len(
-            cache_len,
-            rec.key.len(),
-            rec.value.as_ref().map_or(0, Bytes::len),
-        );
-        if kept > 0 && used.saturating_add(len) > budget {
-            break;
-        }
-        used = used.saturating_add(len);
-        kept += 1;
-    }
-    if kept < records.len() {
-        tracing::debug!(
-            sent = kept,
-            left = records.len() - kept,
-            budget,
-            "cut a pull reply at its byte budget; the records left out are pulled in a later round"
-        );
-        records.truncate(kept);
-    }
-    records
-}
-
-/// Serves an `AePull` request: the records for `keys`, cut at
-/// [`AE_PULL_REPLY_BUDGET`] bytes.
 pub(super) async fn serve_ae_pull(
     framed: &mut PeerFramed,
     cache: SmolStr,
@@ -841,19 +795,14 @@ pub(super) async fn serve_ae_pull(
     handler: &dyn RequestHandler,
     cancel: &CancellationToken,
 ) -> bool {
-    let records = within_pull_budget(
-        cache.len(),
-        handler.records_for(cache.clone(), keys).await,
-        AE_PULL_REPLY_BUDGET,
-    );
+    let records = handler.records_for(cache.clone(), keys).await;
     let mut replies = crate::net::batch_replicate(&cache, records);
     replies.push(Msg::ReqDone);
     send_batch_or_cancelled(framed, &replies, cancel).await
 }
 
 /// Serves an `AePullHashes` request, the sketch-decoded counterpart to
-/// [`serve_ae_pull`]: records for `bucket`'s entries whose key hash is in `hashes`,
-/// cut at the same byte budget.
+/// [`serve_ae_pull`]: records for `bucket`'s entries whose key hash is in `hashes`.
 pub(super) async fn serve_ae_pull_hashes(
     framed: &mut PeerFramed,
     cache: SmolStr,
@@ -862,13 +811,9 @@ pub(super) async fn serve_ae_pull_hashes(
     handler: &dyn RequestHandler,
     cancel: &CancellationToken,
 ) -> bool {
-    let records = within_pull_budget(
-        cache.len(),
-        handler
-            .records_for_hashes(cache.clone(), bucket, hashes)
-            .await,
-        AE_PULL_REPLY_BUDGET,
-    );
+    let records = handler
+        .records_for_hashes(cache.clone(), bucket, hashes)
+        .await;
     let mut replies = crate::net::batch_replicate(&cache, records);
     replies.push(Msg::ReqDone);
     send_batch_or_cancelled(framed, &replies, cancel).await
