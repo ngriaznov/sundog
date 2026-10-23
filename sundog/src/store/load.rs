@@ -144,16 +144,87 @@ where
     }
 }
 
+/// How a stored fill's deadline is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FillExpiry {
+    /// This node's loader produced the value: the shard's default TTL,
+    /// counted from the load's own stamp.
+    Loaded,
+    /// A copy of a record another node stores: that record's absolute expiry
+    /// in epoch milliseconds, `None` when the source entry has none. The
+    /// copy expires at the source's instant.
+    Copied(Option<u64>),
+}
+
+/// A value to store as a fill, with how its deadline is set.
+pub(crate) struct Fill<V> {
+    pub(crate) value: V,
+    pub(crate) expiry: FillExpiry,
+}
+
+impl<V> Fill<V> {
+    /// A value this node's loader produced.
+    pub(crate) fn loaded(value: V) -> Self {
+        Self {
+            value,
+            expiry: FillExpiry::Loaded,
+        }
+    }
+}
+
+/// What a fill's deadline comes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FillDeadline {
+    /// The fill is stored and expires at this instant, never when `None`.
+    Store(Option<u64>),
+    /// A copy whose source record has already expired: it answers the caller
+    /// and every joined waiter and is stored nowhere.
+    Lapsed,
+}
+
+/// The deadline of a fill that completes at `now_ms`. A value this node's
+/// loader produced takes `own`, the shard's default TTL counted from the
+/// load's stamp. A copy keeps its source's instant: a source with none
+/// leaves the copy with none, and a source at or before `now_ms` has lapsed.
+/// Pure; unit tested directly.
+pub(super) const fn fill_deadline(
+    expiry: FillExpiry,
+    own: Option<u64>,
+    now_ms: u64,
+) -> FillDeadline {
+    match expiry {
+        FillExpiry::Loaded => FillDeadline::Store(own),
+        FillExpiry::Copied(Some(at)) if at <= now_ms => FillDeadline::Lapsed,
+        FillExpiry::Copied(at) => FillDeadline::Store(at),
+    }
+}
+
 /// What a [`SourceFn`] returned for one batch: the values to store as fills
 /// and the values to answer with but not store, such as a value another
 /// node loaded for a key this node does not own. A key in neither is one
 /// the source does not hold. A `store` value goes through
 /// [`Shard::get_or_load`]'s fill route, so on a `Mode::Distributed` node
 /// that does not own the key it answers like an `answer` value and is
-/// stored nowhere.
+/// stored nowhere. A `store` value carries how its deadline is set
+/// ([`FillExpiry`]); a copy of another node's record that has already
+/// expired is answered and not stored.
 pub(crate) struct Sourced<K, V> {
-    pub(crate) store: HashMap<K, V>,
+    pub(crate) store: HashMap<K, Fill<V>>,
     pub(crate) answer: HashMap<K, V>,
+}
+
+impl<K: Hash + Eq, V> Sourced<K, V> {
+    /// What this node's loader returned: every value is a fill the loader
+    /// produced.
+    pub(crate) fn loaded(values: HashMap<K, V>) -> Self {
+        Self {
+            store: values
+                .into_iter()
+                .map(|(key, value)| (key, Fill::loaded(value)))
+                .collect(),
+            answer: HashMap::new(),
+        }
+    }
 }
 
 /// Where a batch's keys are read from: the registered loader, or a router
@@ -338,12 +409,7 @@ where
     /// [`CacheError::Codec`] if `key` fails to encode.
     pub async fn load(&self, key: &K) -> Result<Option<V>, CacheError> {
         self.load_from(key, &|keys| {
-            Box::pin(async move {
-                Ok(Sourced {
-                    store: self.call_loader(keys).await?,
-                    answer: HashMap::new(),
-                })
-            })
+            Box::pin(async move { Ok(Sourced::loaded(self.call_loader(keys).await?)) })
         })
         .await
     }
@@ -384,12 +450,7 @@ where
         keys: impl IntoIterator<Item = K>,
     ) -> Result<HashMap<K, V>, CacheError> {
         self.load_many_from(keys, &|keys| {
-            Box::pin(async move {
-                Ok(Sourced {
-                    store: self.call_loader(keys).await?,
-                    answer: HashMap::new(),
-                })
-            })
+            Box::pin(async move { Ok(Sourced::loaded(self.call_loader(keys).await?)) })
         })
         .await
     }
@@ -690,9 +751,10 @@ where
     /// One source call: fills each key's slot before ending its in-flight
     /// load, so every waiter it wakes finds the outcome. A key the source
     /// returns to store is stored like a [`Shard::get_or_load`] fill, which
-    /// a `Mode::Distributed` non-owner answers without storing, one
-    /// it returns to answer with ends uncached, a key it leaves out ends
-    /// absent, and a failure fails every key. Each counts as a miss.
+    /// a `Mode::Distributed` non-owner answers without storing, under the
+    /// deadline its [`FillExpiry`] sets; one it returns to answer with ends
+    /// uncached, a key it leaves out ends absent, and a failure fails every
+    /// key. Each counts as a miss.
     /// Dropping this future mid-call releases every load it holds.
     async fn run_chunk(&self, source: &SourceFn<'_, K, V>, chunk: Vec<Queued<K, V>>) {
         let guards: Vec<_> = chunk
@@ -712,15 +774,15 @@ where
                 mut answer,
             }) => {
                 for (item, guard) in chunk.into_iter().zip(guards) {
-                    if let Some(value) = store.remove(&item.key) {
-                        let _ = item.slot.set(Ok(Some(value.clone())));
+                    if let Some(fill) = store.remove(&item.key) {
+                        let _ = item.slot.set(Ok(Some(fill.value.clone())));
                         self.finish_fill(
                             &item.key,
                             &item.key_bytes,
                             item.hash,
                             item.ver,
                             &item.inflight,
-                            value,
+                            fill,
                         );
                     } else if let Some(value) = answer.remove(&item.key) {
                         let _ = item.slot.set(Ok(Some(value.clone())));
@@ -760,13 +822,13 @@ where
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use smol_str::SmolStr;
 
     use super::*;
     use crate::node::NodeId;
-    use crate::store::{Event, FanOutItem, Mode, Origin, ShardOps};
+    use crate::store::{Event, FanOutItem, Mode, Origin, ShardOps, Ttl};
 
     #[derive(Debug, thiserror::Error)]
     #[error("source unavailable")]
@@ -808,6 +870,79 @@ mod tests {
 
     fn calls_of(calls: &Calls) -> Vec<Vec<u32>> {
         calls.lock().expect("calls lock").clone()
+    }
+
+    /// A shard whose clock a test holds at `clock`, under `ttl` as its
+    /// default lifetime.
+    fn clocked(mode: Mode, ttl: Option<Duration>, clock: &Arc<AtomicU64>) -> Shard<u32, String> {
+        let reader = Arc::clone(clock);
+        Shard::new(
+            SmolStr::new("test"),
+            mode,
+            NodeId::from(1),
+            10_000,
+            ttl,
+            None,
+        )
+        .with_clock(Arc::new(move || reader.load(Ordering::SeqCst)))
+    }
+
+    /// A source that returns each of `values` to store, with the expiry it
+    /// names, and answers with nothing else.
+    fn storing(
+        values: Vec<(u32, &'static str, FillExpiry)>,
+    ) -> impl Fn(Vec<u32>) -> BoxFuture<'static, Result<Sourced<u32, String>, LoadError>> + Send + Sync
+    {
+        move |_keys| {
+            let store = values
+                .iter()
+                .map(|(key, value, expiry)| {
+                    (
+                        *key,
+                        Fill {
+                            value: (*value).to_string(),
+                            expiry: *expiry,
+                        },
+                    )
+                })
+                .collect();
+            Box::pin(async move {
+                Ok(Sourced {
+                    store,
+                    answer: HashMap::new(),
+                })
+            })
+        }
+    }
+
+    /// A source that returns key 2 as a copy expiring at `expires_at_ms`
+    /// once `release` fires, after telling `started` it runs.
+    fn blocking_copy(
+        started: &Arc<Notify>,
+        release: &Arc<Notify>,
+        expires_at_ms: u64,
+    ) -> impl Fn(Vec<u32>) -> BoxFuture<'static, Result<Sourced<u32, String>, LoadError>>
+    + Send
+    + Sync
+    + use<> {
+        let (started, release) = (Arc::clone(started), Arc::clone(release));
+        move |_keys| {
+            let (started, release) = (Arc::clone(&started), Arc::clone(&release));
+            Box::pin(async move {
+                started.notify_one();
+                release.notified().await;
+                Ok(Sourced {
+                    store: HashMap::from([(
+                        2,
+                        Fill {
+                            value: "copy".to_string(),
+                            expiry: FillExpiry::Copied(Some(expires_at_ms)),
+                        },
+                    )]),
+                    answer: HashMap::new(),
+                })
+            })
+        }
     }
 
     #[tokio::test]
@@ -1059,6 +1194,283 @@ mod tests {
         let (loaded, ()) = tokio::join!(s.load(&2), race);
         assert_eq!(loaded.expect("load"), Some("stale".to_string()));
         assert_eq!(s.get(&2).await, None);
+    }
+
+    #[test]
+    fn fill_deadline_gives_a_loaded_value_its_own_and_a_copy_its_sources() {
+        let table = [
+            // (expiry, own, now, expected)
+            (
+                FillExpiry::Loaded,
+                Some(500),
+                100,
+                FillDeadline::Store(Some(500)),
+            ),
+            (FillExpiry::Loaded, None, 100, FillDeadline::Store(None)),
+            (
+                FillExpiry::Loaded,
+                Some(50),
+                100,
+                FillDeadline::Store(Some(50)),
+            ),
+            (
+                FillExpiry::Copied(Some(900)),
+                Some(500),
+                100,
+                FillDeadline::Store(Some(900)),
+            ),
+            (
+                FillExpiry::Copied(Some(900)),
+                None,
+                100,
+                FillDeadline::Store(Some(900)),
+            ),
+            (
+                FillExpiry::Copied(None),
+                Some(500),
+                100,
+                FillDeadline::Store(None),
+            ),
+            (
+                FillExpiry::Copied(None),
+                None,
+                100,
+                FillDeadline::Store(None),
+            ),
+            (
+                FillExpiry::Copied(Some(101)),
+                Some(500),
+                100,
+                FillDeadline::Store(Some(101)),
+            ),
+            (
+                FillExpiry::Copied(Some(100)),
+                Some(500),
+                100,
+                FillDeadline::Lapsed,
+            ),
+            (
+                FillExpiry::Copied(Some(99)),
+                None,
+                100,
+                FillDeadline::Lapsed,
+            ),
+            (
+                FillExpiry::Copied(Some(0)),
+                Some(500),
+                0,
+                FillDeadline::Lapsed,
+            ),
+            (
+                FillExpiry::Copied(Some(0)),
+                Some(500),
+                1,
+                FillDeadline::Lapsed,
+            ),
+        ];
+        for (expiry, own, now_ms, expected) in table {
+            assert_eq!(
+                fill_deadline(expiry, own, now_ms),
+                expected,
+                "{expiry:?} with own {own:?} at {now_ms}"
+            );
+        }
+    }
+
+    #[test]
+    fn sourced_loaded_marks_every_value_as_a_fill_the_loader_produced() {
+        let sourced = Sourced::loaded(HashMap::from([(1u32, "a"), (2, "b")]));
+        assert!(sourced.answer.is_empty());
+        assert_eq!(sourced.store.len(), 2);
+        for (key, fill) in &sourced.store {
+            assert_eq!(fill.expiry, FillExpiry::Loaded, "key {key}");
+        }
+        assert_eq!(sourced.store[&1].value, "a");
+        let fill = Fill::loaded(7u8);
+        assert_eq!((fill.value, fill.expiry), (7, FillExpiry::Loaded));
+    }
+
+    #[tokio::test]
+    async fn load_many_from_stores_a_copy_at_its_sources_expiry() {
+        let clock = Arc::new(AtomicU64::new(1_000_000));
+        let calls = Calls::default();
+        let s = clocked(Mode::Invalidation, Some(Duration::from_secs(60)), &clock)
+            .with_loader(recording_loader(&calls));
+        let source = storing(vec![(2, "copy", FillExpiry::Copied(Some(1_005_000)))]);
+
+        let found = s
+            .load_many_from([2], &source)
+            .await
+            .expect("load_many_from");
+
+        assert_eq!(found, HashMap::from([(2, "copy".to_string())]));
+        assert_eq!(
+            s.ttl_of(&2),
+            Some(Ttl::Remaining(Duration::from_secs(5))),
+            "the copy keeps the source's 5s, not the shard's 60s default"
+        );
+        assert_eq!(calls_of(&calls), Vec::<Vec<u32>>::new(), "no loader call");
+        clock.store(1_005_001, Ordering::SeqCst);
+        assert_eq!(
+            s.get(&2).await,
+            None,
+            "the copy ends at the source's instant"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_many_from_gives_a_copy_with_no_source_expiry_no_deadline() {
+        let clock = Arc::new(AtomicU64::new(1_000_000));
+        let s = clocked(Mode::Invalidation, Some(Duration::from_secs(60)), &clock)
+            .with_loader(recording_loader(&Calls::default()));
+        let source = storing(vec![
+            (2, "copy", FillExpiry::Copied(None)),
+            (4, "loaded", FillExpiry::Loaded),
+        ]);
+
+        s.load_many_from([2, 4], &source)
+            .await
+            .expect("load_many_from");
+
+        assert_eq!(
+            s.ttl_of(&2),
+            Some(Ttl::Never),
+            "the source entry has no deadline, so the copy has none"
+        );
+        assert_eq!(
+            s.ttl_of(&4),
+            Some(Ttl::Remaining(Duration::from_secs(60))),
+            "a value the loader produced takes the default TTL"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_many_from_answers_a_copy_past_its_expiry_and_stores_nothing() {
+        let clock = Arc::new(AtomicU64::new(1_000_000));
+        let s = clocked(Mode::Replicated, Some(Duration::from_secs(60)), &clock)
+            .with_loader(recording_loader(&Calls::default()));
+        let mut events = s.events();
+        let source = storing(vec![
+            (2, "at", FillExpiry::Copied(Some(1_000_000))),
+            (4, "before", FillExpiry::Copied(Some(999_999))),
+            (6, "live", FillExpiry::Copied(Some(1_000_001))),
+        ]);
+
+        let found = s
+            .load_many_from([2, 4, 6], &source)
+            .await
+            .expect("load_many_from");
+
+        assert_eq!(
+            found,
+            HashMap::from([
+                (2, "at".to_string()),
+                (4, "before".to_string()),
+                (6, "live".to_string())
+            ]),
+            "every copy answers the caller"
+        );
+        assert_eq!(s.get(&2).await, None, "a copy expiring now is not stored");
+        assert_eq!(s.get(&4).await, None, "a lapsed copy is not stored");
+        assert_eq!(s.get(&6).await, Some("live".to_string()));
+        assert!(
+            matches!(&s.fan_out.drain()[..], [FanOutItem::Applied(6, _)]),
+            "only the stored copy fans out"
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::Created {
+                key: 6,
+                origin: Origin::Local,
+                ..
+            })
+        ));
+        assert!(
+            events.try_recv().is_err(),
+            "a value stored nowhere emits no event"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalidation_during_a_load_leaves_a_copy_uncached() {
+        let (started, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        let s = shard(Mode::Invalidation).with_loader(recording_loader(&Calls::default()));
+        let source = blocking_copy(&started, &release, super::super::now_ms() + 60_000);
+        let race = async {
+            started.notified().await;
+            let key_bytes = Bytes::from(postcard::to_stdvec(&2u32).expect("encode"));
+            let ver = Hlc {
+                wall_ms: super::super::now_ms(),
+                logical: 0,
+                node: NodeId::from(2),
+            };
+            ShardOps::invalidate(&s, key_bytes, ver).await;
+            release.notify_one();
+        };
+
+        let (found, ()) = tokio::join!(s.load_many_from([2], &source), race);
+
+        assert_eq!(
+            found.expect("load_many_from"),
+            HashMap::from([(2, "copy".to_string())]),
+            "the load answers with the copy"
+        );
+        assert_eq!(s.get(&2).await, None, "the invalidation wins over the copy");
+    }
+
+    #[tokio::test]
+    async fn a_write_during_a_load_outranks_a_copy() {
+        let (started, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        let s = shard(Mode::Invalidation).with_loader(recording_loader(&Calls::default()));
+        let source = blocking_copy(&started, &release, super::super::now_ms() + 60_000);
+        let race = async {
+            started.notified().await;
+            s.insert(2, "fresh".to_string()).await.expect("insert");
+            release.notify_one();
+        };
+
+        let (found, ()) = tokio::join!(s.load_many_from([2], &source), race);
+
+        assert_eq!(
+            found.expect("load_many_from"),
+            HashMap::from([(2, "copy".to_string())])
+        );
+        assert_eq!(
+            s.get(&2).await,
+            Some("fresh".to_string()),
+            "the write stamped after the load began keeps its place over the copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_loaded_value_takes_the_default_ttl_in_every_mode() {
+        for mode in [
+            Mode::Local,
+            Mode::Replicated,
+            Mode::Invalidation,
+            Mode::distributed(),
+        ] {
+            let clock = Arc::new(AtomicU64::new(1_000_000));
+            let calls = Calls::default();
+            let s = clocked(mode, Some(Duration::from_secs(60)), &clock)
+                .with_loader(recording_loader(&calls));
+            assert_eq!(s.load(&2).await.expect("load"), Some("v2".to_string()));
+            assert_eq!(
+                s.ttl_of(&2),
+                Some(Ttl::Remaining(Duration::from_secs(60))),
+                "{mode:?}: the loader's value is stamped now and takes the default TTL"
+            );
+            let bare = clocked(mode, None, &clock).with_loader(recording_loader(&calls));
+            assert_eq!(
+                bare.load_many([4]).await.expect("load_many"),
+                HashMap::from([(4, "v4".to_string())])
+            );
+            assert_eq!(
+                bare.ttl_of(&4),
+                Some(Ttl::Never),
+                "{mode:?}: with no default TTL a loaded value has no deadline"
+            );
+        }
     }
 
     #[test]

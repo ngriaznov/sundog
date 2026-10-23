@@ -895,7 +895,11 @@ where
     /// it and fans it out to the other owners. An owner that declines never
     /// ran its loader. A request that failed after the owner received it can
     /// have run it, so such a key can load on that owner and again on the
-    /// next node.
+    /// next node. In [`Mode::Invalidation`] a value this node copies from
+    /// the node the key's loads gather on keeps that node's expiry: the copy
+    /// ends at the instant the source entry does, has no deadline when the
+    /// source entry has none, and answers the caller without being stored
+    /// when the source entry has already expired.
     ///
     /// # Errors
     ///

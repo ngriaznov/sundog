@@ -18,7 +18,9 @@ use crate::cluster::Cluster;
 use crate::error::{CodecError, RemoteLoaderError};
 use crate::net::LoadOutcome;
 use crate::node::NodeId;
-use crate::store::{LoadError, Mode, PartId, RefreshRequest, Shard, ShardOps, Sourced, encode_key};
+use crate::store::{
+    Fill, FillExpiry, LoadError, Mode, PartId, RefreshRequest, Shard, ShardOps, Sourced, encode_key,
+};
 
 /// The live peers a key of cache `name`, open here under `mode`, may load
 /// or refresh on: they speak [`crate::wire::PROTOCOL_LOAD`], advertise a
@@ -46,6 +48,18 @@ fn loader_peers(cluster: &Cluster, name: &str, mode: Mode) -> HashSet<NodeId> {
 /// directly.
 pub(super) fn routes_loads(mode: Mode) -> bool {
     matches!(mode, Mode::Invalidation | Mode::Distributed { .. })
+}
+
+/// How `mode` takes a record a peer stored for a load, whose expiry is
+/// `expires_at_ms`. `Mode::Invalidation` caches its own working set, so the
+/// record is a copy to store here, and it keeps the record's expiry: it
+/// expires at the instant the peer's entry does, never later. Every other
+/// mode answers the caller with the value and stores nothing from the peer's
+/// answer: a `Mode::Distributed` non-owner keeps no copy, and a node that
+/// owns the key receives the stored value by the loader's fan-out. Pure;
+/// unit tested directly.
+pub(super) fn copy_expiry(mode: Mode, expires_at_ms: Option<u64>) -> Option<FillExpiry> {
+    matches!(mode, Mode::Invalidation).then_some(FillExpiry::Copied(expires_at_ms))
 }
 
 /// The node a key's loads gather on, from this node's side.
@@ -220,13 +234,14 @@ where
     /// owners; only a key no owner takes is loaded here. An owner that loads
     /// stores the value and fans it out to the other owners; a node that
     /// owns nothing of the key answers with the value and keeps no copy.
-    /// In `Mode::Invalidation` a key whose peer declines or cannot be reached
-    /// is loaded here. A peer that declines never ran its loader, so a
-    /// declined key loads once. A request that fails after the peer received
-    /// it can have run the peer's loader, which the requester cannot tell
-    /// from one that never arrived, so such a key can load on that peer and
-    /// again on the next node. A peer whose loader fails fails the batch with
-    /// [`RemoteLoaderError`].
+    /// In `Mode::Invalidation` a value the peer stores comes back as a copy
+    /// that expires when the peer's entry does ([`copy_expiry`]), and a key
+    /// whose peer declines or cannot be reached is loaded here. A peer that
+    /// declines never ran its loader, so a declined key loads once. A
+    /// request that fails after the peer received it can have run the peer's
+    /// loader, which the requester cannot tell from one that never arrived,
+    /// so such a key can load on that peer and again on the next node. A peer
+    /// whose loader fails fails the batch with [`RemoteLoaderError`].
     pub(super) async fn route_load(&self, keys: Vec<K>) -> Result<Sourced<K, V>, LoadError> {
         let name = SmolStr::new(self.shard.name());
         self.route_load_via(keys, &|peer, request| {
@@ -282,7 +297,11 @@ where
                     .map(|(peer, keys)| self.load_on(peer, keys, ask)),
             );
             let (local, remotes) = tokio::join!(local, remotes);
-            sourced.store.extend(local?);
+            sourced.store.extend(
+                local?
+                    .into_iter()
+                    .map(|(key, value)| (key, Fill::loaded(value))),
+            );
             for asked in remotes {
                 match asked? {
                     Asked::Answered(answer) => {
@@ -300,7 +319,8 @@ where
 
     /// Asks `peer`, through `ask`, to load `keys`. A record it stores comes
     /// back to be stored here too in `Mode::Invalidation`, where each node
-    /// caches its own working set, and only answered with in
+    /// caches its own working set, as a copy that expires when the record
+    /// does ([`copy_expiry`]), and only answered with in
     /// `Mode::Distributed`, where `peer` owns the key and this node may not.
     /// A peer that declines or cannot be reached is marked tried on each key,
     /// and the keys come back as [`Asked::Passed`] for the next node.
@@ -338,20 +358,21 @@ where
             store: HashMap::new(),
             answer: HashMap::new(),
         };
-        let stores_here = matches!(self.shard.mode(), Mode::Invalidation);
-        let records = found
-            .into_iter()
-            .filter_map(|rec| rec.value.map(|value| (rec.key, value, stores_here)));
-        let values = uncached.into_iter().map(|(key, value)| (key, value, false));
-        for (key_bytes, value_bytes, store) in records.chain(values) {
+        let mode = self.shard.mode();
+        let records = found.into_iter().filter_map(|rec| {
+            rec.value
+                .map(|value| (rec.key, value, copy_expiry(mode, rec.expires_at_ms)))
+        });
+        let values = uncached.into_iter().map(|(key, value)| (key, value, None));
+        for (key_bytes, value_bytes, expiry) in records.chain(values) {
             let (Some(key), Ok(value)) = (
                 by_bytes.remove(&key_bytes),
                 postcard::from_bytes::<V>(&value_bytes),
             ) else {
                 continue;
             };
-            if store {
-                sourced.store.insert(key, value);
+            if let Some(expiry) = expiry {
+                sourced.store.insert(key, Fill { value, expiry });
             } else {
                 sourced.answer.insert(key, value);
             }

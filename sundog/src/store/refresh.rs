@@ -18,6 +18,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 
+use super::load::Fill;
 use super::{Shard, encode_key, engine};
 use crate::hlc::Hlc;
 
@@ -356,7 +357,7 @@ where
                             hash,
                             ver,
                             &inflight,
-                            value,
+                            Fill::loaded(value),
                         );
                         tally.loaded += 1;
                     } else {

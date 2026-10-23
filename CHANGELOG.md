@@ -7,6 +7,18 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **An `Invalidation` copy made through `load` expires at the source's
+  instant.** `Cache::load` and `Cache::load_many` stored a value copied from
+  the node a key's loads gather on with a fresh lifetime: the cache's default
+  TTL counted from the requester's own clock, and none when the cache has no
+  default TTL. The copy outlived the source entry by up to the whole TTL, and
+  an entry written with `insert_with_ttl` never expired on the requester in a
+  cache with no default TTL. The copy now carries the source record's absolute
+  expiry, so it ends when the source entry does, has no deadline when the
+  source entry has none, and is answered and not stored when the source entry
+  has already expired. A write or invalidation that lands during the load
+  still wins over the copy. `Local`, `Replicated` and `Distributed` loads
+  expire as before.
 - **A graceful shutdown sends the merges a coalesce window still holds.**
   `Cluster::shutdown` sealed each cache's write queue without flushing the
   folds that `Cache::merge` had accepted into a `merge_coalesce_window`, so

@@ -98,6 +98,13 @@ again on the next node. A node whose loader fails fails the read with a
 `Replicated` caches load on the node that misses, and a `Replicated` value
 reaches every node once loaded.
 
+In `Invalidation`, a value copied from the node the key's load gathered on
+keeps that node's expiry. The copy ends at the instant the source entry does,
+whether the source holds the cache's `ttl` counted from its own load or the
+lifetime of an `insert_with_ttl`, and a source entry with no expiry leaves the
+copy with none. A source entry already past its expiry when the copy arrives
+answers the read and is not stored.
+
 A load that an invalidation overtakes, a peer's write announced while the
 loader still read the old row, answers its callers and stores nothing.
 [Operations](../operations.md#registered-loaders) lists the metrics that count

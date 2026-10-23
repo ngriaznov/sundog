@@ -1,7 +1,13 @@
 //! Tests of the registered loader, batch windows and refresh-ahead.
 
+use bytes::Bytes;
+use futures::future::BoxFuture;
+
 use super::*;
-use crate::error::RemoteLoaderError;
+use crate::cache::load::{Asked, Routed};
+use crate::error::{CodecError, RemoteLoaderError};
+use crate::net::LoadOutcome;
+use crate::store::{FillExpiry, Sourced};
 
 #[tokio::test]
 async fn load_and_load_many_read_through_the_registered_loader() {
@@ -322,6 +328,348 @@ async fn a_failing_remote_loader_answers_with_a_remote_loader_error() {
         "a remote failure is not retried here"
     );
     shut_down_all(nodes).await;
+}
+
+/// Two `Mode::Invalidation` nodes with `name` open, each with a batch loader
+/// that records its calls in `log` and holds `v{key}`, under `ttl` as the
+/// cache's default TTL. Returns once each node sees the other advertise a
+/// loader.
+async fn two_invalidation_loaders(
+    name: &'static str,
+    ttl: Option<Duration>,
+    log: &LoadLog,
+) -> Vec<(Cluster, Cache<u32, String>)> {
+    let mut nodes: Vec<(Cluster, Cache<u32, String>)> = Vec::new();
+    for index in 0..2 {
+        let builder = Cluster::builder(name).config(loopback_config().with(|c| {
+            c.fetch_timeout = Duration::from_secs(5);
+            c.phi_threshold = 1_000.0;
+        }));
+        let cluster = match nodes.first() {
+            None => builder.seeds(std::iter::empty()),
+            Some((seed, _)) => builder.seeds([seed.local_gossip_addr()]),
+        }
+        .build()
+        .await
+        .expect("node builds");
+        wait_for_peer_count(&cluster, index).await;
+        let node = cluster.node_id();
+        let log = Arc::clone(log);
+        let mut cache = cluster.cache::<u32, String>(name).mode(Mode::Invalidation);
+        if let Some(ttl) = ttl {
+            cache = cache.ttl(ttl);
+        }
+        let cache = cache
+            .batch_loader(move |keys: Vec<u32>| {
+                let log = Arc::clone(&log);
+                async move {
+                    let mut sorted = keys.clone();
+                    sorted.sort_unstable();
+                    log.lock().expect("log lock").push((node, sorted));
+                    Ok::<_, SourceDown>(
+                        keys.into_iter()
+                            .map(|key| (key, format!("v{key}")))
+                            .collect::<HashMap<_, _>>(),
+                    )
+                }
+            })
+            .open()
+            .await
+            .expect("opens");
+        nodes.push((cluster, cache));
+    }
+    wait_until(
+        CONVERGE,
+        "every node sees the other advertise a loader",
+        async || {
+            nodes
+                .iter()
+                .all(|(_, cache)| cache.loader_peers().len() == 1)
+        },
+    )
+    .await;
+    nodes
+}
+
+/// A key whose loads `requester` sends to `winner`, the node its loads
+/// gather on.
+fn key_gathering_on(requester: &(Cluster, Cache<u32, String>), winner: NodeId) -> u32 {
+    let capable = requester.1.loader_peers();
+    (0..10_000u32)
+        .find(|key| {
+            let part = PartId::of_key(&encode_key(key).expect("u32 encodes"));
+            load_target(
+                Mode::Invalidation,
+                part,
+                requester.0.node_id(),
+                &[],
+                &capable,
+                &HashSet::new(),
+            ) == LoadTarget::Peer(winner)
+        })
+        .expect("a key whose loads gather on the winner")
+}
+
+/// Has `source` write `key` for `ttl` and waits until the invalidation that
+/// write sends has dropped the copy `reader` held, so a load `reader` starts
+/// next cannot be discarded by it. The write is stamped a millisecond after
+/// the copy, so it is the newer.
+async fn source_writes_and_reader_drops_its_copy(
+    source: &Cache<u32, String>,
+    reader: &Cache<u32, String>,
+    key: u32,
+    ttl: Duration,
+) {
+    reader
+        .insert(key, "stale".to_string())
+        .await
+        .expect("insert");
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    source
+        .insert_with_ttl(key, "inserted".to_string(), ttl)
+        .await
+        .expect("insert");
+    wait_until(CONVERGE, "the reader's copy is invalidated", async || {
+        reader.get(&key).await.is_none()
+    })
+    .await;
+}
+
+/// The absolute expiry `cache` stores for the live `key`.
+fn stored_expiry(cache: &Cache<u32, String>, key: u32) -> Option<u64> {
+    match cache
+        .shard
+        .local_record(&encode_key(&key).expect("u32 encodes"))
+        .1
+    {
+        LocalRecord::Live { expires_at_ms, .. } => expires_at_ms,
+        other => panic!("a live entry, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_invalidation_load_copy_expires_at_the_sources_instant() {
+    let log = LoadLog::default();
+    let nodes = two_invalidation_loaders(
+        "cache-it-load-copy-expiry",
+        Some(Duration::from_secs(3600)),
+        &log,
+    )
+    .await;
+    let (a, cache_a) = &nodes[0];
+    let cache_b = &nodes[1].1;
+    let key = key_gathering_on(&nodes[1], a.node_id());
+    source_writes_and_reader_drops_its_copy(cache_a, cache_b, key, Duration::from_secs(5)).await;
+
+    let got = cache_b.load(&key).await.expect("load");
+
+    assert_eq!(got, Some("inserted".to_string()), "answered from a's cache");
+    assert!(
+        log.lock().expect("log lock").is_empty(),
+        "no source call: {:?}",
+        log.lock().expect("log lock")
+    );
+    match cache_b.ttl_of(&key) {
+        Some(Ttl::Remaining(left)) => assert!(
+            left <= Duration::from_secs(5),
+            "b's copy of a 5s record must not outlive a's expiry, but has {left:?} left"
+        ),
+        other => panic!("b holds the copy with a finite ttl, got {other:?}"),
+    }
+    assert_eq!(
+        stored_expiry(cache_b, key),
+        stored_expiry(cache_a, key),
+        "the copy expires at the instant the source does"
+    );
+    shut_down_all(nodes).await;
+}
+
+#[tokio::test]
+async fn an_invalidation_load_copy_of_a_loaded_value_ends_when_the_loading_nodes_entry_does() {
+    let log = LoadLog::default();
+    let nodes = two_invalidation_loaders(
+        "cache-it-load-copy-loaded",
+        Some(Duration::from_secs(60)),
+        &log,
+    )
+    .await;
+    let (a, cache_a) = &nodes[0];
+    let cache_b = &nodes[1].1;
+    let key = key_gathering_on(&nodes[1], a.node_id());
+    assert_eq!(
+        cache_a.load(&key).await.expect("load"),
+        Some(format!("v{key}"))
+    );
+    // b stamps its own load well after a stamped the source copy.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let got = cache_b.load(&key).await.expect("load");
+
+    assert_eq!(got, Some(format!("v{key}")));
+    assert_eq!(
+        log.lock().expect("log lock").clone(),
+        vec![(a.node_id(), vec![key])],
+        "the source ran once, on a"
+    );
+    let Some(Ttl::Remaining(source_left)) = cache_a.ttl_of(&key) else {
+        panic!("a holds the loaded value with a finite ttl");
+    };
+    let Some(Ttl::Remaining(copy_left)) = cache_b.ttl_of(&key) else {
+        panic!("b holds the copy with a finite ttl");
+    };
+    assert!(
+        copy_left <= source_left,
+        "b's copy has {copy_left:?} left, a's entry {source_left:?}"
+    );
+    assert_eq!(
+        stored_expiry(cache_b, key),
+        stored_expiry(cache_a, key),
+        "the copy expires at the instant the source does"
+    );
+    shut_down_all(nodes).await;
+}
+
+#[tokio::test]
+async fn an_invalidation_load_many_copy_of_a_ttl_entry_expires_in_a_cache_with_no_default_ttl() {
+    let log = LoadLog::default();
+    let nodes = two_invalidation_loaders("cache-it-load-copy-no-default", None, &log).await;
+    let (a, cache_a) = &nodes[0];
+    let cache_b = &nodes[1].1;
+    let key = key_gathering_on(&nodes[1], a.node_id());
+    source_writes_and_reader_drops_its_copy(cache_a, cache_b, key, Duration::from_secs(5)).await;
+    let source_left = cache_a.ttl_of(&key);
+
+    let got = cache_b.load_many([key]).await.expect("load_many");
+
+    assert_eq!(
+        got,
+        HashMap::from([(key, "inserted".to_string())]),
+        "answered from a's cache"
+    );
+    assert!(
+        log.lock().expect("log lock").is_empty(),
+        "no source call: {:?}",
+        log.lock().expect("log lock")
+    );
+    let Some(Ttl::Remaining(source_left)) = source_left else {
+        panic!("a holds the entry with a finite ttl, got {source_left:?}");
+    };
+    match cache_b.ttl_of(&key) {
+        Some(Ttl::Remaining(left)) => assert!(
+            left <= source_left,
+            "b's copy has {left:?} left, a's entry had {source_left:?}"
+        ),
+        other => panic!("b holds the copy with the source's finite ttl, got {other:?}"),
+    }
+    assert_eq!(stored_expiry(cache_b, key), stored_expiry(cache_a, key));
+    shut_down_all(nodes).await;
+}
+
+/// A single `mode` node `name` with a loader, and its cache.
+async fn lone_loading_node(name: &'static str, mode: Mode) -> (Cluster, Cache<u32, String>) {
+    let cluster = Cluster::builder(name)
+        .seeds(std::iter::empty())
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("node builds");
+    let cache = cluster
+        .cache::<u32, String>(name)
+        .mode(mode)
+        .ttl(Duration::from_secs(60))
+        .loader(|key: u32| async move { Ok::<_, SourceDown>(Some(format!("v{key}"))) })
+        .open()
+        .await
+        .expect("opens");
+    (cluster, cache)
+}
+
+/// What `cache.load_on` makes of a peer that answers a request for keys 1, 2
+/// and 3 with a record for key 1 expiring at `expires_at_ms`, a record for
+/// key 2 with no expiry and an uncached value for key 3.
+async fn load_on_answered_with_records(
+    cache: &Cache<u32, String>,
+    expires_at_ms: u64,
+) -> Sourced<u32, String> {
+    let peer = NodeId::from(99);
+    let encoded =
+        |value: &str| Bytes::from(postcard::to_stdvec(&value.to_string()).expect("encodes"));
+    let key_bytes = |key: u32| encode_key(&key).expect("u32 encodes");
+    let found = vec![
+        WireRecord {
+            expires_at_ms: Some(expires_at_ms),
+            ..test_record(1, "v1", peer)
+        },
+        test_record(2, "v2", peer),
+    ];
+    let uncached = vec![(key_bytes(3), encoded("v3"))];
+    let ask =
+        |_peer: NodeId, _request: Vec<Bytes>| -> BoxFuture<'_, Result<LoadOutcome, CodecError>> {
+            let (found, uncached) = (found.clone(), uncached.clone());
+            Box::pin(async move { Ok(LoadOutcome::Loaded { found, uncached }) })
+        };
+    let routed = (1..=3u32)
+        .map(|key| Routed::new(key, key_bytes(key)))
+        .collect();
+    match cache.load_on(peer, routed, &ask).await.expect("load_on") {
+        Asked::Answered(sourced) => sourced,
+        Asked::Passed(_) => panic!("the peer answered"),
+    }
+}
+
+#[tokio::test]
+async fn load_on_stores_a_peers_record_as_a_copy_with_its_expiry_in_invalidation() {
+    let (cluster, cache) =
+        lone_loading_node("cache-it-load-on-invalidation", Mode::Invalidation).await;
+
+    let sourced = load_on_answered_with_records(&cache, 1_700_000_000_000).await;
+
+    let mut stored: Vec<_> = sourced
+        .store
+        .iter()
+        .map(|(key, fill)| (*key, fill.value.clone(), fill.expiry))
+        .collect();
+    stored.sort_by_key(|(key, ..)| *key);
+    assert_eq!(
+        stored,
+        vec![
+            (
+                1,
+                "v1".to_string(),
+                FillExpiry::Copied(Some(1_700_000_000_000))
+            ),
+            (2, "v2".to_string(), FillExpiry::Copied(None)),
+        ],
+        "a record the peer stores is a copy that keeps the record's expiry"
+    );
+    assert_eq!(
+        sourced.answer,
+        HashMap::from([(3, "v3".to_string())]),
+        "a value the peer did not store only answers"
+    );
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn load_on_only_answers_with_a_peers_record_in_distributed() {
+    let (cluster, cache) =
+        lone_loading_node("cache-it-load-on-distributed", Mode::distributed()).await;
+
+    let sourced = load_on_answered_with_records(&cache, 1_700_000_000_000).await;
+
+    assert!(
+        sourced.store.is_empty(),
+        "a Distributed requester stores nothing from its owner's answer"
+    );
+    assert_eq!(
+        sourced.answer,
+        HashMap::from([
+            (1, "v1".to_string()),
+            (2, "v2".to_string()),
+            (3, "v3".to_string())
+        ])
+    );
+    cluster.shutdown().await;
 }
 
 /// A 10s TTL with refresh-ahead at 0.1: a key falls due 1s after its

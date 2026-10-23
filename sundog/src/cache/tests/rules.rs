@@ -3,10 +3,12 @@
 
 use super::*;
 use crate::cache::fetch::{decode_live_value, record_reads};
+use crate::cache::load::copy_expiry;
 use crate::cache::open::should_await_first_peer;
 use crate::cache::reconcile::{
     RECONCILE_MAX_ROUNDS, ReconcileBudget, retry_delay, should_keep_reconciling, split_round_result,
 };
+use crate::store::FillExpiry;
 
 /// `record_reads` names what `decode_live_value` makes of a fetched
 /// record: a value exactly when it decodes one, and otherwise why not.
@@ -370,6 +372,24 @@ fn routes_loads_only_where_values_do_not_reach_every_node() {
     assert!(!routes_loads(Mode::Replicated));
     assert!(routes_loads(Mode::Invalidation));
     assert!(routes_loads(Mode::distributed()));
+}
+
+#[test]
+fn copy_expiry_keeps_the_peers_expiry_only_in_invalidation() {
+    for expires_at_ms in [None, Some(0), Some(1_700_000_000_000)] {
+        assert_eq!(
+            copy_expiry(Mode::Invalidation, expires_at_ms),
+            Some(FillExpiry::Copied(expires_at_ms)),
+            "Invalidation stores a copy that expires with the peer's record"
+        );
+        for mode in [Mode::Local, Mode::Replicated, Mode::distributed()] {
+            assert_eq!(
+                copy_expiry(mode, expires_at_ms),
+                None,
+                "{mode:?} stores nothing from a peer's answer"
+            );
+        }
+    }
 }
 
 #[test]

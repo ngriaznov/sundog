@@ -10,6 +10,7 @@ use serde::de::DeserializeOwned;
 
 use super::engine::JoinOutcome;
 use super::fan_out::{FillRoute, ReadThroughRoute, fill_fans_out, fill_route, read_through_route};
+use super::load::{Fill, FillDeadline, fill_deadline};
 use super::{
     Event, FanOutItem, Origin, PartId, Shard, SharedLoaderFailure, encode_key, engine, read_timing,
 };
@@ -34,7 +35,7 @@ where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    /// Ends a loader run that returned `value` for `key`, the load stamped
+    /// Ends a loader run that returned `fill` for `key`, the load stamped
     /// `ver` before it started, through [`Shard::store_loaded`], which
     /// stores the value only where this shard stores a fill, and counts the
     /// run as a miss.
@@ -45,19 +46,23 @@ where
         hash: u64,
         ver: Hlc,
         inflight: &engine::Inflight<V>,
-        value: V,
+        fill: Fill<V>,
     ) {
-        self.store_loaded(key, key_bytes, hash, ver, inflight, value);
+        self.store_loaded(key, key_bytes, hash, ver, inflight, fill);
         self.misses.increment(1);
     }
 
-    /// Stores a loaded `value` for `key` through
+    /// Stores a loaded `fill` for `key` through
     /// [`engine::Engine::complete_fresh_load`], the load stamped `ver`
     /// before it started, or hands it to the caller and joined waiters
     /// without storing it ([`fill_route`]): a node that owns nothing of
     /// the key's part in `Mode::Distributed` keeps no copy, judged on the
     /// shard's view when the fill completes, and a shard at the ceiling
-    /// takes no more. A stored value fans out per [`fill_fans_out`] and
+    /// takes no more. The value expires at the instant [`fill_deadline`]
+    /// gives: a value this node's loader produced takes the default TTL from
+    /// `ver`, and a copy of another node's record keeps that record's
+    /// expiry, so one already past it is handed out like a value stored
+    /// nowhere. A stored value fans out per [`fill_fans_out`] and
     /// emits [`Event::Created`], or [`Event::Updated`] over a live entry; one
     /// a write, removal or invalidation overtook stores and sends nothing,
     /// and a value stored nowhere sends nothing and emits no event. Returns
@@ -69,8 +74,19 @@ where
         hash: u64,
         ver: Hlc,
         inflight: &engine::Inflight<V>,
-        value: V,
+        fill: Fill<V>,
     ) -> bool {
+        let Fill { value, expiry } = fill;
+        let now_ms = self.now_ms();
+        let expires_at_ms = match fill_deadline(expiry, self.expiry_for(ver.wall_ms, None), now_ms)
+        {
+            FillDeadline::Store(at) => at,
+            FillDeadline::Lapsed => {
+                self.engine
+                    .finish_uncached(key_bytes, hash, inflight, value);
+                return false;
+            }
+        };
         let route = fill_route(self.owns_key(key_bytes), self.at_ceiling().is_some());
         if let FillRoute::Uncached { counts_refusal } = route {
             self.engine
@@ -84,7 +100,6 @@ where
             postcard::to_stdvec(&value)
                 .expect("invariant: a value returned by the loader postcard-encodes"),
         );
-        let expires_at_ms = self.expiry_for(ver.wall_ms, None);
         let outcome = self.engine.complete_fresh_load(
             engine::FreshLoad {
                 key,
@@ -95,7 +110,7 @@ where
                 encoded,
                 expires_at_ms,
             },
-            self.now_ms(),
+            now_ms,
             inflight,
         );
         let engine::FillOutcome::Installed { had_live } = outcome else {
@@ -424,13 +439,27 @@ where
                     // An error drops `guard` uncompleted, which frees the
                     // fill for a joined call to take over.
                     if let Some(value) = ask_first(key).await? {
-                        self.finish_fill(key, &key_bytes, hash, ver, &inflight, value.clone());
+                        self.finish_fill(
+                            key,
+                            &key_bytes,
+                            hash,
+                            ver,
+                            &inflight,
+                            Fill::loaded(value.clone()),
+                        );
                         guard.complete();
                         return Ok(value);
                     }
                     return match loader(key).await {
                         Ok(value) => {
-                            self.finish_fill(key, &key_bytes, hash, ver, &inflight, value.clone());
+                            self.finish_fill(
+                                key,
+                                &key_bytes,
+                                hash,
+                                ver,
+                                &inflight,
+                                Fill::loaded(value.clone()),
+                            );
                             guard.complete();
                             Ok(value)
                         }

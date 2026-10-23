@@ -92,8 +92,8 @@ pub(crate) use fan_out::{
     FanOutItem, FanOutQueue, FanOutRecords, ReadThroughRoute, newest_per_key,
 };
 use fan_out::{fan_out_ships_values, partition_writes};
-pub(crate) use load::Sourced;
 pub use load::{DEFAULT_MAX_BATCH_KEYS, LoadError, Loader};
+pub(crate) use load::{Fill, FillExpiry, Sourced};
 pub use part::PartId;
 pub(crate) use part::PartMask;
 pub(crate) use refresh::{RefreshRequest, refresh_permille};
