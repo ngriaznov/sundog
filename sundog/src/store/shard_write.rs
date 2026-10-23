@@ -11,6 +11,7 @@ use serde::de::DeserializeOwned;
 use tokio::sync::broadcast;
 
 use super::engine::{ApplyOutcome, Reservation};
+use super::shard_oversize::Refused;
 use super::{
     BUCKET_COUNT, Event, FanOutItem, FanOutQueue, Incoming, Origin, PartId, Shard, encode_key,
     engine,
@@ -104,7 +105,9 @@ where
 
     /// Handles the outcome of one versioned apply: a local write's fan-out and
     /// event. A `Rejected` outcome, where the incoming record lost, is a
-    /// silent no-op.
+    /// silent no-op. A `TooLarge` outcome, a merge refused for passing the
+    /// frame limit, is counted, and logged when it came from a peer; a local
+    /// caller gets the error from [`Shard::apply`] or [`Shard::apply_grouped`].
     ///
     /// `notify_fan_out: false` is how [`Shard::insert_many`] and
     /// [`Shard::remove_many`] opt out of the per-write queue push in favor
@@ -117,6 +120,12 @@ where
     ) {
         match outcome {
             ApplyOutcome::Rejected => {}
+            ApplyOutcome::TooLarge { key_bytes, size } => {
+                self.count_merge_refused();
+                if matches!(origin, Origin::Remote(_)) {
+                    self.warn_merge_refused(key_bytes.as_ref(), size, Refused::Peer);
+                }
+            }
             ApplyOutcome::Put {
                 key,
                 value,
@@ -166,7 +175,20 @@ where
     /// Equal versions are always a no-op: a given `(wall_ms, logical, node)`
     /// triple comes from at most one write ever, so an equal-version
     /// incoming record is already the one stored.
-    fn apply(&self, key: K, key_bytes: Bytes, ver: Hlc, incoming: Incoming<V>, origin: Origin) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::ValueTooLarge`] for a merge that would leave the
+    /// value past the frame limit and larger than the one it replaces; nothing
+    /// changes.
+    fn apply(
+        &self,
+        key: K,
+        key_bytes: Bytes,
+        ver: Hlc,
+        incoming: Incoming<V>,
+        origin: Origin,
+    ) -> Result<(), CacheError> {
         let hash = engine::hash_key_bytes(key_bytes.as_ref());
         let bucket = engine::stripe_index_from_hash(hash);
         let outcome = self
@@ -183,7 +205,9 @@ where
             .into_iter()
             .next()
             .expect("invariant: apply_many returns exactly one outcome per entry given");
+        let refused = outcome.too_large();
         self.handle_apply_outcome(outcome, origin, true);
+        refused.map_or(Ok(()), |size| Err(self.merge_too_large(size)))
     }
 
     /// Whether this shard's own current ownership view owns `key_bytes`'
@@ -313,7 +337,10 @@ where
     ///
     /// Returns [`CacheError::ValueTooLarge`] if the wire frame this write would
     /// replicate as exceeds the configured frame cap. See
-    /// [`Shard::with_max_frame`], default [`MAX_FRAME`]. Returns
+    /// [`Shard::with_max_frame`], default [`MAX_FRAME`]. Under a merging
+    /// resolver, a write that merges into a stored value is refused as
+    /// [`Shard::merge`] is, when the merged value would pass the cap and be
+    /// larger than the stored one. Returns
     /// [`CacheError::OverMemoryCeiling`] if this shard is at the ceiling set
     /// by [`Shard::with_max_resident_bytes`].
     pub async fn insert(&self, key: K, value: V) -> Result<(), CacheError> {
@@ -395,8 +422,7 @@ where
                 .increment(1);
             return Ok(());
         }
-        self.apply(key, key_bytes, ver, incoming, Origin::Local);
-        Ok(())
+        self.apply(key, key_bytes, ver, incoming, Origin::Local)
     }
 
     /// [`Shard::insert`] for many entries, grouped by key stripe and applied
@@ -408,7 +434,9 @@ where
     /// # Errors
     ///
     /// Returns [`CacheError::ValueTooLarge`] if any entry's wire frame exceeds
-    /// the configured frame cap (see [`Shard::insert`]). Returns
+    /// the configured frame cap (see [`Shard::insert`]), or, for an entry that
+    /// merges past the cap into a stored value under a merging resolver,
+    /// after applying the rest. Returns
     /// [`CacheError::OverMemoryCeiling`], applying nothing, if this shard is
     /// at its ceiling when the call begins; a batch that begins under the
     /// ceiling applies whole.
@@ -489,13 +517,14 @@ where
             return Err(self.closed());
         }
 
-        self.apply_grouped(owned_prepared, |(hash, key, key_bytes, ver, v, e, enc)| {
-            (hash, key, key_bytes, ver, put_incoming(v, e, enc))
-        })
-        .await;
+        let applied = self
+            .apply_grouped(owned_prepared, |(hash, key, key_bytes, ver, v, e, enc)| {
+                (hash, key, key_bytes, ver, put_incoming(v, e, enc))
+            })
+            .await;
         match failure {
             Some(err) => Err(err),
-            None => Ok(()),
+            None => applied,
         }
     }
 
@@ -645,11 +674,16 @@ where
     /// every bucket's [`engine::Engine::apply_many_with_reservation`] call.
     /// [`Shard::retry_reservation_deficit`] then pays down any deficit,
     /// sharing the same deadline rather than a fresh budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::ValueTooLarge`] for the first entry that merged
+    /// past the frame limit, after applying the rest.
     async fn apply_grouped<T>(
         &self,
         prepared: Vec<T>,
         to_batch_entry: impl Fn(T) -> (u64, K, Bytes, Hlc, Incoming<V>),
-    ) {
+    ) -> Result<(), CacheError> {
         let batch_entries: Vec<(u64, K, Bytes, Hlc, Incoming<V>)> =
             prepared.into_iter().map(to_batch_entry).collect();
 
@@ -672,6 +706,7 @@ where
         // is back with the tier before `retry_reservation_deficit` asks for
         // a fresh one: a retry clamped to the whole flush queue can never be
         // granted while this call still holds part of it.
+        let mut refused = None;
         let deficit = {
             let mut reservation = reservation;
             let mut deficit = 0u64;
@@ -693,6 +728,7 @@ where
                 deficit += bucket_deficit;
                 for outcome in outcomes {
                     applied_keys.extend(outcome.key().cloned().zip(outcome.version()));
+                    refused = refused.or(outcome.too_large());
                     self.handle_apply_outcome(outcome, Origin::Local, false);
                 }
                 self.hand_off_bulk(&mut applied_keys, false);
@@ -702,6 +738,7 @@ where
         self.hand_off_bulk(&mut applied_keys, true);
         self.retry_reservation_deficit(0, deficit, deadline, &mut written)
             .await;
+        refused.map_or(Ok(()), |size| Err(self.merge_too_large(size)))
     }
 
     /// Stamps and applies a local tombstone, then fans it out per [`Mode`], as
@@ -741,8 +778,7 @@ where
                 .increment(1);
             return Ok(());
         }
-        self.apply(key.clone(), key_bytes, ver, Incoming::DELETE, Origin::Local);
-        Ok(())
+        self.apply(key.clone(), key_bytes, ver, Incoming::DELETE, Origin::Local)
     }
 
     /// [`Shard::remove`] for many keys at once, the tombstone counterpart of
@@ -776,8 +812,7 @@ where
         self.apply_grouped(owned_prepared, |(hash, key, key_bytes, ver)| {
             (hash, key, key_bytes, ver, Incoming::DELETE)
         })
-        .await;
-        Ok(())
+        .await
     }
 
     /// Hands a bulk write's landed keys to the fan-out queue one full

@@ -21,9 +21,10 @@ mod support;
 use crate::pins::{
     SKEW_HOLD_PIN_CAPACITY, TOMBSTONE_PIN_COUNT, accept_drop_pin_metrics, clock_skew_pin_metrics,
     count_hits_and_misses, fan_out_wait_timeout_pin_metrics, loader_calls_pin_metric,
-    memory_ceiling_pin_metrics, read_durations_pin_metrics, refresh_hints_pin_metric,
-    refresh_outcomes_pin_metrics, skew_hold_pin_bytes, skew_hold_pin_metrics,
-    tombstone_ignored_pin_metrics, tombstone_pin_metrics,
+    memory_ceiling_pin_metrics, merge_refused_pin_metric, read_durations_pin_metrics,
+    refresh_hints_pin_metric, refresh_outcomes_pin_metrics, skew_hold_pin_bytes,
+    skew_hold_pin_metrics, sync_skipped_pin_metric, tombstone_ignored_pin_metrics,
+    tombstone_pin_metrics,
 };
 use crate::seeds::{
     seed_crdt_compaction_metrics, seed_distributed_metrics, seed_part_mismatch,
@@ -84,6 +85,8 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     fan_out_wait_timeout_pin_metrics().await;
     clock_skew_pin_metrics().await;
     tombstone_ignored_pin_metrics().await;
+    merge_refused_pin_metric().await;
+    sync_skipped_pin_metric().await;
     let ceiling_pin_bytes = f64::from(
         u32::try_from(memory_ceiling_pin_metrics(&cluster).await).expect("one entry's bytes fit"),
     );
@@ -342,6 +345,39 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         ),
         Some(1.0),
         "expected exactly one refused record on the 'clock-skew-pin' cache; got body:\n{body}"
+    );
+    // sundog_merge_refused_total: pinned by the bare-Shard scenario above, a
+    // merge and an insert refused for passing the frame cap and a clearing
+    // merge accepted.
+    assert_eq!(
+        scraped_metric_value(
+            &body,
+            "sundog_merge_refused_total",
+            &[("cache", "merge-refused-pin"), ("reason", "too_large")]
+        ),
+        Some(2.0),
+        "expected exactly two refused merges on the 'merge-refused-pin' cache; got body:\n{body}"
+    );
+    assert_eq!(
+        scraped_metric_value(
+            &body,
+            "sundog_merge_refused_total",
+            &[("cache", "ceiling-pin")]
+        ),
+        None,
+        "a cache that refused no merge exports no series; got body:\n{body}"
+    );
+    // sundog_sync_skipped_total: pinned by the bare-Shard scenario above, a
+    // record larger than a frame left out of a pull reply's records and of
+    // a state-transfer snapshot.
+    assert_eq!(
+        scraped_metric_value(
+            &body,
+            "sundog_sync_skipped_total",
+            &[("cache", "sync-skipped-pin"), ("reason", "too_large")]
+        ),
+        Some(2.0),
+        "expected exactly two skipped records on the 'sync-skipped-pin' cache; got body:\n{body}"
     );
     // sundog_tombstones_ignored_total: pinned by the bare-Shard scenario
     // above, three deletes stamped an hour ago ignored and one stamped a

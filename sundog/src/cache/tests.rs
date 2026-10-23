@@ -12,6 +12,7 @@ mod forwarding_skew;
 mod lifecycle;
 mod load_next_owner;
 mod loading;
+mod merge_cap;
 mod merge_expiry;
 mod merge_sequenced;
 mod merge_shutdown;

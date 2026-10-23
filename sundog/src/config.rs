@@ -179,7 +179,14 @@ pub struct ClusterConfig {
     pub outbox_capacity: usize,
     /// Hard cap on a single wire frame, in bytes. Must not exceed
     /// [`crate::wire::MAX_FRAME`]; `build()` rejects a higher value with
-    /// [`crate::error::JoinError::InvalidConfig`].
+    /// [`crate::error::JoinError::InvalidConfig`]. A write whose record
+    /// would not fit one frame fails with
+    /// [`CacheError::ValueTooLarge`](crate::error::CacheError::ValueTooLarge),
+    /// and so does a merge that would leave a value past the cap and larger
+    /// than it was; a merge from a peer that would is refused and counted in
+    /// `sundog_merge_refused_total`. Keep it equal on every node: a node under
+    /// a smaller cap refuses a merged value a node under a larger one
+    /// builds.
     pub max_frame: usize,
     /// Bind address for the gossip (membership) UDP socket. Port `0` picks the
     /// zeroconf default.
@@ -253,9 +260,10 @@ pub struct ClusterConfig {
     /// [`ae_part_min_bucket`](Self::ae_part_min_bucket) has narrowed a
     /// bucket to it. A sketch costs a fixed ~9 KB at the default
     /// `ae_sketch_cells`; a listing costs ~23 bytes per entry, so 384 is the
-    /// crossover for small keys. A listing sent in place of a sketch is one
-    /// frame, so keep this threshold times the largest key under
-    /// [`max_frame`](Self::max_frame).
+    /// crossover for small keys. A listing sent in place of a sketch goes in
+    /// frames of about 2 MiB, several when the keys are large, which a
+    /// requester on [`wire::PROTOCOL_AE_LISTING_CHUNKS`](crate::wire::PROTOCOL_AE_LISTING_CHUNKS)
+    /// joins.
     pub ae_sketch_min_bucket: usize,
     /// Cell count of the IBLT sketch built for a bucket past
     /// [`ae_sketch_min_bucket`](Self::ae_sketch_min_bucket). The default of

@@ -17,6 +17,7 @@ use serde::de::DeserializeOwned;
 
 use super::crdt::WriterId;
 use super::engine::{Fold, fold_sides};
+use super::shard_oversize::Refused;
 use super::{
     Incoming, Merged, PendingMerge, PendingMergeStripe, RecordView, Shard, Winner, duration_ms,
     encode_key, engine,
@@ -164,10 +165,25 @@ where
     /// the fold whole, including contributions folded in before the
     /// tombstone's version.
     ///
+    /// A merged value stays within one frame. A merge whose result would
+    /// pass the configured frame cap ([`Shard::with_max_frame`],
+    /// [`wire::MAX_FRAME`] by default) and be larger than the value it
+    /// replaces is refused and changes nothing, so a merge that shrinks a
+    /// value, or leaves it as it is, always succeeds, even for a value that
+    /// already passes the cap. The same rule refuses a merge arriving from a
+    /// peer, which leaves the stored value as it is and is counted in
+    /// `sundog_merge_refused_total`. With a coalescing window, the call that
+    /// would leave its own pending fold past the cap gets the error. A fold
+    /// that flushes into a stored value it would push past the cap is
+    /// refused at the flush, where no caller waits: it is counted and logged,
+    /// and its contributions are lost.
+    ///
     /// # Errors
     ///
     /// Returns [`CacheError::ValueTooLarge`] if `value`'s wire frame exceeds
-    /// the configured frame cap. See [`Shard::with_max_frame`]. Returns
+    /// the configured frame cap. See [`Shard::with_max_frame`]. Returns it
+    /// also for a merge that would leave the stored value, or with a window
+    /// the pending fold, past that cap and larger than it was. Returns
     /// [`CacheError::OverMemoryCeiling`] as [`Shard::insert`] does; a call
     /// folded into a pending value within the window is checked when it is
     /// made, not when the fold flushes.
@@ -439,6 +455,12 @@ where
     /// replaced by the new call, a lapsed new call is dropped, and two
     /// lapsed sides fall to the resolver's `winner`, which a non-merging
     /// resolver always uses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::ValueTooLarge`] when the fold of the two sides
+    /// would pass the frame cap and be larger than the pending value; the
+    /// pending value stays as it is.
     fn fold_into_occupied_merge(
         &self,
         slot: OccupiedEntry<'_, K, PendingMerge<V>>,
@@ -486,6 +508,14 @@ where
                     expires_at_ms: merged_expires_at_ms,
                 }),
             ) => {
+                let pending_len = slot.get().encoded.len();
+                if !self
+                    .merge_cap()
+                    .admits(key_bytes.len(), merged_bytes.len(), Some(pending_len))
+                {
+                    self.count_merge_refused();
+                    return Err(self.merge_too_large(merged_bytes.len()));
+                }
                 let merged_value: V =
                     postcard::from_bytes(&merged_bytes).map_err(CodecError::from)?;
                 let entry = slot.into_mut();
@@ -543,8 +573,15 @@ where
         // and nothing calling this (the background sweep, the seal for a
         // close, or `Drop`) has anywhere to hand an error to, the same fate
         // an ordinary local write racing a close already gets, documented on
-        // `Shard::insert`.
-        let _ = self.apply_or_forward(key, pending.key_bytes, pending.ver, incoming);
+        // `Shard::insert`. A fold that would push the stored value past the
+        // frame cap is refused the same way and is logged, since the calls
+        // that made it returned long ago.
+        let key_bytes = pending.key_bytes.clone();
+        if let Err(CacheError::ValueTooLarge { size, .. }) =
+            self.apply_or_forward(key, pending.key_bytes, pending.ver, incoming)
+        {
+            self.warn_merge_refused(key_bytes.as_ref(), size, Refused::Fold);
+        }
     }
 
     /// Whether any fold is pending. One load: the tombstone paths check it

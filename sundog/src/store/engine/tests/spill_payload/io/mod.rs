@@ -672,6 +672,9 @@ fn merge_against_a_spilled_counter_folds_the_stored_side_instead_of_dropping_it(
         ApplyOutcome::Tombstoned { .. } => {
             panic!("expected a Put outcome carrying the merged counter, got Tombstoned")
         }
+        ApplyOutcome::TooLarge { .. } => {
+            panic!("expected a Put outcome carrying the merged counter, got TooLarge")
+        }
     }
     assert_eq!(
         engine.get(&key, 0).map(|c| c.value()),

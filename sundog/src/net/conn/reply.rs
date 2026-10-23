@@ -86,16 +86,39 @@ pub(in crate::net) async fn collect_ae_mismatches(
     collect_replies(reply, "digest reply", Vec::new(), push_mismatch).await
 }
 
-fn push_mismatch(msg: Msg, out: &mut Vec<AeMismatch>) {
+/// Folds one reply message into `out`. The `AeBucket` messages of one bucket
+/// join into one [`AeMismatch::Bucket`] in arrival order, whatever else
+/// arrives between them: a responder on
+/// [`crate::wire::PROTOCOL_AE_LISTING_CHUNKS`] sends a bucket of large keys as
+/// several.
+pub(super) fn push_mismatch(msg: Msg, out: &mut Vec<AeMismatch>) {
     match msg {
         Msg::AeBucket {
             bucket, entries, ..
-        } => out.push(AeMismatch::Bucket(bucket, wire_to_key_versions(entries))),
+        } => push_bucket_listing(out, bucket, wire_to_key_versions(entries)),
         Msg::AeSketch { bucket, cells, .. } => out.push(AeMismatch::Sketch(bucket, cells)),
         Msg::AePartDigests {
             bucket, digests, ..
         } => out.push(AeMismatch::PartDigests(bucket, digests)),
         _ => {}
+    }
+}
+
+/// Appends `entries` to the [`AeMismatch::Bucket`] `out` holds for `bucket`,
+/// or pushes a new one when it holds none. Looks the bucket up rather than
+/// checking only the last element, as [`merge_bucket_chunk`] does.
+pub(super) fn push_bucket_listing(
+    out: &mut Vec<AeMismatch>,
+    bucket: u16,
+    entries: Vec<KeyVersion>,
+) {
+    let held = out.iter_mut().find_map(|mismatch| match mismatch {
+        AeMismatch::Bucket(id, held) if *id == bucket => Some(held),
+        _ => None,
+    });
+    match held {
+        Some(held) => held.extend(entries),
+        None => out.push(AeMismatch::Bucket(bucket, entries)),
     }
 }
 

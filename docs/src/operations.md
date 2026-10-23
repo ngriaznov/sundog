@@ -48,6 +48,8 @@ addresses once it forms, under `cluster formed`.
 | `sundog_tombstones_ignored_total{cache}` | tombstones a peer sent that arrived already past their retention and were ignored: stored nowhere, deleting nothing. A late delete, an expiry tombstone past its `tombstone_ttl` and a delete offered by a node that defers all count. A forwarded delete among them is the only copy of a non-owner's write and also logs a warning, at most once a minute; see [guarantees](guarantees.md#deletes) |
 | `sundog_cache_bytes{cache}` | a cache with a `max_resident_bytes` ceiling: resident bytes of this node's live entries, as `Cache::resident_bytes` counts them |
 | `sundog_ceiling_refusals_total{cache, kind}` | a cache with a `max_resident_bytes` ceiling: local writes refused (`write`) and fills returned uncached (`fill`) |
+| `sundog_merge_refused_total{cache, reason}` | merges refused instead of stored: `too_large`, a merge whose result would pass `max_frame` and be larger than the value it replaces. A local call gets `CacheError::ValueTooLarge`; a merge from a peer, or a coalesced fold at its flush, leaves the stored value as it is and logs a warning, at most once a minute for each cache; see [Merges are refused at the frame limit](#merges-are-refused-at-the-frame-limit) |
+| `sundog_sync_skipped_total{cache, reason}` | records left out of anti-entropy, state transfer or a rebalance chunk: `too_large`, a record that does not fit one frame. It stays on its node and every other key syncs; a warning, at most once a minute for each cache, names the largest |
 | `sundog_fan_out_backlog{cache}` | written keys not yet sent to peers |
 | `sundog_fan_out_wait_timeouts_total{cache}` | writes that waited out `fan_out_wait_timeout` for backlog room and proceeded over capacity |
 | `sundog_ae_repaired_total{cache}` | entries anti-entropy repaired, counted per batch as each moves |
@@ -299,6 +301,41 @@ record that would wait longer than a day (or `tombstone_max_ttl`, if
 shorter), a stamp ahead by more than `max_clock_skew` plus that limit, which
 no clock skew explains. A node that logs that its clock is behind its own last
 write stamp had its system clock stepped back; its writes keep their order.
+
+### Merges are refused at the frame limit
+
+`sundog_merge_refused_total` rises. A merged value would pass `max_frame`,
+4 MiB by default, and be larger than the value it replaces, so the node
+refused the merge and kept the value as it was. A call on this node got
+`CacheError::ValueTooLarge`. A merge from a peer, or a fold that flushed out
+of a `merge_coalesce_window`, had no caller to tell: the node logged a
+warning that names the key by its encoded bytes in hex, the merged size and
+the limit, and the contribution is lost. The usual cause is an `OrSet` that
+only grows. Replicas that each hold part of a value too large to combine
+refuse each other's state and stay apart.
+
+Shrink the value: merge `OrSet::remove` for elements that have served their
+purpose, from any node. A merge that leaves a value no larger is always
+accepted, and once the value fits, the replicas merge again at their next
+write or anti-entropy round. Delete the key with `Cache::remove` when its
+content is not worth keeping. Bound the growth in the application, as
+[the resolver guide](resolvers.md#a-merged-value-stays-within-a-frame)
+describes. Nodes under different `max_frame` values refuse what the larger one
+builds, so set the same on every node.
+
+### Records are left out of a sync
+
+`sundog_sync_skipped_total` rises, and the node logs a warning that names the
+largest key left out. The cache holds a value that does not fit one frame:
+stored under a larger `max_frame`, or by a release that set no limit. It
+serves reads on this node and does not replicate; state transfer, anti-entropy
+and rebalance leave it out, and the other keys sync as usual. A node that
+joins, or a peer that missed it, never receives it. The value cannot grow. In
+a `Distributed` cache a node that stops owning the part of such a value
+cannot hand it to the new owners, and drops it when the part releases, so
+shrink it before a membership change moves the part. Shrink it with a merge
+that removes content, or delete the key with `Cache::remove`; the counter
+stops rising once no record is over the limit.
 
 ### A spill tier drops evictions
 

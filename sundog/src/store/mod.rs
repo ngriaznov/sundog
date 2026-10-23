@@ -41,6 +41,7 @@ mod shard_build;
 mod shard_ignored;
 mod shard_merge;
 mod shard_ops;
+mod shard_oversize;
 mod shard_pause;
 mod shard_read;
 mod shard_rearm;
@@ -522,6 +523,13 @@ where
     /// The clock reading of the last warning about forwarded tombstones
     /// ignored as lapsed, `u64::MAX` before the first; see `shard_ignored.rs`.
     ignored_forward_warned_ms: AtomicU64,
+    /// The clock reading of the last warning about a merge refused for
+    /// passing the frame limit that nobody waited on, `u64::MAX` before the
+    /// first; see `shard_oversize.rs`.
+    merge_refused_warned_ms: AtomicU64,
+    /// Counts and logs the records a sync leaves out for being larger than
+    /// one frame; see `shard_oversize.rs`.
+    sync_skips: shard_oversize::SyncSkips,
     /// Runs the spill tier's checkpointed close once. The flag is true once
     /// a close finished; the lock is held for the whole checkpoint by the
     /// task running it, so later and concurrent closers, and one that

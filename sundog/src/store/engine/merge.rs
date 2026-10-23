@@ -7,6 +7,7 @@ use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 use crate::hlc::Hlc;
 use crate::node::NodeId;
 use crate::store::{ConflictResolver, Incoming, Merged, RecordView, Winner};
+use crate::wire;
 
 #[cfg(doc)]
 use super::apply::apply_locked;
@@ -319,20 +320,78 @@ pub(super) fn mint_stamp(sv: Hlc, ver: Hlc, node: NodeId) -> Hlc {
     }
 }
 
+/// Whether a merge that leaves a record `merged_len` bytes long, where it
+/// replaces one `stored_len` bytes long, stays within a frame of `limit`
+/// bytes: when the merged record fits, or when it is no larger than the one it
+/// replaces. A merge never grows a record past the limit, and one that
+/// shrinks a record, or leaves it as it is, is always accepted, so a value
+/// that already passes the limit can still lose content. All three lengths
+/// are frame lengths, as [`wire::replicate_frame_len`] counts them. Pure;
+/// unit tested directly.
+pub(crate) const fn merge_fits(merged_len: usize, stored_len: usize, limit: usize) -> bool {
+    merged_len <= limit || merged_len <= stored_len
+}
+
+/// The frame limit a merge keeps a value within, as the frame a
+/// `Msg::Replicate` of the record would take under a cache name of
+/// `cache_len` bytes. [`Shard::with_max_frame`](crate::store::Shard::with_max_frame)
+/// sets it on the engine of a shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MergeCap {
+    /// The byte length of the cache's name.
+    pub(crate) cache_len: usize,
+    /// The largest frame a merged record may take.
+    pub(crate) limit: usize,
+}
+
+impl MergeCap {
+    /// Whether a merge of the record under a key of `key_len` bytes into a
+    /// value of `merged_len` bytes stays within the cap, where it replaces a
+    /// value of `stored_len` bytes, or nothing live (`None`). See
+    /// [`merge_fits`]. Pure; unit tested directly.
+    pub(crate) fn admits(
+        self,
+        key_len: usize,
+        merged_len: usize,
+        stored_len: Option<usize>,
+    ) -> bool {
+        let frame = |value_len| wire::replicate_frame_len(self.cache_len, key_len, value_len);
+        merge_fits(frame(merged_len), stored_len.map_or(0, frame), self.limit)
+    }
+}
+
+/// What [`resolve_and_rebind`] decided for a write.
+pub(super) enum Rebound<V> {
+    /// The write changes nothing: it lost outright, an already-absorbed merge
+    /// came back, or the resolver's bytes did not decode.
+    Lost,
+    /// Store this version and content.
+    Store(Hlc, Incoming<V>),
+    /// The merge would leave the record `size` value bytes long, past the
+    /// cap and larger than the record it replaces ([`merge_fits`]): nothing is
+    /// stored. The write is handed back untouched, so a pre-fold can leave it
+    /// to apply on its own.
+    TooLarge { incoming: Incoming<V>, size: usize },
+}
+
 /// [`apply_locked`]'s full collision decision: consults [`resolve_conflict`]
 /// and, on [`Resolution::Merged`], rebinds `ver`/`incoming` to the version
-/// and content [`merge_version`] decides. Returns `None` for a rejected write
-/// (outright loss, the engine-enforced tombstone/spill guard, a redelivered
-/// already-absorbed merge, or bytes that fail to decode as `V`) and
-/// `Some((ver, incoming))` otherwise: unchanged for an outright win, rebound
-/// for a merge. `stored_absent` and `stored_tombstone` are
+/// and content [`merge_version`] decides, unless the merged content fails
+/// `cap`: [`Rebound::TooLarge`] then hands `incoming` back and stores
+/// nothing. Returns [`Rebound::Lost`] for a rejected write (outright loss,
+/// the engine-enforced tombstone/spill guard, a redelivered already-absorbed
+/// merge, or bytes that fail to decode as `V`) and [`Rebound::Store`]
+/// otherwise: unchanged for an outright win, rebound for a merge. Only a
+/// merge meets `cap`; an outright win is the contribution itself, which the
+/// writer checked. `stored_absent` and `stored_tombstone` are
 /// [`resolve_conflict`]'s.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the two sides of a collision, each with its version, bytes and deadline, plus the resolver and key"
+    reason = "the two sides of a collision, each with its version, bytes and deadline, plus the resolver, key and cap"
 )]
 pub(super) fn resolve_and_rebind<V: DeserializeOwned>(
     resolver: &dyn ConflictResolver,
+    cap: Option<MergeCap>,
     key_bytes: &[u8],
     sv: Hlc,
     stored_encoded: Option<&[u8]>,
@@ -341,7 +400,7 @@ pub(super) fn resolve_and_rebind<V: DeserializeOwned>(
     stored_tombstone: bool,
     ver: Hlc,
     incoming: Incoming<V>,
-) -> Option<(Hlc, Incoming<V>)> {
+) -> Rebound<V> {
     match resolve_conflict(
         resolver,
         key_bytes,
@@ -353,8 +412,8 @@ pub(super) fn resolve_and_rebind<V: DeserializeOwned>(
         ver,
         &incoming,
     ) {
-        Resolution::IncomingLoses => None,
-        Resolution::IncomingWins => Some((ver, incoming)),
+        Resolution::IncomingLoses => Rebound::Lost,
+        Resolution::IncomingWins => Rebound::Store(ver, incoming),
         Resolution::Merged {
             value,
             expires_at_ms,
@@ -368,7 +427,7 @@ pub(super) fn resolve_and_rebind<V: DeserializeOwned>(
                 ..
             } = &incoming
             else {
-                return None;
+                return Rebound::Lost;
             };
             let result_is_incoming =
                 value == *incoming_encoded && expires_at_ms == *incoming_expires_at_ms;
@@ -385,23 +444,39 @@ pub(super) fn resolve_and_rebind<V: DeserializeOwned>(
                 (value.as_ref(), expires_at_ms),
             );
             match merged_version {
-                MergedVersion::NoOp => None,
+                MergedVersion::NoOp => Rebound::Lost,
+                MergedVersion::Store(_)
+                    if cap.is_some_and(|cap| {
+                        !cap.admits(
+                            key_bytes.len(),
+                            value.len(),
+                            stored.map(|(bytes, _)| bytes.len()),
+                        )
+                    }) =>
+                {
+                    Rebound::TooLarge {
+                        size: value.len(),
+                        incoming,
+                    }
+                }
                 // The result is the incoming record: its decoded value is
                 // already in hand.
-                MergedVersion::Store(new_ver) if result_is_incoming => Some((new_ver, incoming)),
+                MergedVersion::Store(new_ver) if result_is_incoming => {
+                    Rebound::Store(new_ver, incoming)
+                }
                 MergedVersion::Store(new_ver) => {
                     // Never trust a resolver's bytes blindly: reject, don't panic.
                     let Ok(decoded): Result<V, _> = postcard::from_bytes(&value) else {
-                        return None;
+                        return Rebound::Lost;
                     };
-                    Some((
+                    Rebound::Store(
                         new_ver,
                         Incoming::Put {
                             value: decoded,
                             expires_at_ms,
                             encoded: value,
                         },
-                    ))
+                    )
                 }
             }
         }

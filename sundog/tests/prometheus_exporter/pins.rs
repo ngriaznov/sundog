@@ -6,7 +6,9 @@ use std::num::NonZeroU8;
 use std::sync::Arc;
 use std::time::Duration;
 use sundog::store::{Shard, ShardOps};
-use sundog::{Cluster, Mode, NodeId};
+use sundog::{
+    CacheError, Cluster, ConflictResolver, Merged, Mode, NodeId, RecordView, Winner, later_deadline,
+};
 
 use crate::support::{node_config, reserve_tcp_addr};
 
@@ -462,6 +464,113 @@ pub(crate) async fn tombstone_ignored_pin_metrics() {
     };
     assert_eq!(held(4).await.len(), 1, "the fresh delete is kept");
     assert!(held(1).await.is_empty(), "a lapsed one is not");
+}
+
+/// A resolver over byte vectors whose merge appends the incoming vector to
+/// the stored one, and clears the value when the incoming one is empty.
+struct ConcatResolver;
+
+impl ConflictResolver for ConcatResolver {
+    fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
+        if a.ver >= b.ver { Winner::A } else { Winner::B }
+    }
+
+    fn merges(&self) -> bool {
+        true
+    }
+
+    fn merge(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Option<Merged> {
+        let mut left: Vec<u8> = postcard::from_bytes(a.value?).ok()?;
+        let right: Vec<u8> = postcard::from_bytes(b.value?).ok()?;
+        if right.is_empty() {
+            left.clear();
+        } else {
+            left.extend(right);
+        }
+        Some(Merged {
+            value: bytes::Bytes::from(postcard::to_stdvec(&left).ok()?),
+            expires_at_ms: later_deadline(a.expires_at_ms, b.expires_at_ms),
+        })
+    }
+}
+
+/// Drives `sundog_merge_refused_total{cache, reason="too_large"}` through a
+/// bare `Shard` that keeps frames to a kilobyte: a merge of 600 bytes
+/// stores, a second 600 bytes would make 1,200 and is refused, an insert that
+/// merges the same way is refused, and a merge that clears the value
+/// shrinks it and is accepted, so the counter reads exactly two.
+pub(crate) async fn merge_refused_pin_metric() {
+    let shard = Shard::<u32, Vec<u8>>::new(
+        SmolStr::new("merge-refused-pin"),
+        Mode::Local,
+        NodeId::from(1),
+        10_000,
+        None,
+        None,
+    )
+    .with_resolver(Arc::new(ConcatResolver))
+    .with_max_frame(1_024);
+    shard.merge(1, vec![1; 600]).await.expect("600 bytes fit");
+    assert!(matches!(
+        shard.merge(1, vec![2; 600]).await,
+        Err(CacheError::ValueTooLarge { .. })
+    ));
+    assert!(matches!(
+        shard.insert(1, vec![3; 600]).await,
+        Err(CacheError::ValueTooLarge { .. })
+    ));
+    shard.merge(1, Vec::new()).await.expect("a clear shrinks");
+    assert_eq!(shard.get(&1).await, Some(Vec::new()));
+}
+
+/// Drives `sundog_sync_skipped_total{cache, reason="too_large"}` through a
+/// bare `Shard` that holds a record larger than any frame, stored below the
+/// public API as one stored before the frame cap applied would be: it stays
+/// readable, and the sync leaves it out twice, once from a pull reply's
+/// records and once from a state-transfer snapshot, so the counter reads
+/// exactly two.
+pub(crate) async fn sync_skipped_pin_metric() {
+    use futures::StreamExt as _;
+    let shard = Shard::<u32, Vec<u8>>::new(
+        SmolStr::new("sync-skipped-pin"),
+        Mode::Replicated,
+        NodeId::from(1),
+        10_000,
+        None,
+        None,
+    );
+    let key = bytes::Bytes::from(postcard::to_stdvec(&1u32).expect("key encodes"));
+    let big = sundog::wire::WireRecord {
+        key: key.clone(),
+        value: Some(bytes::Bytes::from(
+            postcard::to_stdvec(&vec![0u8; sundog::wire::MAX_FRAME]).expect("value encodes"),
+        )),
+        ver: sundog::Hlc {
+            wall_ms: u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("the clock is past the epoch")
+                    .as_millis(),
+            )
+            .expect("epoch milliseconds fit in u64"),
+            logical: 0,
+            node: NodeId::from(2),
+        },
+        expires_at_ms: None,
+    };
+    shard.apply_remote(big).await;
+    assert_eq!(
+        shard.get(&1).await.map(|v| v.len()),
+        Some(sundog::wire::MAX_FRAME)
+    );
+    let records = shard.records_for(vec![key]).await;
+    assert_eq!(records.len(), 1, "a read answers it");
+    assert!(
+        shard.skip_unframeable(records).is_empty(),
+        "a sync does not"
+    );
+    let snapshot: Vec<_> = shard.snapshot_chunks().collect().await;
+    assert!(snapshot.iter().all(Vec::is_empty), "nor does a snapshot");
 }
 
 /// The records the skew hold keeps per cache: the cap

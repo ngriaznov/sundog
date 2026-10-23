@@ -225,6 +225,22 @@ pub trait ShardOps: Send + Sync {
     /// entries and tombstones alike, answering an `AePull`.
     fn records_for(&self, keys: Vec<Bytes>) -> BoxFuture<'_, Vec<WireRecord>>;
 
+    /// Drops from `records`, the set a sync is about to send a peer, every
+    /// record that cannot travel in one frame. A frame holds at most
+    /// [`crate::wire::MAX_FRAME`] bytes, and a record that does not fit
+    /// fails the whole exchange it is part of. The record stays in the store,
+    /// and the skip is counted in `sundog_sync_skipped_total` and logged. A
+    /// merge never grows a value past the frame limit, so only a value stored
+    /// before that limit applied, or under a larger one, is skipped. Default:
+    /// `records` unchanged, for a shard that holds nothing. Anti-entropy
+    /// pushes and pulls, state transfer and rebalance chunks pass their
+    /// records through this; a [`Msg::Fetch`](crate::wire::Msg::Fetch) reply
+    /// does not, so a fetch of such a record fails instead of answering a
+    /// miss.
+    fn skip_unframeable(&self, records: Vec<WireRecord>) -> Vec<WireRecord> {
+        records
+    }
+
     /// Streams the shard's full contents in ~500-record chunks for state
     /// transfer to a joining node, applied on arrival through the same
     /// versioned [`ShardOps::apply_remote`] path as live traffic.

@@ -13,6 +13,7 @@ use smol_str::SmolStr;
 use tokio::sync::{Notify, broadcast};
 
 use super::engine::Engine;
+use super::shard_oversize::SyncSkips;
 use super::skew_hold::{SKEW_HOLD_MAX_BYTES, SKEW_HOLD_MAX_RECORDS, SkewHold};
 use super::{
     BUCKET_COUNT, CeilingRefusals, CompactionBounds, ConflictResolver, FanOutQueue, LwwResolver,
@@ -146,12 +147,14 @@ where
                 .starting_gc_deferred(mode.defers_tombstone_gc())
                 .guarding_pauses(mode.defers_tombstone_gc()),
         );
+        engine.set_merge_cap(name.len(), MAX_FRAME);
         let hits = metrics::counter!("sundog_cache_hits_total", "cache" => name.to_string());
         let misses = metrics::counter!("sundog_cache_misses_total", "cache" => name.to_string());
         let read_durations = read_timing::ReadDurations::new(&name);
         let skew_rejected =
             metrics::counter!("sundog_clock_skew_rejected_total", "cache" => name.to_string());
         let fan_out = Arc::new(FanOutQueue::new(name.clone(), !matches!(mode, Mode::Local)));
+        let sync_skips = SyncSkips::new(name.clone());
 
         Self {
             name,
@@ -172,6 +175,8 @@ where
             skew_wake: Notify::new(),
             skew_drop_warned: AtomicBool::new(false),
             ignored_forward_warned_ms: AtomicU64::new(u64::MAX),
+            merge_refused_warned_ms: AtomicU64::new(u64::MAX),
+            sync_skips,
             spill_close: Arc::new(tokio::sync::Mutex::new(false)),
             #[cfg(all(test, feature = "spill"))]
             spill_checkpoint_panic: AtomicBool::new(false),
@@ -310,9 +315,14 @@ where
     /// Overrides the hard cap [`Shard::insert`] enforces before writing a
     /// value, threaded from a live cluster's configured
     /// `ClusterConfig::max_frame`. Defaults to [`MAX_FRAME`].
+    ///
+    /// The same cap bounds what a merge stores: a merge whose result passes
+    /// it and is larger than the value it replaces is refused. See
+    /// [`Shard::merge`].
     #[must_use]
     pub fn with_max_frame(mut self, max_frame: usize) -> Self {
         self.max_frame = max_frame;
+        self.engine.set_merge_cap(self.name.len(), max_frame);
         self
     }
 
@@ -499,6 +509,7 @@ where
         .starting_gc_deferred(self.mode.defers_tombstone_gc())
         .guarding_pauses(self.mode.defers_tombstone_gc());
         engine.set_prefold_enabled(self.engine.prefold_enabled());
+        engine.set_merge_cap(self.name.len(), self.max_frame);
         Arc::new(if self.max_resident_bytes == u64::MAX {
             engine
         } else {

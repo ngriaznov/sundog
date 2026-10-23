@@ -90,6 +90,9 @@ ships two: `PnCounter` with `PnCounterResolver` and `OrSet` with
 when a merging resolver fits, how to write its values, and how they expire.
 An `OrSet` needs one writer's adds to apply in sequence order, which
 `Cache::merge_sequenced` keeps ([Writing a set](resolvers.md#writing-a-set)).
+A merged value stays within one frame: a merge that would grow it past
+`max_frame` is refused
+([the frame limit](resolvers.md#a-merged-value-stays-within-a-frame)).
 
 ```rust
 {{#include ../cookbook/src/counters.rs:counter}}

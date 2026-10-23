@@ -18,6 +18,49 @@ All notable changes to this project are documented in this file. Format follows
   with the lock held: it must be cheap and must not call into the cache.
   `Shard::merge_sequenced` and `Shard::merge_sequenced_with_ttl` are the
   shard-level forms and take the writer as an argument.
+- **`sundog_merge_refused_total{cache, reason}` and
+  `sundog_sync_skipped_total{cache, reason}`.** The first counts merges
+  refused for passing the frame limit, with `reason="too_large"`; the second
+  counts records that anti-entropy, state transfer and rebalance leave out
+  because one frame cannot hold them. Each comes with a `warn`, at most once a
+  minute for each cache.
+- **`ShardOps::skip_unframeable`.** It drops from the records a sync is about
+  to send the ones that do not fit a frame, and counts them. The default
+  returns its records unchanged.
+
+### Changed
+
+- **`Cache::merge` can fail with `CacheError::ValueTooLarge` for a value that
+  grew past a frame.** A merged value stays within `ClusterConfig::max_frame`,
+  4 MiB by default. A `merge`, `merge_with_ttl`, `merge_sequenced`,
+  `merge_sequenced_with_ttl` or `insert` under a merging resolver whose result
+  would pass that limit and be larger than the value it replaces fails with
+  `ValueTooLarge` and changes nothing. A merge that leaves the value no larger
+  is always accepted, so a remove can shrink a value that is already over the
+  limit. A merge from a peer follows the same rule and is refused, counted and
+  logged. With a `merge_coalesce_window`, the call that would overflow its
+  own pending fold gets the error, and a fold that overflows the stored value
+  at its flush is refused there, counted and logged. An `OrSet` that is only
+  added to reaches the limit; the resolver guide says how to bound one.
+- **A responder leaves out a record that does not fit a frame.** A record
+  larger than one frame stays on its node and out of state transfer,
+  anti-entropy and rebalance chunks, which carry every other key as usual,
+  where the record failed the exchange it was part of. Such a value can exist
+  when it was stored under a larger `max_frame` or by a release without the
+  limit; it keeps serving reads and cannot grow. A merge that removes content,
+  or `Cache::remove`, brings it back under the limit.
+- **A listing of large keys goes in several frames on the digest path.** The
+  `AeBucket` reply to a digest exchange for a bucket of at most
+  `ae_sketch_min_bucket` entries is cut into frames of about 2 MiB, as the
+  full-listing fallback already is, for a peer on protocol 9. The requester
+  joins the messages of a bucket. A listing that fits one frame is sent as
+  before. The wire protocol does not change; a peer on a release that does not
+  join the messages of a digest reply treats each message as the whole bucket
+  and pushes the records it holds that the message lacks, where the exchange
+  failed.
+- **A round of anti-entropy goes on after a failed pull.** `pull_repairs`
+  asks for the next batch after one fails, and stops after two failures in a
+  row. A pull batch holds at most 512 KiB of keys beside its 4,096 keys.
 
 ### Fixed
 
@@ -40,6 +83,20 @@ All notable changes to this project are documented in this file. Format follows
   dropped when the hold is full), an entry evicted or expired between two
   adds, and a copy that has not caught up, such as a new owner's part that is
   still being pulled.
+- **A merged value that outgrew a frame stalled anti-entropy.** A value built
+  by merging, an `OrSet` that was only added to for example, could pass the
+  4 MiB frame. Fan-out dropped it, a peer's pull of it ended with the
+  connection closed and no log on the responder, the round failed and repeated
+  unchanged every `ae_interval` with the keys behind it in the pull list, and
+  state transfer and rebalance chunks that carried it failed the same way. In
+  `Distributed`, a former owner's push of it failed and the part released
+  after two disown grace periods with the only copy dropped. A merge refuses to
+  grow a value past the frame, a responder leaves out a record it cannot send,
+  and a failed pull batch does not discard the batches after it. A value
+  stored before the limit applied that is over it is still dropped when its
+  part leaves a `Distributed` node, since no frame can carry it to the new
+  owners; the warning names it, and a remove that shrinks it, or
+  `Cache::remove`, keeps it from reaching that point.
 - **An `Invalidation` copy made through `load` expires at the source's
   instant.** `Cache::load` and `Cache::load_many` stored a value copied from
   the node a key's loads gather on with a fresh lifetime: the cache's default

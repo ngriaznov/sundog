@@ -942,7 +942,10 @@ where
     /// # Errors
     ///
     /// Returns [`CacheError::ValueTooLarge`] if the encoded value exceeds
-    /// the frame cap, [`CacheError::OverMemoryCeiling`] if this node is at
+    /// the frame cap, or, under a merging resolver, where the write merges
+    /// into the stored value, if the merged value would pass the cap and be
+    /// larger than the stored one,
+    /// [`CacheError::OverMemoryCeiling`] if this node is at
     /// its [`CacheBuilder::max_resident_bytes`] ceiling, or
     /// [`CacheError::Codec`] if `key` fails to encode.
     pub async fn insert(&self, key: K, value: V) -> Result<(), CacheError> {
@@ -1013,9 +1016,29 @@ where
     /// The folded record carries the cache's default TTL, if any; a
     /// merging resolver keeps the later deadline of the two sides.
     ///
+    /// A merged value stays within one frame, the cluster's
+    /// [`ClusterConfig::max_frame`](crate::config::ClusterConfig::max_frame),
+    /// 4 MiB by default. A merge whose result would pass it and be larger
+    /// than the value it replaces fails with [`CacheError::ValueTooLarge`]
+    /// and changes nothing. A merge that leaves the value no larger always
+    /// succeeds, so a remove can shrink a value that already passes the
+    /// limit. A merge that reaches this node from a peer follows the same
+    /// rule: it is refused, counted in `sundog_merge_refused_total` and
+    /// logged, and the contribution is lost. With a window, the call that
+    /// would leave its own pending fold past the limit gets the error; a
+    /// fold that would push the stored value past it when the window closes
+    /// is refused at that flush, where no caller waits. A `Distributed` call
+    /// for a key this node does not own returns before its owners apply it,
+    /// so an owner's refusal is counted and logged there. A set that keeps
+    /// growing, such as an [`OrSet`](crate::crdt::OrSet) that is only added
+    /// to, reaches the limit; see the resolver guide.
+    ///
     /// # Errors
     ///
-    /// As [`Cache::insert`].
+    /// Returns [`CacheError::ValueTooLarge`] if `value`'s own frame exceeds
+    /// the limit, or if the merge would leave the stored value, or with a
+    /// window the pending fold, past the limit and larger than it was. Other
+    /// errors are [`Cache::insert`]'s.
     pub async fn merge(&self, key: K, value: V) -> Result<(), CacheError> {
         self.shard.merge(key, value).await
     }
@@ -1028,7 +1051,7 @@ where
     ///
     /// # Errors
     ///
-    /// As [`Cache::insert`].
+    /// As [`Cache::merge`].
     pub async fn merge_with_ttl(&self, key: K, value: V, ttl: Duration) -> Result<(), CacheError> {
         self.shard.merge_with_ttl(key, value, ttl).await
     }

@@ -122,7 +122,7 @@ impl RequestHandler for ClusterRequestHandler {
     fn records_for(&self, cache: SmolStr, keys: Vec<Bytes>) -> BoxFuture<'_, Vec<WireRecord>> {
         Box::pin(async move {
             match self.lookup(&cache) {
-                Some(shard) => shard.records_for(keys).await,
+                Some(shard) => shard.skip_unframeable(shard.records_for(keys).await),
                 None => Vec::new(),
             }
         })
@@ -392,7 +392,7 @@ fn id_chunks(
         })
         .then(move |(id, batch)| {
             let shard = Arc::clone(&shard);
-            async move { (id, shard.records_for(batch).await) }
+            async move { (id, shard.skip_unframeable(shard.records_for(batch).await)) }
         })
         .flat_map(|(id, recs)| {
             stream::iter(

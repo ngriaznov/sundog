@@ -20,7 +20,7 @@ use super::apply::prefetch_spilled_conflict_bytes;
 use super::expiry::{absent_at, decode_expiry};
 #[cfg(doc)]
 use super::merge::resolve_conflict;
-use super::merge::{Fold, fold_sides, resolve_and_rebind};
+use super::merge::{Fold, MergeCap, Rebound, fold_sides, resolve_and_rebind};
 use super::record::{record_key, record_value_bytes};
 #[cfg(doc)]
 use super::{ApplyOutcome, Engine};
@@ -60,14 +60,18 @@ struct FoldedRun<V> {
 /// carries the stored record the fold stops before the first step that
 /// [`fold_sides`] does not decide as [`Fold::Both`]: the survivor, applied
 /// against that same stored record, would otherwise fold the content the
-/// step dropped back in. The unconsumed tail is returned for sequential
-/// application.
+/// step dropped back in. The fold also stops before a step `cap` refuses
+/// ([`Rebound::TooLarge`]): the accumulator is then the content sequential
+/// application would have stored just before that step, and the step meets it
+/// again in [`apply_locked`], where the cap refuses it against the stored
+/// record. The unconsumed tail is returned for sequential application.
 #[allow(
     clippy::too_many_arguments,
     reason = "one caller; the seed, its absence, the clock and the run are each a distinct input"
 )]
 fn fold_run<V: DeserializeOwned>(
     resolver: &dyn ConflictResolver,
+    cap: Option<MergeCap>,
     key_bytes: &[u8],
     seed_ver: Hlc,
     seed_incoming: Incoming<V>,
@@ -105,8 +109,9 @@ fn fold_run<V: DeserializeOwned>(
             break;
         }
         let (ver, incoming) = rest.next().expect("just peeked");
-        if let Some((new_ver, new_incoming)) = resolve_and_rebind(
+        match resolve_and_rebind(
             resolver,
+            cap,
             key_bytes,
             acc_ver,
             stored_encoded,
@@ -116,14 +121,26 @@ fn fold_run<V: DeserializeOwned>(
             ver,
             incoming,
         ) {
-            acc_ver = new_ver;
-            acc_incoming = new_incoming;
-            // The stored entry is displaced: every later step folds against
-            // the running accumulator, which sequential application would
-            // have stored, and which reads as absent once `now_ms` reaches
-            // its deadline. A rejected step leaves the stored entry, still
-            // absent, in place.
-            acc_absent = reaches_deadline(&acc_incoming, now_ms);
+            Rebound::Store(new_ver, new_incoming) => {
+                acc_ver = new_ver;
+                acc_incoming = new_incoming;
+                // The stored entry is displaced: every later step folds
+                // against the running accumulator, which sequential
+                // application would have stored, and which reads as absent
+                // once `now_ms` reaches its deadline. A rejected step leaves
+                // the stored entry, still absent, in place.
+                acc_absent = reaches_deadline(&acc_incoming, now_ms);
+            }
+            Rebound::Lost => {}
+            Rebound::TooLarge { incoming, .. } => {
+                let mut remaining = vec![(ver, incoming)];
+                remaining.extend(rest);
+                return FoldedRun {
+                    ver: acc_ver,
+                    incoming: acc_incoming,
+                    remaining,
+                };
+            }
         }
     }
     FoldedRun {
@@ -299,6 +316,7 @@ pub(super) fn prefold_batch<K, V: DeserializeOwned>(
     entries: Vec<BatchEntry<K, V>>,
     runs: Vec<Vec<usize>>,
     resolver: &dyn ConflictResolver,
+    cap: Option<MergeCap>,
     stored_seeds: &HashMap<Bytes, PrefoldSeed>,
     now_ms: u64,
 ) -> Vec<Option<BatchEntry<K, V>>> {
@@ -346,6 +364,7 @@ pub(super) fn prefold_batch<K, V: DeserializeOwned>(
             };
             fold_run(
                 resolver,
+                cap,
                 key_bytes.as_ref(),
                 sv,
                 stored_incoming,
@@ -360,6 +379,7 @@ pub(super) fn prefold_batch<K, V: DeserializeOwned>(
             let seed_absent = reaches_deadline(&seed_incoming, now_ms);
             fold_run(
                 resolver,
+                cap,
                 key_bytes.as_ref(),
                 seed_ver,
                 seed_incoming,

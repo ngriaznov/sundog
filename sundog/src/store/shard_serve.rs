@@ -797,9 +797,11 @@ where
     }
 
     /// [`ShardOps::records_for`]'s note applies here too: a spilled entry is
-    /// read off-lock and folded in, never promoted.
+    /// read off-lock and folded in, never promoted. A record larger than one
+    /// frame is left out of the snapshot ([`ShardOps::skip_unframeable`]).
     fn snapshot_chunks(&self) -> BoxStream<'static, Vec<WireRecord>> {
         let engine = Arc::clone(&self.engine);
+        let skips = self.sync_skips.clone();
         let now = self.now_ms();
         let residency = self.residency_check();
         #[cfg(feature = "spill")]
@@ -830,9 +832,13 @@ where
                     .collect(),
                 None => records,
             };
-            chunk_records_for_snapshot(records)
+            chunk_records_for_snapshot(skips.skip(records))
         };
         Box::pin(stream::once(fut).flat_map(stream::iter))
+    }
+
+    fn skip_unframeable(&self, records: Vec<WireRecord>) -> Vec<WireRecord> {
+        self.sync_skips.skip(records)
     }
 
     fn gc_tombstones(&self, defer: bool) -> BoxFuture<'_, ()> {

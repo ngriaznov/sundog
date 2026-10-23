@@ -8,6 +8,8 @@ mod diff;
 #[cfg(not(feature = "sim"))]
 mod parts;
 #[cfg(not(feature = "sim"))]
+mod pull;
+#[cfg(not(feature = "sim"))]
 mod repair;
 mod rules;
 mod tombstone_drain;

@@ -5,7 +5,7 @@ use crate::cluster::handler::{bucket_runs, serve_order, st_bucket_key_sub_batche
 use crate::hlc::Hlc;
 use crate::ownership::Granularity;
 use crate::store::{BucketDigest, BucketLen, BucketPart, BucketPartDigests, KeyVersion};
-use crate::wire::WireRecord;
+use crate::wire::{self, WireRecord};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::stream::{BoxStream, StreamExt as _};
@@ -333,4 +333,30 @@ async fn close_spill_checkpointed_default_resolves_and_calls_the_sync_close() {
         1,
         "the default close_spill_checkpointed calls the sync close_spill exactly once"
     );
+}
+
+/// A shard that does not override [`ShardOps::skip_unframeable`] has nothing
+/// it cannot ship, so the default hands back every record, in order.
+#[test]
+fn skip_unframeable_default_hands_back_every_record_unchanged() {
+    let shard = RecordingShard {
+        entries: Vec::new(),
+        held: Vec::new(),
+        records: HashMap::new(),
+        records_for_calls: Mutex::new(Vec::new()),
+        close_spill_calls: AtomicUsize::new(0),
+    };
+    let record = |key: &'static [u8]| WireRecord {
+        key: Bytes::from_static(key),
+        value: Some(Bytes::from(vec![0u8; wire::MAX_FRAME])),
+        ver: Hlc {
+            wall_ms: 1,
+            logical: 0,
+            node: NodeId::from(1),
+        },
+        expires_at_ms: None,
+    };
+    let records = vec![record(b"a"), record(b"b")];
+
+    assert_eq!(shard.skip_unframeable(records.clone()), records);
 }

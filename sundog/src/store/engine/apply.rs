@@ -25,9 +25,9 @@ use super::expiry::{
     tombstone_anchor_ms, tombstone_deadlines,
 };
 use super::keys::{digest_slot, hasher_for, part_index_from_hash, stripe_index_from_hash};
-use super::merge::resolve_and_rebind;
+use super::merge::{MergeCap, Rebound, resolve_and_rebind};
 #[cfg(doc)]
-use super::merge::{merge_version, resolve_conflict};
+use super::merge::{merge_fits, merge_version, resolve_conflict};
 #[cfg(doc)]
 use super::prefold::peek_stored_seed;
 use super::prefold::{BatchEntry, group_prefold_runs, peek_prefold_seeds, prefold_batch};
@@ -157,6 +157,9 @@ pub(crate) struct ApplyCtx<'a, K, V> {
     pub(super) weigher: Option<&'a Weigher<K, V>>,
     pub(super) tti_ms: Option<u64>,
     pub(super) resolver: &'a dyn ConflictResolver,
+    /// The frame a merged value stays within; `None` leaves it unbounded. See
+    /// [`MergeCap`].
+    pub(super) merge_cap: Option<MergeCap>,
     #[cfg(feature = "spill")]
     pub(super) prefetched_spilled: &'a HashMap<SpillLoc, Bytes>,
     #[cfg(feature = "spill")]
@@ -253,13 +256,19 @@ pub(super) fn read_stored_live<K, V>(
 /// [`prefetch_spilled_conflict_bytes`].
 /// With [`ApplyCtx::held_only`] set, a write that does not fold into a
 /// visible live entry is [`ApplyOutcome::Rejected`] and stores nothing; see
-/// [`reject_unheld`]. Synchronous under the caller's write lock on `stripe`;
-/// no disk I/O of its own. `prefetched_spilled` (`spill` builds) is
+/// [`reject_unheld`]. A merge whose result would pass [`ApplyCtx::merge_cap`]
+/// and be larger than the record it replaces is [`ApplyOutcome::TooLarge`]
+/// and stores nothing either; see [`merge_fits`]. Synchronous under the
+/// caller's write lock on `stripe`; no disk I/O of its own. `prefetched_spilled` (`spill` builds) is
 /// [`prefetch_spilled_conflict_bytes`]'s off-lock read of the stored side's
 /// bytes; a lookup miss falls back to [`read_spilled_for_conflict`] under
 /// this lock rather than treating the side as value-less. Returns whether
 /// this displaced a [`EntryState::Spilled`] entry (`false` for `Rejected`);
 /// see [`Engine::note_spill_departure`].
+#[expect(
+    clippy::too_many_lines,
+    reason = "the versioned-apply decision reads best whole: the gates that refuse a write, the collision, then the write"
+)]
 pub(crate) fn apply_locked<K, V>(
     stripe: &mut Stripe<K, V>,
     ctx: &ApplyCtx<'_, K, V>,
@@ -315,6 +324,7 @@ where
         let stored_absent = stored_live.as_ref().is_some_and(|s| !s.visible);
         match resolve_and_rebind(
             ctx.resolver,
+            ctx.merge_cap,
             key_bytes.as_ref(),
             sv,
             stored_encoded,
@@ -324,8 +334,11 @@ where
             ver,
             incoming,
         ) {
-            None => return (ApplyOutcome::Rejected, false),
-            Some((new_ver, new_incoming)) => {
+            Rebound::Lost => return (ApplyOutcome::Rejected, false),
+            Rebound::TooLarge { size, .. } => {
+                return (ApplyOutcome::TooLarge { key_bytes, size }, false);
+            }
+            Rebound::Store(new_ver, new_incoming) => {
                 ver = new_ver;
                 incoming = new_incoming;
             }
@@ -602,6 +615,27 @@ where
         self.prefold_enabled.load(Ordering::Relaxed)
     }
 
+    /// Keeps every merge this engine applies within a frame of `limit` bytes
+    /// under a cache name of `cache_len` bytes: a merge is refused as
+    /// [`ApplyOutcome::TooLarge`] when its result passes the limit and is
+    /// larger than the value it replaces. The default is no cap.
+    /// [`super::super::Shard::with_max_frame`] sets it from the cluster's
+    /// frame limit.
+    pub(crate) fn set_merge_cap(&self, cache_len: usize, limit: usize) {
+        self.merge_cap_cache_len.store(cache_len, Ordering::Relaxed);
+        self.merge_cap_limit.store(limit, Ordering::Relaxed);
+    }
+
+    /// The cap [`Engine::set_merge_cap`] set, which a shard's engine rebuild
+    /// carries forward onto the new engine; `None` without one.
+    pub(crate) fn merge_cap(&self) -> Option<MergeCap> {
+        let limit = self.merge_cap_limit.load(Ordering::Relaxed);
+        (limit != usize::MAX).then(|| MergeCap {
+            cache_len: self.merge_cap_cache_len.load(Ordering::Relaxed),
+            limit,
+        })
+    }
+
     /// Applies a batch of versioned writes that all hash into `bucket`,
     /// under one write-lock acquisition for the whole group. Runs
     /// [`Self::enforce_capacity`] once afterward, outside the write lock,
@@ -718,6 +752,7 @@ where
         written: &mut Written,
     ) -> (Vec<ApplyOutcome<K, V>>, u64) {
         let held_only = scope == ApplyScope::HeldOnly;
+        let merge_cap = self.merge_cap();
         let ignored = AtomicU64::new(0);
         // Read once for the batch: a collection that lands mid-batch applies
         // from the next call on.
@@ -758,7 +793,7 @@ where
                     &prefetched_spilled,
                 )
             };
-            prefold_batch(entries, runs, resolver, &stored_seeds, now_ms)
+            prefold_batch(entries, runs, resolver, merge_cap, &stored_seeds, now_ms)
         } else {
             entries.into_iter().map(Some).collect()
         };
@@ -781,6 +816,7 @@ where
                     weigher: self.weigher.as_ref(),
                     tti_ms: self.tti_ms,
                     resolver,
+                    merge_cap,
                     #[cfg(feature = "spill")]
                     prefetched_spilled: &prefetched_spilled,
                     #[cfg(feature = "spill")]
@@ -866,6 +902,7 @@ where
                 weigher: self.weigher.as_ref(),
                 tti_ms: self.tti_ms,
                 resolver,
+                merge_cap: self.merge_cap(),
                 #[cfg(feature = "spill")]
                 prefetched_spilled: &prefetched_spilled,
                 #[cfg(feature = "spill")]

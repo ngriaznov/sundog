@@ -73,7 +73,9 @@ pub(super) async fn serve_state_transfer(
 /// replies with its 64 part digests ([`Msg::AePartDigests`]) without ever
 /// materializing its listing; a smaller mismatched bucket falls back to the
 /// existing rule, an IBLT sketch past `handler.ae_sketch_min_bucket()`
-/// entries or else the full [`Msg::AeBucket`] listing. Does not append the
+/// entries or else the full [`Msg::AeBucket`] listing, which a bucket of
+/// large keys sends as several messages, as [`ae_entries_replies`] cuts them
+/// for a peer on [`wire::PROTOCOL_AE_LISTING_CHUNKS`]. Does not append the
 /// trailing [`Msg::ReqDone`]; callers add it.
 async fn ae_mismatch_replies(
     cache: &SmolStr,
@@ -130,23 +132,28 @@ async fn ae_mismatch_replies(
             // materialized.
             let min_bucket = handler.ae_sketch_min_bucket();
             let sketch_cells = handler.ae_sketch_cells();
+            let chunked = wire::peer_supports(peer_protocol, wire::PROTOCOL_AE_LISTING_CHUNKS);
             replies.extend(
                 handler
                     .entries_for_buckets(cache.clone(), small)
                     .await
                     .into_iter()
-                    .map(|(bucket, entries)| {
+                    .flat_map(|(bucket, entries)| {
                         match listing_or_sketch(entries, min_bucket, sketch_cells) {
-                            ListingOrSketch::Sketch(cells) => Msg::AeSketch {
+                            ListingOrSketch::Sketch(cells) => vec![Msg::AeSketch {
                                 cache: cache.clone(),
                                 bucket,
                                 cells,
-                            },
-                            ListingOrSketch::Listing(entries) => Msg::AeBucket {
-                                cache: cache.clone(),
-                                bucket,
-                                entries: key_versions_to_wire(entries),
-                            },
+                            }],
+                            // A listing too large for one frame, which keys
+                            // of several KiB each reach well under the
+                            // sketch threshold, goes out in slices.
+                            ListingOrSketch::Listing(entries) => ae_entries_replies(
+                                cache,
+                                vec![(bucket, entries)],
+                                chunked,
+                                AE_LISTING_BUDGET,
+                            ),
                         }
                     }),
             );

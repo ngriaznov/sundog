@@ -84,6 +84,7 @@ fn test_ctx<'a, K, V>(
         weigher: engine.weigher.as_ref(),
         tti_ms: engine.tti_ms,
         resolver,
+        merge_cap: None,
         #[cfg(feature = "spill")]
         prefetched_spilled: empty_prefetched(),
         #[cfg(feature = "spill")]
@@ -212,6 +213,7 @@ where
         weigher: engine.weigher.as_ref(),
         tti_ms: engine.tti_ms,
         resolver: &resolver,
+        merge_cap: None,
         #[cfg(feature = "spill")]
         prefetched_spilled: &prefetched_spilled,
         #[cfg(feature = "spill")]
@@ -279,6 +281,7 @@ where
         weigher: engine.weigher.as_ref(),
         tti_ms: engine.tti_ms,
         resolver,
+        merge_cap: None,
         #[cfg(feature = "spill")]
         prefetched_spilled: &prefetched_spilled,
         #[cfg(feature = "spill")]
@@ -483,3 +486,8 @@ mod merge_expiry;
 /// never the `(version, bytes)` it leaves stored or the set of keys it
 /// reports a real outcome for.
 mod apply_many_prefold;
+
+/// Coverage for the frame cap on a merge: the pure [`merge_fits`] rule, and
+/// [`Engine::apply_many`] refusing a merge that would grow a value past the
+/// cap, with and without the pre-fold.
+mod merge_cap;

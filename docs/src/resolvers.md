@@ -116,8 +116,9 @@ out the adds the read observed; an add of the same element made concurrently
 elsewhere survives. Never use `Cache::remove` for one element: it deletes the
 whole set. Every add creates a tag that stays until a remove observes it, so
 re-adding an element that is already present, on every heartbeat for
-example, grows the value with each write. `OrSet::contains` and
-`OrSet::iter` read the members.
+example, grows the value with each write, and a value that keeps growing
+reaches [the frame limit](#a-merged-value-stays-within-a-frame).
+`OrSet::contains` and `OrSet::iter` read the members.
 
 The order holds past the node that draws it. A `Replicated` or `Invalidation`
 peer receives the stored value, which holds every number applied before the
@@ -182,6 +183,54 @@ give merged values a lifetime as they give any other value one:
   again, so a remove does not reset a count; a new key does. A fold still
   waiting in `merge_coalesce_window` dies with the remove, and a merge made
   after it starts a new fold.
+
+## A merged value stays within a frame
+
+A record travels as one message, and a message is at most `max_frame` bytes:
+4 MiB by default, and never more than `wire::MAX_FRAME`. A merged value is
+held to that, the frame it takes with its key and the cache's name. A
+`Cache::merge`, `merge_with_ttl`, `merge_sequenced` or `insert` that would
+leave a value past the limit and larger than it was fails with
+`CacheError::ValueTooLarge` and changes nothing. A merge that leaves the
+value no larger always succeeds, so a remove can shrink a value that already
+passes the limit.
+
+An `OrSet` that is only ever added to reaches it: each add leaves a tag in the
+value until a remove observes it. Bound a set before it gets there. Remove the
+elements that have served their purpose, keep a re-add of an element that is
+already present out of the write path, or spread one set over several keys.
+
+A merge that arrives from a peer, by replication, anti-entropy, state
+transfer or a `Distributed` forward, follows the same rule. The node leaves
+the stored value as it is, counts the refusal in
+`sundog_merge_refused_total{cache, reason="too_large"}` and logs a warning
+that names the key, at most once a minute for each cache. The contribution is
+lost, since no caller waits for it. Two replicas that each hold half of a set
+too large to merge refuse each other's state and stay apart, and a
+`Distributed` non-owner's call returns before the owner applies it, so only
+the owner sees its refusal. One remove that shrinks the value on any node
+brings the replicas back together, because a state that fits merges
+everywhere.
+
+With a `merge_coalesce_window`, the call that would leave its own pending fold
+past the limit gets the error. A fold that fits while it is pending but would
+push the stored value past the limit when the window closes is refused at that
+flush, where no caller waits: it is counted and logged like a merge from a
+peer, and its contributions are lost. Give a windowed set room below the limit.
+
+A value over the limit can exist: one stored under a larger `max_frame`, or by
+a release that set no limit. It keeps serving reads on its node and cannot
+grow. It cannot travel in one frame, so anti-entropy, state transfer and
+rebalance leave it out. The nodes that lack it do not receive it, and every
+other key syncs as usual. Each record left out counts in
+`sundog_sync_skipped_total{cache, reason="too_large"}`, and a warning that
+names the largest key follows, at most once a minute for each cache. In a
+`Distributed` cache, a node that stops owning the part of such a value cannot
+hand it to the new owners, and drops it when the part releases. To bring a
+value back under the limit, merge a remove that shrinks it, which every merge
+accepts, or delete the key with `Cache::remove`; the tombstone replicates, and
+the next writes build a value that fits. Do it before a membership change
+moves the part.
 
 ## What a CRDT costs
 

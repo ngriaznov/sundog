@@ -61,12 +61,21 @@ pub enum JoinError {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CacheError {
-    /// A value or key exceeds the configured max frame size and is
-    /// rejected at the API boundary rather than fragmented.
+    /// A value would not fit one frame, the configured max frame size, and
+    /// is rejected at the API boundary rather than fragmented. Either the
+    /// write's own value is too large, or, under a merging resolver, the
+    /// merge would leave the stored value past the cap and larger than it
+    /// was: a merge that leaves the value no larger always succeeds, so a
+    /// value that already passes the cap can still shrink. The write changes
+    /// nothing. A merged value, an
+    /// [`OrSet`](crate::crdt::OrSet) that keeps growing for example, needs a
+    /// bound of its own.
     #[error("value for cache {cache:?} is {size} bytes, exceeding the {limit}-byte frame cap")]
     ValueTooLarge {
         /// The cache the oversized write targeted.
         cache: SmolStr,
+        /// The encoded bytes of the value: the write's own, or the merged
+        /// value the write would have stored.
         size: usize,
         /// The configured cap it exceeded.
         limit: usize,

@@ -15,6 +15,7 @@ mod hand_off;
 mod inbound;
 mod invalidation_fold;
 mod modes;
+mod oversize_sync;
 mod request_handler;
 mod resolvers;
 mod serve_chunks;

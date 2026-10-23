@@ -25,6 +25,7 @@ use std::io;
 use xxhash_rust::xxh3::xxh3_64;
 
 mod anti_entropy;
+mod digest_listing;
 mod distribution;
 mod fan_out;
 mod peers;

@@ -1,0 +1,615 @@
+//! A merged value stays within one frame: a merge that would push a value
+//! past the shard's `max_frame` is refused and changes nothing, however it
+//! reaches the shard, and a record too large to ship stays out of a sync.
+
+use std::sync::{Arc, Mutex};
+
+use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+#[cfg(not(feature = "sim"))]
+use tracing_subscriber::layer::SubscriberExt as _;
+
+use super::*;
+#[cfg(not(feature = "sim"))]
+use crate::cluster::test_support::{ScopedSubscriber, scoped_subscriber};
+use crate::store::crdt::WriterId;
+use crate::store::shard_oversize::{
+    OVERSIZE_WARN_SPACING_MS, key_for_log, oversize_warn_due, split_unframeable,
+};
+use crate::wire;
+
+const WINDOW: Duration = Duration::from_secs(60);
+
+/// A resolver over byte vectors whose merge appends the incoming vector to
+/// the stored one, and clears the value when the incoming one is empty: a
+/// merge that can grow a value, leave it as it is, and shrink it.
+#[derive(Debug, Clone, Copy, Default)]
+struct ConcatResolver;
+
+impl ConflictResolver for ConcatResolver {
+    fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
+        if a.ver >= b.ver { Winner::A } else { Winner::B }
+    }
+
+    fn merges(&self) -> bool {
+        true
+    }
+
+    fn merge(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Option<Merged> {
+        let mut left: Vec<u8> = postcard::from_bytes(a.value?).ok()?;
+        let right: Vec<u8> = postcard::from_bytes(b.value?).ok()?;
+        if right.is_empty() {
+            left.clear();
+        } else {
+            left.extend(right);
+        }
+        Some(Merged {
+            value: Bytes::from(postcard::to_stdvec(&left).ok()?),
+            expires_at_ms: later_deadline(a.expires_at_ms, b.expires_at_ms),
+        })
+    }
+}
+
+/// The frame cap that admits a value of `value_bytes` encoded bytes under a
+/// one-byte key in the cache `shard` names, `test`.
+fn cap_for(value_bytes: usize) -> usize {
+    wire::replicate_frame_len("test".len(), 1, value_bytes)
+}
+
+/// A shard whose values stay within `value_bytes` encoded bytes. A vector of
+/// `n` bytes under 128 encodes to `n + 1`.
+fn capped_shard(value_bytes: usize) -> Shard<u32, Vec<u8>> {
+    shard::<u32, Vec<u8>>(1)
+        .with_resolver(Arc::new(ConcatResolver))
+        .with_max_frame(cap_for(value_bytes))
+}
+
+/// Four bytes: five encoded, so two of them merge to nine, past a cap of
+/// eight.
+fn four(byte: u8) -> Vec<u8> {
+    vec![byte; 4]
+}
+
+/// A record for key 1 carrying `value` at `ver`.
+fn bytes_record(value: &[u8], ver: Hlc) -> WireRecord {
+    WireRecord {
+        key: key_bytes(&1u32),
+        value: Some(Bytes::from(
+            postcard::to_stdvec(&value.to_vec()).expect("test value encodes"),
+        )),
+        ver,
+        expires_at_ms: None,
+    }
+}
+
+/// The record stored for key 1.
+async fn stored_record(s: &Shard<u32, Vec<u8>>) -> Option<WireRecord> {
+    ShardOps::records_for(s, vec![key_bytes(&1u32)])
+        .await
+        .into_iter()
+        .next()
+}
+
+/// Reads the counters a recorder holds. A snapshot resets the counters it
+/// reads, so this keeps running totals.
+struct Counted {
+    snapshotter: Snapshotter,
+    totals: Mutex<HashMap<String, u64>>,
+}
+
+impl Counted {
+    fn new(recorder: &DebuggingRecorder) -> Self {
+        Self {
+            snapshotter: recorder.snapshotter(),
+            totals: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The total of `name{cache="test", reason}` so far, 0 while the series
+    /// does not exist.
+    fn total(&self, name: &str, reason: &str) -> u64 {
+        let mut totals = self.totals.lock().expect("lock");
+        for (key, _, _, value) in self.snapshotter.snapshot().into_vec() {
+            let labelled = |label: &str, expected: &str| {
+                key.key()
+                    .labels()
+                    .any(|l| l.key() == label && l.value() == expected)
+            };
+            if key.key().name() != name || !labelled("cache", "test") || !labelled("reason", reason)
+            {
+                continue;
+            }
+            let DebugValue::Counter(n) = value else {
+                panic!("a counter, got {value:?}");
+            };
+            *totals.entry(name.to_owned()).or_default() += n;
+        }
+        totals.get(name).copied().unwrap_or(0)
+    }
+
+    fn refused(&self) -> u64 {
+        self.total("sundog_merge_refused_total", "too_large")
+    }
+
+    fn skipped(&self) -> u64 {
+        self.total("sundog_sync_skipped_total", "too_large")
+    }
+}
+
+/// A tracing layer that keeps the message and fields of every `WARN` event.
+/// A `sim` build has no cluster test support to install it with, so it
+/// captures nothing and its tests skip the assertions on the log.
+#[derive(Clone, Default)]
+struct Warnings(Arc<Mutex<Vec<String>>>);
+
+#[cfg(feature = "sim")]
+type ScopedSubscriber = ();
+
+struct Message(String);
+
+impl tracing::field::Visit for Message {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write as _;
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        } else {
+            let _ = write!(self.0, " {}={value:?}", field.name());
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if *event.metadata().level() != tracing::Level::WARN {
+            return;
+        }
+        let mut message = Message(String::new());
+        event.record(&mut message);
+        self.0.lock().expect("lock").push(message.0);
+    }
+}
+
+impl Warnings {
+    /// Whether this build installs the layer.
+    const CAPTURES: bool = cfg!(not(feature = "sim"));
+
+    fn capture() -> (Self, ScopedSubscriber) {
+        let warnings = Self::default();
+        #[cfg(not(feature = "sim"))]
+        let guard = scoped_subscriber(tracing_subscriber::registry().with(warnings.clone()));
+        #[cfg(feature = "sim")]
+        let guard = ();
+        (warnings, guard)
+    }
+
+    fn logged(&self) -> Vec<String> {
+        self.0.lock().expect("lock").clone()
+    }
+
+    /// Asserts that exactly one warning was logged and that it holds each of
+    /// `parts`, its message or a field as `name="value"`. A build that
+    /// captures nothing skips the check.
+    fn assert_one(&self, parts: &[&str]) {
+        if !Self::CAPTURES {
+            return;
+        }
+        let logged = self.logged();
+        assert_eq!(
+            logged.len(),
+            1,
+            "one warning inside the spacing: {logged:?}"
+        );
+        for part in parts {
+            assert!(logged[0].contains(part), "{part} is in {logged:?}");
+        }
+    }
+}
+
+fn too_large(result: Result<(), CacheError>) -> (usize, usize) {
+    match result {
+        Err(CacheError::ValueTooLarge { size, limit, .. }) => (size, limit),
+        other => panic!("expected ValueTooLarge, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_warning_is_due_at_first_and_then_once_per_spacing() {
+    assert!(oversize_warn_due(None, 0));
+    assert!(!oversize_warn_due(Some(1_000), 1_000), "the same instant");
+    assert!(!oversize_warn_due(
+        Some(1_000),
+        1_000 + OVERSIZE_WARN_SPACING_MS - 1
+    ));
+    assert!(oversize_warn_due(
+        Some(1_000),
+        1_000 + OVERSIZE_WARN_SPACING_MS
+    ));
+    assert!(
+        oversize_warn_due(Some(5_000), 4_999),
+        "the clock stepped back"
+    );
+}
+
+#[test]
+fn a_key_shows_in_a_log_as_hex_cut_at_forty_eight_bytes() {
+    assert_eq!(key_for_log(&[]), "");
+    assert_eq!(key_for_log(&[0x00, 0x0a, 0xff]), "000aff");
+    assert_eq!(
+        key_for_log(&[0xab; 48]),
+        "ab".repeat(48),
+        "a key of 48 bytes is whole"
+    );
+    assert_eq!(
+        key_for_log(&[0xab; 49]),
+        format!("{}..", "ab".repeat(48)),
+        "one byte more is cut and marked"
+    );
+}
+
+#[test]
+fn a_record_fits_a_frame_up_to_max_frame_and_not_one_byte_past_it() {
+    let record = |key_len: usize, value_len: usize| WireRecord {
+        key: Bytes::from(vec![0u8; key_len]),
+        value: Some(Bytes::from(vec![0u8; value_len])),
+        ver: hlc(1, 1),
+        expires_at_ms: None,
+    };
+    let cache_len = 4;
+    let room = wire::MAX_FRAME - wire::replicate_frame_len(cache_len, 1, 0);
+
+    let (kept, largest) = split_unframeable(
+        cache_len,
+        vec![
+            record(1, 3),
+            record(1, room),
+            record(1, room + 1),
+            record(2, room),
+        ],
+    );
+
+    assert_eq!(
+        kept.iter()
+            .map(|r| (r.key.len(), r.value.as_ref().map_or(0, Bytes::len)))
+            .collect::<Vec<_>>(),
+        [(1, 3), (1, room)],
+        "the lone record at the limit stays, in order; a longer key tips one over"
+    );
+    assert_eq!(
+        largest,
+        Some((wire::MAX_FRAME + 1, Bytes::from(vec![0u8; 1]))),
+        "the frame length and key of the largest one left out, the first of two that tie"
+    );
+    let (all, none) = split_unframeable(cache_len, vec![record(1, 3)]);
+    assert_eq!((all.len(), none), (1, None));
+}
+
+#[tokio::test]
+async fn a_growing_merge_past_the_cap_fails_with_value_too_large_and_changes_nothing() {
+    let s = capped_shard(8);
+    let mut events = s.events();
+    s.merge(1, four(1)).await.expect("five bytes fit");
+    events
+        .try_recv()
+        .expect("the first merge published its event");
+    let before = stored_record(&s).await.expect("stored");
+    s.fan_out_queue().drain();
+
+    let (size, limit) = too_large(s.merge(1, four(2)).await);
+
+    assert_eq!(size, 9, "the merged vector would encode to nine bytes");
+    assert_eq!(limit, cap_for(8), "against the shard's frame cap");
+    assert_eq!(
+        stored_record(&s).await,
+        Some(before),
+        "the stored record is whole: same version, same bytes"
+    );
+    assert!(events.try_recv().is_err(), "no event for a refused merge");
+    assert!(
+        s.fan_out_queue().drain().is_empty(),
+        "nothing queued to replicate"
+    );
+    assert_digest_matches_full_recompute(&s).await;
+}
+
+#[tokio::test]
+async fn every_local_merge_entry_point_refuses_the_same_growth() {
+    let s = capped_shard(8);
+    s.merge(1, four(1)).await.expect("fits");
+
+    too_large(s.merge_with_ttl(1, four(2), Duration::from_secs(60)).await);
+    too_large(
+        s.merge_sequenced(1, WriterId::new(NodeId::from(1), 1), |_, _| four(3))
+            .await,
+    );
+    too_large(
+        s.merge_sequenced_with_ttl(
+            1,
+            WriterId::new(NodeId::from(1), 1),
+            |_, _| four(4),
+            Duration::from_secs(60),
+        )
+        .await,
+    );
+
+    assert_eq!(s.get(&1).await, Some(four(1)), "nothing grew");
+}
+
+#[tokio::test]
+async fn a_merge_sequenced_call_that_is_refused_spends_its_number() {
+    let s = capped_shard(8);
+    let writer = WriterId::new(NodeId::from(1), 1);
+    let handed = Mutex::new(Vec::new());
+    let call = |value: Vec<u8>| {
+        let handed = &handed;
+        async {
+            s.merge_sequenced(1, writer, |_, seq| {
+                handed.lock().expect("lock").push(seq);
+                value
+            })
+            .await
+        }
+    };
+
+    call(four(1)).await.expect("fits");
+    too_large(call(four(2)).await);
+    call(Vec::new())
+        .await
+        .expect("a clearing merge always fits");
+
+    assert_eq!(
+        *handed.lock().expect("lock"),
+        [1, 2, 3],
+        "the refused call drew number 2 and the next call gets 3"
+    );
+    assert_eq!(s.get(&1).await, Some(Vec::new()));
+}
+
+#[tokio::test]
+async fn a_merge_that_shrinks_or_keeps_an_oversized_value_succeeds_and_one_that_grows_it_does_not()
+{
+    let s = capped_shard(8);
+    // Stored before the cap applied: twenty bytes, twelve past it. A peer's
+    // record is how a shard comes to hold it.
+    ShardOps::apply_remote(&s, bytes_record(&[7u8; 20], hlc(ahead_ms(), 2))).await;
+    assert_eq!(
+        s.get(&1).await,
+        Some(vec![7u8; 20]),
+        "it keeps serving reads"
+    );
+
+    let (size, _) = too_large(s.merge(1, vec![1]).await);
+    assert_eq!(size, 22, "one more byte, and its length byte, is refused");
+    assert_eq!(s.get(&1).await, Some(vec![7u8; 20]));
+
+    s.merge(1, Vec::new()).await.expect("a clear shrinks it");
+    assert_eq!(s.get(&1).await, Some(Vec::new()));
+    s.merge(1, four(1)).await.expect("and it fits again");
+    assert_eq!(s.get(&1).await, Some(four(1)));
+}
+
+#[tokio::test]
+async fn an_insert_that_merges_into_a_stored_value_meets_the_cap_and_so_does_insert_many() {
+    let s = capped_shard(8);
+    s.insert(1, four(1)).await.expect("the first insert stores");
+    s.insert(3, four(3)).await.expect("so does another key");
+
+    too_large(s.insert(1, four(2)).await);
+    assert_eq!(s.get(&1).await, Some(four(1)));
+
+    let result = s.insert_many([(1, four(2)), (2, four(5))]).await;
+    too_large(result);
+    assert_eq!(
+        s.get(&1).await,
+        Some(four(1)),
+        "the refused entry changed nothing"
+    );
+    assert_eq!(
+        s.get(&2).await,
+        Some(four(5)),
+        "the entries around it applied, as a batch that is not a transaction does"
+    );
+}
+
+#[tokio::test]
+async fn the_default_cap_is_one_wire_frame() {
+    let s = shard::<u32, Vec<u8>>(1).with_resolver(Arc::new(ConcatResolver));
+    let three_mib = vec![1u8; 3 * 1024 * 1024];
+    s.merge(1, three_mib.clone()).await.expect("fits a frame");
+
+    let (_, limit) = too_large(s.merge(1, three_mib).await);
+
+    assert_eq!(limit, wire::MAX_FRAME);
+    assert_eq!(s.get(&1).await.map(|v| v.len()), Some(3 * 1024 * 1024));
+}
+
+#[tokio::test]
+async fn the_cap_survives_the_builders_that_rebuild_the_engine() {
+    for capped_last in [false, true] {
+        let base = shard::<u32, Vec<u8>>(1).with_resolver(Arc::new(ConcatResolver));
+        let s = if capped_last {
+            base.with_capacity_hint(16).with_max_frame(cap_for(8))
+        } else {
+            base.with_max_frame(cap_for(8)).with_capacity_hint(16)
+        };
+        s.merge(1, four(1)).await.expect("fits");
+
+        too_large(s.merge(1, four(2)).await);
+    }
+    let weighed = shard::<u32, Vec<u8>>(1)
+        .with_resolver(Arc::new(ConcatResolver))
+        .with_max_frame(cap_for(8))
+        .with_weigher(|_, v: &Vec<u8>| u32::try_from(v.len()).unwrap_or(u32::MAX));
+    weighed.merge(1, four(1)).await.expect("fits");
+    too_large(weighed.merge(1, four(2)).await);
+}
+
+#[tokio::test]
+async fn a_remote_merge_past_the_cap_is_refused_counted_and_logged_once_per_spacing() {
+    let recorder = DebuggingRecorder::new();
+    let counted = Counted::new(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let (warnings, _log) = Warnings::capture();
+    let s = capped_shard(8);
+    ShardOps::apply_remote(&s, bytes_record(&four(1), hlc(ahead_ms(), 2))).await;
+    let before = stored_record(&s).await.expect("stored");
+    s.fan_out_queue().drain();
+    let mut events = s.events();
+
+    ShardOps::apply_remote(&s, bytes_record(&four(2), hlc(ahead_ms() + 1, 3))).await;
+    ShardOps::apply_remote_batch(&s, vec![bytes_record(&four(3), hlc(ahead_ms() + 2, 4))]).await;
+
+    assert_eq!(
+        stored_record(&s).await,
+        Some(before),
+        "the stored value is as it was"
+    );
+    assert!(events.try_recv().is_err(), "no event");
+    assert!(
+        s.fan_out_queue().drain().is_empty(),
+        "and nothing to fan out"
+    );
+    assert_eq!(counted.refused(), 2, "each refusal counts");
+    warnings.assert_one(&["frame limit", "key=\"01\""]);
+}
+
+#[tokio::test]
+async fn a_local_refusal_counts_but_does_not_log_since_the_caller_gets_the_error() {
+    let recorder = DebuggingRecorder::new();
+    let counted = Counted::new(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let (warnings, _log) = Warnings::capture();
+    let s = capped_shard(8);
+    s.merge(1, four(1)).await.expect("fits");
+
+    too_large(s.merge(1, four(2)).await);
+    too_large(s.insert(1, four(3)).await);
+
+    assert_eq!(counted.refused(), 2);
+    assert!(warnings.logged().is_empty(), "{:?}", warnings.logged());
+}
+
+#[tokio::test]
+async fn a_windowed_call_that_overflows_its_own_pending_fold_gets_the_error() {
+    let recorder = DebuggingRecorder::new();
+    let counted = Counted::new(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let s = capped_shard(8).with_merge_coalesce_window(WINDOW);
+    s.merge(1, four(1)).await.expect("opens a fold");
+    let pending = s.pending_merge_snapshot(&1).expect("pending");
+
+    let (size, _) = too_large(s.merge(1, four(2)).await);
+
+    assert_eq!(size, 9, "the fold of the two would hold eight bytes");
+    assert_eq!(
+        s.pending_merge_snapshot(&1),
+        Some(pending),
+        "the pending fold is as it was, version included"
+    );
+    assert_eq!(counted.refused(), 1);
+    s.merge(1, Vec::new()).await.expect("a clear still folds");
+    s.flush_all_pending_merges();
+    assert_eq!(s.get(&1).await, Some(Vec::new()));
+}
+
+#[tokio::test]
+async fn a_fold_that_overflows_the_stored_value_is_refused_at_its_flush_where_it_is_logged() {
+    let recorder = DebuggingRecorder::new();
+    let counted = Counted::new(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let (warnings, _log) = Warnings::capture();
+    let s = capped_shard(8).with_merge_coalesce_window(WINDOW);
+    s.merge(1, four(1)).await.expect("fold");
+    s.flush_all_pending_merges();
+    let stored = stored_record(&s).await.expect("stored");
+
+    s.merge(1, four(2))
+        .await
+        .expect("the call returns before the fold meets the stored value");
+    assert_eq!(counted.refused(), 0, "not refused yet");
+    s.flush_all_pending_merges();
+
+    assert_eq!(
+        stored_record(&s).await,
+        Some(stored),
+        "the stored value is as it was"
+    );
+    assert_eq!(counted.refused(), 1);
+    warnings.assert_one(&["frame limit", "key=\"01\""]);
+}
+
+/// The value bytes of the record `unshippable_record` builds are a vector of
+/// this many bytes under a four-byte length prefix.
+const UNSHIPPABLE_PREFIX: usize = 4;
+
+/// A record for key 2 whose frame is one byte past [`wire::MAX_FRAME`].
+fn unshippable_record(s: &Shard<u32, Vec<u8>>) -> WireRecord {
+    let key = key_bytes(&2u32);
+    let base = wire::replicate_frame_len(s.name.len(), key.len(), 0);
+    let value_len = wire::MAX_FRAME - base + 1;
+    let value = postcard::to_stdvec(&vec![9u8; value_len - UNSHIPPABLE_PREFIX])
+        .expect("test value encodes");
+    assert_eq!(
+        value.len(),
+        value_len,
+        "a four-byte prefix for a vector this long"
+    );
+    WireRecord {
+        key,
+        value: Some(Bytes::from(value)),
+        ver: hlc(ahead_ms(), 2),
+        expires_at_ms: None,
+    }
+}
+
+#[tokio::test]
+async fn a_record_too_large_for_a_frame_stays_here_and_out_of_every_sync() {
+    let recorder = DebuggingRecorder::new();
+    let counted = Counted::new(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let (warnings, _log) = Warnings::capture();
+    let s = capped_shard(8);
+    let big = unshippable_record(&s);
+    assert_eq!(
+        wire::replicate_frame_len(
+            s.name.len(),
+            big.key.len(),
+            big.value.as_ref().map_or(0, Bytes::len)
+        ),
+        wire::MAX_FRAME + 1
+    );
+    // Stored before the cap applied, as a peer's record, below the public API.
+    ShardOps::apply_remote(&s, big.clone()).await;
+    ShardOps::apply_remote(&s, bytes_record(&four(1), hlc(ahead_ms(), 2))).await;
+    assert_eq!(
+        s.get(&2).await.map(|v| v.len()),
+        Some(big.value.as_ref().map_or(0, Bytes::len) - UNSHIPPABLE_PREFIX),
+        "the local copy keeps serving"
+    );
+
+    let keys = vec![key_bytes(&1u32), key_bytes(&2u32)];
+    let read = ShardOps::records_for(&s, keys).await;
+    assert_eq!(
+        read.len(),
+        2,
+        "a read answers both: only a sync leaves one out"
+    );
+    let shipped = ShardOps::skip_unframeable(&s, read);
+    assert_eq!(
+        shipped.iter().map(|r| r.key.clone()).collect::<Vec<_>>(),
+        [key_bytes(&1u32)]
+    );
+    assert_eq!(counted.skipped(), 1);
+
+    let snapshot: Vec<Vec<WireRecord>> = ShardOps::snapshot_chunks(&s).collect().await;
+    let snapshot_keys: Vec<Bytes> = snapshot.into_iter().flatten().map(|r| r.key).collect();
+    assert_eq!(
+        snapshot_keys,
+        [key_bytes(&1u32)],
+        "a state transfer skips it too"
+    );
+    assert_eq!(counted.skipped(), 2, "each skip counts");
+    warnings.assert_one(&["larger than one frame", "largest_key=\"02\""]);
+}

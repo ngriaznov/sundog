@@ -34,6 +34,7 @@ mod expiry_tombstone;
 mod fan_out_view;
 mod gc_digests;
 mod invalidation_fold;
+mod merge_cap;
 mod merge_expiry;
 mod merge_sequenced;
 mod merging;

@@ -83,6 +83,13 @@ pub(crate) async fn scheduler_task(
 /// incrementally across batches rather than in one oversized exchange.
 const REPAIR_BATCH: usize = 4096;
 
+/// Key bytes per pull request, beside [`REPAIR_BATCH`]'s key count. An
+/// `ae_pull` carries its keys in one frame, so a batch of 4,096 keys that
+/// average over 1 KiB would not fit one; keys that large tend to hold values
+/// that large, whose reply takes longer to arrive than the request timeout
+/// allows. A batch holds at least one key, however long.
+const REPAIR_BATCH_KEY_BYTES: usize = 512 * 1024;
+
 /// A jittered delay around `interval`, uniformly in `[0.5, 1.5) * interval`
 /// and floored at 1ms, so anti-entropy rounds don't land in lockstep.
 fn jittered(interval: Duration) -> Duration {
@@ -935,6 +942,46 @@ fn push_needed(local: Hlc, pulled: Option<Hlc>) -> bool {
     pulled != Some(local)
 }
 
+/// Splits `keys` into pull batches of at most `max_keys` keys and `max_bytes`
+/// key bytes, in order. A key longer than `max_bytes` is a batch of its own.
+/// Pure; unit tested directly.
+fn pull_batches(keys: &[Bytes], max_keys: usize, max_bytes: usize) -> Vec<&[Bytes]> {
+    let mut batches = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0usize;
+    for (index, key) in keys.iter().enumerate() {
+        let full = index > start && (index - start >= max_keys || bytes + key.len() > max_bytes);
+        if full {
+            batches.push(&keys[start..index]);
+            start = index;
+            bytes = 0;
+        }
+        bytes += key.len();
+    }
+    if start < keys.len() {
+        batches.push(&keys[start..]);
+    }
+    batches
+}
+
+/// Pull requests in a row that may fail before a round gives up on the rest
+/// of its pulls. One failed batch costs only itself, a later one may well
+/// arrive, but a peer that stalls costs a request timeout per batch, so the
+/// round does not try them all.
+const MAX_CONSECUTIVE_PULL_FAILURES: u32 = 2;
+
+/// Whether a round stops pulling after `consecutive_failures` failed requests
+/// in a row. Pure; unit tested directly.
+const fn pull_gives_up(consecutive_failures: u32) -> bool {
+    consecutive_failures >= MAX_CONSECUTIVE_PULL_FAILURES
+}
+
+/// One request of a round's pulls: keys, or the hashes of one bucket's keys.
+enum PullBatch<'a> {
+    Keys(&'a [Bytes]),
+    Hashes(u16, &'a [u64]),
+}
+
 /// Pushes `push_keys`' current records to `peer`, skipping any whose stored
 /// version `pulled` shows the peer already holds. Answers whether every
 /// batch reached `peer`'s outbox: a peer a flap dropped from the mesh
@@ -953,7 +1000,7 @@ async fn push_repairs(
     // each landed batch shrinks the next round's diff, instead of one
     // all-or-nothing exchange racing a request timeout.
     for batch in push_keys.chunks(REPAIR_BATCH) {
-        let mut records = shard.records_for(batch.to_vec()).await;
+        let mut records = shard.skip_unframeable(shard.records_for(batch.to_vec()).await);
         records.retain(|rec| push_needed(rec.ver, pulled.get(&rec.key).copied()));
         tally.add(cache, &records);
         // `net::batch_replicate` chunks this into a handful of full frames, not
@@ -964,9 +1011,11 @@ async fn push_repairs(
     enqueued
 }
 
-/// Pulls `pull_keys` and then `pull_hashes` from `peer` and applies them.
-/// A failed request ends its own list, keeping what earlier batches
-/// landed. Returns the version of every record the peer sent, by key, and
+/// Pulls `pull_keys` and then `pull_hashes` from `peer` and applies them, in
+/// batches ([`pull_batches`], and [`REPAIR_BATCH`] hashes). A batch that
+/// fails costs only its own records, which the next round pulls again, so the
+/// round goes on with the next, until [`pull_gives_up`] says the peer is not
+/// answering. Returns the version of every record the peer sent, by key, and
 /// whether every request was answered.
 async fn pull_repairs(
     mesh: &crate::net::Mesh,
@@ -979,31 +1028,40 @@ async fn pull_repairs(
 ) -> (HashMap<Bytes, Hlc>, bool) {
     let mut pulled = HashMap::new();
     let mut complete = true;
-    let mut land = async |records: Vec<WireRecord>, pulled: &mut HashMap<Bytes, Hlc>| {
-        tally.add(cache, &records);
-        pulled.extend(records.iter().map(|rec| (rec.key.clone(), rec.ver)));
-        shard.apply_remote_batch(records).await;
-    };
-    for batch in pull_keys.chunks(REPAIR_BATCH) {
-        match mesh.ae_pull(peer, cache.clone(), batch.to_vec()).await {
-            Ok(records) => land(records, &mut pulled).await,
+    let mut failures = 0u32;
+    let mut batches: Vec<PullBatch<'_>> =
+        pull_batches(&pull_keys, REPAIR_BATCH, REPAIR_BATCH_KEY_BYTES)
+            .into_iter()
+            .map(PullBatch::Keys)
+            .collect();
+    for (bucket, hashes) in &pull_hashes {
+        batches.extend(
+            hashes
+                .chunks(REPAIR_BATCH)
+                .map(|batch| PullBatch::Hashes(*bucket, batch)),
+        );
+    }
+    for batch in batches {
+        let reply = match batch {
+            PullBatch::Keys(keys) => mesh.ae_pull(peer, cache.clone(), keys.to_vec()).await,
+            PullBatch::Hashes(bucket, hashes) => {
+                mesh.ae_pull_hashes(peer, cache.clone(), bucket, hashes.to_vec())
+                    .await
+            }
+        };
+        match reply {
+            Ok(records) => {
+                failures = 0;
+                tally.add(cache, &records);
+                pulled.extend(records.iter().map(|rec| (rec.key.clone(), rec.ver)));
+                shard.apply_remote_batch(records).await;
+            }
             Err(error) => {
                 tracing::debug!(%error, "anti-entropy pull failed; keeping progress");
                 complete = false;
-                break;
-            }
-        }
-    }
-    for (bucket, hashes) in pull_hashes {
-        for batch in hashes.chunks(REPAIR_BATCH) {
-            match mesh
-                .ae_pull_hashes(peer, cache.clone(), bucket, batch.to_vec())
-                .await
-            {
-                Ok(records) => land(records, &mut pulled).await,
-                Err(error) => {
-                    tracing::debug!(%error, "anti-entropy hash pull failed; keeping progress");
-                    return (pulled, false);
+                failures += 1;
+                if pull_gives_up(failures) {
+                    break;
                 }
             }
         }

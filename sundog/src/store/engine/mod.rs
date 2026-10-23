@@ -46,7 +46,7 @@ use std::hash::Hash;
 use std::marker::PhantomData;
 #[cfg(all(feature = "spill", test))]
 use std::sync::atomic::AtomicI64;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -126,7 +126,7 @@ pub(crate) use self::inflight::{FillOutcome, FreshLoad, JoinOutcome};
 pub(crate) use self::keys::part_index_from_hash;
 use self::keys::{digest_slot, hasher_for};
 pub(crate) use self::keys::{hash_key_bytes, stripe_index_from_hash};
-pub(crate) use self::merge::{Fold, fold_sides};
+pub(crate) use self::merge::{Fold, MergeCap, fold_sides};
 #[cfg(doc)]
 use self::merge::{merge_version, resolve_conflict};
 #[cfg(doc)]
@@ -524,22 +524,36 @@ pub(crate) enum ApplyOutcome<K, V> {
     /// preceded it. Unlike `Put`'s `created`, this carries no
     /// prior-liveness flag.
     Tombstoned { key: K, version: Hlc },
+    /// A merge of `key_bytes` would leave the value `size` bytes long, past
+    /// the engine's [`MergeCap`] and larger than the value it replaces;
+    /// nothing changes.
+    TooLarge { key_bytes: Bytes, size: usize },
 }
 
 impl<K, V> ApplyOutcome<K, V> {
-    /// The key a write landed on; `None` for a rejected write, which changed
-    /// nothing and has nothing to fan out.
+    /// The value size of a merge refused for passing the cap; `None` for any
+    /// other outcome.
+    pub(crate) const fn too_large(&self) -> Option<usize> {
+        match self {
+            Self::TooLarge { size, .. } => Some(*size),
+            Self::Rejected | Self::Put { .. } | Self::Tombstoned { .. } => None,
+        }
+    }
+
+    /// The key a write landed on; `None` for a rejected or refused write,
+    /// which changed nothing and has nothing to fan out.
     pub(crate) fn key(&self) -> Option<&K> {
         match self {
-            Self::Rejected => None,
+            Self::Rejected | Self::TooLarge { .. } => None,
             Self::Put { key, .. } | Self::Tombstoned { key, .. } => Some(key),
         }
     }
 
-    /// The version the write landed at; `None` for a rejected write.
+    /// The version the write landed at; `None` for a rejected or refused
+    /// write.
     pub(crate) fn version(&self) -> Option<Hlc> {
         match self {
-            Self::Rejected => None,
+            Self::Rejected | Self::TooLarge { .. } => None,
             Self::Put { version, .. } | Self::Tombstoned { version, .. } => Some(*version),
         }
     }
@@ -613,6 +627,11 @@ pub(crate) struct Engine<K, V> {
     /// no effect at all on a resolver that doesn't merge; see
     /// `apply_many`'s docs.
     prefold_enabled: AtomicBool,
+    /// The frame cap a merge keeps a value within, as
+    /// `(cache name length, limit)`; the limit is `usize::MAX`, the default,
+    /// for no cap. Set by [`Engine::set_merge_cap`].
+    merge_cap_limit: AtomicUsize,
+    merge_cap_cache_len: AtomicUsize,
     /// Where [`Engine::compact`]'s next call resumes: the index of the next
     /// stripe it has not yet visited, so consecutive ticks rotate through
     /// every stripe in turn instead of always starting over at stripe `0`.
@@ -696,6 +715,8 @@ where
             #[cfg(feature = "spill")]
             pending_spill_weight: AtomicU64::new(0),
             prefold_enabled: AtomicBool::new(true),
+            merge_cap_limit: AtomicUsize::new(usize::MAX),
+            merge_cap_cache_len: AtomicUsize::new(0),
             compact_cursor: AtomicU64::new(0),
             gc_deferring: AtomicBool::new(false),
             last_gc_ms: AtomicU64::new(0),
