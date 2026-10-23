@@ -404,19 +404,18 @@ pub(super) enum Rebound<V> {
     Store(Hlc, Incoming<V>),
     /// The merge would leave the record `size` value bytes long, past the
     /// cap and larger than the record it replaces ([`merge_fits`]): nothing is
-    /// stored. The write is handed back untouched, so a pre-fold can leave it
-    /// to apply on its own.
-    TooLarge { incoming: Incoming<V>, size: usize },
+    /// stored and the write is dropped.
+    TooLarge { size: usize },
 }
 
 /// [`apply_locked`]'s full collision decision: consults [`resolve_conflict`]
 /// and, on [`Resolution::Merged`], rebinds `ver`/`incoming` to the version
 /// and content [`merge_version`] decides, unless the merged content fails
-/// `cap`: [`Rebound::TooLarge`] then hands `incoming` back and stores
-/// nothing. Returns [`Rebound::Lost`] for a rejected write (outright loss,
-/// the engine-enforced tombstone/spill guard, a redelivered already-absorbed
-/// merge, or bytes that fail to decode as `V`) and [`Rebound::Store`]
-/// otherwise: unchanged for an outright win, rebound for a merge. Only a
+/// `cap`: [`Rebound::TooLarge`] then stores nothing. Returns
+/// [`Rebound::Lost`] for a rejected write (outright loss, the engine-enforced
+/// tombstone/spill guard, a redelivered already-absorbed merge, or bytes that
+/// fail to decode as `V`) and [`Rebound::Store`] otherwise: unchanged for an
+/// outright win, rebound for a merge. Only a
 /// merge meets `cap`; an outright win is the contribution itself, which the
 /// writer checked. A merge whose result is the contribution, as when the
 /// stored side has lapsed or the resolver keeps the contribution, is held to
@@ -494,10 +493,7 @@ pub(super) fn resolve_and_rebind<V: DeserializeOwned>(
                         }
                     }) =>
                 {
-                    Rebound::TooLarge {
-                        size: value.len(),
-                        incoming,
-                    }
+                    Rebound::TooLarge { size: value.len() }
                 }
                 // The result is the incoming record: its decoded value is
                 // already in hand.

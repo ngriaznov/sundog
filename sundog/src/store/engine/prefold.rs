@@ -10,6 +10,9 @@ use crate::hlc::Hlc;
 use crate::store::spill::SpillLoc;
 use crate::store::{ConflictResolver, Incoming};
 
+use super::ApplyOutcome;
+#[cfg(doc)]
+use super::Engine;
 #[cfg(feature = "spill")]
 use super::EntryState;
 use super::Stripe;
@@ -22,8 +25,6 @@ use super::expiry::{absent_at, decode_expiry};
 use super::merge::resolve_conflict;
 use super::merge::{Fold, MergeCap, Rebound, fold_sides, resolve_and_rebind};
 use super::record::{record_key, record_value_bytes};
-#[cfg(doc)]
-use super::{ApplyOutcome, Engine};
 
 /// One [`Engine::apply_many`] batch entry, before or after pre-fold:
 /// precomputed hash, the typed key, its wire-encoded bytes, the write's
@@ -33,11 +34,59 @@ use super::{ApplyOutcome, Engine};
 /// tuple every caller already builds.
 pub(super) type BatchEntry<K, V> = (u64, K, Bytes, Hlc, Incoming<V>);
 
-/// What [`fold_run`] leaves: the accumulator, and the entries it stopped
-/// before.
+/// What a batch index becomes once [`prefold_batch`] has run.
+pub(super) enum Slot<K, V> {
+    /// The entry [`apply_locked`] still runs: a write no run touched, the
+    /// survivor of a run, or an entry a run left for sequential application.
+    Apply(BatchEntry<K, V>),
+    /// Absorbed into its run's survivor, whose own [`apply_locked`] call is
+    /// this entry's only real contribution. [`Engine::apply_many`] reports it
+    /// [`ApplyOutcome::Rejected`].
+    Absorbed,
+    /// A merge the cap refused while its run folded, which would have left
+    /// `size` value bytes under `key_bytes`: nothing of it is stored, and no
+    /// [`apply_locked`] call is made for it. [`Engine::apply_many`] reports it
+    /// [`ApplyOutcome::TooLarge`].
+    Refused { key_bytes: Bytes, size: usize },
+}
+
+impl<K, V> Slot<K, V> {
+    /// The entry [`apply_locked`] runs, or for an entry [`prefold_batch`]
+    /// settled, the outcome [`Engine::apply_many`] reports for it.
+    pub(super) fn into_entry(self) -> Result<BatchEntry<K, V>, ApplyOutcome<K, V>> {
+        match self {
+            Self::Apply(entry) => Ok(entry),
+            Self::Absorbed => Err(ApplyOutcome::Rejected),
+            Self::Refused { key_bytes, size } => Err(ApplyOutcome::TooLarge { key_bytes, size }),
+        }
+    }
+
+    /// The entry of a slot [`prefold_batch`] has not touched yet.
+    fn entry(&self) -> &BatchEntry<K, V> {
+        let Self::Apply(entry) = self else {
+            panic!("invariant: each batch index belongs to at most one run");
+        };
+        entry
+    }
+
+    /// Takes the entry out of a slot that holds one, leaving it absorbed.
+    fn take(&mut self) -> BatchEntry<K, V> {
+        let Self::Apply(entry) = std::mem::replace(self, Self::Absorbed) else {
+            panic!("invariant: each batch index belongs to at most one run");
+        };
+        entry
+    }
+}
+
+/// What [`fold_run`] leaves: the accumulator, the steps the cap refused, and
+/// the entries it stopped before.
 struct FoldedRun<V> {
     ver: Hlc,
     incoming: Incoming<V>,
+    /// The steps the cap refused, each as its position among the entries
+    /// [`fold_run`] was given and the value bytes the merge would have left,
+    /// in order.
+    refused: Vec<(usize, usize)>,
     /// The tail of the run [`fold_run`] did not consume, in order.
     remaining: Vec<(Hlc, Incoming<V>)>,
 }
@@ -60,11 +109,16 @@ struct FoldedRun<V> {
 /// carries the stored record the fold stops before the first step that
 /// [`fold_sides`] does not decide as [`Fold::Both`]: the survivor, applied
 /// against that same stored record, would otherwise fold the content the
-/// step dropped back in. The fold also stops before a step `cap` refuses
-/// ([`Rebound::TooLarge`]): the accumulator is then the content sequential
-/// application would have stored just before that step, and the step meets it
-/// again in [`apply_locked`], where the cap refuses it against the stored
-/// record. The unconsumed tail is returned for sequential application.
+/// step dropped back in. The unconsumed tail is returned for sequential
+/// application.
+///
+/// A step `cap` refuses ([`Rebound::TooLarge`]) changes nothing, as in
+/// sequential application, where a refused merge leaves the stored record as
+/// it is: the accumulator stays the content sequential application would have
+/// stored, the fold goes on with the next step, and the refusal is returned in
+/// [`FoldedRun::refused`]. A refused step is never handed to [`apply_locked`],
+/// which would merge it again under the stripe's write lock, once for every
+/// refused step of a run against a record at the cap.
 #[allow(
     clippy::too_many_arguments,
     reason = "one caller; the seed, its absence, the clock and the run are each a distinct input"
@@ -83,6 +137,8 @@ fn fold_run<V: DeserializeOwned>(
     let mut acc_ver = seed_ver;
     let mut acc_incoming = seed_incoming;
     let mut acc_absent = seed_absent;
+    let mut refused = Vec::new();
+    let mut step = 0usize;
     let mut rest = rest.into_iter().peekable();
     while let Some((ver, incoming)) = rest.peek() {
         let (stored_encoded, stored_expires_at_ms) = match &acc_incoming {
@@ -132,20 +188,14 @@ fn fold_run<V: DeserializeOwned>(
                 acc_absent = reaches_deadline(&acc_incoming, now_ms);
             }
             Rebound::Lost => {}
-            Rebound::TooLarge { incoming, .. } => {
-                let mut remaining = vec![(ver, incoming)];
-                remaining.extend(rest);
-                return FoldedRun {
-                    ver: acc_ver,
-                    incoming: acc_incoming,
-                    remaining,
-                };
-            }
+            Rebound::TooLarge { size } => refused.push((step, size)),
         }
+        step += 1;
     }
     FoldedRun {
         ver: acc_ver,
         incoming: acc_incoming,
+        refused,
         remaining: rest.collect(),
     }
 }
@@ -309,9 +359,13 @@ pub(super) fn peek_prefold_seeds<K, V>(
 /// [`fold_run`] stops early folds only its consumed prefix; the rest of its
 /// entries stay in their own slots.
 ///
-/// Returns one slot per original index: `Some` where [`apply_locked`] still
-/// runs, `None` where a run absorbed the entry ([`Engine::apply_many`]
-/// reports those as [`ApplyOutcome::Rejected`]).
+/// Returns one [`Slot`] per original index: [`Slot::Apply`] where
+/// [`apply_locked`] still runs, [`Slot::Absorbed`] where a run absorbed the
+/// entry, and [`Slot::Refused`] where `cap` refused the merge of the entry, at
+/// the entry's own index. The survivor takes the last slot of the run's
+/// consumed prefix that no refusal took; a run whose steps the cap all
+/// refused against a stored record leaves that record as the survivor, which
+/// needs no apply.
 pub(super) fn prefold_batch<K, V: DeserializeOwned>(
     entries: Vec<BatchEntry<K, V>>,
     runs: Vec<Vec<usize>>,
@@ -319,19 +373,14 @@ pub(super) fn prefold_batch<K, V: DeserializeOwned>(
     cap: Option<MergeCap>,
     stored_seeds: &HashMap<Bytes, PrefoldSeed>,
     now_ms: u64,
-) -> Vec<Option<BatchEntry<K, V>>> {
-    let mut slots: Vec<Option<BatchEntry<K, V>>> = entries.into_iter().map(Some).collect();
+) -> Vec<Slot<K, V>> {
+    let mut slots: Vec<Slot<K, V>> = entries.into_iter().map(Slot::Apply).collect();
     for run in runs {
         if run.len() < 2 {
             // Alone for this run: nothing to fold, left exactly as given.
             continue;
         }
-        let key_seed = {
-            let (_, _, key_bytes, ..) = slots[run[0]]
-                .as_ref()
-                .expect("each batch index belongs to at most one run");
-            stored_seeds.get(key_bytes.as_ref())
-        };
+        let key_seed = stored_seeds.get(slots[run[0]].entry().2.as_ref());
         // Decoding the peeked stored bytes never happens under the read
         // lock `peek_prefold_seeds` took: that lock is gone by here. Bytes
         // that do not decode leave the run to sequential application.
@@ -348,13 +397,16 @@ pub(super) fn prefold_batch<K, V: DeserializeOwned>(
         let mut parts: Vec<(u64, K, Bytes)> = Vec::with_capacity(run.len());
         let mut versioned: Vec<(Hlc, Incoming<V>)> = Vec::with_capacity(run.len());
         for &idx in &run {
-            let (hash, key, key_bytes, ver, incoming) = slots[idx]
-                .take()
-                .expect("each batch index belongs to at most one run");
+            let (hash, key, key_bytes, ver, incoming) = slots[idx].take();
             parts.push((hash, key, key_bytes));
             versioned.push((ver, incoming));
         }
         let key_bytes = parts[0].2.clone();
+        // The position among the run's entries of the first one the fold
+        // merges: the first of all against a stored record, which seeds the
+        // accumulator, and the second without one, where the run's own first
+        // entry seeds it.
+        let first_step = usize::from(stored_decoded.is_none());
 
         let folded = if let Some((sv, value, encoded, expires_at_ms, absent)) = stored_decoded {
             let stored_incoming = Incoming::Put {
@@ -392,14 +444,29 @@ pub(super) fn prefold_batch<K, V: DeserializeOwned>(
         // The run's entries consumed so far, counting the unseeded fold's
         // own first entry, which seeds the accumulator.
         let consumed = run.len() - folded.remaining.len();
-        let mut parts = parts.into_iter();
-        if let Some((hash, key, key_bytes)) = parts.by_ref().take(consumed).last() {
-            slots[run[consumed - 1]] = Some((hash, key, key_bytes, folded.ver, folded.incoming));
-        }
-        for ((idx, (hash, key, key_bytes)), (ver, incoming)) in
-            run[consumed..].iter().zip(parts).zip(folded.remaining)
-        {
-            slots[*idx] = Some((hash, key, key_bytes, ver, incoming));
+        let refusals: Vec<(usize, usize)> = folded
+            .refused
+            .iter()
+            .map(|&(step, size)| (step + first_step, size))
+            .collect();
+        let survivor_at = (0..consumed)
+            .rev()
+            .find(|position| !refusals.iter().any(|(at, _)| at == position));
+        let mut survivor = Some((folded.ver, folded.incoming));
+        let mut remaining = folded.remaining.into_iter();
+        for (position, (&idx, (hash, key, key_bytes))) in run.iter().zip(parts).enumerate() {
+            if position >= consumed {
+                let (ver, incoming) = remaining
+                    .next()
+                    .expect("one remaining entry for each unconsumed index");
+                slots[idx] = Slot::Apply((hash, key, key_bytes, ver, incoming));
+            } else if let Some(&(_, size)) = refusals.iter().find(|(at, _)| *at == position) {
+                slots[idx] = Slot::Refused { key_bytes, size };
+            } else if Some(position) == survivor_at
+                && let Some((ver, incoming)) = survivor.take()
+            {
+                slots[idx] = Slot::Apply((hash, key, key_bytes, ver, incoming));
+            }
         }
     }
     slots

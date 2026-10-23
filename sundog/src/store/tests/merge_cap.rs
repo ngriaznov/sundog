@@ -600,6 +600,28 @@ async fn a_local_refusal_counts_but_does_not_log_since_the_caller_gets_the_error
 }
 
 #[tokio::test]
+async fn an_insert_many_of_one_key_counts_every_refused_entry_and_changes_nothing() {
+    let recorder = DebuggingRecorder::new();
+    let counted = Counted::new(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let s = capped_shard(8);
+    s.insert(1, four(1)).await.expect("fits");
+    let before = stored_record(&s).await;
+
+    // Three entries of one key fold into a run before they apply, and each is
+    // refused on its own: none grows the value past the cap and out of it.
+    let (size, _) = too_large(
+        s.insert_many([(1, four(2)), (1, four(3)), (1, four(4))])
+            .await,
+    );
+
+    assert_eq!(size, 9, "each would leave nine encoded bytes");
+    assert_eq!(counted.refused(), 3, "one count for each refused entry");
+    assert_eq!(stored_record(&s).await, before, "the record is whole");
+    assert_digest_matches_full_recompute(&s).await;
+}
+
+#[tokio::test]
 async fn a_windowed_call_that_overflows_its_own_pending_fold_gets_the_error() {
     let recorder = DebuggingRecorder::new();
     let counted = Counted::new(&recorder);

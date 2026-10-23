@@ -30,7 +30,7 @@ use super::merge::{MergeCap, Rebound, resolve_and_rebind};
 use super::merge::{merge_fits, merge_version, resolve_conflict};
 #[cfg(doc)]
 use super::prefold::peek_stored_seed;
-use super::prefold::{BatchEntry, group_prefold_runs, peek_prefold_seeds, prefold_batch};
+use super::prefold::{BatchEntry, Slot, group_prefold_runs, peek_prefold_seeds, prefold_batch};
 use super::record::{build_resident_record, record_key, record_value_bytes};
 use super::{ApplyOutcome, Engine, Live, Reservation, Stripe, Written, remove_live};
 
@@ -335,7 +335,7 @@ where
             incoming,
         ) {
             Rebound::Lost => return (ApplyOutcome::Rejected, false),
-            Rebound::TooLarge { size, .. } => {
+            Rebound::TooLarge { size } => {
                 return (ApplyOutcome::TooLarge { key_bytes, size }, false);
             }
             Rebound::Store(new_ver, new_incoming) => {
@@ -645,9 +645,11 @@ where
     /// (`prefold_enabled`, toggled only via [`Engine::set_prefold_enabled`]),
     /// `entries` are grouped into runs and folded through [`prefold_batch`]
     /// before any [`apply_locked`] call, collapsing repeated keys to one
-    /// call each with every other index reported [`ApplyOutcome::Rejected`];
-    /// see [`prefold_batch`]'s doc for why the result matches sequential
-    /// application exactly, version and all.
+    /// call each with every other index reported [`ApplyOutcome::Rejected`],
+    /// except a merge the cap refuses while its run folds, which is reported
+    /// [`ApplyOutcome::TooLarge`] at its own index and costs the stripe lock
+    /// nothing; see [`prefold_batch`]'s doc for why the result matches
+    /// sequential application exactly, version and all.
     ///
     /// [`prefetch_spilled_conflict_bytes`] reads back any currently-spilled
     /// stored sides off-lock first, before the write lock this call holds
@@ -779,35 +781,33 @@ where
             self.tti_ms,
             now_ms,
         );
-        let entries: Vec<Option<BatchEntry<K, V>>> = if prefold {
-            let runs = group_prefold_runs(&entries);
-            let stored_seeds = {
-                let stripe = self.stripes[bucket].read();
-                peek_prefold_seeds(
-                    &stripe,
-                    &entries,
-                    &runs,
-                    self.tti_ms,
-                    now_ms,
-                    #[cfg(feature = "spill")]
-                    &prefetched_spilled,
-                )
-            };
-            prefold_batch(entries, runs, resolver, merge_cap, &stored_seeds, now_ms)
+        let entries: Vec<Slot<K, V>> = if prefold {
+            self.prefold_slots(
+                bucket,
+                entries,
+                resolver,
+                now_ms,
+                #[cfg(feature = "spill")]
+                &prefetched_spilled,
+            )
         } else {
-            entries.into_iter().map(Some).collect()
+            entries.into_iter().map(Slot::Apply).collect()
         };
         let mut outcomes = Vec::with_capacity(entries.len());
         let mut wrote = false;
         {
             let mut stripe = self.stripes[bucket].write();
-            for entry in entries {
-                let Some((hash, key, key_bytes, ver, incoming)) = entry else {
-                    // Absorbed into its run's survivor by `prefold_batch`;
-                    // that survivor's own `apply_locked` call, elsewhere in
-                    // this same loop, is this entry's only real contribution.
-                    outcomes.push(ApplyOutcome::Rejected);
-                    continue;
+            for slot in entries {
+                // An entry `prefold_batch` settled needs no `apply_locked`
+                // call: one absorbed into its run's survivor, whose own call
+                // elsewhere in this loop is its only real contribution, or
+                // one the cap refused while its run folded.
+                let (hash, key, key_bytes, ver, incoming) = match slot.into_entry() {
+                    Ok(entry) => entry,
+                    Err(settled) => {
+                        outcomes.push(settled);
+                        continue;
+                    }
                 };
                 let ctx = ApplyCtx {
                     digest_bucket: &self.digest[digest_slot(bucket, part_index_from_hash(hash))],
@@ -857,6 +857,41 @@ where
             0
         };
         (outcomes, deficit)
+    }
+
+    /// The pre-fold stage of [`Engine::apply_many_in`]: reads the stored
+    /// record of each key that has a run to fold under a brief read lock of
+    /// `bucket`'s stripe, then folds every run outside any lock with
+    /// [`prefold_batch`].
+    fn prefold_slots(
+        &self,
+        bucket: usize,
+        entries: Vec<BatchEntry<K, V>>,
+        resolver: &dyn ConflictResolver,
+        now_ms: u64,
+        #[cfg(feature = "spill")] prefetched_spilled: &HashMap<SpillLoc, Bytes>,
+    ) -> Vec<Slot<K, V>> {
+        let runs = group_prefold_runs(&entries);
+        let stored_seeds = {
+            let stripe = self.stripes[bucket].read();
+            peek_prefold_seeds(
+                &stripe,
+                &entries,
+                &runs,
+                self.tti_ms,
+                now_ms,
+                #[cfg(feature = "spill")]
+                prefetched_spilled,
+            )
+        };
+        prefold_batch(
+            entries,
+            runs,
+            resolver,
+            self.merge_cap(),
+            &stored_seeds,
+            now_ms,
+        )
     }
 
     /// [`Engine::apply_many`] for one entry, applied only while the key's

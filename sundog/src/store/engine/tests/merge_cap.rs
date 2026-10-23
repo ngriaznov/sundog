@@ -3,6 +3,8 @@
 //! pre-fold.
 
 use std::collections::BTreeSet;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicUsize;
 
 use proptest::prelude::*;
 
@@ -513,7 +515,7 @@ fn a_merge_whose_result_is_the_contribution_is_held_to_the_replicate_frame_it_tr
 }
 
 #[test]
-fn a_pre_folded_batch_stops_where_the_cap_refuses_and_leaves_the_rest_to_the_apply() {
+fn a_pre_folded_batch_refuses_the_step_the_cap_stops_and_folds_on_with_the_rest() {
     let engine = capped_engine(3);
     apply(&engine, vec![entry_of(1, hlc(10, 1), &elems(0, 1))], 0);
 
@@ -535,6 +537,175 @@ fn a_pre_folded_batch_stops_where_the_cap_refuses_and_leaves_the_rest_to_the_app
         Some(elems(0, 3)),
         "the first three fit, and the fourth contribution adds nothing"
     );
+}
+
+/// A union resolver that counts the merges it computes, and how many of them
+/// run while the calling thread holds the write lock of the stripe the key
+/// lives in: a merge under that lock stalls every reader and writer of the
+/// stripe for as long as it takes.
+struct LockProbe {
+    engine: OnceLock<Arc<SetEngine>>,
+    bucket: usize,
+    merges: AtomicUsize,
+    under_lock: AtomicUsize,
+}
+
+impl LockProbe {
+    fn over(engine: &Arc<SetEngine>, key: u32) -> Self {
+        let probe = Self {
+            engine: OnceLock::new(),
+            bucket: stripe_index_from_hash(hash_key_bytes(key_bytes(key).as_ref())),
+            merges: AtomicUsize::new(0),
+            under_lock: AtomicUsize::new(0),
+        };
+        probe.engine.set(Arc::clone(engine)).ok();
+        probe
+    }
+
+    fn counts(&self) -> (usize, usize) {
+        (
+            self.merges.load(Ordering::SeqCst),
+            self.under_lock.load(Ordering::SeqCst),
+        )
+    }
+}
+
+impl ConflictResolver for LockProbe {
+    fn winner(&self, key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
+        UnionSetResolver.winner(key, a, b)
+    }
+
+    fn merges(&self) -> bool {
+        true
+    }
+
+    fn merge(&self, key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Option<Merged> {
+        self.merges.fetch_add(1, Ordering::SeqCst);
+        let engine = self.engine.get().expect("the probe is wired to its engine");
+        // Nothing else touches the stripe in these tests, so a write lock
+        // that cannot be taken is the one this very call holds.
+        if engine.stripes[self.bucket].try_write().is_none() {
+            self.under_lock.fetch_add(1, Ordering::SeqCst);
+        }
+        UnionSetResolver.merge(key, a, b)
+    }
+}
+
+#[test]
+fn a_run_of_refused_steps_against_a_record_at_the_cap_merges_nothing_under_the_stripe_lock() {
+    let engine = Arc::new(capped_engine(3));
+    apply(&engine, vec![entry_of(1, hlc(10, 1), &elems(0, 3))], 0);
+    let before = record(&engine, 1);
+    let probe = LockProbe::over(&engine, 1);
+    let bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(1).as_ref()));
+
+    let outcomes = engine.apply_many(
+        Arrival::Peer,
+        bucket,
+        (0..6)
+            .map(|n| {
+                entry_of(
+                    1,
+                    hlc(20 + n, 2),
+                    &elems(3 + usize::try_from(n).unwrap(), 1),
+                )
+            })
+            .collect(),
+        &probe,
+        60_000,
+        600_000,
+        0,
+    );
+
+    assert_eq!(outcomes.len(), 6, "one outcome for each entry given");
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| o.too_large() == Some(set_len(4)) && o.key().is_none()),
+        "every step is refused at its own index, with the size it would leave"
+    );
+    assert_eq!(record(&engine, 1), before, "the stored record is whole");
+    assert_eq!(
+        probe.counts(),
+        (6, 0),
+        "each step merged once, in the fold, and none under the stripe lock"
+    );
+}
+
+#[test]
+fn a_run_goes_on_folding_past_a_refused_step_and_each_outcome_stays_at_its_index() {
+    let engine = Arc::new(capped_engine(3));
+    apply(&engine, vec![entry_of(1, hlc(10, 1), &elems(0, 2))], 0);
+    let probe = LockProbe::over(&engine, 1);
+    let bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(1).as_ref()));
+
+    // Two new elements would make four: refused. One new element makes
+    // three: folds. Another would make four again: refused, and last.
+    let outcomes = engine.apply_many(
+        Arrival::Peer,
+        bucket,
+        vec![
+            entry_of(1, hlc(20, 2), &elems(2, 2)),
+            entry_of(1, hlc(21, 2), &elems(2, 1)),
+            entry_of(1, hlc(22, 2), &elems(4, 1)),
+        ],
+        &probe,
+        60_000,
+        600_000,
+        0,
+    );
+
+    assert!(matches!(
+        outcomes[..],
+        [
+            ApplyOutcome::TooLarge { size: first, .. },
+            ApplyOutcome::Put { .. },
+            ApplyOutcome::TooLarge { size: last, .. },
+        ] if first == set_len(4) && last == set_len(4)
+    ));
+    assert_eq!(stored(&engine, 1), Some(elems(0, 3)));
+    assert_eq!(
+        probe.counts(),
+        (4, 1),
+        "three merges ran in the fold, and the survivor's one against the stored record under the lock"
+    );
+}
+
+#[test]
+fn a_refusal_in_a_pre_folded_run_leaves_the_same_store_and_outcomes_as_sequential_apply() {
+    let batch = || {
+        vec![
+            entry_of(1, hlc(20, 2), &elems(2, 2)),
+            entry_of(1, hlc(21, 3), &elems(2, 1)),
+            entry_of(1, hlc(22, 2), &elems(4, 1)),
+            entry_of(1, hlc(23, 3), &elems(0, 1)),
+        ]
+    };
+    let on = capped_engine(3);
+    let off = capped_engine(3);
+    off.set_prefold_enabled(false);
+    for engine in [&on, &off] {
+        apply(engine, vec![entry_of(1, hlc(10, 1), &elems(0, 2))], 0);
+    }
+
+    let on_outcomes = apply(&on, batch(), 0);
+    let off_outcomes = apply(&off, batch(), 0);
+
+    assert_eq!(record(&on, 1), record(&off, 1), "version and bytes");
+    let refused = |outcomes: &[ApplyOutcome<u32, BTreeSet<String>>]| {
+        let mut sizes: Vec<_> = outcomes
+            .iter()
+            .filter_map(ApplyOutcome::too_large)
+            .collect();
+        sizes.sort_unstable();
+        sizes
+    };
+    assert_eq!(
+        refused(&on_outcomes),
+        refused(&off_outcomes),
+        "the same contributions are refused, with the same sizes"
+    );
+    assert_eq!(refused(&on_outcomes), [set_len(4), set_len(4)]);
 }
 
 #[test]
