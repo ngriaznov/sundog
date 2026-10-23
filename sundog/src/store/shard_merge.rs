@@ -122,9 +122,10 @@ where
     /// every call applies at once. With a non-zero window, consecutive calls to the same key fold into an in-memory
     /// pending value instead, applying once when the window that opened at
     /// the first call elapses (`crate::cache::tasks::merge_coalesce_task`,
-    /// `Cache::close`, and this shard's `Drop` all guarantee a flush);
+    /// `Shard::seal_for_close`, and this shard's `Drop` all guarantee a flush);
     /// replication and every [`Event`] then see exactly one record, the
-    /// fold, not each call.
+    /// fold, not each call. A seal for a close applies the pending folds
+    /// before the fan-out queue seals, so the peers receive them.
     ///
     /// [`Shard::get`]/[`Shard::get_sync`] never consult a pending fold: it
     /// stays invisible to reads for up to one whole window.
@@ -341,8 +342,8 @@ where
     /// would have, and a forwarded fold carries the call's version to the
     /// owners. Pushes onto the fan-out queue without awaiting room first,
     /// unlike `Shard::merge`'s immediate-apply branch: this runs from the
-    /// merge-coalesce sweep and from `Drop`, where no async runtime may be
-    /// left to await on.
+    /// merge-coalesce sweep, from [`Shard::seal_for_close`] and from `Drop`,
+    /// where no async runtime may be left to await on.
     pub(super) fn flush_one_pending_merge(&self, key: K, pending: PendingMerge<V>) {
         let incoming = Incoming::Put {
             value: pending.value,
@@ -350,9 +351,9 @@ where
             encoded: pending.encoded,
         };
         // Best-effort: a forward failure here means the cache is closing,
-        // and nothing calling this (the background sweep, `close`, or
-        // `Drop`) has anywhere to hand an error to, the same fate an
-        // ordinary local write racing a close already gets, documented on
+        // and nothing calling this (the background sweep, the seal for a
+        // close, or `Drop`) has anywhere to hand an error to, the same fate
+        // an ordinary local write racing a close already gets, documented on
         // `Shard::insert`.
         let _ = self.apply_or_forward(key, pending.key_bytes, pending.ver, incoming);
     }
@@ -565,11 +566,12 @@ where
     }
 
     /// Flushes every currently pending coalesced merge, regardless of
-    /// whether its window has elapsed: `crate::cache::Cache::close` and
-    /// this shard's own `Drop` call this so nothing folded in stays
-    /// invisible past the cache's own lifetime, closing the one gap
-    /// [`Shard::flush_due_pending_merges`]'s window-bound leaves. Drains
-    /// each stripe in turn, the same one-stripe-at-a-time locking
+    /// whether its window has elapsed: [`Shard::seal_for_close`], which
+    /// `crate::cache::Cache::close` and `Cluster::shutdown` run before the
+    /// fan-out queue seals, and this shard's own `Drop` call this so nothing
+    /// folded in stays invisible past the cache's own lifetime, closing the
+    /// one gap [`Shard::flush_due_pending_merges`]'s window-bound leaves.
+    /// Drains each stripe in turn, the same one-stripe-at-a-time locking
     /// [`Shard::flush_due_pending_merges`] uses.
     pub(crate) fn flush_all_pending_merges(&self) {
         for stripe_lock in &*self.pending_merges {

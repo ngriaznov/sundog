@@ -328,8 +328,12 @@ when the files on disk do not match the configuration.
 Call `Cluster::shutdown` on the way out. It gossips that the node is
 leaving on purpose, so `Replicated` caches on the other nodes do not hold
 tombstones back waiting for it to return, and a spill tier writes its
-checkpoint. A node with `Distributed` caches first reconciles the parts it
-owns with each live co-owner, so a write only it held reaches them. Each
+checkpoint. It first applies the folds that each cache's
+`merge_coalesce_window` still holds and sends them with the writes already
+queued. A graceful `Cluster::shutdown` or `Cache::close` sends the folds
+pending in a window; a crash loses them, up to one window of merges per key.
+A node with `Distributed` caches then reconciles the parts it owns, those
+folds included, with each live co-owner, so a write only it held reaches them. Each
 co-owner of each cache gets an equal share of `state_transfer_budget`
 (20 s by default), and a round that fails or answers `Stale` is retried within
 the share. A live co-owner that does not answer holds the shutdown for its

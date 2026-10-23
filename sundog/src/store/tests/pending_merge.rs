@@ -677,6 +677,80 @@ async fn a_clear_waits_for_a_due_flush_and_for_an_invalidation_flush() {
     );
 }
 
+/// The seal refuses every push after it, so a fold still pending when the
+/// queue seals reaches no peer: sealing for a close applies the fold first, and
+/// the applied write is in the backlog the fan-out task's final drain sends.
+#[tokio::test]
+async fn sealing_for_close_applies_a_pending_fold_into_the_fan_out_backlog() {
+    let s = coalescing_shard();
+    let mut events = s.events();
+    s.merge(1, 5).await.expect("merge");
+    s.merge(1, 2).await.expect("merge again");
+    assert_eq!(s.pending_merge_count(), 1, "the two calls fold into one");
+    assert!(
+        s.fan_out_queue().drain().is_empty(),
+        "nothing is queued while the fold waits in its window"
+    );
+
+    s.seal_for_close();
+
+    assert_eq!(s.pending_merge_count(), 0, "the seal flushed the fold");
+    assert_eq!(s.get(&1).await, Some(7), "the fold is applied here");
+    assert_eq!(
+        applied_keys(s.fan_out_queue().drain()),
+        [1],
+        "the applied fold is in the backlog, not behind the seal"
+    );
+    assert!(
+        matches!(events.try_recv(), Ok(Event::Created { key: 1, .. })),
+        "the flush publishes the one write event"
+    );
+}
+
+/// A node that does not own the key has no copy to apply the fold to: the seal
+/// puts it in the backlog as a forward for the owners.
+#[tokio::test]
+async fn sealing_for_close_forwards_a_non_owners_pending_fold_into_the_backlog() {
+    let (s, owned, unowned) = distributed_coalescing_shard();
+    s.merge(unowned, 3).await.expect("merge an unowned key");
+    s.merge(owned, 4).await.expect("merge an owned key");
+
+    s.seal_for_close();
+
+    assert_eq!(s.pending_merge_count(), 0);
+    assert_eq!(s.get(&owned).await, Some(4), "the owned fold is applied");
+    assert_eq!(s.get(&unowned).await, None, "the unowned one is not stored");
+    let queued = s.fan_out_queue().drain();
+    assert_eq!(queued.len(), 2, "one item per key: {queued:?}");
+    for item in queued {
+        match item {
+            FanOutItem::Applied(key, _) => assert_eq!(key, owned),
+            FanOutItem::Forward(rec) => {
+                assert_eq!(rec.key, key_bytes(&unowned));
+                assert_eq!(
+                    rec.value.as_deref(),
+                    Some(postcard::to_stdvec(&3u32).expect("encode").as_slice()),
+                    "the owners receive the fold as the merge call made it"
+                );
+            }
+        }
+    }
+}
+
+/// A close after a cluster shutdown seals again: the second seal finds nothing
+/// pending, so the backlog holds the fold once.
+#[tokio::test]
+async fn sealing_for_close_twice_queues_the_fold_once() {
+    let s = coalescing_shard();
+    s.merge(1, 5).await.expect("merge");
+
+    s.seal_for_close();
+    s.seal_for_close();
+
+    assert_eq!(applied_keys(s.fan_out_queue().drain()), [1]);
+    assert_eq!(s.get(&1).await, Some(5));
+}
+
 #[test]
 fn a_clear_tombstones_only_the_pending_keys_it_owns() {
     let (owned, foreign) =

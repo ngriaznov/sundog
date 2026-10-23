@@ -208,6 +208,11 @@ where
     /// applies at once, equivalent to [`Cache::insert`] under a merging
     /// resolver.
     ///
+    /// A fold waits at most one window, and [`Cache::close`] or
+    /// [`Cluster::shutdown`] applies and sends every fold still waiting. A
+    /// node that crashes loses the folds pending in its windows, up to one
+    /// window of merges per key.
+    ///
     /// [`CacheBuilder::open`] returns
     /// [`CacheError::MergeWindowRequiresMergingResolver`] for a nonzero
     /// window combined with a resolver whose [`ConflictResolver::merges`]
@@ -984,8 +989,10 @@ where
     /// fold applies exactly once, when the window that opened at the first
     /// of those calls elapses: replication and every [`Event`] this key
     /// gets during the window see one record, not one per call.
-    /// [`Cache::close`], and dropping this cache's last handle, both flush
-    /// whatever is still pending regardless of the window.
+    /// [`Cache::close`], [`Cluster::shutdown`] and dropping this cache's last
+    /// handle flush whatever is still pending regardless of the window. A
+    /// graceful close or shutdown sends those folds to the peers as it
+    /// applies them; a crash loses them.
     ///
     /// [`Cache::get`] never consults a pending fold: a value folded in but
     /// not yet flushed is invisible to a read for as long as it stays
@@ -1186,7 +1193,9 @@ where
         self.shard.events()
     }
 
-    /// Closes this cache: stops its background tasks and waits for them,
+    /// Closes this cache: applies the folds still pending in a
+    /// [`CacheBuilder::merge_coalesce_window`] and sends them with the
+    /// writes already queued, stops its background tasks and waits for them,
     /// closes its spill tier if one is configured, drops it from the
     /// cluster's shard registry, and clears its gossiped mode, so peers
     /// stop seeing it advertised and this node stops serving or applying
@@ -1206,15 +1215,12 @@ where
     /// rather than being accepted and never sent. A cache never explicitly closed
     /// still has its spill tier closed by `Cluster::shutdown`.
     pub async fn close(self) {
-        // Flushed before sealing: a pending coalesced merge this flush
-        // applies still gets a chance at the fan-out task's final drain,
-        // exactly like any other write landing right before close.
-        self.shard.flush_all_pending_merges();
         // Sealed before the tasks are cancelled: a write accepted until
         // now is in the backlog the fan-out task drains on its way out,
         // and a write from now on fails with `CacheError::Closed`. The
-        // forwards held for clock skew join that backlog first, so the
-        // other owners take them over.
+        // seal applies the folds still pending in a merge-coalesce window
+        // first, so they join that backlog, and then the forwards held for
+        // clock skew, so the other owners take them over.
         self.shard.seal_for_close();
         self.cancel.cancel();
         self.tasks.close();

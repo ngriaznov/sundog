@@ -96,7 +96,9 @@ when a merging resolver fits, how to write its values, and how they expire.
 `Cache::merge` writes through the resolver without a read.
 `CacheBuilder::merge_coalesce_window` folds a writer's consecutive merges
 (`merge` and `merge_with_ttl`) to one key into one applied record per
-window, and a read does not see a fold still pending inside its window.
+window, and a read does not see a fold still pending inside its window. A
+graceful `Cache::close` or `Cluster::shutdown` applies and sends the folds
+still pending; a crash loses them.
 
 Each writer owns a slot in a merged value. A background sweep retires the
 slot of a writer whose node has been absent longer than

@@ -6,7 +6,7 @@ use super::*;
 /// first coalesces its merges for a minute, so a fold stays pending there;
 /// the others apply at once. Returns once the first node's view has a key it
 /// does not own, with that key.
-async fn three_nodes_the_first_coalescing(
+pub(super) async fn three_nodes_the_first_coalescing(
     name: &'static str,
 ) -> (
     (Cluster, Cache<u32, PnCounter>),

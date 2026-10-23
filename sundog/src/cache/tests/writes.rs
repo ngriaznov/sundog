@@ -389,6 +389,31 @@ async fn close_flushes_a_pending_coalesced_merge() {
     cluster.shutdown().await;
 }
 
+#[tokio::test]
+async fn cluster_shutdown_flushes_a_pending_coalesced_merge() {
+    let (cluster, cache) =
+        coalescing_counter_cache("cache-it-merge-shutdown-flush", Duration::from_secs(60)).await;
+    let survivor = cache.clone();
+    let writer = cache.writer_id();
+    cache
+        .merge(1, PnCounter::local_delta(writer, 7))
+        .await
+        .expect("merge");
+    assert_eq!(
+        survivor.get(&1).await,
+        None,
+        "still pending: the 60s window has not elapsed"
+    );
+
+    cluster.shutdown().await;
+
+    assert_eq!(
+        survivor.get(&1).await.map(|c| c.value()),
+        Some(7),
+        "a shutdown applies whatever was still pending, with the handles still alive"
+    );
+}
+
 /// A counter cache whose merges coalesce for `window`, on a one-node cluster.
 async fn coalescing_counter_cache(
     cluster_name: &str,

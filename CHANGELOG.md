@@ -7,6 +7,14 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **A graceful shutdown sends the merges a coalesce window still holds.**
+  `Cluster::shutdown` sealed each cache's write queue without flushing the
+  folds that `Cache::merge` had accepted into a `merge_coalesce_window`, so
+  the node applied them locally when its last handle dropped and no peer
+  received them, and a `Distributed` fold for a key the node does not own was
+  discarded. Sealing the queue, whether for `Cluster::shutdown` or
+  `Cache::close`, now applies the pending folds first, so they join the final
+  drain and the leave hand-off. A crash still loses them.
 - **A graceful leave retries a co-owner that does not answer.** A node that
   shuts down reconciles every part it owns with each live co-owner. A failed
   round or a `Stale` reply, which a membership change causes, no longer ends

@@ -538,11 +538,17 @@ impl Cluster {
         self.inner.tracker.spawn(tasks.track_future(fut));
     }
 
-    /// Leaves the cluster gracefully: a node with [`Mode::Distributed`]
-    /// caches first reconciles the parts it owns with each live co-owner,
-    /// retrying a round that fails or answers `Stale` within that co-owner's
-    /// share of [`ClusterConfig::state_transfer_budget`], so the shutdown can
-    /// take that long and logs at `warn` the parts still diverging when a
+    /// Leaves the cluster gracefully: every still-registered cache first
+    /// applies the folds still pending in its
+    /// [`merge_coalesce_window`](crate::cache::CacheBuilder::merge_coalesce_window)
+    /// (a crash loses them) and seals its fan-out queue, so those folds and
+    /// every write accepted until now are sent, and a write from then on
+    /// fails with [`CacheError::Closed`](crate::error::CacheError::Closed).
+    /// A node with [`Mode::Distributed`] caches then reconciles the parts it
+    /// owns, folds included, with each live co-owner, retrying a round that
+    /// fails or answers `Stale` within that co-owner's share of
+    /// [`ClusterConfig::state_transfer_budget`], so the shutdown can take
+    /// that long and logs at `warn` the parts still diverging when a
     /// group ends. Then background loops are cancelled and joined, every
     /// still-registered cache has its spill tier closed (see
     /// [`ShardOps::close_spill_checkpointed`], a no-op if already closed),
@@ -560,7 +566,9 @@ impl Cluster {
         // cancelled: a write accepted until now stays in the backlog its
         // fan-out task drains on the way out, and a write from now on
         // fails with `CacheError::Closed` instead of being accepted and
-        // never sent.
+        // never sent. Each seal applies the folds still pending in a
+        // merge-coalesce window first, so they join the backlog, and the
+        // leave hand-off below sees the keys they changed.
         for shard in self.inner.shards.read_shards().values() {
             shard.seal_fan_out();
         }

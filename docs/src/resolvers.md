@@ -145,7 +145,8 @@ give merged values a lifetime as they give any other value one:
   encodes the result.** `CacheBuilder::merge_coalesce_window` folds a key's
   consecutive `Cache::merge` and `Cache::merge_with_ttl` calls in memory and
   applies them once per window. A read does not see a fold still waiting in
-  its window, a remove discards it, a crash loses it, and the flushed record
+  its window, a remove discards it, a crash loses it, a graceful
+  `Cache::close` or `Cluster::shutdown` sends it, and the flushed record
   carries the version of its last call. `insert` never waits in a window, and
   `open` refuses a nonzero window for a resolver that does not merge.
 - **The value grows with its writers.** Each writer, one run of one node,

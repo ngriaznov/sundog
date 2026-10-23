@@ -244,9 +244,9 @@ pub(crate) enum LocalRearm {
 
 /// One key's in-flight [`Shard::merge`] fold: accumulated in memory, across
 /// however many `merge` calls land inside the current coalescing window,
-/// until [`Shard::flush_due_pending_merges`] (or a close/drop flush that
-/// ignores the deadline) hands it to the ordinary write path as a single
-/// [`Shard::apply`], the same versioned apply every other write goes
+/// until [`Shard::flush_due_pending_merges`] (or a seal-for-close or drop
+/// flush that ignores the deadline) hands it to the ordinary write path as a
+/// single [`Shard::apply`], the same versioned apply every other write goes
 /// through, which folds it again against whatever is stored. The flush
 /// applies it at [`Self::ver`], so the fold orders against every other write
 /// as its last call did; a tombstone newer than that version discards it

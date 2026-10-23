@@ -219,10 +219,15 @@ where
             .extend(handed.into_iter().map(FanOutItem::Forward));
     }
 
-    /// Stops accepting writes: hands the skew hold to the fan-out, then seals
-    /// the queue for its final drain. The first step of a close or a cluster
-    /// shutdown.
+    /// Stops accepting writes: applies every [`Shard::merge`] fold still
+    /// pending in its coalescing window, hands the skew hold to the fan-out,
+    /// then seals the queue for its final drain. The first step of a close or
+    /// a cluster shutdown, so both share one flush-then-seal sequence. The
+    /// folds apply first: a fold applied once the queue is sealed reaches no
+    /// peer, and a `Mode::Distributed` fold for a key this node does not own
+    /// could not be forwarded and would be lost.
     pub(crate) fn seal_for_close(&self) {
+        self.flush_all_pending_merges();
         self.hand_off_skew_hold();
         self.fan_out.seal();
     }

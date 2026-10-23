@@ -135,10 +135,11 @@ pub(super) async fn spawn_cache_tasks<K, V>(
 /// [`CacheBuilder::merge_coalesce_window`]: sleeps until the pending map's
 /// earliest deadline (or, with nothing pending, until either a fresh
 /// window opens via [`Shard::merge_wake_notified`] or `cancel` fires), then
-/// flushes everything due and loops. [`Cache::close`]'s own explicit flush
-/// and this shard's own `Drop` both guarantee every fold lands regardless,
-/// so this task's timing is never load-bearing for correctness, only for
-/// the staleness bound [`Cache::merge`]'s docs commit to.
+/// flushes everything due and loops. The seal that [`Cache::close`] and
+/// [`Cluster::shutdown`] run flushes every fold regardless of its deadline,
+/// and so does this shard's own `Drop`, so this task's timing is never
+/// load-bearing for correctness, only for the staleness bound
+/// [`Cache::merge`]'s docs commit to.
 async fn merge_coalesce_task<K, V>(shard: Arc<Shard<K, V>>, cancel: CancellationToken)
 where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
