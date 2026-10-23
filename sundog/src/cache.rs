@@ -978,7 +978,9 @@ where
     /// transaction**: an entry that fails partway through still leaves the
     /// entries before it applied. An entry that merges past the frame limit
     /// into a stored value is refused and the entries after it apply as well;
-    /// the first such refusal is the error returned.
+    /// the error returned is the first such refusal in the order given. An
+    /// entry whose own value exceeds the frame cap ends the call at that
+    /// entry, and its error is returned instead.
     ///
     /// # Errors
     ///

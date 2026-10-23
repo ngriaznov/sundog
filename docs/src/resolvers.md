@@ -220,8 +220,8 @@ A merge that arrives from a peer, by replication, anti-entropy, state
 transfer or a `Distributed` forward, follows the same rule. The node leaves
 the stored value as it is, counts the refusal in
 `sundog_merge_refused_total{cache, reason="too_large"}` and logs a warning
-that names the key, at most once a minute for each cache. The contribution is
-lost, since no caller waits for it. Two replicas that each hold half of a set
+that identifies the key by hash and length, at most once a minute for each
+cache. The contribution is lost, since no caller waits for it. Two replicas that each hold half of a set
 too large to merge refuse each other's state and stay apart, and a
 `Distributed` non-owner's call returns before the owner applies it, so only
 the owner sees its refusal. A merge that shrinks the value on any node, a
@@ -242,10 +242,10 @@ and cannot grow. For the second, anti-entropy, state transfer and rebalance
 leave the value out. The nodes that lack it do not receive it, a
 `Distributed` fetch of it fails, and every other key syncs as usual. Each
 record left out counts in `sundog_sync_skipped_total{cache,
-reason="too_large"}`, and a warning that names the largest key follows, at
-most once a minute for each cache. In a `Distributed` cache, a node that stops
-owning the part of such a value cannot hand it to the new owners, and drops
-it when the part releases. To bring a value back under the limit, merge a
+reason="too_large"}`, and a warning that identifies the largest key by hash
+and length follows, at most once a minute for each cache. In a `Distributed`
+cache, a node that stops owning the part of such a value cannot hand it to the
+new owners, and drops it when the part releases. To bring a value back under the limit, merge a
 remove that fits a frame and shrinks it, or delete the key with
 `Cache::remove`; the tombstone replicates, and the next writes build a value
 that fits. Do it before a membership change moves the part.

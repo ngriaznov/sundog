@@ -434,8 +434,10 @@ where
     /// # Errors
     ///
     /// Returns [`CacheError::ValueTooLarge`] if any entry's wire frame exceeds
-    /// the configured frame cap (see [`Shard::insert`]), or, for an entry that
-    /// merges past the cap into a stored value under a merging resolver,
+    /// the configured frame cap (see [`Shard::insert`]): the call stops
+    /// preparing at that entry, applies those before it, and returns its
+    /// error. Otherwise it returns it for the first entry in the order given
+    /// that merges past the cap into a stored value under a merging resolver,
     /// after applying the rest. Returns
     /// [`CacheError::OverMemoryCeiling`], applying nothing, if this shard is
     /// at its ceiling when the call begins; a batch that begins under the
@@ -677,8 +679,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`CacheError::ValueTooLarge`] for the first entry that merged
-    /// past the frame limit, after applying the rest.
+    /// Returns [`CacheError::ValueTooLarge`] for the first entry, in the order
+    /// given, that merged past the frame limit, after applying the rest.
     async fn apply_grouped<T>(
         &self,
         prepared: Vec<T>,
@@ -695,9 +697,11 @@ where
             )
             .await;
 
+        // Each entry keeps its position in the call, so the refusal returned
+        // is the first in call order however the stripes are visited.
         let mut by_stripe: Vec<Vec<_>> = (0..BUCKET_COUNT).map(|_| Vec::new()).collect();
-        for batch_entry in batch_entries {
-            by_stripe[engine::stripe_index_from_hash(batch_entry.0)].push(batch_entry);
+        for (position, batch_entry) in batch_entries.into_iter().enumerate() {
+            by_stripe[engine::stripe_index_from_hash(batch_entry.0)].push((position, batch_entry));
         }
         let now = self.now_ms();
         let mut applied_keys: Vec<(K, Hlc)> = Vec::new();
@@ -706,7 +710,7 @@ where
         // is back with the tier before `retry_reservation_deficit` asks for
         // a fresh one: a retry clamped to the whole flush queue can never be
         // granted while this call still holds part of it.
-        let mut refused = None;
+        let mut refused: Option<(usize, usize)> = None;
         let deficit = {
             let mut reservation = reservation;
             let mut deficit = 0u64;
@@ -714,6 +718,7 @@ where
                 if group.is_empty() {
                     continue;
                 }
+                let (positions, group): (Vec<usize>, Vec<_>) = group.into_iter().unzip();
                 let (outcomes, bucket_deficit) = self.engine.apply_many_with_reservation(
                     engine::Arrival::Local,
                     bucket,
@@ -726,9 +731,13 @@ where
                     &mut written,
                 );
                 deficit += bucket_deficit;
-                for outcome in outcomes {
+                for (position, outcome) in positions.into_iter().zip(outcomes) {
                     applied_keys.extend(outcome.key().cloned().zip(outcome.version()));
-                    refused = refused.or(outcome.too_large());
+                    if let Some(size) = outcome.too_large()
+                        && refused.is_none_or(|(first, _)| position < first)
+                    {
+                        refused = Some((position, size));
+                    }
                     self.handle_apply_outcome(outcome, Origin::Local, false);
                 }
                 self.hand_off_bulk(&mut applied_keys, false);
@@ -738,7 +747,7 @@ where
         self.hand_off_bulk(&mut applied_keys, true);
         self.retry_reservation_deficit(0, deficit, deadline, &mut written)
             .await;
-        refused.map_or(Ok(()), |size| Err(self.merge_too_large(size)))
+        refused.map_or(Ok(()), |(_, size)| Err(self.merge_too_large(size)))
     }
 
     /// Stamps and applies a local tombstone, then fans it out per [`Mode`], as

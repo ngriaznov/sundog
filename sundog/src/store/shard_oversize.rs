@@ -10,19 +10,21 @@
 //! replaces ([`merge_fits`](super::engine::merge_fits)). A result that is the
 //! contribution itself, as over a lapsed value or under a resolver that keeps
 //! the contribution, is counted as the replicate frame it was checked as or
-//! arrived in. A refused merge
-//! counts in `sundog_merge_refused_total{cache, reason="too_large"}`. A caller
-//! gets [`CacheError::ValueTooLarge`]; a merge nobody waits on, from a peer or
-//! out of a coalesce window, also logs at `warn`, at most once per
-//! [`OVERSIZE_WARN_SPACING_MS`].
+//! arrived in. A refused merge counts in
+//! `sundog_merge_refused_total{cache, reason="too_large"}`. A caller gets
+//! [`CacheError::ValueTooLarge`]; a merge nobody waits on, from a peer or out
+//! of a coalesce window, also logs at `warn`, at most once per
+//! [`OVERSIZE_WARN_SPACING_MS`]. A log line names a key by the hash and length
+//! of its encoded bytes ([`key_for_log`]), never by the key.
 //!
 //! A value larger than [`wire::MAX_FRAME`] can be in the store, which a merge
 //! never builds. It keeps serving local reads and can only shrink;
 //! anti-entropy and state transfer cannot ship it, so
 //! [`Shard::skip_unframeable`] leaves it out of what they send, counted in
 //! `sundog_sync_skipped_total{cache, reason="too_large"}` and logged at
-//! `warn` under the same spacing. A value past a lowered `max_frame` that
-//! fits a wire frame syncs as any other and cannot grow.
+//! `warn` under the same spacing, which names the largest by its hash and
+//! length. A value past a lowered `max_frame` that fits a wire frame syncs as
+//! any other and cannot grow.
 
 use std::hash::Hash;
 use std::sync::Arc;
@@ -33,7 +35,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use smol_str::SmolStr;
 
-use super::engine::MergeCap;
+use super::engine::{MergeCap, hash_key_bytes};
 use super::{Shard, now_ms};
 use crate::error::CacheError;
 use crate::wire::{self, WireRecord};
@@ -90,24 +92,13 @@ impl Refused {
     }
 }
 
-/// The longest key a log line shows, in bytes.
-const LOGGED_KEY_BYTES: usize = 48;
-
-/// `key`'s bytes in hex for a log line, cut at [`LOGGED_KEY_BYTES`] with a
-/// trailing `..` when it is longer. A key's postcard bytes are what the wire
-/// and the digests know it by; a string or integer key is readable in them.
+/// How a log line names a key: the 64-bit xxh3 of its encoded bytes in 16 hex
+/// digits, the hash anti-entropy names the key by, with the encoded length.
+/// A line never carries the key itself, which is often a user identifier. To
+/// find a key from its hash, hash the postcard encoding of the candidates.
 /// Pure; unit tested directly.
-pub(super) fn key_for_log(key: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let shown = &key[..key.len().min(LOGGED_KEY_BYTES)];
-    let mut out = String::with_capacity(shown.len() * 2 + 2);
-    for byte in shown {
-        let _ = write!(out, "{byte:02x}");
-    }
-    if shown.len() < key.len() {
-        out.push_str("..");
-    }
-    out
+pub(super) fn key_for_log(key: &[u8]) -> (String, usize) {
+    (format!("{:016x}", hash_key_bytes(key)), key.len())
 }
 
 /// The records of `records` that fit one frame under a cache name of
@@ -175,12 +166,13 @@ where
     /// lost.
     pub(super) fn warn_merge_refused(&self, key: &[u8], size: usize, from: Refused) {
         let limit = self.max_frame;
-        let key = key_for_log(key);
+        let (key_hash, key_len) = key_for_log(key);
         if claim_warning(&self.merge_refused_warned_ms, self.now_ms()) {
             tracing::warn!(
                 cache = %self.name,
                 source = from.source(),
-                key,
+                key_hash,
+                key_len,
                 size,
                 limit,
                 "refused a change that would leave the value past the frame limit: the stored \
@@ -191,7 +183,8 @@ where
             tracing::debug!(
                 cache = %self.name,
                 source = from.source(),
-                key,
+                key_hash,
+                key_len,
                 size,
                 limit,
                 "refused a change that would leave the value past the frame limit"
@@ -229,7 +222,7 @@ impl SyncSkips {
         let Some((largest, key)) = largest else {
             return kept;
         };
-        let key = key_for_log(&key);
+        let (key_hash, key_len) = key_for_log(&key);
         let skipped = total - kept.len();
         metrics::counter!(
             "sundog_sync_skipped_total",
@@ -241,7 +234,8 @@ impl SyncSkips {
             tracing::warn!(
                 cache = %self.cache,
                 skipped,
-                largest_key = key,
+                largest_key_hash = key_hash,
+                largest_key_len = key_len,
                 largest_frame = largest,
                 limit = wire::MAX_FRAME,
                 "left records out of a sync because each is larger than one frame: they stay \
@@ -252,7 +246,8 @@ impl SyncSkips {
             tracing::debug!(
                 cache = %self.cache,
                 skipped,
-                largest_key = key,
+                largest_key_hash = key_hash,
+                largest_key_len = key_len,
                 largest_frame = largest,
                 "left records out of a sync because each is larger than one frame"
             );

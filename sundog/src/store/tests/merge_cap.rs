@@ -234,19 +234,37 @@ fn a_warning_is_due_at_first_and_then_once_per_spacing() {
 }
 
 #[test]
-fn a_key_shows_in_a_log_as_hex_cut_at_forty_eight_bytes() {
-    assert_eq!(key_for_log(&[]), "");
-    assert_eq!(key_for_log(&[0x00, 0x0a, 0xff]), "000aff");
-    assert_eq!(
-        key_for_log(&[0xab; 48]),
-        "ab".repeat(48),
-        "a key of 48 bytes is whole"
+fn a_key_shows_in_a_log_as_the_hash_and_length_of_its_encoded_bytes() {
+    // The xxh3 of the empty input and of the single byte 0x01.
+    assert_eq!(key_for_log(&[]), ("2d06800538d394c2".to_owned(), 0));
+    let (hash, len) = key_for_log(&[0x01]);
+    assert_eq!(hash, format!("{:016x}", engine::hash_key_bytes(&[0x01])));
+    assert_eq!(len, 1);
+    assert_eq!(hash.len(), 16, "always sixteen digits");
+
+    let long = [0xab; 1_000];
+    let (long_hash, long_len) = key_for_log(&long);
+    assert_eq!(long_len, 1_000, "the length is the whole key's");
+    assert_eq!(long_hash.len(), 16, "and the hash stays as short");
+    assert_ne!(
+        long_hash,
+        key_for_log(&long[..999]).0,
+        "it covers every byte"
     );
-    assert_eq!(
-        key_for_log(&[0xab; 49]),
-        format!("{}..", "ab".repeat(48)),
-        "one byte more is cut and marked"
-    );
+}
+
+/// The two fields a log line holds for key `key` under `name`, as
+/// `Warnings::assert_one` reads them: `key` for a refused merge,
+/// `largest_key` for a sync skip.
+fn key_fields(name: &str, key: u32) -> [String; 2] {
+    let bytes = key_bytes(&key);
+    [
+        format!(
+            "{name}_hash=\"{:016x}\"",
+            engine::hash_key_bytes(bytes.as_ref())
+        ),
+        format!("{name}_len={}", bytes.len()),
+    ]
 }
 
 #[test]
@@ -580,7 +598,8 @@ async fn a_remote_merge_past_the_cap_is_refused_counted_and_logged_once_per_spac
         "and nothing to fan out"
     );
     assert_eq!(counted.refused(), 2, "each refusal counts");
-    warnings.assert_one(&["frame limit", "key=\"01\""]);
+    let [hash, len] = key_fields("key", 1);
+    warnings.assert_one(&["frame limit", &hash, &len]);
 }
 
 #[tokio::test]
@@ -619,6 +638,111 @@ async fn an_insert_many_of_one_key_counts_every_refused_entry_and_changes_nothin
     assert_eq!(counted.refused(), 3, "one count for each refused entry");
     assert_eq!(stored_record(&s).await, before, "the record is whole");
     assert_digest_matches_full_recompute(&s).await;
+}
+
+/// The stripe a `u32` key lives in.
+fn stripe_of(key: u32) -> usize {
+    engine::stripe_index_from_hash(engine::hash_key_bytes(key_bytes(&key).as_ref()))
+}
+
+/// Two keys, the first in a higher stripe than the second: a batch given in
+/// this order reaches the second's stripe first.
+fn keys_in_descending_stripes() -> (u32, u32) {
+    let first = (1u32..1_000)
+        .find(|key| stripe_of(*key) > 0)
+        .expect("a key outside stripe 0");
+    let second = (1u32..1_000)
+        .find(|key| stripe_of(*key) < stripe_of(first))
+        .expect("a key in a lower stripe");
+    (first, second)
+}
+
+#[tokio::test]
+async fn an_insert_many_returns_the_refusal_of_the_first_entry_given_not_the_first_stripe() {
+    let s = capped_shard(8);
+    let (first, second) = keys_in_descending_stripes();
+    s.insert(first, four(1)).await.expect("fits");
+    s.insert(second, four(1)).await.expect("fits");
+
+    // `first` would leave nine encoded bytes, `second` ten. The batch is
+    // given with `first` first and applies stripe by stripe, `second`'s
+    // stripe before `first`'s.
+    let (size, _) = too_large(
+        s.insert_many([(first, four(2)), (second, vec![2; 5])])
+            .await,
+    );
+
+    assert_eq!(size, 9, "the first entry given, not the first stripe");
+    assert_eq!(s.get(&first).await, Some(four(1)));
+    assert_eq!(s.get(&second).await, Some(four(1)));
+}
+
+#[tokio::test]
+async fn an_insert_many_whose_entry_is_over_the_frame_ends_there_and_returns_that_error() {
+    let recorder = DebuggingRecorder::new();
+    let counted = Counted::new(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let s = capped_shard(8);
+    s.insert(1, four(1)).await.expect("fits");
+    s.insert(3, four(1)).await.expect("fits");
+
+    // Entry 1 merges past the cap; entry 2 is a contribution no frame holds,
+    // which ends the call before entry 3 is prepared.
+    let (size, _) = too_large(
+        s.insert_many([(1, four(2)), (2, vec![9; 40]), (3, four(3))])
+            .await,
+    );
+
+    assert_eq!(size, 41, "the contribution's error, not the merge's nine");
+    assert_eq!(s.get(&1).await, Some(four(1)), "the refused entry is whole");
+    assert_eq!(s.get(&2).await, None);
+    assert_eq!(
+        s.get(&3).await,
+        Some(four(1)),
+        "the entries after the contribution are not applied"
+    );
+    assert_eq!(counted.refused(), 1, "the merge refused before it counts");
+}
+
+#[tokio::test]
+async fn a_log_line_names_a_key_by_hash_and_length_never_by_its_bytes() {
+    use std::fmt::Write as _;
+
+    let (warnings, _log) = Warnings::capture();
+    let s = shard::<String, Vec<u8>>(1)
+        .with_resolver(Arc::new(ConcatResolver))
+        .with_max_frame(cap_for(8));
+    let key = "alice@example.com".to_owned();
+    let record = |value: &[u8], ver: Hlc| WireRecord {
+        key: key_bytes(&key),
+        value: Some(Bytes::from(
+            postcard::to_stdvec(&value.to_vec()).expect("test value encodes"),
+        )),
+        ver,
+        expires_at_ms: None,
+    };
+    ShardOps::apply_remote(&s, record(&four(1), hlc(ahead_ms(), 2))).await;
+
+    ShardOps::apply_remote(&s, record(&four(2), hlc(ahead_ms() + 1, 3))).await;
+
+    let encoded = key_bytes(&key);
+    warnings.assert_one(&[
+        "frame limit",
+        &format!(
+            "key_hash=\"{:016x}\"",
+            engine::hash_key_bytes(encoded.as_ref())
+        ),
+        &format!("key_len={}", encoded.len()),
+    ]);
+    if Warnings::CAPTURES {
+        let line = warnings.logged().join("\n");
+        let hex = encoded.iter().fold(String::new(), |mut acc, byte| {
+            let _ = write!(acc, "{byte:02x}");
+            acc
+        });
+        assert!(!line.contains("alice"), "{line}");
+        assert!(!line.contains(&hex), "{line}");
+    }
 }
 
 #[tokio::test]
@@ -667,7 +791,8 @@ async fn a_fold_that_overflows_the_stored_value_is_refused_at_its_flush_where_it
         "the stored value is as it was"
     );
     assert_eq!(counted.refused(), 1);
-    warnings.assert_one(&["frame limit", "key=\"01\""]);
+    let [hash, len] = key_fields("key", 1);
+    warnings.assert_one(&["frame limit", &hash, &len]);
 }
 
 /// The value bytes of the record `unshippable_record` builds are a vector of
@@ -741,7 +866,8 @@ async fn a_record_too_large_for_a_frame_stays_here_and_out_of_every_sync() {
         "a state transfer skips it too"
     );
     assert_eq!(counted.skipped(), 2, "each skip counts");
-    warnings.assert_one(&["larger than one frame", "largest_key=\"02\""]);
+    let [hash, len] = key_fields("largest_key", 2);
+    warnings.assert_one(&["larger than one frame", &hash, &len]);
 }
 
 /// A set of `count` adds by `writer`, numbered from 1.
@@ -796,7 +922,8 @@ async fn a_compaction_that_would_grow_a_value_past_the_cap_is_refused_counted_an
         1,
         "the refusal counts as a refused merge"
     );
-    warnings.assert_one(&["a compaction pass", "frame limit", "key=\"01\""]);
+    let [hash, len] = key_fields("key", 1);
+    warnings.assert_one(&["a compaction pass", "frame limit", &hash, &len]);
 
     ShardOps::compact_pass(&s, 2_000, &retire, Quiescence::Settled, bounds, 100).await;
     assert_eq!(counted.refused(), 2, "each pass that meets it counts again");

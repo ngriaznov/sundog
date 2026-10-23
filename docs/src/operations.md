@@ -49,7 +49,7 @@ addresses once it forms, under `cluster formed`.
 | `sundog_cache_bytes{cache}` | a cache with a `max_resident_bytes` ceiling: resident bytes of this node's live entries, as `Cache::resident_bytes` counts them |
 | `sundog_ceiling_refusals_total{cache, kind}` | a cache with a `max_resident_bytes` ceiling: local writes refused (`write`) and fills returned uncached (`fill`) |
 | `sundog_merge_refused_total{cache, reason}` | merges refused instead of stored: `too_large`, a merge whose result would pass `max_frame` and be larger than the value it replaces, or a CRDT compaction rewrite that would. A local call gets `CacheError::ValueTooLarge`; a merge from a peer, a coalesced fold at its flush, or a compaction pass leaves the stored value as it is and logs a warning, at most once a minute for each cache; see [Merges are refused at the frame limit](#merges-are-refused-at-the-frame-limit) |
-| `sundog_sync_skipped_total{cache, reason}` | records left out of anti-entropy, state transfer or a rebalance chunk: `too_large`, a record that does not fit one frame. It stays on its node and every other key syncs; a warning, at most once a minute for each cache, names the largest |
+| `sundog_sync_skipped_total{cache, reason}` | records left out of anti-entropy, state transfer or a rebalance chunk: `too_large`, a record that does not fit one frame. It stays on its node and every other key syncs; a warning, at most once a minute for each cache, identifies the largest by `largest_key_hash` and `largest_key_len` |
 | `sundog_fan_out_backlog{cache}` | written keys not yet sent to peers |
 | `sundog_fan_out_wait_timeouts_total{cache}` | writes that waited out `fan_out_wait_timeout` for backlog room and proceeded over capacity |
 | `sundog_ae_repaired_total{cache}` | entries anti-entropy repaired, counted per batch as each moves |
@@ -309,8 +309,11 @@ write stamp had its system clock stepped back; its writes keep their order.
 refused the merge and kept the value as it was. A call on this node got
 `CacheError::ValueTooLarge`. A merge from a peer, or a fold that flushed out
 of a `merge_coalesce_window`, had no caller to tell: the node logged a
-warning that names the key by its encoded bytes in hex, the merged size and
-the limit, and the contribution is lost. A CRDT compaction pass that would
+warning that identifies the key by `key_hash` and `key_len`, the merged size
+and the limit, and the contribution is lost. `key_hash` is the xxh3 of the
+key's postcard encoding in 16 hex digits, the hash a cache routes the key by,
+and a log never carries the key itself; hash the encoded keys you suspect to
+find it. A CRDT compaction pass that would
 grow a value at the limit is refused and logged the same way, on every pass,
 and leaves the retired writers in the value. The usual cause is an `OrSet`
 that only grows. Replicas that each hold part of a value too large to combine
@@ -330,8 +333,9 @@ builds, so set the same on every node.
 
 ### Records are left out of a sync
 
-`sundog_sync_skipped_total` rises, and the node logs a warning that names the
-largest key left out. The cache holds a value larger than one wire frame,
+`sundog_sync_skipped_total` rises, and the node logs a warning that identifies
+the largest key left out by `largest_key_hash` and `largest_key_len`, as the
+previous section describes for `key_hash`. The cache holds a value larger than one wire frame,
 4 MiB, which a merge never builds and an upgrade can leave behind. It serves
 reads on this node and does not replicate; state transfer, anti-entropy and
 rebalance leave it out, and the other keys sync as usual. A node that joins,
