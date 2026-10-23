@@ -20,8 +20,6 @@ mod admit;
 mod framing;
 mod pool;
 mod reply;
-#[cfg(test)]
-mod reply_tests;
 mod serve;
 #[cfg(test)]
 mod tests;

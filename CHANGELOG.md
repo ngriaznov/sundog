@@ -58,18 +58,6 @@ All notable changes to this project are documented in this file. Format follows
   removes content and fits a frame, or `Cache::remove`, brings it back under
   the limit. A value past a lowered `max_frame` fits a frame and syncs
   as any other.
-- **A listing of large keys goes in several frames on the digest path.** The
-  `AeBucket` reply to a digest exchange for a bucket of at most
-  `ae_sketch_min_bucket` entries whose listing no frame holds is cut into
-  frames of about 2 MiB, as the full-listing fallback is, for a peer on
-  protocol 9. The requester joins the messages of a bucket. A listing that
-  fits one frame is one message to every peer. The wire protocol does not
-  change; a peer on a release that does not join the messages of a digest
-  reply treats each message as the whole bucket and pushes the records it
-  holds that the message lacks, where the exchange failed. The listing of a
-  mismatched part is one message, so a part of at most
-  `ae_sketch_min_bucket` entries whose keys average past about 10 KiB fails to
-  send.
 - **A round of anti-entropy goes on after a failed pull.** `pull_repairs`
   asks for the next batch after one fails, and stops after two failures in a
   row. A pull batch holds at most 512 KiB of keys beside its 4,096 keys, and a

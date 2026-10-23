@@ -73,10 +73,8 @@ pub(super) async fn serve_state_transfer(
 /// replies with its 64 part digests ([`Msg::AePartDigests`]) without ever
 /// materializing its listing; a smaller mismatched bucket falls back to the
 /// existing rule, an IBLT sketch past `handler.ae_sketch_min_bucket()`
-/// entries or else the full [`Msg::AeBucket`] listing, which a bucket of
-/// keys too large for one frame sends as several messages
-/// ([`digest_listing_replies`]). Does not append the trailing
-/// [`Msg::ReqDone`]; callers add it.
+/// entries or else the full [`Msg::AeBucket`] listing. Does not append the
+/// trailing [`Msg::ReqDone`]; callers add it.
 async fn ae_mismatch_replies(
     cache: &SmolStr,
     local: &std::collections::HashMap<u16, u64>,
@@ -132,25 +130,23 @@ async fn ae_mismatch_replies(
             // materialized.
             let min_bucket = handler.ae_sketch_min_bucket();
             let sketch_cells = handler.ae_sketch_cells();
-            let chunked = wire::peer_supports(peer_protocol, wire::PROTOCOL_AE_LISTING_CHUNKS);
             replies.extend(
                 handler
                     .entries_for_buckets(cache.clone(), small)
                     .await
                     .into_iter()
-                    .flat_map(|(bucket, entries)| {
+                    .map(|(bucket, entries)| {
                         match listing_or_sketch(entries, min_bucket, sketch_cells) {
-                            ListingOrSketch::Sketch(cells) => vec![Msg::AeSketch {
+                            ListingOrSketch::Sketch(cells) => Msg::AeSketch {
                                 cache: cache.clone(),
                                 bucket,
                                 cells,
-                            }],
-                            // A listing too large for one frame, which keys
-                            // of several KiB each reach well under the
-                            // sketch threshold, goes out in slices.
-                            ListingOrSketch::Listing(entries) => {
-                                digest_listing_replies(cache, bucket, entries, chunked)
-                            }
+                            },
+                            ListingOrSketch::Listing(entries) => Msg::AeBucket {
+                                cache: cache.clone(),
+                                bucket,
+                                entries: key_versions_to_wire(entries),
+                            },
                         }
                     }),
             );
@@ -701,20 +697,6 @@ pub(super) fn listing_or_sketch(
 /// half a frame, leaving room for the cache name and the bucket.
 pub(super) const AE_LISTING_BUDGET: usize = MAX_FRAME / 2;
 
-/// An upper bound on the encoded bytes one listing entry takes: its key and
-/// the widest encoding of the rest.
-fn ae_entry_cost(entry: &KeyVersion) -> usize {
-    entry.key.len() + AE_ENTRY_MAX_WIRE_LEN
-}
-
-/// An upper bound on the encoded bytes a listing's entries take, as
-/// [`chunk_ae_listing`] charges them.
-fn ae_listing_cost(entries: &[KeyVersion]) -> usize {
-    entries
-        .iter()
-        .fold(0usize, |sum, kv| sum.saturating_add(ae_entry_cost(kv)))
-}
-
 /// Splits one bucket's `entries` into slices whose encoded size stays within
 /// `budget`, in order: a slice holds an entry only while its keys' bytes plus
 /// [`AE_ENTRY_MAX_WIRE_LEN`] each fit, and a slice larger than `budget` is a
@@ -725,14 +707,18 @@ fn ae_listing_cost(entries: &[KeyVersion]) -> usize {
 /// A key within a few hundred bytes of [`MAX_FRAME`] fits in no frame, so a
 /// listing that holds one still fails to send.
 pub(super) fn chunk_ae_listing(entries: Vec<KeyVersion>, budget: usize) -> Vec<Vec<KeyVersion>> {
-    if ae_listing_cost(&entries) <= budget {
+    let cost = |kv: &KeyVersion| kv.key.len() + AE_ENTRY_MAX_WIRE_LEN;
+    let total = entries
+        .iter()
+        .fold(0usize, |sum, kv| sum.saturating_add(cost(kv)));
+    if total <= budget {
         return vec![entries];
     }
     let mut chunks = Vec::new();
     let mut current = Vec::new();
     let mut used = 0usize;
     for kv in entries {
-        let len = ae_entry_cost(&kv);
+        let len = cost(&kv);
         if used > 0 && used + len > budget {
             chunks.push(std::mem::take(&mut current));
             used = 0;
@@ -771,34 +757,6 @@ pub(super) fn ae_entries_replies(
             entries: key_versions_to_wire(entries),
         })
         .collect()
-}
-
-/// The [`Msg::AeBucket`] replies to a digest exchange for one bucket's
-/// `entries`: one message when the listing fits a frame, whatever the peer's
-/// protocol, and slices of [`AE_LISTING_BUDGET`] when it does not and the peer
-/// is on [`wire::PROTOCOL_AE_LISTING_CHUNKS`]. A listing that fits one frame
-/// goes out whole because a release on that protocol that joins the slices of
-/// an `AeEntries` reply only reads each message of a digest reply as the
-/// whole bucket, and a listing that fits reads correctly there. A listing
-/// past a frame failed to send before slices existed. The estimate
-/// [`chunk_ae_listing`] charges settles a listing of at most
-/// [`AE_LISTING_BUDGET`] without an encode; only a larger one encodes to
-/// learn whether a frame holds it. Unit tested directly.
-pub(super) fn digest_listing_replies(
-    cache: &SmolStr,
-    bucket: u16,
-    entries: Vec<KeyVersion>,
-    chunked: bool,
-) -> Vec<Msg> {
-    let whole = |entries| ae_entries_replies(cache, vec![(bucket, entries)], false, usize::MAX);
-    if !chunked || ae_listing_cost(&entries) <= AE_LISTING_BUDGET {
-        return whole(entries);
-    }
-    let single = whole(entries.clone());
-    if single.iter().all(|msg| wire::encode(msg).is_ok()) {
-        return single;
-    }
-    ae_entries_replies(cache, vec![(bucket, entries)], true, AE_LISTING_BUDGET)
 }
 
 /// Serves an `AeEntries` request: the sketch fallback, full listings for the

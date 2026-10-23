@@ -344,12 +344,6 @@ frame, or delete the key with `Cache::remove`; the counter stops rising once
 no record is over the limit. A value past a lowered `max_frame` that a frame
 holds syncs as any other and is not counted.
 
-One listing is not cut to fit: the listing of a mismatched part, which a part
-of at most `ae_sketch_min_bucket` entries answers in a single message. A
-part whose keys average past about 10 KiB fails to send, and its round fails
-and repeats; lower `ae_sketch_min_bucket` so such a part answers with a
-sketch.
-
 ### A spill tier drops evictions
 
 `sundog_spill_dropped_total` grows: the flusher falls behind eviction, or

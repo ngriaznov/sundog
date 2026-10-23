@@ -64,9 +64,8 @@ pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 /// - 8: A merging `Mode::Invalidation` cache sends [`Msg::Replicate`] and
 ///   [`Msg::ReplicateBatch`] records in place of [`Msg::Invalidate`]. See
 ///   [`PROTOCOL_INVALIDATION_FOLD`].
-/// - 9: A reply to [`Msg::AeEntries`] or [`Msg::AeDigest`] may carry one
-///   bucket's listing across several [`Msg::AeBucket`] messages. See
-///   [`PROTOCOL_AE_LISTING_CHUNKS`].
+/// - 9: A reply to [`Msg::AeEntries`] may carry one bucket's listing across
+///   several [`Msg::AeBucket`] messages. See [`PROTOCOL_AE_LISTING_CHUNKS`].
 pub const PROTOCOL_VERSION: u16 = 9;
 
 /// The oldest peer protocol this build still serves in full.
@@ -134,14 +133,10 @@ pub const PROTOCOL_INVALIDATION_FOLD: u16 = 8;
 /// The protocol under which a responder may answer one bucket of an
 /// [`Msg::AeEntries`] request with several [`Msg::AeBucket`] messages, each
 /// holding a slice of the bucket's listing, which the requester concatenates
-/// in arrival order. A reply to an [`Msg::AeDigest`] does the same, but only
-/// for a listing that does not fit one frame: a release on this protocol
-/// that joins the slices of an `AeEntries` reply and not those of a digest
-/// reply reads each digest message as the whole bucket, so a listing that
-/// fits a frame is one message. A requester joins the messages of a bucket
-/// whatever the responder's protocol; a responder sends a peer on an older
-/// protocol one message per bucket, since that peer would read each message
-/// as the whole bucket.
+/// in arrival order. A requester joins the messages of a bucket whatever the
+/// responder's protocol; a responder sends a peer on an older protocol one
+/// message per bucket, since that peer would read each message as the whole
+/// bucket.
 pub const PROTOCOL_AE_LISTING_CHUNKS: u16 = 9;
 
 /// The `cluster` a [`Msg::Hello`] carries when its sender names none: a
@@ -259,8 +254,7 @@ pub enum Msg {
         buckets: Vec<(u16, u64)>,
     },
     /// Anti-entropy round, step 2: `(key, version)` pairs live in the
-    /// mismatched `bucket` on the sender. A reply to [`Msg::AeEntries`], or
-    /// to an [`Msg::AeDigest`] whose listing does not fit one frame, may
+    /// mismatched `bucket` on the sender. A reply to [`Msg::AeEntries`] may
     /// repeat it for one bucket, each message holding the next slice of the
     /// listing, and the receiver concatenates them; see
     /// [`PROTOCOL_AE_LISTING_CHUNKS`].

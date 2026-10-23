@@ -152,7 +152,7 @@ async fn ae_round_retries_a_pooled_connection_the_server_already_closed() {
 /// A raw request connection to `addr` that has already sent `hello`, for
 /// speaking as a peer of any protocol version, including the ones this
 /// build's own `Mesh` doesn't send.
-pub(super) async fn raw_request_conn(
+async fn raw_request_conn(
     addr: SocketAddr,
     hello: Bytes,
 ) -> tokio_util::codec::Framed<tokio::net::TcpStream, tokio_util::codec::LengthDelimitedCodec> {
@@ -185,7 +185,7 @@ fn legacy_hello(node: NodeId) -> Bytes {
     legacy
 }
 
-pub(super) async fn replies_until_req_done(
+async fn replies_until_req_done(
     framed: &mut tokio_util::codec::Framed<
         tokio::net::TcpStream,
         tokio_util::codec::LengthDelimitedCodec,
