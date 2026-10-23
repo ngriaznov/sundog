@@ -889,7 +889,7 @@ fn a_run_plan_of_many_refused_steps_takes_one_pass() {
 }
 
 #[test]
-fn under_a_cap_a_key_folds_only_up_to_its_first_tombstone() {
+fn a_key_folds_only_up_to_its_first_tombstone() {
     let ver = hlc(10, 1);
     let one = elems(0, 1);
     let entries = vec![
@@ -910,19 +910,7 @@ fn under_a_cap_a_key_folds_only_up_to_its_first_tombstone() {
     };
 
     assert_eq!(
-        sorted(group_prefold_runs(&entries, false)),
-        [
-            vec![0, 1],
-            vec![2],
-            vec![3, 4],
-            vec![5, 6],
-            vec![7],
-            vec![8, 9]
-        ],
-        "without a cap every run between tombstones folds"
-    );
-    assert_eq!(
-        sorted(group_prefold_runs(&entries, true)),
+        sorted(group_prefold_runs(&entries)),
         [
             vec![0, 1],
             vec![2],
@@ -933,7 +921,7 @@ fn under_a_cap_a_key_folds_only_up_to_its_first_tombstone() {
             vec![8],
             vec![9]
         ],
-        "under one only the entries before the key's first tombstone do"
+        "only the entries before a key's first tombstone fold"
     );
 }
 

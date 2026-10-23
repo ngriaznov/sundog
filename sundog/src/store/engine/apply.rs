@@ -874,7 +874,7 @@ where
         #[cfg(feature = "spill")] prefetched_spilled: &HashMap<SpillLoc, Bytes>,
     ) -> Vec<Slot<K, V>> {
         let cap = self.merge_cap();
-        let runs = group_prefold_runs(&entries, cap.is_some());
+        let runs = group_prefold_runs(&entries);
         let stored_seeds = {
             let stripe = self.stripes[bucket].read();
             peek_prefold_seeds(

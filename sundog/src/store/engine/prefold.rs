@@ -220,19 +220,15 @@ pub(super) fn reaches_deadline<V>(incoming: &Incoming<V>, now_ms: u64) -> bool {
 /// [`Engine::apply_many`]'s seed lookup so both agree on exactly which runs
 /// are long enough to fold.
 ///
-/// `leading_run_only` cuts a key at its first tombstone: the tombstone and
-/// every entry after it is a singleton run, which nothing folds. A later run
-/// would fold from the record stored before the batch, but by the time it
-/// applies, the key's earlier entries have changed that record, and a delete
-/// among them has removed content the fold would put back. A cap decides each
-/// merge against the record it meets, so that fold is refused at other steps
-/// than sequential application refuses it. A key's leading run starts from
-/// the stored record itself and folds exactly. [`Engine::apply_many`] sets it
-/// when a cap is in force.
-pub(super) fn group_prefold_runs<K, V>(
-    entries: &[BatchEntry<K, V>],
-    leading_run_only: bool,
-) -> Vec<Vec<usize>> {
+/// A key is cut at its first tombstone: the tombstone and every entry after
+/// it is a singleton run, which nothing folds. A later run would fold from
+/// the record stored before the batch, but by the time it applies, the key's
+/// earlier entries have changed that record: a delete among them has removed
+/// content the fold would put back, and a cap decides each merge against the
+/// record it meets, so the fold would be refused at other steps than
+/// sequential application refuses it. A key's leading run starts from the
+/// stored record itself and folds exactly.
+pub(super) fn group_prefold_runs<K, V>(entries: &[BatchEntry<K, V>]) -> Vec<Vec<usize>> {
     let mut by_key: HashMap<Bytes, Vec<usize>> = HashMap::new();
     for (i, entry) in entries.iter().enumerate() {
         by_key.entry(entry.2.clone()).or_default().push(i);
@@ -253,7 +249,7 @@ pub(super) fn group_prefold_runs<K, V>(
                         runs.push(std::mem::take(&mut current));
                     }
                     runs.push(vec![idx]);
-                    past_leading_run = leading_run_only;
+                    past_leading_run = true;
                 }
             }
         }

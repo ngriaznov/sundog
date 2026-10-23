@@ -561,3 +561,55 @@ fn set_prefold_enabled_toggles_the_flag_the_getter_reports() {
     engine.set_prefold_enabled(true);
     assert!(engine.prefold_enabled());
 }
+
+#[test]
+fn a_delete_in_a_batch_keeps_the_stored_elements_out_of_the_puts_after_it() {
+    let resolver = UnionSetResolver;
+    let k = 7u32;
+    let kb = key_bytes(k);
+    let hash = hash_key_bytes(kb.as_ref());
+    let bucket = stripe_index_from_hash(hash);
+    let setup = || vec![put_entry(k, hlc(1, 1), "a"), put_entry(k, hlc(2, 1), "b")];
+    let batch = || -> Vec<SetEntry> {
+        vec![
+            (hash, k, kb.clone(), hlc(30, 1), Incoming::DELETE),
+            put_entry(k, hlc(31, 1), "c"),
+            put_entry(k, hlc(32, 1), "d"),
+        ]
+    };
+    let run = |prefold: bool| {
+        let engine: SetEngine = Engine::new(u64::MAX, None, None, None);
+        engine.set_prefold_enabled(prefold);
+        engine.apply_many(
+            Arrival::Peer,
+            bucket,
+            setup(),
+            &resolver,
+            60_000,
+            600_000,
+            0,
+        );
+        engine.apply_many(
+            Arrival::Peer,
+            bucket,
+            batch(),
+            &resolver,
+            60_000,
+            600_000,
+            0,
+        );
+        (engine.get(&k, 0), engine.record_for(kb.as_ref(), 0))
+    };
+    let (sequential, sequential_record) = run(false);
+    let (prefolded, prefolded_record) = run(true);
+    assert_eq!(
+        sequential,
+        Some(string_set(&["c", "d"])),
+        "the delete removed \"a\" and \"b\""
+    );
+    assert_eq!(
+        prefolded, sequential,
+        "the puts after the delete must not fold from the record stored before it"
+    );
+    assert_eq!(prefolded_record, sequential_record);
+}

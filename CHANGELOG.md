@@ -73,6 +73,13 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **A delete in a batch of peer records keeps what it removed out of the
+  merges after it.** A replicate, anti-entropy or state-transfer batch that
+  carries a delete of a key and then merges into the same key, applied over a
+  value already stored under a merging resolver, folded those merges from the
+  value stored before the batch, so the elements the delete removed came back.
+  The batch pre-fold now folds a key only up to its first tombstone; the
+  entries after it apply one by one, as sequential application applies them.
 - **An `OrSet` add could be lost to a remove that had not observed it.**
   `OrSet::remove` raises a writer's watermark to the highest sequence number
   it observed, which covers every lower number of that writer too. Two tasks
