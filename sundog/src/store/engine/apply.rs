@@ -758,7 +758,8 @@ where
         written: &mut Written,
     ) -> (Vec<ApplyOutcome<K, V>>, u64) {
         let held_only = scope == ApplyScope::HeldOnly;
-        let merge_cap = self.merge_cap();
+        // Only a merge meets the cap.
+        let merge_cap = resolver.merges().then(|| self.merge_cap()).flatten();
         let ignored = AtomicU64::new(0);
         // Read once for the batch: a collection that lands mid-batch applies
         // from the next call on.

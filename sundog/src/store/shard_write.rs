@@ -202,8 +202,7 @@ where
                 self.tombstone_max_ttl_ms,
                 self.now_ms(),
             )
-            .into_iter()
-            .next()
+            .pop()
             .expect("invariant: apply_many returns exactly one outcome per entry given");
         let refused = outcome.too_large();
         self.handle_apply_outcome(outcome, origin, true);
