@@ -613,3 +613,25 @@ fn a_delete_in_a_batch_keeps_the_stored_elements_out_of_the_puts_after_it() {
     );
     assert_eq!(prefolded_record, sequential_record);
 }
+
+#[test]
+fn a_batch_pre_folds_only_under_a_merging_resolver_with_two_entries_or_more() {
+    use super::super::prefold::prefold_engages;
+    // (merges, held_only, enabled, entries, engages)
+    let cases = [
+        (true, false, true, 2, true),
+        (true, false, true, 1_000, true),
+        (true, false, true, 1, false),
+        (true, false, true, 0, false),
+        (false, false, true, 1_000, false),
+        (true, true, true, 1_000, false),
+        (true, false, false, 1_000, false),
+    ];
+    for (merges, held_only, enabled, entries, engages) in cases {
+        assert_eq!(
+            prefold_engages(merges, held_only, enabled, entries),
+            engages,
+            "merges={merges} held_only={held_only} enabled={enabled} entries={entries}"
+        );
+    }
+}
