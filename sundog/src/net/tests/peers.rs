@@ -348,6 +348,68 @@ async fn mark_dirty_shows_up_in_the_next_take() {
 }
 
 #[tokio::test]
+async fn pull_limit_is_kept_per_peer_and_cache_and_goes_with_the_peer() {
+    let (mesh, _inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+    let first = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 1));
+    let second = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 2));
+    mesh.update_peers(vec![
+        peer_at(NodeId::from(2), first),
+        peer_at(NodeId::from(3), second),
+    ]);
+    assert_eq!(
+        mesh.pull_limit(NodeId::from(2), "users"),
+        None,
+        "a peer that never shrank has no limit"
+    );
+
+    mesh.set_pull_limit(NodeId::from(2), "users", 64);
+    assert_eq!(mesh.pull_limit(NodeId::from(2), "users"), Some(64));
+    assert_eq!(
+        mesh.pull_limit(NodeId::from(2), "orders"),
+        None,
+        "another cache of the same peer"
+    );
+    assert_eq!(
+        mesh.pull_limit(NodeId::from(3), "users"),
+        None,
+        "the same cache of another peer"
+    );
+    mesh.set_pull_limit(NodeId::from(2), "orders", 8);
+    mesh.set_pull_limit(NodeId::from(2), "users", 128);
+    assert_eq!(mesh.pull_limit(NodeId::from(2), "users"), Some(128));
+    assert_eq!(mesh.pull_limit(NodeId::from(2), "orders"), Some(8));
+
+    mesh.set_pull_limit(NodeId::from(42), "users", 5);
+    assert_eq!(
+        mesh.pull_limit(NodeId::from(42), "users"),
+        None,
+        "a peer the mesh does not know keeps nothing"
+    );
+
+    mesh.update_peers(vec![
+        peer_at(NodeId::from(2), first),
+        peer_at(NodeId::from(3), second),
+    ]);
+    assert_eq!(
+        mesh.pull_limit(NodeId::from(2), "users"),
+        Some(128),
+        "an unchanged peer keeps its limit"
+    );
+
+    mesh.update_peers(vec![peer_at(NodeId::from(3), second)]);
+    assert_eq!(mesh.pull_limit(NodeId::from(2), "users"), None);
+    mesh.update_peers(vec![
+        peer_at(NodeId::from(2), first),
+        peer_at(NodeId::from(3), second),
+    ]);
+    assert_eq!(
+        mesh.pull_limit(NodeId::from(2), "users"),
+        None,
+        "a peer that left and came back starts again"
+    );
+}
+
+#[tokio::test]
 async fn request_to_an_unknown_peer_errors_instead_of_hanging() {
     let (mesh, _inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
     let err = mesh

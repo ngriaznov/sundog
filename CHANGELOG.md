@@ -67,12 +67,21 @@ All notable changes to this project are documented in this file. Format follows
 - **A round of anti-entropy goes on after a failed pull.** `pull_repairs`
   asks for the next batch after one fails, and stops after two failures in a
   row. A pull batch holds at most 512 KiB of keys beside its 4,096 keys, so a
-  request of long keys fits one frame. A responder never cuts a pull reply,
-  so a reply too large to arrive within the request timeout still fails its
-  batch.
+  request of long keys fits one frame.
 
 ### Fixed
 
+- **A pull whose reply cannot arrive in time goes out again smaller.** A pull
+  of large records, whose reply took longer than the 10-second request
+  timeout, failed the same way every round, and its keys never repaired from
+  that peer. A pull that times out goes out again with half as many keys or
+  hashes, and the next batch to that peer is cut at the new size. The size is
+  kept for each peer and cache, doubles after each answer that takes a quarter
+  of the timeout or less, and stays within 4,096. A key that times out alone
+  waits for the next round, and a round stops pulling after two failures in a
+  row. A debug line logs each shrink, and a warning logs the batch
+  reaching one key, since a record then takes longer than the request timeout
+  to arrive.
 - **A delete in a batch of peer records keeps what it removed out of the
   merges after it.** A replicate, anti-entropy or state-transfer batch that
   carries a delete of a key and then merges into the same key, applied over a

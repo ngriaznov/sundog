@@ -3,9 +3,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use smol_str::SmolStr;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -196,6 +197,7 @@ impl Mesh {
             invalidate,
             replicate_tx,
             dirty,
+            pull_limits: Mutex::new(HashMap::new()),
             last_replicate_enqueued: Arc::new(AtomicU64::new(0)),
             ae_deferrals: AtomicU32::new(0),
             cancel,
@@ -474,6 +476,50 @@ impl Mesh {
             .expect("invariant: peers lock is never poisoned");
         if let Some(handle) = table.get(&peer) {
             handle.dirty.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// The most keys or hashes an anti-entropy pull from `peer` asks for in
+    /// `cache`, once a pull to it timed out and shrank the batch; `None` for
+    /// a peer that never shrank and for one the mesh does not know. The
+    /// limit lives with the peer's handle, so it goes when
+    /// [`Mesh::update_peers`] drops the peer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the peer-table lock or the peer's limit lock is poisoned.
+    pub(crate) fn pull_limit(&self, peer: NodeId, cache: &str) -> Option<usize> {
+        let table = self
+            .inner
+            .peers
+            .read()
+            .expect("invariant: peers lock is never poisoned");
+        let limits = table
+            .get(&peer)?
+            .pull_limits
+            .lock()
+            .expect("invariant: pull limit lock is never poisoned");
+        limits.get(cache).copied()
+    }
+
+    /// Records `limit` as the most an anti-entropy pull from `peer` asks for
+    /// in `cache`. A peer the mesh does not know keeps nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the peer-table lock or the peer's limit lock is poisoned.
+    pub(crate) fn set_pull_limit(&self, peer: NodeId, cache: &str, limit: usize) {
+        let table = self
+            .inner
+            .peers
+            .read()
+            .expect("invariant: peers lock is never poisoned");
+        if let Some(handle) = table.get(&peer) {
+            handle
+                .pull_limits
+                .lock()
+                .expect("invariant: pull limit lock is never poisoned")
+                .insert(SmolStr::new(cache), limit);
         }
     }
 

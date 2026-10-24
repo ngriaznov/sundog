@@ -43,8 +43,9 @@ thread_local! {
 
 /// The request timeout every `ae_*`/`request_state` call races against:
 /// [`REQUEST_TIMEOUT`], unless a test installed a shorter override on this
-/// thread via [`with_request_timeout`].
-fn request_timeout() -> Duration {
+/// thread via [`with_request_timeout`]. Anti-entropy reads it to tell a quick
+/// pull answer from a slow one against the timeout the pull raced.
+pub(crate) fn request_timeout() -> Duration {
     #[cfg(all(test, not(feature = "sim")))]
     {
         if let Some(over) = REQUEST_TIMEOUT_OVERRIDE.with(std::cell::Cell::get) {
@@ -61,7 +62,7 @@ fn request_timeout() -> Duration {
 /// `fut`'s whole lifetime, not only the moment this function is called.
 /// Doesn't change production behavior, which never reads the override.
 #[cfg(all(test, not(feature = "sim")))]
-pub(super) async fn with_request_timeout<T>(
+pub(crate) async fn with_request_timeout<T>(
     duration: Duration,
     fut: impl std::future::Future<Output = T>,
 ) -> T {

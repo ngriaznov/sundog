@@ -38,6 +38,9 @@ mod handler;
 mod mesh;
 mod outbox;
 mod request;
+pub(crate) use request::request_timeout;
+#[cfg(all(test, not(feature = "sim")))]
+pub(crate) use request::with_request_timeout;
 mod tcp;
 #[cfg(all(test, not(feature = "sim")))]
 pub(crate) mod test_support;
@@ -66,7 +69,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use smol_str::SmolStr;
@@ -169,6 +172,11 @@ struct PeerHandle {
     /// outbox dropped a message for it, or its writer redialed after a
     /// connection that carried frames broke ([`Mesh::take_dirty_peers`]).
     dirty: Arc<AtomicBool>,
+    /// The most keys or hashes the next anti-entropy pull from this peer
+    /// asks for, per cache, once a pull to it has timed out
+    /// ([`Mesh::pull_limit`]). A cache absent from the map has not shrunk.
+    /// Dropped with this handle when the peer departs.
+    pull_limits: Mutex<HashMap<SmolStr, usize>>,
     /// [`mono_ms`] + 1 of the last `Replicate` frame enqueued, `0` if none.
     /// Read by [`Mesh::replicate_in_flight`].
     last_replicate_enqueued: Arc<AtomicU64>,

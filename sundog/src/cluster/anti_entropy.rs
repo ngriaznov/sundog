@@ -14,8 +14,13 @@
 //! A sketch that fails to peel is retried once as a full listing, after every
 //! other reply in the round is handled. `Invalidation` caches never run this:
 //! their nodes hold different subsets by design.
+//!
+//! A round pulls in batches. A pull to a peer that times out goes out again in
+//! halves, and the batch size to that peer, kept for each cache, recovers
+//! after quick answers ([`next_pull_limit`]).
 
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +28,7 @@ use bytes::Bytes;
 use rand::RngExt as _;
 use rand::seq::IndexedRandom as _;
 use smol_str::SmolStr;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -30,7 +36,7 @@ use super::Cluster;
 use super::sketch::{Cell, Decoded, Iblt};
 use crate::error::CodecError;
 use crate::hlc::Hlc;
-use crate::net::{AeMismatch, AePartReply, AeRoundOutcome, Mesh, MsgClass};
+use crate::net::{AeMismatch, AePartReply, AeRoundOutcome, Mesh, MsgClass, request_timeout};
 use crate::node::NodeId;
 use crate::store::part::PartSet;
 use crate::store::{BucketPart, PartId, PartMask, Scope, ScopedDigests, ShardOps};
@@ -78,9 +84,11 @@ pub(crate) async fn scheduler_task(
     }
 }
 
-/// Keys per push/pull batch within one round. Bounds each `ae_pull`
-/// request/response under the frame cap, so a large divergence repairs
-/// incrementally across batches rather than in one oversized exchange.
+/// Entries per push or pull batch within one round: the largest batch. Bounds
+/// each `ae_pull` request/response under the frame cap, so a large divergence
+/// repairs incrementally across batches rather than in one oversized exchange.
+/// The batch of pulls to a peer shrinks after a timeout and grows back to this
+/// after quick answers ([`next_pull_limit`]).
 const REPAIR_BATCH: usize = 4096;
 
 /// Key bytes per pull request, beside [`REPAIR_BATCH`]'s key count. An
@@ -851,10 +859,11 @@ fn wire_record_len(cache_len: usize, record: &WireRecord) -> u64 {
 }
 
 /// Applies a round's classified push/pull/hash-pull sets against `peer`, in
-/// [`REPAIR_BATCH`] chunks, counts each chunk under
-/// `sundog_ae_repaired_total{cache}` as it moves ([`RepairTally::add`]), and
-/// returns the total wire bytes moved (pushed plus pulled) and whether
-/// every pull was answered and every push reached `peer`'s outbox.
+/// chunks of at most [`REPAIR_BATCH`] (pulls follow [`pull_repairs`]'s limit
+/// for the peer), counts each chunk under `sundog_ae_repaired_total{cache}` as
+/// it moves ([`RepairTally::add`]), and returns the total wire bytes moved
+/// (pushed plus pulled) and whether every pull was answered and every push
+/// reached `peer`'s outbox.
 ///
 /// Without `both_ways`, pushes go out first: the two sets are disjoint. With
 /// `both_ways` (a resolver that merges or reads values), a key both sides
@@ -942,26 +951,18 @@ fn push_needed(local: Hlc, pulled: Option<Hlc>) -> bool {
     pulled != Some(local)
 }
 
-/// Splits `keys` into pull batches of at most `max_keys` keys and `max_bytes`
-/// key bytes, in order. A key longer than `max_bytes` is a batch of its own.
-/// Pure; unit tested directly.
-fn pull_batches(keys: &[Bytes], max_keys: usize, max_bytes: usize) -> Vec<&[Bytes]> {
-    let mut batches = Vec::new();
-    let mut start = 0;
+/// The length of the first pull batch of `keys`: at most `max_keys` keys and
+/// `max_bytes` key bytes. A key longer than `max_bytes` is a batch of its own.
+/// `0` for no keys, otherwise at least `1`. Pure; unit tested directly.
+fn pull_batch_len(keys: &[Bytes], max_keys: usize, max_bytes: usize) -> usize {
     let mut bytes = 0usize;
     for (index, key) in keys.iter().enumerate() {
-        let full = index > start && (index - start >= max_keys || bytes + key.len() > max_bytes);
-        if full {
-            batches.push(&keys[start..index]);
-            start = index;
-            bytes = 0;
+        if index > 0 && (index >= max_keys || bytes + key.len() > max_bytes) {
+            return index;
         }
         bytes += key.len();
     }
-    if start < keys.len() {
-        batches.push(&keys[start..]);
-    }
-    batches
+    keys.len()
 }
 
 /// Pull requests in a row that may fail before a round gives up on the rest
@@ -976,10 +977,129 @@ const fn pull_gives_up(consecutive_failures: u32) -> bool {
     consecutive_failures >= MAX_CONSECUTIVE_PULL_FAILURES
 }
 
-/// One request of a round's pulls: keys, or the hashes of one bucket's keys.
-enum PullBatch<'a> {
+/// How one pull request ended, for [`next_pull_limit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PullOutcome {
+    /// The exchange did not finish within the request timeout.
+    TimedOut,
+    /// The exchange failed any other way.
+    Failed,
+    /// The peer answered. `quick` when the exchange took at most a quarter of
+    /// the request timeout ([`pull_was_quick`]).
+    Answered { quick: bool },
+}
+
+/// The most entries the next pull to a peer holds, after a pull cut at
+/// `limit` ended in `outcome`. A timeout halves it, never below `1`, and a
+/// quick answer doubles it, up to [`REPAIR_BATCH`]. Any other failure and a
+/// slower answer leave it. Pure; unit tested directly.
+fn next_pull_limit(limit: usize, outcome: PullOutcome) -> usize {
+    match outcome {
+        PullOutcome::TimedOut => (limit / 2).max(1),
+        PullOutcome::Answered { quick: true } => limit.saturating_mul(2).min(REPAIR_BATCH),
+        PullOutcome::Failed | PullOutcome::Answered { quick: false } => limit,
+    }
+}
+
+/// Whether `error` is a pull exchange that ran past the request timeout, the
+/// [`io::ErrorKind::TimedOut`] error `net::request` builds for it. Pure; unit
+/// tested directly.
+fn pull_timed_out(error: &CodecError) -> bool {
+    matches!(error, CodecError::Io(source) if source.kind() == io::ErrorKind::TimedOut)
+}
+
+/// Whether an exchange that took `elapsed` was quick under `timeout`: at most
+/// a quarter of it. Pure; unit tested directly.
+fn pull_was_quick(elapsed: Duration, timeout: Duration) -> bool {
+    elapsed <= timeout / 4
+}
+
+/// How a pull exchange that took `elapsed` under `timeout` ended in `reply`.
+/// Pure; unit tested directly.
+fn pull_outcome<T>(
+    reply: &Result<T, CodecError>,
+    elapsed: Duration,
+    timeout: Duration,
+) -> PullOutcome {
+    match reply {
+        Ok(_) => PullOutcome::Answered {
+            quick: pull_was_quick(elapsed, timeout),
+        },
+        Err(error) if pull_timed_out(error) => PullOutcome::TimedOut,
+        Err(_) => PullOutcome::Failed,
+    }
+}
+
+/// What one pull request leaves for the next: the limit, and whether its
+/// entries are done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PullStep {
+    limit: usize,
+    consumed: bool,
+}
+
+/// The step after a request of `sent` entries, cut at `limit`, ended in
+/// `outcome`. A timed-out batch of several entries is not consumed: it goes
+/// out again at the smaller limit. That limit halves the size of the batch
+/// that timed out, not `limit`, which a batch cut short by the key bytes or
+/// the end of the list sits under. A timed-out batch of one entry waits for
+/// the next round, as any other failed batch does. Pure; unit tested
+/// directly.
+fn pull_step(limit: usize, sent: usize, outcome: PullOutcome) -> PullStep {
+    let timed_out = outcome == PullOutcome::TimedOut;
+    PullStep {
+        limit: next_pull_limit(if timed_out { limit.min(sent) } else { limit }, outcome),
+        consumed: !(timed_out && sent > 1),
+    }
+}
+
+/// A round's pulls of one kind: its keys, or the hashes of one bucket's keys.
+enum PullSource<'a> {
     Keys(&'a [Bytes]),
     Hashes(u16, &'a [u64]),
+}
+
+impl PullSource<'_> {
+    const fn len(&self) -> usize {
+        match self {
+            Self::Keys(keys) => keys.len(),
+            Self::Hashes(_, hashes) => hashes.len(),
+        }
+    }
+
+    /// How many entries from `done` on go in the next request under `limit`.
+    fn batch_len(&self, done: usize, limit: usize) -> usize {
+        match self {
+            Self::Keys(keys) => pull_batch_len(&keys[done..], limit, REPAIR_BATCH_KEY_BYTES),
+            Self::Hashes(_, hashes) => (hashes.len() - done).min(limit),
+        }
+    }
+
+    /// Requests the `count` entries from `done` on from `peer`.
+    async fn pull(
+        &self,
+        mesh: &Mesh,
+        peer: NodeId,
+        cache: &SmolStr,
+        done: usize,
+        count: usize,
+    ) -> Result<Vec<WireRecord>, CodecError> {
+        match self {
+            Self::Keys(keys) => {
+                mesh.ae_pull(peer, cache.clone(), keys[done..done + count].to_vec())
+                    .await
+            }
+            Self::Hashes(bucket, hashes) => {
+                mesh.ae_pull_hashes(
+                    peer,
+                    cache.clone(),
+                    *bucket,
+                    hashes[done..done + count].to_vec(),
+                )
+                .await
+            }
+        }
+    }
 }
 
 /// Pushes `push_keys`' current records to `peer`, skipping any whose stored
@@ -1012,11 +1132,17 @@ async fn push_repairs(
 }
 
 /// Pulls `pull_keys` and then `pull_hashes` from `peer` and applies them, in
-/// batches ([`pull_batches`], and [`REPAIR_BATCH`] hashes). A batch that
-/// fails costs only its own records, which the next round pulls again, so the
-/// round goes on with the next, until [`pull_gives_up`] says the peer is not
-/// answering. Returns the version of every record the peer sent, by key, and
-/// whether every request was answered.
+/// batches cut as each is sent: at most the peer's current limit
+/// ([`Mesh::pull_limit`], [`REPAIR_BATCH`] until a pull to it times out) keys
+/// and [`REPAIR_BATCH_KEY_BYTES`] key bytes, or that many hashes of one bucket.
+/// A batch that fails costs only its own records, which the next round pulls
+/// again, so the round goes on with the next, until [`pull_gives_up`] says the
+/// peer is not answering. A batch of several entries that times out is not
+/// consumed: the limit halves and the same entries go out again at the new
+/// limit, and each answer that took at most a quarter of the request timeout
+/// doubles it again ([`pull_step`]). The limit is kept on the mesh for the
+/// peer, so the next round starts from it. Returns the version of every record
+/// the peer sent, by key, and whether every request was answered.
 async fn pull_repairs(
     mesh: &crate::net::Mesh,
     shard: &Arc<dyn ShardOps>,
@@ -1029,44 +1155,65 @@ async fn pull_repairs(
     let mut pulled = HashMap::new();
     let mut complete = true;
     let mut failures = 0u32;
-    let mut batches: Vec<PullBatch<'_>> =
-        pull_batches(&pull_keys, REPAIR_BATCH, REPAIR_BATCH_KEY_BYTES)
-            .into_iter()
-            .map(PullBatch::Keys)
-            .collect();
-    for (bucket, hashes) in &pull_hashes {
-        batches.extend(
-            hashes
-                .chunks(REPAIR_BATCH)
-                .map(|batch| PullBatch::Hashes(*bucket, batch)),
-        );
-    }
-    for batch in batches {
-        let reply = match batch {
-            PullBatch::Keys(keys) => mesh.ae_pull(peer, cache.clone(), keys.to_vec()).await,
-            PullBatch::Hashes(bucket, hashes) => {
-                mesh.ae_pull_hashes(peer, cache.clone(), bucket, hashes.to_vec())
-                    .await
-            }
-        };
-        match reply {
-            Ok(records) => {
-                failures = 0;
-                tally.add(cache, &records);
-                pulled.extend(records.iter().map(|rec| (rec.key.clone(), rec.ver)));
-                shard.apply_remote_batch(records).await;
-            }
-            Err(error) => {
-                tracing::debug!(%error, "anti-entropy pull failed; keeping progress");
-                complete = false;
-                failures += 1;
-                if pull_gives_up(failures) {
-                    break;
+    let mut limit = mesh.pull_limit(peer, cache).unwrap_or(REPAIR_BATCH);
+    let sources = std::iter::once(PullSource::Keys(&pull_keys)).chain(
+        pull_hashes
+            .iter()
+            .map(|(bucket, hashes)| PullSource::Hashes(*bucket, hashes)),
+    );
+    for source in sources {
+        let mut done = 0;
+        while done < source.len() {
+            let sent = source.batch_len(done, limit);
+            let timeout = request_timeout();
+            let started = Instant::now();
+            let reply = source.pull(mesh, peer, cache, done, sent).await;
+            let outcome = pull_outcome(&reply, started.elapsed(), timeout);
+            let step = pull_step(limit, sent, outcome);
+            match reply {
+                Ok(records) => {
+                    failures = 0;
+                    tally.add(cache, &records);
+                    pulled.extend(records.iter().map(|rec| (rec.key.clone(), rec.ver)));
+                    shard.apply_remote_batch(records).await;
                 }
+                Err(error) => {
+                    tracing::debug!(%error, "anti-entropy pull failed; keeping progress");
+                    complete = false;
+                    failures += 1;
+                }
+            }
+            if step.limit != limit {
+                note_pull_limit(mesh, peer, cache, limit, step.limit);
+                limit = step.limit;
+            }
+            if step.consumed {
+                done += sent;
+            }
+            if pull_gives_up(failures) {
+                return (pulled, complete);
             }
         }
     }
     (pulled, complete)
+}
+
+/// Keeps `new` as the pull limit for `peer` and `cache`, and logs a shrink:
+/// at `debug` for every one, at `warn` when the limit reaches `1`.
+fn note_pull_limit(mesh: &Mesh, peer: NodeId, cache: &SmolStr, old: usize, new: usize) {
+    mesh.set_pull_limit(peer, cache, new);
+    if new >= old {
+        return;
+    }
+    tracing::debug!(%peer, %cache, limit = new, "anti-entropy pull timed out; shrinking the batch");
+    if new == 1 {
+        tracing::warn!(
+            %peer,
+            %cache,
+            "anti-entropy pulls from this peer time out one key at a time: a record takes longer \
+             than the request timeout to arrive"
+        );
+    }
 }
 
 /// Classifies one `AeMismatch::Sketch(bucket, cells)` reply through

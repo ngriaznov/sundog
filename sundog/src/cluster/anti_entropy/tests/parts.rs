@@ -300,6 +300,55 @@ async fn run_round_for_parts_marks_a_bucket_matched_once_its_digest_exchange_rep
     c.shutdown().await;
 }
 
+/// Pins that a round scoped to parts pulls under the limit kept for the
+/// peer, as every other round does: it starts from a limit of one key and
+/// the quick answers on loopback double it.
+#[tokio::test]
+async fn run_round_for_parts_pulls_under_the_limit_kept_for_the_peer() {
+    use crate::cluster::test_support::wait_until;
+
+    let name = SmolStr::new("scoped-round-pull-limit");
+    let (b, c, node_b, shard_b, shard_c) =
+        two_distributed_co_owners("scoped-pull-limit", &name).await;
+
+    let keys = keys_in_distinct_buckets(3);
+    for &(key, _) in &keys {
+        let (_, record) = encode_test_record(key, "held by b", node_b);
+        shard_b.apply_remote(record).await;
+    }
+    let parts: Vec<PartId> = keys.iter().map(|&(key, _)| part_of_u32(key)).collect();
+
+    let mut outcome = PartRoundOutcome::default();
+    wait_until(
+        Duration::from_secs(10),
+        "b's view catches up to c joining, so the round runs instead of reporting stale",
+        async || {
+            c.mesh().set_pull_limit(node_b, &name, 1);
+            outcome = run_round_for_parts(c.mesh(), &shard_c, &name, node_b, &parts).await;
+            !outcome.failed
+        },
+    )
+    .await;
+
+    assert!(
+        c.mesh()
+            .pull_limit(node_b, &name)
+            .is_some_and(|limit| limit > 1),
+        "the pull started at one key and grew with its quick answers"
+    );
+    for &(key, _) in &keys {
+        let key = Bytes::from(postcard::to_stdvec(&key).expect("key encodes"));
+        assert_eq!(
+            shard_c.records_for(vec![key]).await.len(),
+            1,
+            "the round pulled every record b held"
+        );
+    }
+
+    b.shutdown().await;
+    c.shutdown().await;
+}
+
 /// Pins that an unknown peer fails the round: everything requested
 /// lands in `still_diverged`.
 #[tokio::test]

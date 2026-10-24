@@ -348,6 +348,22 @@ frame, or delete the key with `Cache::remove`; the counter stops rising once
 no record is over the limit. A value past a lowered `max_frame` that a frame
 holds syncs as any other and is not counted.
 
+### Anti-entropy pulls time out one key at a time
+
+The node logs a warning, `anti-entropy pulls from this peer time out one key at
+a time`, that names the peer and the cache. An anti-entropy pull asks a peer for
+up to 4,096 keys, and the whole exchange, request and reply, has to finish
+within 10 seconds. A pull that times out goes out again with half the keys, and
+the batch to that peer, kept for each cache, shrinks until a pull fits. The
+warning means the batch has reached one key: a record takes longer than 10
+seconds to arrive, or the link to that peer is that slow. The batch doubles
+again after each answer that takes a quarter of the timeout or less, up to 4,096
+keys, so a peer that recovers returns to full batches. A key that times out
+alone waits for the next round, and a round that fails two pulls in a row
+stops pulling. Check the peer's load and the link to it, and the size of the
+values behind the keys; a debug log line for each shrink names the new batch
+size.
+
 ### A spill tier drops evictions
 
 `sundog_spill_dropped_total` grows: the flusher falls behind eviction, or
