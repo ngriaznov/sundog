@@ -5,7 +5,7 @@ use super::*;
 /// A directory path under the OS temp dir, unique to this test
 /// process and call. Never created on disk: config validation in
 /// `open()` is pure arithmetic and never touches the filesystem.
-fn fresh_spill_dir(label: &str) -> std::path::PathBuf {
+pub(super) fn fresh_spill_dir(label: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
         "sundog-spill-gate-{label}-{}-{}",
         std::process::id(),
@@ -649,7 +649,7 @@ async fn solo_cluster_for(label: &'static str) -> Cluster {
 }
 
 /// The snapshot file a checkpointed close wrote under `dir`.
-fn snapshot_under(dir: &std::path::Path) -> std::path::PathBuf {
+pub(super) fn snapshot_under(dir: &std::path::Path) -> std::path::PathBuf {
     let mut pending = vec![dir.to_path_buf()];
     while let Some(next) = pending.pop() {
         for entry in std::fs::read_dir(next).expect("the spill directory lists") {

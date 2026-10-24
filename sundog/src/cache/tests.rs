@@ -1,6 +1,7 @@
 //! Unit tests for the cache: pure rules, builder validation and loopback clusters.
 
 mod builder;
+mod cancelled_open;
 mod clear_nonowner;
 mod distributed_fetch;
 mod expiry_tombstone;

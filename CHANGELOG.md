@@ -71,6 +71,15 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **A cancelled `CacheBuilder::open` closes the cache it registered.** Dropping
+  the `open` future of a `Replicated` or `Distributed` cache while it waited
+  for its state transfer or first pull, as a `tokio::time::timeout` or a
+  `select!` does, left the name registered and advertised for good. Every
+  later `open` of it failed with `AlreadyOpen`, and the orphan never repaired
+  or collected tombstones. Dropping the future closes the cache as
+  `Cache::close` does, and an `open` of the same name started meanwhile waits
+  for that close, so a retry succeeds and a spill tier is closed before the
+  name can be taken again. `CacheBuilder::open` is cancel-safe.
 - **A pull whose reply cannot arrive in time goes out again smaller.** A pull
   of large records, whose reply took longer than the 10-second request
   timeout, failed the same way every round, and its keys never repaired from

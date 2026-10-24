@@ -4,7 +4,7 @@
 use super::*;
 
 /// A loopback UDP address nothing listens on, for forcing a wait to time out.
-async fn dead_gossip_addr() -> SocketAddr {
+pub(super) async fn dead_gossip_addr() -> SocketAddr {
     let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("bind an ephemeral loopback udp port to reserve a dead gossip address");

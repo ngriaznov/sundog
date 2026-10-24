@@ -12,6 +12,7 @@
 
 pub(crate) mod absence;
 pub(crate) mod anti_entropy;
+pub(crate) mod closing;
 pub(crate) mod crdt_compact;
 pub(crate) mod fan_out;
 mod handler;
@@ -142,6 +143,9 @@ struct ClusterInner {
     /// cluster ([`Cluster::merge_seq_counter`]). Nothing removes an entry, so
     /// a name that closes and opens again keeps counting.
     merge_seqs: Mutex<HashMap<SmolStr, Arc<AtomicU64>>>,
+    /// The names a cancelled `open` is still closing; see
+    /// [`Cluster::mark_closing`].
+    closing: closing::ClosingMarks,
     /// The [`Mode`] each open cache opens under; [`mode_conflict_task`]'s
     /// local half, shared with the `prometheus` feature's `/readyz` route.
     local_modes: Arc<RwLock<HashMap<SmolStr, Mode>>>,
@@ -499,6 +503,34 @@ impl Cluster {
         true
     }
 
+    /// Marks `name` as closing and answers the mark's id: a cancelled
+    /// `open` of the name is tearing its cache down, and an `open` of the name
+    /// waits for [`Cluster::clear_closing`] instead of failing with
+    /// `AlreadyOpen`. The mark is set while the registry still holds the
+    /// cache and cleared once [`Cluster::forget_cache`] has freed the name.
+    pub(crate) fn mark_closing(&self, name: &str) -> u64 {
+        self.inner.closing.mark(name)
+    }
+
+    /// Clears the mark `mark` set on `name`; see [`Cluster::mark_closing`].
+    pub(crate) fn clear_closing(&self, name: &str, mark: u64) {
+        self.inner.closing.clear(name, mark);
+    }
+
+    /// A receiver that resolves [`closing::cleared`] once `name`'s closing
+    /// mark clears; `None` when `name` is not closing. Callers hold the shard
+    /// registry's lock while they ask, so the answer is consistent with the
+    /// registry.
+    pub(crate) fn closing_watch(&self, name: &str) -> Option<watch::Receiver<()>> {
+        self.inner.closing.watch(name)
+    }
+
+    /// Whether `name` is marked closing.
+    #[cfg(all(test, not(feature = "sim")))]
+    pub(crate) fn is_closing(&self, name: &str) -> bool {
+        self.inner.closing.is_marked(name)
+    }
+
     /// Gossips that this node has a loader for cache `name`, so peers pick
     /// it to load and refresh that cache's keys.
     pub(crate) fn advertise_loader(&self, name: &str) {
@@ -553,6 +585,15 @@ impl Cluster {
         self.inner.tracker.spawn(fut);
     }
 
+    /// [`Cluster::spawn_tracked`] on `runtime`, for a caller that holds a
+    /// handle but runs outside the runtime, such as a `Drop`.
+    pub(crate) fn spawn_tracked_on<F>(&self, runtime: &tokio::runtime::Handle, fut: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.inner.tracker.spawn_on(fut, runtime);
+    }
+
     /// [`Cluster::spawn_tracked`], also tracked by `tasks`, the tracker one
     /// cache's `close` waits on.
     pub(crate) fn spawn_tracked_in<F>(&self, tasks: &TaskTracker, fut: F)
@@ -575,7 +616,8 @@ impl Cluster {
     /// fails or answers `Stale` within that co-owner's share of
     /// [`ClusterConfig::state_transfer_budget`], so the shutdown can take
     /// that long and logs at `warn` the parts still diverging when a
-    /// group ends. Then background loops are cancelled and joined, every
+    /// group ends. Then background loops are cancelled and joined, along with
+    /// the close of any cache whose `open` was dropped, every
     /// still-registered cache has its spill tier closed (see
     /// [`ShardOps::close_spill_checkpointed`], a no-op if already closed),
     /// chitchat departs and the data plane sends the invalidations and writes
@@ -1094,6 +1136,7 @@ impl ClusterBuilder {
                 mesh,
                 shards,
                 merge_seqs: Mutex::new(HashMap::new()),
+                closing: closing::ClosingMarks::default(),
                 local_modes,
                 config,
                 absence,

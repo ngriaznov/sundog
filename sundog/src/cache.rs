@@ -55,8 +55,8 @@ use load::routes_loads;
 #[cfg(feature = "spill")]
 use open::attach_spill_and_record_warm;
 use open::{
-    LoadConfig, attach_ownership, await_initial_peers, validate_load_config, validate_merge_window,
-    validate_mode,
+    LoadConfig, OpenGuard, attach_ownership, await_initial_peers, reserve_name, tear_down,
+    validate_load_config, validate_merge_window, validate_mode,
 };
 use tasks::spawn_cache_tasks;
 
@@ -340,6 +340,18 @@ where
     /// [`CacheError::ModeMismatch`], best-effort, if a live peer already
     /// advertises `name` under a different [`Mode`].
     ///
+    /// # Cancel safety
+    ///
+    /// The future is cancel-safe. Dropping it before it returns, as
+    /// `tokio::time::timeout` or a `select!` branch does, closes the cache it
+    /// registered the way [`Cache::close`] does: the background tasks stop,
+    /// the spill tier closes (with the checkpoint `SpillConfig::warm_reopen`
+    /// asks for), and the name leaves the cluster with its gossiped mode and
+    /// loader. An `open` of the same name that starts meanwhile waits for that
+    /// close and then proceeds, so a retry after a timeout is not refused with
+    /// [`CacheError::AlreadyOpen`]. [`Cluster::shutdown`] waits for a close
+    /// that is running.
+    ///
     /// # Panics
     ///
     /// Panics if the shard registry lock is poisoned.
@@ -480,41 +492,26 @@ where
         let (shard, distributed) = attach_ownership(shard, &cluster, &name, mode);
         let shard = Arc::new(shard);
 
-        // The registry check-and-reserve runs before any spill I/O: two
-        // `open()` calls for the same already-open name would otherwise both
-        // wipe and preallocate the same `<dir>/<cache>/` region files before
-        // either learns it lost to `AlreadyOpen`, corrupting whichever cache
-        // is already running. Reserving this name first means a losing
-        // `open()` never touches disk for it.
-        let registry = cluster.shards();
-        {
-            let mut guard = registry
-                .write()
-                .expect("invariant: shard registry lock is never poisoned");
-            if guard.contains_key(&name) {
-                return Err(CacheError::AlreadyOpen { cache: name });
-            }
-            guard.insert(name.clone(), Arc::clone(&shard) as Arc<dyn ShardOps>);
-        }
+        let cancel = cluster.cancel_token().child_token();
+        let tasks = TaskTracker::new();
+        reserve_name(&cluster, &name, &shard).await?;
+        let guard = OpenGuard::new(&cluster, &shard, &cancel, &tasks);
 
         // Only the `open()` that won the reservation above ever attaches a
         // spill tier. `Shard::attach_spill` runs through `&self`; its
         // `Engine`/`SpillRead` fields are `OnceLock`s, so it runs on a
         // shard already `Arc`-shared in the registry. A failure here rolls
-        // the reservation back: nothing has advertised or scheduled tasks
-        // for this name yet, so removing it is enough. A success threads
-        // whether the tier landed a warm reopen into `distributed`, so
-        // `distributed_warm_and_rebalance` knows which owned parts get
-        // eager reconciliation instead of an ordinary cold pull.
+        // the reservation back through the guard: nothing has advertised or
+        // scheduled tasks for this name yet, so releasing it is enough. A
+        // success threads whether the tier landed a warm reopen into
+        // `distributed`, so `distributed_warm_and_rebalance` knows which owned
+        // parts get eager reconciliation instead of an ordinary cold pull.
         #[cfg(feature = "spill")]
         let mut distributed = distributed;
         #[cfg(feature = "spill")]
         if let Err(source) = attach_spill_and_record_warm(&shard, spill.as_ref(), &mut distributed)
         {
-            registry
-                .write()
-                .expect("invariant: shard registry lock is never poisoned")
-                .remove(&name);
+            guard.abort();
             return Err(CacheError::SpillUnavailable {
                 cache: name.clone(),
                 source,
@@ -532,8 +529,6 @@ where
             cluster.mark_warm(&name);
         }
 
-        let cancel = cluster.cancel_token().child_token();
-        let tasks = TaskTracker::new();
         spawn_cache_tasks(
             &cluster,
             &shard,
@@ -545,6 +540,7 @@ where
             membership_settled,
         )
         .await;
+        guard.disarm();
 
         Ok(Cache {
             shard,
@@ -1338,20 +1334,7 @@ where
     /// rather than being accepted and never sent. A cache never explicitly closed
     /// still has its spill tier closed by `Cluster::shutdown`.
     pub async fn close(self) {
-        // Sealed before the tasks are cancelled: a write accepted until
-        // now is in the backlog the fan-out task drains on its way out,
-        // and a write that must be forwarded to another owner fails with
-        // `CacheError::Closed`. The seal applies the folds still pending
-        // in a merge-coalesce window first, so they join that backlog,
-        // then hands it the forwards held for clock skew, so the other
-        // owners take them over.
-        self.shard.seal_for_close();
-        self.cancel.cancel();
-        self.tasks.close();
-        self.tasks.wait().await;
-        self.shard.fan_out_queue().close();
-        self.shard.close_spill_checkpointed().await;
-        self.cluster.forget_cache(self.shard.name(), &self.shard);
+        tear_down(&self.cluster, &self.shard, &self.cancel, &self.tasks).await;
     }
 }
 

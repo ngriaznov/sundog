@@ -10,14 +10,16 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use smol_str::SmolStr;
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
-use crate::cluster::Cluster;
+use crate::cluster::{Cluster, closing};
 use crate::config::ClusterConfig;
 use crate::error::CacheError;
 use crate::ownership::{OwnershipTracker, OwnershipView, ResidencySet};
 #[cfg(feature = "spill")]
 use crate::store::spill::SpillConfig;
-use crate::store::{Mode, PartId, Shard, refresh_permille};
+use crate::store::{Mode, PartId, Shard, ShardOps, refresh_permille};
 
 #[cfg(doc)]
 use super::tasks::distributed_warm_and_rebalance;
@@ -273,4 +275,240 @@ where
             warm_reloaded_parts: HashSet::new(),
         }),
     )
+}
+
+/// Reserves `name` in the cluster's shard registry for `shard`, the check and
+/// the insert under one write lock, and answers [`CacheError::AlreadyOpen`]
+/// when another cache holds the name.
+///
+/// This runs before any spill I/O: two `open()` calls for the same
+/// already-open name would otherwise both wipe and preallocate the same
+/// `<dir>/<cache>/` region files before either learns it lost, corrupting
+/// whichever cache is already running. A losing `open()` never touches disk.
+///
+/// A name that a cancelled `open` is still closing is not open: this waits
+/// until the close has freed it, its spill tier closed, and reserves it then.
+/// The wait is as long as that teardown and no longer.
+pub(super) async fn reserve_name<K, V>(
+    cluster: &Cluster,
+    name: &SmolStr,
+    shard: &Arc<Shard<K, V>>,
+) -> Result<(), CacheError>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    let registry = cluster.shards();
+    loop {
+        let closing = {
+            let mut held = registry
+                .write()
+                .expect("invariant: shard registry lock is never poisoned");
+            if !held.contains_key(name) {
+                held.insert(name.clone(), Arc::clone(shard) as Arc<dyn ShardOps>);
+                return Ok(());
+            }
+            // Asked under the registry lock. A dropped `open` marks the name
+            // before its teardown frees it and clears the mark after, so a
+            // held name with no mark belongs to an `open` still running.
+            cluster.closing_watch(name)
+        };
+        let Some(closing) = closing else {
+            return Err(CacheError::AlreadyOpen {
+                cache: name.clone(),
+            });
+        };
+        closing::cleared(closing).await;
+    }
+}
+
+/// Closes a cache: [`Cache::close`] and a dropped [`CacheBuilder::open`] run
+/// this one sequence.
+///
+/// The shard is sealed before the tasks are cancelled: a write accepted until
+/// now is in the backlog the fan-out task drains on its way out, and a write
+/// that must be forwarded to another owner fails with [`CacheError::Closed`].
+/// The seal applies the folds still pending in a merge-coalesce window first,
+/// so they join that backlog, then hands it the forwards held for clock skew,
+/// so the other owners take them over. The name is freed last, after the spill
+/// tier has closed.
+pub(super) async fn tear_down<K, V>(
+    cluster: &Cluster,
+    shard: &Arc<Shard<K, V>>,
+    cancel: &CancellationToken,
+    tasks: &TaskTracker,
+) where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    shard.seal_for_close();
+    cancel.cancel();
+    tasks.close();
+    tasks.wait().await;
+    shard.fan_out_queue().close();
+    shard.close_spill_checkpointed().await;
+    cluster.forget_cache(shard.name(), shard);
+}
+
+/// What a cache registered by `CacheBuilder::open` needs to close.
+struct Registration<K, V>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    cluster: Cluster,
+    shard: Arc<Shard<K, V>>,
+    cancel: CancellationToken,
+    tasks: TaskTracker,
+}
+
+impl<K, V> Registration<K, V>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    /// Frees the name without waiting for anything: cancels the tasks, closes
+    /// the fan-out queue and the spill tier without a checkpoint, and removes
+    /// the cache from the cluster. For a drop that has no runtime to run
+    /// [`tear_down`] on, and for an `open` that fails before it starts a task.
+    /// The name is free when this returns.
+    fn release(&self) {
+        self.cancel.cancel();
+        self.shard.fan_out_queue().close();
+        self.shard.close_spill();
+        self.cluster.forget_cache(self.shard.name(), &self.shard);
+    }
+}
+
+/// Undoes what `CacheBuilder::open` registers when the `open` does not return
+/// `Ok`: created right after the registry insert, disarmed when the `open`
+/// returns its cache.
+///
+/// Dropped armed, which is what a dropped `open` future does, the guard marks
+/// the name closing on the cluster, cancels the cache's tasks and runs
+/// [`tear_down`] as a task on the cluster, then clears the mark. An `open` of
+/// the name waits for the mark. A drop that finds no runtime releases the name
+/// at once and runs nothing else.
+#[must_use = "an armed guard closes the cache it guards as soon as it drops"]
+pub(super) struct OpenGuard<K, V>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    armed: Option<Registration<K, V>>,
+}
+
+impl<K, V> OpenGuard<K, V>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    /// Guards `shard`, registered under its name in `cluster`, with the
+    /// `cancel` token and the `tasks` tracker the cache's tasks run under.
+    pub(super) fn new(
+        cluster: &Cluster,
+        shard: &Arc<Shard<K, V>>,
+        cancel: &CancellationToken,
+        tasks: &TaskTracker,
+    ) -> Self {
+        Self {
+            armed: Some(Registration {
+                cluster: cluster.clone(),
+                shard: Arc::clone(shard),
+                cancel: cancel.clone(),
+                tasks: tasks.clone(),
+            }),
+        }
+    }
+
+    /// The `open` returned its cache: nothing to undo.
+    pub(super) fn disarm(mut self) {
+        self.armed = None;
+    }
+
+    /// The `open` fails before it starts a task or advertises the cache:
+    /// frees the name at once, so the error reaches a caller that finds it
+    /// free.
+    #[cfg(feature = "spill")]
+    pub(super) fn abort(mut self) {
+        if let Some(registration) = self.armed.take() {
+            registration.release();
+        }
+    }
+}
+
+impl<K, V> Drop for OpenGuard<K, V>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    fn drop(&mut self) {
+        let Some(registration) = self.armed.take() else {
+            return;
+        };
+        let mark = registration.cluster.mark_closing(registration.shard.name());
+        registration.cancel.cancel();
+        tracing::info!(
+            cache = %registration.shard.name(),
+            "open dropped before it returned; closing the cache it registered"
+        );
+        let cluster = registration.cluster.clone();
+        let teardown = Teardown {
+            registration,
+            mark,
+            completed: false,
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => cluster.spawn_tracked_on(&runtime, teardown.run()),
+            // No runtime to run on, as at the teardown of one: the drop of
+            // `teardown` releases the name.
+            Err(_) => drop(teardown),
+        }
+    }
+}
+
+/// A dropped `open`'s teardown. Dropped before it completes, as a runtime that
+/// shuts down drops its tasks, it still releases the name and clears the mark.
+struct Teardown<K, V>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    registration: Registration<K, V>,
+    /// The id of the closing mark this teardown set.
+    mark: u64,
+    completed: bool,
+}
+
+impl<K, V> Teardown<K, V>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    async fn run(mut self) {
+        let registration = &self.registration;
+        tear_down(
+            &registration.cluster,
+            &registration.shard,
+            &registration.cancel,
+            &registration.tasks,
+        )
+        .await;
+        self.completed = true;
+    }
+}
+
+impl<K, V> Drop for Teardown<K, V>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    fn drop(&mut self) {
+        if !self.completed {
+            self.registration.release();
+        }
+        self.registration
+            .cluster
+            .clear_closing(self.registration.shard.name(), self.mark);
+    }
 }
