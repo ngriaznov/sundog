@@ -130,6 +130,20 @@ fn a_streaming_peer_is_skipped_a_bounded_number_of_times() {
 }
 
 #[test]
+fn forget_departed_skips_keeps_exactly_the_counts_of_live_peers() {
+    let (live, departed) = (NodeId::from(1), NodeId::from(2));
+    let mut skipped = HashMap::from([(live, 2_u32), (departed, 3)]);
+    forget_departed_skips(&mut skipped, &[live, NodeId::from(4)]);
+    assert_eq!(
+        skipped,
+        HashMap::from([(live, 2)]),
+        "the live peer keeps its count, the departed one loses it, and a live peer never skipped is not added"
+    );
+    forget_departed_skips(&mut skipped, &[]);
+    assert!(skipped.is_empty(), "no live peer forgets every count");
+}
+
+#[test]
 fn choose_peer_prefers_a_dirty_peer_over_live_ones() {
     let mut rng = rand::rng();
     let dirty = vec![NodeId::from(1)];

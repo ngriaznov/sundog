@@ -198,6 +198,20 @@ impl InboundActivity {
             age <= u64::try_from(window.as_millis()).unwrap_or(u64::MAX)
         })
     }
+
+    /// Forgets the peers outside `live`. [`membership_to_mesh_task`] calls it
+    /// on each view change, so the stamp every inbound replicate frame writes
+    /// stays one insert. A frame that lands after its peer left stamps the
+    /// peer again, and the next view change forgets it.
+    pub(crate) fn retain_live(&self, live: &[Peer]) {
+        let live: HashSet<NodeId> = live.iter().map(|peer| peer.node).collect();
+        retain_live_stamps(&mut self.seen_mut(), &live);
+    }
+}
+
+/// Drops the stamp of every peer not in `live`.
+fn retain_live_stamps(seen: &mut HashMap<NodeId, u64>, live: &HashSet<NodeId>) {
+    seen.retain(|peer, _| live.contains(peer));
 }
 
 /// The caches this node can donate a snapshot of: every `Local` or
@@ -1277,6 +1291,7 @@ fn spawn_cluster_background_tasks(cluster: &Cluster, inbound_rx: mpsc::Receiver<
     cluster.spawn_tracked(membership_to_mesh_task(
         cluster.inner.membership.peers(),
         cluster.inner.mesh.clone(),
+        Arc::clone(&cluster.inner.inbound_activity),
         cluster.cancel_token(),
     ));
     cluster.spawn_tracked(mode_conflict_task(cluster.clone(), cluster.cancel_token()));
@@ -1323,9 +1338,12 @@ where
 }
 
 /// Republishes [`Membership::peers`] changes as [`Mesh::update_peers`] calls.
+/// Each change also has [`InboundActivity::retain_live`] forget the peers that
+/// left.
 async fn membership_to_mesh_task(
     mut peers: watch::Receiver<Vec<Peer>>,
     mesh: Mesh,
+    activity: Arc<InboundActivity>,
     cancel: CancellationToken,
 ) {
     let initial = peers.borrow_and_update().clone();
@@ -1341,6 +1359,7 @@ async fn membership_to_mesh_task(
         let current = peers.borrow_and_update().clone();
         tracing::info!(peer_count = current.len(), "membership view changed");
         set_live_peers_gauge(current.len());
+        activity.retain_live(&current);
         mesh.update_peers(current);
     }
 }
@@ -1375,13 +1394,15 @@ struct ModeConflict {
 }
 
 /// The conflicts in `advertised` against `local_modes` that `warned` has not
-/// seen yet. Each is recorded in `warned`, so a mismatch is reported once
-/// and clears only via a re-`open()` under a fresh [`NodeId`].
+/// seen yet. Each is recorded in `warned`, so a conflict is reported once for
+/// each time its peer appears with it: a peer that leaves the view is
+/// forgotten, and one that returns with the conflict is reported again.
 fn new_mode_conflicts(
     advertised: &CacheModes,
     local_modes: &HashMap<SmolStr, Mode>,
     warned: &mut HashSet<(NodeId, SmolStr)>,
 ) -> Vec<ModeConflict> {
+    forget_departed_warnings(warned, advertised);
     let mut found = Vec::new();
     for (&peer, caches) in advertised {
         for (cache, &remote) in caches {
@@ -1399,6 +1420,11 @@ fn new_mode_conflicts(
         }
     }
     found
+}
+
+/// Drops the warning of every pair whose peer `advertised` no longer lists.
+fn forget_departed_warnings(warned: &mut HashSet<(NodeId, SmolStr)>, advertised: &CacheModes) {
+    warned.retain(|(peer, _)| advertised.contains_key(peer));
 }
 
 /// Logs a `tracing::error!` for every conflict [`new_mode_conflicts`] finds.

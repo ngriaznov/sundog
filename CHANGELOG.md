@@ -103,6 +103,19 @@ All notable changes to this project are documented in this file. Format follows
   tick for the whole cluster. Tombstone retention, the writer retirement
   sweep and the check for a part owned alone read nothing inside those spans
   differently.
+- **Four per-peer maps forget the peers that left.** The stamp of each peer's
+  last inbound replicate traffic, the anti-entropy scheduler's skip count for
+  each peer, the protocol notice already logged for a peer and the cache mode
+  conflict already reported for a peer each gained an entry for every peer
+  incarnation and never lost one, so a node that outlived many peer restarts
+  grew by a few tens of bytes for each. Each is now pruned against the live
+  view, and never by the write that fills it: a membership view change drops
+  the inbound stamps and the notices, each scheduler round drops the skip
+  counts of peers outside the live set, and each mode conflict sweep drops the
+  conflicts of peers the view no longer lists. A peer that leaves and returns
+  under the same `NodeId` is noticed again for its protocol and reported again
+  for a mode conflict: a conflict is reported once for each time the peer
+  appears with it.
 - **A pull whose reply cannot arrive in time goes out again smaller.** A pull
   of large records, whose reply took longer than the 10-second request
   timeout, failed the same way every round, and its keys never repaired from

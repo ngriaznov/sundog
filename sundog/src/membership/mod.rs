@@ -579,6 +579,11 @@ fn protocol_notice(peer_protocol: u16) -> Option<&'static str> {
     }
 }
 
+/// Drops the notice of every peer not in `live`.
+fn forget_departed_notices(noticed: &mut HashSet<NodeId>, live: &HashMap<NodeId, LiveFlags>) {
+    noticed.retain(|peer| live.contains_key(peer));
+}
+
 /// The cache modes `node_state` advertises, or none once it gossips a
 /// departure: a gracefully leaving node stops being eligible to own any
 /// `Mode::Distributed` cache the moment it announces, so ownership moves
@@ -762,7 +767,8 @@ async fn run(
     let chitchat = handle.chitchat();
     let mut live_nodes = chitchat.lock().await.live_nodes_watch_stream().fuse();
     // Peers whose protocol version has been logged once, so a view refresh
-    // does not repeat the notice.
+    // does not repeat the notice; a peer that leaves the view is dropped and
+    // noticed again when it returns.
     let mut protocol_noticed: HashSet<NodeId> = HashSet::new();
 
     loop {
@@ -800,6 +806,7 @@ async fn run(
                     );
                     peers.push(peer);
                 }
+                forget_departed_notices(&mut protocol_noticed, &live_flags);
                 tracing::debug!(count = peers.len(), "membership view updated");
                 // The observer first: an ownership view built from the new
                 // peers or modes then never runs ahead of the live set
@@ -926,6 +933,24 @@ mod tests {
         assert!(protocol_notice(crate::wire::MIN_PROTOCOL_VERSION).is_none());
         assert!(protocol_notice(crate::wire::PROTOCOL_VERSION + 1).is_some());
         assert!(protocol_notice(0).is_some());
+    }
+
+    #[test]
+    fn forget_departed_notices_keeps_exactly_the_notices_of_live_peers() {
+        let (live, departed) = (NodeId::from(1), NodeId::from(2));
+        let mut noticed = HashSet::from([live, departed]);
+        let view = HashMap::from([
+            (live, LiveFlags::default()),
+            (NodeId::from(3), LiveFlags { departing: true }),
+        ]);
+        forget_departed_notices(&mut noticed, &view);
+        assert_eq!(
+            noticed,
+            HashSet::from([live]),
+            "the live peer stays noticed, the departed one is forgotten, and a live peer never noticed is not added"
+        );
+        forget_departed_notices(&mut noticed, &HashMap::new());
+        assert!(noticed.is_empty(), "an empty view forgets every notice");
     }
 
     #[test]

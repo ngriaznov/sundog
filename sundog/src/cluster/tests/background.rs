@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::cluster::inbound::{MAX_FORWARD_HOPS, reforward_groups};
+use crate::cluster::test_support::wait_for_no_peers;
 use crate::hlc::Hlc;
 use crate::wire::WireRecord;
 use bytes::Bytes;
@@ -84,6 +85,200 @@ fn mode_conflicts_are_reported_once_per_peer_and_cache() {
     );
     let conflicts = new_mode_conflicts(&advertised, &local, &mut warned);
     assert!(conflicts.is_empty(), "{conflicts:?}");
+}
+
+#[test]
+fn a_mode_conflict_with_a_peer_that_left_is_released() {
+    let peer = NodeId::from(1);
+    let local: HashMap<SmolStr, Mode> = [(SmolStr::new("users"), Mode::Replicated)]
+        .into_iter()
+        .collect();
+    let mut advertised: CacheModes = HashMap::new();
+    advertised.insert(
+        peer,
+        [(SmolStr::new("users"), Mode::Invalidation)]
+            .into_iter()
+            .collect(),
+    );
+    let mut warned = HashSet::new();
+    assert_eq!(
+        new_mode_conflicts(&advertised, &local, &mut warned).len(),
+        1
+    );
+
+    // The peer leaves the membership view: nothing is advertised any more.
+    let gone: CacheModes = HashMap::new();
+    let conflicts = new_mode_conflicts(&gone, &local, &mut warned);
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    assert!(
+        warned.is_empty(),
+        "state keyed by a departed peer is released, but warned still holds {warned:?}"
+    );
+}
+
+/// One cache `"users"` advertised under `mode` by each of `peers`.
+fn advertised_users(peers: &[NodeId], mode: Mode) -> CacheModes {
+    peers
+        .iter()
+        .map(|&peer| (peer, HashMap::from([(SmolStr::new("users"), mode)])))
+        .collect()
+}
+
+#[test]
+fn a_mode_conflict_with_a_peer_that_stays_is_not_reported_again() {
+    let (leaving, staying) = (NodeId::from(1), NodeId::from(2));
+    let local = HashMap::from([(SmolStr::new("users"), Mode::Replicated)]);
+    let mut warned = HashSet::new();
+    let both = advertised_users(&[leaving, staying], Mode::Invalidation);
+    assert_eq!(new_mode_conflicts(&both, &local, &mut warned).len(), 2);
+
+    let only_staying = advertised_users(&[staying], Mode::Invalidation);
+    assert!(
+        new_mode_conflicts(&only_staying, &local, &mut warned).is_empty(),
+        "the peer that stayed is not reported a second time"
+    );
+    assert_eq!(
+        warned,
+        HashSet::from([(staying, SmolStr::new("users"))]),
+        "the warning of the departed peer goes and the live peer's stays"
+    );
+}
+
+#[test]
+fn a_peer_that_returns_with_its_conflict_is_reported_again() {
+    let peer = NodeId::from(1);
+    let local = HashMap::from([(SmolStr::new("users"), Mode::Replicated)]);
+    let present = advertised_users(&[peer], Mode::Invalidation);
+    let mut warned = HashSet::new();
+    assert_eq!(new_mode_conflicts(&present, &local, &mut warned).len(), 1);
+    let conflicts = new_mode_conflicts(&present, &local, &mut warned);
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+
+    let conflicts = new_mode_conflicts(&CacheModes::new(), &local, &mut warned);
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    assert_eq!(
+        new_mode_conflicts(&present, &local, &mut warned),
+        vec![ModeConflict {
+            peer,
+            cache: SmolStr::new("users"),
+            local: Mode::Replicated,
+            remote: Mode::Invalidation,
+        }],
+        "the same peer id appearing with the conflict again is a new report"
+    );
+}
+
+#[test]
+fn forget_departed_warnings_keeps_exactly_the_pairs_of_advertised_peers() {
+    let (live, departed) = (NodeId::from(1), NodeId::from(2));
+    let pair = |peer, cache: &str| (peer, SmolStr::new(cache));
+    let mut warned = HashSet::from([
+        pair(live, "users"),
+        pair(live, "orders"),
+        pair(departed, "users"),
+        pair(departed, "orders"),
+    ]);
+    // A live peer advertising no cache at all is still live.
+    let advertised: CacheModes = HashMap::from([(live, HashMap::new())]);
+    forget_departed_warnings(&mut warned, &advertised);
+    assert_eq!(
+        warned,
+        HashSet::from([pair(live, "users"), pair(live, "orders")])
+    );
+
+    forget_departed_warnings(&mut warned, &advertised);
+    assert_eq!(warned.len(), 2, "a second pass changes nothing");
+    forget_departed_warnings(&mut warned, &CacheModes::new());
+    assert!(warned.is_empty(), "an empty view forgets every pair");
+}
+
+#[test]
+fn retain_live_stamps_keeps_exactly_the_stamps_of_live_peers() {
+    let (live, departed) = (NodeId::from(1), NodeId::from(2));
+    let mut seen = HashMap::from([(live, 10_u64), (departed, 20)]);
+    retain_live_stamps(&mut seen, &HashSet::from([live, NodeId::from(3)]));
+    assert_eq!(
+        seen,
+        HashMap::from([(live, 10)]),
+        "the live peer keeps its stamp, the departed one loses it, and a live peer never stamped is not added"
+    );
+    retain_live_stamps(&mut seen, &HashSet::new());
+    assert!(seen.is_empty());
+}
+
+#[test]
+fn inbound_activity_forgets_a_peer_that_left_the_view_and_keeps_one_that_stayed() {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    let (live, departed) = (NodeId::from(1), NodeId::from(2));
+    let activity = InboundActivity::default();
+    activity.note(live);
+    activity.note(departed);
+    let window = Duration::from_secs(3600);
+
+    activity.retain_live(&[crate::net::test_support::peer_at(live, addr)]);
+    assert!(activity.recent(live, window));
+    assert!(!activity.recent(departed, window));
+    assert_eq!(activity.seen().len(), 1);
+
+    activity.retain_live(&[]);
+    assert!(!activity.recent(live, window));
+    assert!(activity.seen().is_empty());
+}
+
+/// Replicate traffic from a peer stamps it in the inbound activity; once the
+/// peer leaves the view, the membership-to-mesh task forgets the stamp.
+#[tokio::test]
+async fn a_peer_that_leaves_is_forgotten_by_the_inbound_activity() {
+    let cluster_a = Cluster::builder("cluster-it-activity-forgets-departed")
+        .seeds(std::iter::empty())
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("node a builds");
+    let cache_a = cluster_a
+        .cache::<u32, String>("users")
+        .mode(Mode::Replicated)
+        .open()
+        .await
+        .expect("node a opens the cache");
+    let gossip_a = cluster_a.inner.membership.local_peer().gossip_addr;
+    let cluster_b = Cluster::builder("cluster-it-activity-forgets-departed")
+        .seeds([gossip_a])
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("node b builds");
+    let node_b = cluster_b.node_id();
+    let cache_b = cluster_b
+        .cache::<u32, String>("users")
+        .mode(Mode::Replicated)
+        .open()
+        .await
+        .expect("node b opens the cache");
+    wait_for_peer_count(&cluster_a, 1).await;
+
+    let window = Duration::from_secs(3600);
+    cache_b.insert(1, "one".to_string()).await.expect("insert");
+    wait_until(
+        Duration::from_secs(20),
+        "node a stamps the peer that streamed to it",
+        async || {
+            cache_a.get(&1).await.is_some()
+                && cluster_a.inner.inbound_activity.recent(node_b, window)
+        },
+    )
+    .await;
+
+    cluster_b.shutdown().await;
+    wait_for_no_peers(&cluster_a).await;
+    wait_until(
+        Duration::from_secs(20),
+        "node a forgets the stamp of the peer that left",
+        async || !cluster_a.inner.inbound_activity.recent(node_b, window),
+    )
+    .await;
+
+    cluster_a.shutdown().await;
 }
 
 /// A `WireRecord` for `key`, its own postcard-encoded bytes as `key`.

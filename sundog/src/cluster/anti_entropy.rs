@@ -61,7 +61,9 @@ pub(crate) async fn scheduler_task(
         {
             return;
         }
-        let Some((peer, was_dirty)) = pick_peer(&cluster, &shard) else {
+        let live = cluster.live_peer_ids();
+        forget_departed_skips(&mut skipped, &live);
+        let Some((peer, was_dirty)) = pick_peer(&cluster, &shard, live) else {
             continue;
         };
         let skips = skipped.entry(peer).or_insert(0);
@@ -116,6 +118,11 @@ fn should_skip_round(streaming: bool, skipped_so_far: u32) -> bool {
     streaming && skipped_so_far < MAX_STREAMING_SKIPS
 }
 
+/// Drops the skip count of every peer not in `live`.
+fn forget_departed_skips(skipped: &mut HashMap<NodeId, u32>, live: &[NodeId]) {
+    skipped.retain(|peer, _| live.contains(peer));
+}
+
 /// The choice for one round: a `dirty` peer wins whenever there is one,
 /// leaving every other dirty peer in the returned give-back list for the
 /// caller to re-mark; with none dirty, a `live` peer is chosen instead, with
@@ -143,16 +150,19 @@ fn choose_peer(
     live.choose(rng).map(|&peer| (peer, false, Vec::new()))
 }
 
-/// The peer for this round, and whether it came from the dirty set; a
-/// skipped round can hand the mark back. `shard`'s
+/// The peer for this round out of the `live` ids, and whether it came from the
+/// dirty set; a skipped round can hand the mark back. `shard`'s
 /// [`ShardOps::ae_peer_filter`] narrows both candidate sets to its current
 /// cohort first: identity for every mode but `Mode::Distributed`, whose
 /// override drops a peer sharing no bucket this shard currently owns or is
 /// mid disown-grace on, since such a peer has nothing to reconcile.
-fn pick_peer(cluster: &Cluster, shard: &Arc<dyn ShardOps>) -> Option<(NodeId, bool)> {
+fn pick_peer(
+    cluster: &Cluster,
+    shard: &Arc<dyn ShardOps>,
+    live: Vec<NodeId>,
+) -> Option<(NodeId, bool)> {
     let mut rng = rand::rng();
     let dirty = cluster.mesh().take_dirty_peers();
-    let live = cluster.live_peer_ids();
     let (dirty, live) = shard.ae_peer_filter(dirty, live);
     let (peer, was_dirty, give_back) = choose_peer(dirty, live, &mut rng)?;
     for other in give_back {
