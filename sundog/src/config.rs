@@ -323,7 +323,8 @@ pub struct ClusterConfig {
     /// [`rebalance_ack_window_value`](Self::rebalance_ack_window_value)
     /// bounds this by `distributed_disown_grace_rounds * ae_interval` -- an
     /// ack only speeds up confirmation, never bypasses the grace-round
-    /// floor.
+    /// floor. A node drops an ack once it is older than the window, and the
+    /// acks of a peer that leaves with it.
     pub rebalance_ack_window: Duration,
     /// Backlog capacity, in keys, for a cache's fan-out queue. An async
     /// write (`Cache::insert` and friends) awaits room under this cap, up

@@ -222,8 +222,65 @@ struct MeshInner {
     /// Bucket acks from `Msg::StBucketAck`, written by
     /// `conn::serve_st_buckets` when a requester releases a bucket.
     /// `rebalance_task` uses a fresh, current-view entry to skip a
-    /// redundant confirming AE round for that bucket.
+    /// redundant confirming AE round for that bucket. A row goes when its
+    /// requester leaves the peer table ([`Mesh::update_peers`]) or when it
+    /// outlives [`MeshInner::ack_window`] ([`MeshInner::record_bucket_ack_at`]).
     acked_buckets: RwLock<HashMap<AckedBucketKey, AckedBucketEntry>>,
+    /// The `rebalance_ack_window` `rebalance_task` passes to
+    /// [`MeshInner::acked_owners`]: an ack older than it never counts again.
+    ack_window: Duration,
+    /// When the last age sweep of `acked_buckets` started.
+    ack_swept_at: Mutex<Instant>,
+}
+
+/// The shortest gap between two age sweeps of the acknowledgment table, so a
+/// tiny `rebalance_ack_window` cannot make every insert scan the table.
+const ACK_SWEEP_FLOOR: Duration = Duration::from_secs(1);
+
+/// The capacity from which the acknowledgment table shrinks after a drop.
+const ACK_SHRINK_FLOOR: usize = 256;
+
+/// Whether an ack recorded at `acked_at` counts at `now` under `window`: the
+/// one rule [`MeshInner::acked_owners`] reads with and the age sweep keeps
+/// rows by, so a swept row is one the reader refuses.
+fn ack_within_window(acked_at: Instant, now: Instant, window: Duration) -> bool {
+    now.saturating_duration_since(acked_at) <= window
+}
+
+/// Whether the ack rows of `requester` outlive a change of the peer table to
+/// `peers`: they do while it is still a peer.
+fn ack_requester_is_peer<V>(requester: NodeId, peers: &HashMap<NodeId, V>) -> bool {
+    peers.contains_key(&requester)
+}
+
+/// Whether the age sweep of the acknowledgment table runs at an insert at
+/// `now`: once `window` has passed since the sweep at `swept_at`, and never
+/// more often than [`ACK_SWEEP_FLOOR`].
+fn ack_sweep_due(swept_at: Instant, now: Instant, window: Duration) -> bool {
+    now.saturating_duration_since(swept_at) >= window.max(ACK_SWEEP_FLOOR)
+}
+
+/// Whether an acknowledgment table of `len` rows in `capacity` slots gives
+/// memory back: from [`ACK_SHRINK_FLOOR`] slots up, once a quarter is in use.
+const fn ack_table_oversized(len: usize, capacity: usize) -> bool {
+    capacity >= ACK_SHRINK_FLOOR && len <= capacity / 4
+}
+
+/// Drops from `rows` every ack that [`ack_within_window`] refuses at `now`.
+fn sweep_aged_acks(
+    rows: &mut HashMap<AckedBucketKey, AckedBucketEntry>,
+    now: Instant,
+    window: Duration,
+) {
+    rows.retain(|_, (acked_at, _)| ack_within_window(*acked_at, now, window));
+    shrink_ack_table(rows);
+}
+
+/// Gives `rows`' memory back once a drop has left it mostly empty.
+fn shrink_ack_table(rows: &mut HashMap<AckedBucketKey, AckedBucketEntry>) {
+    if ack_table_oversized(rows.len(), rows.capacity()) {
+        rows.shrink_to_fit();
+    }
 }
 
 /// Digests from one peer answered empty in a row before the responder serves
@@ -336,10 +393,46 @@ impl MeshInner {
     /// `view_hash` is the acker's own view hash at request time;
     /// [`MeshInner::acked_owners`] checks it against this node's current one.
     fn record_bucket_ack(&self, cache: SmolStr, bucket: u16, from: NodeId, view_hash: u64) {
-        self.acked_buckets
+        self.record_bucket_ack_at(cache, bucket, from, view_hash, Instant::now());
+    }
+
+    /// [`MeshInner::record_bucket_ack`] at `now`. An insert that finds the
+    /// last age sweep a full [`MeshInner::ack_window`] behind it sweeps the
+    /// table.
+    fn record_bucket_ack_at(
+        &self,
+        cache: SmolStr,
+        bucket: u16,
+        from: NodeId,
+        view_hash: u64,
+        now: Instant,
+    ) {
+        let mut rows = self
+            .acked_buckets
             .write()
-            .expect("invariant: acked_buckets lock is never poisoned")
-            .insert((cache, bucket, from), (Instant::now(), view_hash));
+            .expect("invariant: acked_buckets lock is never poisoned");
+        rows.insert((cache, bucket, from), (now, view_hash));
+        let mut swept_at = self
+            .ack_swept_at
+            .lock()
+            .expect("invariant: ack_swept_at lock is never poisoned");
+        if ack_sweep_due(*swept_at, now, self.ack_window) {
+            *swept_at = now;
+            sweep_aged_acks(&mut rows, now, self.ack_window);
+        }
+    }
+
+    /// Drops every ack whose requester is not in `peers`, the peer table
+    /// [`Mesh::update_peers`] just built. An ack is a hint that saves one
+    /// confirming anti-entropy round, so a dropped row costs that round at
+    /// most and never releases a part early.
+    fn forget_acks_of_departed<V>(&self, peers: &HashMap<NodeId, V>) {
+        let mut rows = self
+            .acked_buckets
+            .write()
+            .expect("invariant: acked_buckets lock is never poisoned");
+        rows.retain(|(_, _, requester), _| ack_requester_is_peer(*requester, peers));
+        shrink_ack_table(&mut rows);
     }
 
     /// Every acked owner of each of `due`'s buckets of `cache`, keyed by
@@ -365,7 +458,7 @@ impl MeshInner {
         {
             if c == cache
                 && due.contains(bucket)
-                && now.saturating_duration_since(*acked_at) <= window
+                && ack_within_window(*acked_at, now, window)
                 && *acked_view_hash == view_hash
             {
                 acked.entry(*bucket).or_default().insert(*owner);
@@ -398,7 +491,23 @@ impl MeshInner {
     /// `handle_accepted` over a raw accepted stream.
     #[cfg(all(test, not(feature = "sim")))]
     pub(super) fn for_tests(tls: TlsCtx, accept_cancel: CancellationToken) -> Arc<Self> {
-        Self::for_tests_admitting(tls, accept_cancel, conn::Admission::new())
+        Self::for_tests_admitting(
+            tls,
+            accept_cancel,
+            conn::Admission::new(),
+            Duration::from_secs(60),
+        )
+    }
+
+    /// [`MeshInner::for_tests`] with `ack_window` as the age past which an
+    /// ack row is swept.
+    #[cfg(all(test, not(feature = "sim")))]
+    pub(super) fn for_tests_with_ack_window(
+        tls: TlsCtx,
+        accept_cancel: CancellationToken,
+        ack_window: Duration,
+    ) -> Arc<Self> {
+        Self::for_tests_admitting(tls, accept_cancel, conn::Admission::new(), ack_window)
     }
 
     /// [`MeshInner::for_tests`] with `cap` connections from unknown sources
@@ -409,7 +518,12 @@ impl MeshInner {
         accept_cancel: CancellationToken,
         cap: usize,
     ) -> Arc<Self> {
-        Self::for_tests_admitting(tls, accept_cancel, conn::Admission::with_cap(cap))
+        Self::for_tests_admitting(
+            tls,
+            accept_cancel,
+            conn::Admission::with_cap(cap),
+            Duration::from_secs(60),
+        )
     }
 
     #[cfg(all(test, not(feature = "sim")))]
@@ -417,6 +531,7 @@ impl MeshInner {
         tls: TlsCtx,
         accept_cancel: CancellationToken,
         admission: conn::Admission,
+        ack_window: Duration,
     ) -> Arc<Self> {
         Arc::new(Self {
             node: NodeId::from(1),
@@ -428,6 +543,8 @@ impl MeshInner {
             tls,
             admission,
             acked_buckets: RwLock::new(HashMap::new()),
+            ack_window,
+            ack_swept_at: Mutex::new(Instant::now()),
         })
     }
 }

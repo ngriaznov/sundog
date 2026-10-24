@@ -80,6 +80,17 @@ All notable changes to this project are documented in this file. Format follows
   `Cache::close` does, and an `open` of the same name started meanwhile waits
   for that close, so a retry succeeds and a spill tier is closed before the
   name can be taken again. `CacheBuilder::open` is cancel-safe.
+- **A `Distributed` node forgets the rebalance acks of peers that left.** A
+  node that serves rebalance pulls kept one acknowledgment row for every part
+  a requester pulled from it and never dropped one. Each restart under a
+  random `NodeId` and each new peer added up to 65,536 rows for each cache
+  across the donors, so the node's memory grew with the cluster's restart
+  history. The
+  node now drops the rows of a requester when the requester leaves its peer
+  table, drops a row once it is older than `rebalance_ack_window` (a sweep at
+  most once per window, on an ack insert), and returns the memory. An
+  acknowledgment only saves a confirming anti-entropy round, so a dropped row
+  costs at most that round.
 - **A pull whose reply cannot arrive in time goes out again smaller.** A pull
   of large records, whose reply took longer than the 10-second request
   timeout, failed the same way every round, and its keys never repaired from

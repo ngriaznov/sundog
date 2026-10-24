@@ -265,6 +265,362 @@ async fn mesh_acked_owners_delegates_to_the_inner_table() {
     );
 }
 
+/// A mesh with no listener and the peer table `peers`, for the tests of the
+/// acknowledgment table.
+fn ack_mesh(peers: &[u64]) -> Mesh {
+    let mesh = Mesh {
+        local_addr: "127.0.0.1:0".parse().expect("valid loopback addr"),
+        inner: MeshInner::for_tests(no_tls(), CancellationToken::new()),
+    };
+    mesh.update_peers(
+        peers
+            .iter()
+            .map(|&id| {
+                peer_at_protocol(
+                    NodeId::from(id),
+                    "127.0.0.1:1".parse().expect("valid loopback addr"),
+                    3,
+                )
+            })
+            .collect(),
+    );
+    mesh
+}
+
+fn ack_rows(mesh: &Mesh) -> usize {
+    mesh.inner
+        .acked_buckets
+        .read()
+        .expect("lock is never poisoned")
+        .len()
+}
+
+#[tokio::test]
+async fn acks_of_a_requester_that_leaves_the_peer_table_are_dropped_with_it() {
+    let mesh = ack_mesh(&[3]);
+    for bucket in 0..1000u16 {
+        mesh.inner
+            .record_bucket_ack(SmolStr::new("prices"), bucket, NodeId::from(3), 42);
+    }
+    mesh.update_peers(Vec::new());
+    let len = ack_rows(&mesh);
+    assert_eq!(
+        len, 0,
+        "acks of a departed peer are dropped with it; {len} rows remain"
+    );
+}
+
+#[tokio::test]
+async fn acks_of_a_requester_that_stays_in_the_peer_table_are_kept() {
+    let mesh = ack_mesh(&[3, 4]);
+    for bucket in 0..10u16 {
+        mesh.inner
+            .record_bucket_ack(SmolStr::new("prices"), bucket, NodeId::from(3), 42);
+        mesh.inner
+            .record_bucket_ack(SmolStr::new("prices"), bucket, NodeId::from(4), 42);
+    }
+    assert_eq!(ack_rows(&mesh), 20);
+    mesh.update_peers(vec![peer_at_protocol(
+        NodeId::from(3),
+        "127.0.0.1:1".parse().expect("valid loopback addr"),
+        3,
+    )]);
+    let kept: HashSet<NodeId> = mesh
+        .inner
+        .acked_buckets
+        .read()
+        .expect("lock is never poisoned")
+        .keys()
+        .map(|&(_, _, requester)| requester)
+        .collect();
+    assert_eq!(
+        kept,
+        HashSet::from([NodeId::from(3)]),
+        "the rows of the requester that left go and the rows of the one that stays remain"
+    );
+    assert_eq!(
+        ack_rows(&mesh),
+        10,
+        "every ack of the staying requester is kept"
+    );
+    assert_eq!(
+        mesh.acked_owners(
+            &SmolStr::new("prices"),
+            &[0, 9],
+            Duration::from_secs(60),
+            42
+        ),
+        HashMap::from([
+            (0u16, HashSet::from([NodeId::from(3)])),
+            (9u16, HashSet::from([NodeId::from(3)])),
+        ]),
+        "a kept ack still counts for the reader"
+    );
+}
+
+#[tokio::test]
+async fn an_ack_that_reaches_the_table_before_its_requester_is_a_peer_goes_at_the_next_update() {
+    let mesh = ack_mesh(&[]);
+    mesh.inner
+        .record_bucket_ack(SmolStr::new("prices"), 7, NodeId::from(3), 42);
+    assert_eq!(ack_rows(&mesh), 1);
+    mesh.update_peers(Vec::new());
+    assert_eq!(
+        ack_rows(&mesh),
+        0,
+        "an ack from a node the table has not admitted costs the confirming round, nothing more"
+    );
+}
+
+#[tokio::test]
+async fn the_ack_table_gives_memory_back_after_its_requesters_leave() {
+    let mesh = ack_mesh(&[3]);
+    for bucket in 0..1000u16 {
+        mesh.inner
+            .record_bucket_ack(SmolStr::new("prices"), bucket, NodeId::from(3), 42);
+    }
+    let grown = mesh
+        .inner
+        .acked_buckets
+        .read()
+        .expect("lock is never poisoned")
+        .capacity();
+    assert!(grown >= 1000, "the table grew to hold the rows: {grown}");
+    mesh.update_peers(Vec::new());
+    let shrunk = mesh
+        .inner
+        .acked_buckets
+        .read()
+        .expect("lock is never poisoned")
+        .capacity();
+    assert!(
+        shrunk < ACK_SHRINK_FLOOR,
+        "an emptied table keeps no large allocation: {shrunk} slots"
+    );
+}
+
+#[tokio::test]
+async fn a_spawned_mesh_ages_acks_out_on_the_window_the_rebalance_reader_applies() {
+    let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid loopback addr");
+    for configured in [Duration::from_secs(7), Duration::from_secs(3600)] {
+        let config = ClusterConfig::default().with(|c| c.rebalance_ack_window = configured);
+        let (mesh, _inbound) = Mesh::spawn(addr, NodeId::from(1), 1, &config, empty_handler())
+            .await
+            .expect("bind loopback");
+        assert_eq!(
+            mesh.inner.ack_window,
+            config.rebalance_ack_window_value(),
+            "the mesh sweeps by the window `rebalance_task` reads with, clamped as it is"
+        );
+    }
+}
+
+/// A mesh whose acks age out after `window`, plus an instant to count from.
+fn ack_mesh_aging_after(window: Duration) -> (Arc<MeshInner>, Instant) {
+    let mesh = MeshInner::for_tests_with_ack_window(no_tls(), CancellationToken::new(), window);
+    (mesh, Instant::now())
+}
+
+fn ack_buckets_of(mesh: &MeshInner) -> Vec<u16> {
+    let mut buckets: Vec<u16> = mesh
+        .acked_buckets
+        .read()
+        .expect("lock is never poisoned")
+        .keys()
+        .map(|&(_, bucket, _)| bucket)
+        .collect();
+    buckets.sort_unstable();
+    buckets
+}
+
+#[test]
+fn an_insert_a_window_after_the_last_sweep_drops_the_acks_older_than_the_window() {
+    let window = Duration::from_secs(5);
+    let (mesh, base) = ack_mesh_aging_after(window);
+    let cache = SmolStr::new("prices");
+    mesh.record_bucket_ack_at(cache.clone(), 1, NodeId::from(3), 42, base);
+    mesh.record_bucket_ack_at(
+        cache.clone(),
+        2,
+        NodeId::from(3),
+        42,
+        base + Duration::from_secs(3),
+    );
+    assert_eq!(
+        ack_buckets_of(&mesh),
+        vec![1, 2],
+        "no sweep is due inside the first window"
+    );
+    mesh.record_bucket_ack_at(
+        cache.clone(),
+        3,
+        NodeId::from(3),
+        42,
+        base + Duration::from_secs(6),
+    );
+    assert_eq!(
+        ack_buckets_of(&mesh),
+        vec![2, 3],
+        "the sweep drops the ack past the window and keeps the two inside it"
+    );
+}
+
+#[test]
+fn the_ack_sweep_runs_at_most_once_per_window() {
+    let window = Duration::from_secs(5);
+    let (mesh, base) = ack_mesh_aging_after(window);
+    let cache = SmolStr::new("prices");
+    let swept = |mesh: &MeshInner| *mesh.ack_swept_at.lock().expect("lock is never poisoned");
+    let before = swept(&mesh);
+    mesh.record_bucket_ack_at(
+        cache.clone(),
+        1,
+        NodeId::from(3),
+        42,
+        base + Duration::from_secs(6),
+    );
+    let first = swept(&mesh);
+    assert!(first > before, "the first insert a window on sweeps");
+    for secs in [7, 8, 10] {
+        mesh.record_bucket_ack_at(
+            cache.clone(),
+            2,
+            NodeId::from(3),
+            42,
+            base + Duration::from_secs(secs),
+        );
+        assert_eq!(
+            swept(&mesh),
+            first,
+            "an insert {secs} seconds in, inside the window of the last sweep, does not sweep"
+        );
+    }
+    mesh.record_bucket_ack_at(
+        cache,
+        3,
+        NodeId::from(3),
+        42,
+        base + Duration::from_secs(12),
+    );
+    assert!(
+        swept(&mesh) > first,
+        "the next insert a window after the last sweep sweeps again"
+    );
+}
+
+#[test]
+fn an_ack_sweep_gives_the_table_its_memory_back() {
+    let window = Duration::from_secs(5);
+    let (mesh, base) = ack_mesh_aging_after(window);
+    let cache = SmolStr::new("prices");
+    for bucket in 0..1000u16 {
+        mesh.record_bucket_ack_at(cache.clone(), bucket, NodeId::from(3), 42, base);
+    }
+    mesh.record_bucket_ack_at(
+        cache,
+        5000,
+        NodeId::from(3),
+        42,
+        base + Duration::from_secs(6),
+    );
+    assert_eq!(ack_buckets_of(&mesh), vec![5000]);
+    let capacity = mesh
+        .acked_buckets
+        .read()
+        .expect("lock is never poisoned")
+        .capacity();
+    assert!(
+        capacity < ACK_SHRINK_FLOOR,
+        "the swept table keeps no large allocation: {capacity} slots"
+    );
+}
+
+#[test]
+fn a_swept_ack_is_one_the_reader_already_refuses() {
+    let window = Duration::from_secs(5);
+    let base = Instant::now();
+    for (age, counts) in [
+        (Duration::ZERO, true),
+        (Duration::from_millis(4_999), true),
+        (window, true),
+        (window + Duration::from_millis(1), false),
+        (window * 10, false),
+    ] {
+        assert_eq!(
+            ack_within_window(base, base + age, window),
+            counts,
+            "an ack {age:?} old under a {window:?} window"
+        );
+    }
+    assert!(
+        ack_within_window(base + Duration::from_secs(1), base, window),
+        "a clock that reads earlier than the ack never ages it"
+    );
+}
+
+#[test]
+fn ack_requester_is_peer_follows_the_peer_table() {
+    let peers: HashMap<NodeId, u8> = HashMap::from([(NodeId::from(3), 0), (NodeId::from(4), 0)]);
+    assert!(ack_requester_is_peer(NodeId::from(3), &peers));
+    assert!(ack_requester_is_peer(NodeId::from(4), &peers));
+    assert!(!ack_requester_is_peer(NodeId::from(5), &peers));
+    assert!(!ack_requester_is_peer(
+        NodeId::from(3),
+        &HashMap::<NodeId, u8>::new()
+    ));
+}
+
+#[test]
+fn ack_sweep_is_due_a_window_after_the_last_one_and_never_sooner_than_the_floor() {
+    let base = Instant::now();
+    let sixty = Duration::from_secs(60);
+    assert!(!ack_sweep_due(base, base, sixty));
+    assert!(!ack_sweep_due(
+        base,
+        base + Duration::from_millis(59_999),
+        sixty
+    ));
+    assert!(ack_sweep_due(base, base + sixty, sixty));
+    assert!(ack_sweep_due(base, base + sixty * 3, sixty));
+    // A window under the floor sweeps no more often than the floor.
+    for window in [Duration::ZERO, Duration::from_millis(1), ACK_SWEEP_FLOOR] {
+        assert!(
+            !ack_sweep_due(base, base + Duration::from_millis(999), window),
+            "a {window:?} window never sweeps inside the floor"
+        );
+        assert!(
+            ack_sweep_due(base, base + ACK_SWEEP_FLOOR, window),
+            "a {window:?} window sweeps once the floor has passed"
+        );
+    }
+    assert!(
+        !ack_sweep_due(base + sixty, base, sixty),
+        "a clock that reads earlier than the last sweep is never due"
+    );
+}
+
+#[test]
+fn ack_table_oversized_only_when_large_and_mostly_empty() {
+    for (len, capacity, oversized) in [
+        (0, 0, false),
+        (0, 28, false),
+        (10, ACK_SHRINK_FLOOR - 1, false),
+        (0, ACK_SHRINK_FLOOR, true),
+        (ACK_SHRINK_FLOOR / 4, ACK_SHRINK_FLOOR, true),
+        (ACK_SHRINK_FLOOR / 4 + 1, ACK_SHRINK_FLOOR, false),
+        (0, 65_536, true),
+        (16_384, 65_536, true),
+        (16_385, 65_536, false),
+        (65_536, 65_536, false),
+    ] {
+        assert_eq!(
+            ack_table_oversized(len, capacity),
+            oversized,
+            "{len} rows in {capacity} slots"
+        );
+    }
+}
+
 #[tokio::test]
 async fn replicate_in_flight_reflects_queued_and_recent_frames() {
     let (mesh, _inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;

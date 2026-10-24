@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use smol_str::SmolStr;
 use tokio::sync::mpsc;
@@ -94,6 +94,8 @@ impl Mesh {
             tls,
             admission: conn::Admission::new(),
             acked_buckets: RwLock::new(HashMap::new()),
+            ack_window: config.rebalance_ack_window_value(),
+            ack_swept_at: Mutex::new(Instant::now()),
         });
         tokio::spawn(conn::accept_loop(
             listener,
@@ -120,9 +122,10 @@ impl Mesh {
 
     /// Refreshes the set of peers the mesh dials and fans traffic out to:
     /// spawns a writer for each newly seen peer, cancels it for any that
-    /// departed or changed `data_addr`. The IPs of the peers' data addresses
-    /// are the sources the cap on connections waiting for their `Hello`
-    /// never refuses. Called on every
+    /// departed or changed `data_addr`, and drops the bucket acks of every
+    /// requester that is no longer a peer. The IPs of the peers' data
+    /// addresses are the sources the cap on connections waiting for their
+    /// `Hello` never refuses. Called on every
     /// [`crate::membership::Membership::peers`] change.
     ///
     /// # Panics
@@ -173,6 +176,11 @@ impl Mesh {
         self.inner
             .admission
             .set_known_sources(table.values().map(|handle| handle.data_addr.ip()));
+        // The table now holds exactly `incoming`'s peers. The ack sweep runs
+        // after the peer-table lock is released: it walks every ack row, and
+        // the fan-out paths read that table.
+        drop(table);
+        self.inner.forget_acks_of_departed(&incoming);
     }
 
     fn spawn_peer_handle(&self, peer: NodeId, data_addr: SocketAddr, protocol: u16) -> PeerHandle {
