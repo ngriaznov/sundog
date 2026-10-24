@@ -645,8 +645,9 @@ where
     ///
     /// When `resolver` merges, pre-folding is enabled (`prefold_enabled`,
     /// toggled only via [`Engine::set_prefold_enabled`]) and the batch holds
-    /// two entries or more ([`prefold_engages`]), `entries` are grouped into runs and folded through [`prefold_batch`]
-    /// before any [`apply_locked`] call, collapsing repeated keys to one
+    /// two entries or more ([`prefold_engages`]), `entries` are grouped into
+    /// runs and folded through [`prefold_batch`] before any [`apply_locked`]
+    /// call, collapsing repeated keys to one
     /// call each with every other index reported [`ApplyOutcome::Rejected`],
     /// except a merge the cap refuses while its run folds, which is reported
     /// [`ApplyOutcome::TooLarge`] at its own index and costs the stripe lock

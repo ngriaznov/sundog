@@ -710,11 +710,11 @@ where
         let now = self.now_ms();
         let mut applied_keys: Vec<(K, Hlc)> = Vec::new();
         let mut written = engine::Written::default();
+        let mut first_refused: Vec<(usize, usize, usize)> = Vec::new();
         // The reservation lives in this block only, so its unspent budget
         // is back with the tier before `retry_reservation_deficit` asks for
         // a fresh one: a retry clamped to the whole flush queue can never be
         // granted while this call still holds part of it.
-        let mut first_refused: Vec<(usize, usize, usize)> = Vec::new();
         let deficit = {
             let mut reservation = reservation;
             let mut deficit = 0u64;

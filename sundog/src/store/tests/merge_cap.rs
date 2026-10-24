@@ -704,6 +704,58 @@ async fn an_insert_many_returns_the_refusal_of_the_first_entry_given_not_the_fir
 }
 
 #[tokio::test]
+async fn an_insert_many_returns_the_first_refusal_of_a_stripe_not_its_last() {
+    // Each entry of key 1 is refused on its own against the stored four
+    // bytes: four more leave nine encoded bytes, five more leave ten.
+    for (batch, first) in [([four(2), vec![2; 5]], 9), ([vec![2; 5], four(2)], 10)] {
+        let s = capped_shard(8);
+        s.insert(1, four(1)).await.expect("fits");
+
+        let (size, _) = too_large(s.insert_many(batch.map(|value| (1, value))).await);
+
+        assert_eq!(size, first, "the refusal of the entry given first");
+        assert_eq!(s.get(&1).await, Some(four(1)));
+    }
+}
+
+/// Two keys in one stripe other than stripe 0, and a third key in a lower
+/// stripe: a batch reaches the third key's stripe before the pair's.
+fn a_pair_in_one_stripe_above_a_third_key() -> (u32, u32, u32) {
+    let (a, b) = (1u32..1_000)
+        .filter(|key| stripe_of(*key) > 0)
+        .find_map(|a| {
+            (a + 1..100_000)
+                .find(|b| stripe_of(*b) == stripe_of(a))
+                .map(|b| (a, b))
+        })
+        .expect("two keys in one stripe");
+    let c = (1u32..1_000)
+        .find(|key| stripe_of(*key) < stripe_of(a))
+        .expect("a key in a lower stripe");
+    (a, b, c)
+}
+
+#[tokio::test]
+async fn an_insert_many_finds_a_refusal_by_its_place_in_its_stripe() {
+    let s = capped_shard(8);
+    let (a, b, c) = a_pair_in_one_stripe_above_a_third_key();
+    s.insert(b, four(1)).await.expect("fits");
+    s.insert(c, four(1)).await.expect("fits");
+
+    // `a` is new and fits. `c`, given second, would leave ten encoded bytes;
+    // `b`, given third and second in its stripe, nine.
+    let (size, _) = too_large(
+        s.insert_many([(a, four(2)), (c, vec![2; 5]), (b, four(2))])
+            .await,
+    );
+
+    assert_eq!(size, 10, "the refusal of the entry given first");
+    assert_eq!(s.get(&a).await, Some(four(2)));
+    assert_eq!(s.get(&b).await, Some(four(1)));
+    assert_eq!(s.get(&c).await, Some(four(1)));
+}
+
+#[tokio::test]
 async fn an_insert_many_whose_entry_is_over_the_frame_ends_there_and_returns_that_error() {
     let recorder = DebuggingRecorder::new();
     let counted = Counted::new(&recorder);
