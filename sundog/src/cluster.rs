@@ -150,6 +150,9 @@ struct ClusterInner {
     /// local half, shared with the `prometheus` feature's `/readyz` route.
     local_modes: Arc<RwLock<HashMap<SmolStr, Mode>>>,
     config: ClusterConfig,
+    /// Which members are absent or only just back; one for the cluster, read
+    /// by every cache's gc task, which also has it forget the members that
+    /// left ([`absence::AbsenceTracker::forget_departed`]).
     absence: absence::AbsenceTracker,
     /// When [`ClusterBuilder::build`] began, before membership started to
     /// observe anyone; see [`Cluster::started_at`].
@@ -1092,7 +1095,7 @@ impl ClusterBuilder {
         let advertise_ip = crate::membership::advertise_ip_for(&config, data_bind_addr.ip());
         let advertise_data_addr = SocketAddr::new(advertise_ip, data_bind_addr.port());
 
-        let absence = absence::AbsenceTracker::default();
+        let absence = absence::AbsenceTracker::new(absence::ForgetPolicy::for_config(&config));
         let observed = absence.clone();
         let membership = Membership::spawn_observed(
             name.clone(),
@@ -1497,7 +1500,10 @@ fn gc_defers(mode: Mode, absent_defers: bool, uptime: Duration, settle: Duration
 /// expired entry has its cap at its ttl deadline, so no deferral keeps it.
 /// `now_ms` reads the wall clock in epoch milliseconds that places the grid;
 /// the cache's tasks pass [`crate::store::now_ms`]. The uptime comes from
-/// the tokio clock.
+/// the tokio clock. Each tick also has `absence` forget the members that
+/// left ([`absence::AbsenceTracker::forget_departed`]), so the tracker stays
+/// bounded in a cluster whose caches never merge; the tracker is one for the
+/// cluster, and the first task of a tick does the work for all of them.
 pub(crate) async fn tombstone_gc_task(
     shard: Arc<dyn ShardOps>,
     mode: Mode,
@@ -1516,6 +1522,7 @@ pub(crate) async fn tombstone_gc_task(
             return;
         }
         shard.run_pending_tasks().await;
+        absence.forget_departed();
         let view = shard.ownership_view();
         let absent_defers = absence::should_defer_gc(
             mode,

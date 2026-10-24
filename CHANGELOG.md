@@ -91,6 +91,18 @@ All notable changes to this project are documented in this file. Format follows
   most once per window, on an ack insert), and returns the memory. An
   acknowledgment only saves a confirming anti-entropy round, so a dropped row
   costs at most that round.
+- **A node forgets the members that left, whatever its caches do.** The
+  tracker of absent members kept one record for every peer incarnation it had
+  seen live, and only the CRDT sweep, which runs for a cache with a merging
+  resolver, ever forgot one. A cluster whose caches all use the default
+  resolver kept a record for every restart under a random `NodeId`, and a
+  cluster with a merging cache kept the record of a member that returned from
+  an absence and left for good. The tombstone collection task, which every
+  cache runs, now forgets a member gone for longer than a CRDT fold receipt
+  lives, and a return older than that and `state_transfer_budget`, once per
+  tick for the whole cluster. Tombstone retention, the writer retirement
+  sweep and the check for a part owned alone read nothing inside those spans
+  differently.
 - **A pull whose reply cannot arrive in time goes out again smaller.** A pull
   of large records, whose reply took longer than the 10-second request
   timeout, failed the same way every round, and its keys never repaired from

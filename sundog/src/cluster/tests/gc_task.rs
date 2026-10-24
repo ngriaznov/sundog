@@ -409,3 +409,97 @@ async fn the_gc_task_arms_the_pause_guard_when_the_wall_clock_jumps_under_it() {
     cancel.cancel();
     task.await.expect("the gc task ends once cancelled");
 }
+
+/// A live set of `(node, departing)` pairs.
+fn live_set(peers: &[(u64, bool)]) -> HashMap<NodeId, crate::membership::LiveFlags> {
+    peers
+        .iter()
+        .map(|&(node, departing)| {
+            (
+                NodeId::from(node),
+                crate::membership::LiveFlags { departing },
+            )
+        })
+        .collect()
+}
+
+/// Every cache's gc task has the tracker forget the members that left, so a
+/// cluster whose caches never merge, where no CRDT sweep runs, keeps a record
+/// of a departed peer only as long as the policy says. Half the members left
+/// gracefully and half crashed; the tombstone cap of zero ages a crash out in
+/// the same tick.
+#[tokio::test(start_paused = true)]
+async fn the_gc_task_forgets_departed_members_in_a_cluster_with_no_merging_cache() {
+    let tracker = absence::AbsenceTracker::new(absence::ForgetPolicy::new(
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+        Duration::from_millis(2),
+    ));
+    let everyone: Vec<(u64, bool)> = (0..100).map(|node| (node, node < 50)).collect();
+    tracker.observe(&live_set(&everyone));
+    tracker.observe(&live_set(&[]));
+    assert_eq!(tracker.record_count(), 100, "every departure is recorded");
+    // The policy counts on the real clock the tracker stamps with.
+    std::thread::sleep(Duration::from_millis(30));
+
+    let wall_clock = paused_wall_clock(1_700_000_000_000);
+    let probe = Arc::new(GcProbe {
+        wall_clock,
+        collected_at: Mutex::new(Vec::new()),
+        deferred: Mutex::new(Vec::new()),
+    });
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn(tombstone_gc_task(
+        Arc::clone(&probe) as Arc<dyn ShardOps>,
+        Mode::Replicated,
+        Duration::from_secs(8),
+        Duration::ZERO,
+        tracker.clone(),
+        wall_clock,
+        cancel.clone(),
+    ));
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    cancel.cancel();
+    task.await.expect("the gc task ends once cancelled");
+
+    assert_eq!(
+        tracker.record_count(),
+        0,
+        "the first tick forgot every member that left"
+    );
+}
+
+/// The gc task forgets only what the policy has spent: a member that left
+/// less than the horizon ago keeps its record through the tick.
+#[tokio::test(start_paused = true)]
+async fn the_gc_task_keeps_the_record_of_a_member_that_left_inside_the_horizon() {
+    let tracker = absence::AbsenceTracker::new(absence::ForgetPolicy::new(
+        Duration::from_hours(1),
+        Duration::from_hours(1),
+        Duration::from_secs(4),
+    ));
+    tracker.observe(&live_set(&[(1, true)]));
+    tracker.observe(&live_set(&[]));
+
+    let wall_clock = paused_wall_clock(1_700_000_000_000);
+    let probe = Arc::new(GcProbe {
+        wall_clock,
+        collected_at: Mutex::new(Vec::new()),
+        deferred: Mutex::new(Vec::new()),
+    });
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn(tombstone_gc_task(
+        Arc::clone(&probe) as Arc<dyn ShardOps>,
+        Mode::Replicated,
+        Duration::from_secs(8),
+        Duration::from_hours(24),
+        tracker.clone(),
+        wall_clock,
+        cancel.clone(),
+    ));
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    cancel.cancel();
+    task.await.expect("the gc task ends once cancelled");
+
+    assert_eq!(tracker.record_count(), 1, "the member left a moment ago");
+}

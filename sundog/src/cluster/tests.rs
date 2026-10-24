@@ -10,6 +10,7 @@ mod background;
 mod builder;
 mod distributed;
 mod forget_cache;
+mod forget_departed;
 mod gc_task;
 mod hand_off;
 mod inbound;
