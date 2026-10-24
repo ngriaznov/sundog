@@ -370,19 +370,6 @@ pub(super) fn peek_prefold_seeds<K, V>(
     seeds
 }
 
-/// Whether a batch of `entries` entries goes through the pre-fold: under a
-/// resolver that `merges`, outside a held-only apply, with pre-fold
-/// `enabled`, and with at least two entries, the fewest a run to fold holds.
-/// Pure; unit tested directly.
-pub(super) const fn prefold_engages(
-    merges: bool,
-    held_only: bool,
-    enabled: bool,
-    entries: usize,
-) -> bool {
-    merges && !held_only && enabled && entries >= 2
-}
-
 /// What one entry of a folded run becomes; see [`plan_run`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RunSlot {

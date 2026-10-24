@@ -30,9 +30,7 @@ use super::merge::{MergeCap, Rebound, resolve_and_rebind};
 use super::merge::{merge_fits, merge_version, resolve_conflict};
 #[cfg(doc)]
 use super::prefold::peek_stored_seed;
-use super::prefold::{
-    BatchEntry, Slot, group_prefold_runs, peek_prefold_seeds, prefold_batch, prefold_engages,
-};
+use super::prefold::{BatchEntry, Slot, group_prefold_runs, peek_prefold_seeds, prefold_batch};
 use super::record::{build_resident_record, record_key, record_value_bytes};
 use super::{ApplyOutcome, Engine, Live, Reservation, Stripe, Written, remove_live};
 
@@ -643,11 +641,10 @@ where
     /// [`Self::enforce_capacity`] once afterward, outside the write lock,
     /// iff the batch put anything.
     ///
-    /// When `resolver` merges, pre-folding is enabled (`prefold_enabled`,
-    /// toggled only via [`Engine::set_prefold_enabled`]) and the batch holds
-    /// two entries or more ([`prefold_engages`]), `entries` are grouped into
-    /// runs and folded through [`prefold_batch`] before any [`apply_locked`]
-    /// call, collapsing repeated keys to one
+    /// When `resolver` merges and pre-folding is enabled
+    /// (`prefold_enabled`, toggled only via [`Engine::set_prefold_enabled`]),
+    /// `entries` are grouped into runs and folded through [`prefold_batch`]
+    /// before any [`apply_locked`] call, collapsing repeated keys to one
     /// call each with every other index reported [`ApplyOutcome::Rejected`],
     /// except a merge the cap refuses while its run folds, which is reported
     /// [`ApplyOutcome::TooLarge`] at its own index and costs the stripe lock
@@ -771,12 +768,8 @@ where
             max_ttl_ms: tombstone_max_ttl_ms,
             now_ms,
         };
-        let prefold = prefold_engages(
-            resolver.merges(),
-            held_only,
-            self.prefold_enabled.load(Ordering::Relaxed),
-            entries.len(),
-        );
+        let prefold =
+            resolver.merges() && !held_only && self.prefold_enabled.load(Ordering::Relaxed);
         #[cfg(feature = "spill")]
         let prefetched_spilled = prefetch_spilled_conflict_bytes(
             &self.stripes[bucket],
@@ -870,9 +863,7 @@ where
     /// The pre-fold stage of [`Engine::apply_many_in`]: reads the stored
     /// record of each key that has a run to fold under a brief read lock of
     /// `bucket`'s stripe, then folds every run outside any lock with
-    /// [`prefold_batch`], under the `cap` the batch applies under. A batch
-    /// with no run of two entries or more has nothing to fold and takes no
-    /// lock: every entry stays as given, as [`prefold_batch`] leaves it.
+    /// [`prefold_batch`], under the `cap` the batch applies under.
     fn prefold_slots(
         &self,
         bucket: usize,
@@ -883,9 +874,6 @@ where
         #[cfg(feature = "spill")] prefetched_spilled: &HashMap<SpillLoc, Bytes>,
     ) -> Vec<Slot<K, V>> {
         let runs = group_prefold_runs(&entries);
-        if runs.iter().all(|run| run.len() < 2) {
-            return entries.into_iter().map(Slot::Apply).collect();
-        }
         let stored_seeds = {
             let stripe = self.stripes[bucket].read();
             peek_prefold_seeds(
