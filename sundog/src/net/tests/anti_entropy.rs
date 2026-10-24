@@ -358,6 +358,109 @@ async fn ae_parts_returns_listings_and_sketches_per_the_threshold() {
     );
 }
 
+/// `count` entries whose keys are `key_len` bytes each, the big-endian index
+/// leading, at one version.
+fn long_key_entries(count: u64, key_len: usize) -> Vec<(Bytes, Hlc)> {
+    (0..count)
+        .map(|i| {
+            let mut key = vec![0u8; key_len];
+            key[..8].copy_from_slice(&i.to_be_bytes());
+            (
+                Bytes::from(key),
+                Hlc {
+                    wall_ms: 5,
+                    logical: 0,
+                    node: NodeId::from(1),
+                },
+            )
+        })
+        .collect()
+}
+
+/// The sketch a responder with the default cell count builds over `entries`.
+fn sketch_of(entries: &[(Bytes, Hlc)]) -> Vec<wire::Cell> {
+    let mut iblt = crate::cluster::sketch::Iblt::new(ClusterConfig::default().ae_sketch_cells);
+    for (key, version) in entries {
+        iblt.insert(xxh3_64(key), *version);
+    }
+    iblt.into_cells()
+}
+
+/// One digest exchange for bucket 1 of `users`, which the requester holds
+/// under a different digest, against a responder whose bucket holds
+/// `entries`.
+async fn ae_round_over_bucket(entries: Vec<(Bytes, Hlc)>) -> Vec<AeMismatch> {
+    let handler = Arc::new(FixtureHandler {
+        digests: vec![(1, 222)],
+        bucket_entries: entries,
+        ..Default::default()
+    });
+    let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+    let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+    client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+    client
+        .ae_round(NodeId::from(1), SmolStr::new("users"), vec![(1, 999)])
+        .await
+        .expect("ae round succeeds")
+}
+
+#[tokio::test]
+async fn a_digest_exchange_answers_a_small_bucket_of_long_keys_with_a_sketch() {
+    // Three entries, far under ae_sketch_min_bucket, whose keys of a sixth of
+    // a frame each make a listing past the half frame a reply may hold.
+    let long = long_key_entries(3, MAX_FRAME / 6);
+    assert_eq!(
+        ae_round_over_bucket(long.clone()).await,
+        vec![AeMismatch::Sketch(1, sketch_of(&long))]
+    );
+
+    let short = long_key_entries(3, 32);
+    assert_eq!(
+        ae_round_over_bucket(short.clone()).await,
+        vec![AeMismatch::Bucket(1, kv(short))],
+        "the same count of short keys stays a listing"
+    );
+}
+
+#[tokio::test]
+async fn an_ae_parts_request_answers_a_small_part_of_long_keys_with_a_sketch() {
+    let long = long_key_entries(3, MAX_FRAME / 6);
+    let short = long_key_entries(3, 32);
+    let handler = Arc::new(FixtureHandler {
+        part_entries: vec![
+            (BucketPart { bucket: 1, part: 2 }, kv(long.clone())),
+            (BucketPart { bucket: 1, part: 3 }, kv(short.clone())),
+        ],
+        ..Default::default()
+    });
+    let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+    let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+    client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+
+    let got = client
+        .ae_parts(NodeId::from(1), SmolStr::new("users"), vec![(1, 2), (1, 3)])
+        .await
+        .expect("ae_parts succeeds");
+
+    assert_eq!(got.len(), 2, "one reply per requested part: {got:?}");
+    assert!(
+        got.contains(&AePartReply::Sketch {
+            bucket: 1,
+            part: 2,
+            cells: sketch_of(&long),
+        }),
+        "the part of long keys answers with a sketch"
+    );
+    assert!(
+        got.contains(&AePartReply::Listing {
+            bucket: 1,
+            part: 3,
+            entries: kv(short),
+        }),
+        "the part of short keys stays a listing"
+    );
+}
+
 #[tokio::test]
 async fn ae_digest_from_a_peer_with_replicate_frames_queued_is_answered_empty() {
     let entries = vec![(

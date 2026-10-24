@@ -123,6 +123,144 @@ fn listing_cost(slice: &[crate::store::KeyVersion]) -> usize {
         .sum()
 }
 
+/// `count` entries whose keys are `key_len` bytes each.
+fn long_listing(count: u64, key_len: usize) -> Vec<crate::store::KeyVersion> {
+    (0..count).map(|n| listing_entry(n, key_len)).collect()
+}
+
+#[test]
+fn listing_fits_counts_each_key_plus_the_entry_overhead() {
+    let entries = long_listing(4, 100);
+    let exact = 4 * (100 + wire::AE_ENTRY_MAX_WIRE_LEN);
+    for (budget, fits) in [
+        (usize::MAX, true),
+        (exact + 1, true),
+        (exact, true),
+        (exact - 1, false),
+        (3 * (100 + wire::AE_ENTRY_MAX_WIRE_LEN), false),
+        (0, false),
+    ] {
+        assert_eq!(
+            super::serve::listing_fits(&entries, budget),
+            fits,
+            "budget {budget}"
+        );
+    }
+}
+
+#[test]
+fn listing_fits_takes_an_empty_listing_at_any_budget() {
+    assert!(super::serve::listing_fits(&[], 0));
+    assert!(super::serve::listing_fits(
+        &[],
+        super::serve::AE_LISTING_BUDGET
+    ));
+}
+
+#[test]
+fn listing_fits_rejects_one_key_longer_than_the_budget() {
+    let one = long_listing(1, 1_000);
+    assert!(super::serve::listing_fits(
+        &one,
+        1_000 + wire::AE_ENTRY_MAX_WIRE_LEN
+    ));
+    assert!(!super::serve::listing_fits(
+        &one,
+        999 + wire::AE_ENTRY_MAX_WIRE_LEN
+    ));
+}
+
+#[test]
+fn listing_fits_weighs_key_length_not_entry_count() {
+    let many_short = long_listing(100, 8);
+    let few_long = long_listing(3, 2_000);
+    let budget = 100 * (8 + wire::AE_ENTRY_MAX_WIRE_LEN);
+    assert!(super::serve::listing_fits(&many_short, budget));
+    assert!(
+        !super::serve::listing_fits(&few_long, budget),
+        "three 2000-byte keys outweigh a hundred 8-byte ones"
+    );
+}
+
+#[test]
+fn listing_fits_agrees_with_chunk_ae_listing_on_what_is_one_slice() {
+    let entries: Vec<_> = (0..20)
+        .map(|n| listing_entry(n, 10 + 7 * usize::try_from(n).expect("small")))
+        .collect();
+    let total = listing_cost(&entries);
+    for budget in [0, 1, total / 3, total - 1, total, total + 1] {
+        let one_slice = super::serve::chunk_ae_listing(entries.clone(), budget).len() == 1;
+        assert_eq!(
+            super::serve::listing_fits(&entries, budget),
+            one_slice,
+            "budget {budget} of {total}"
+        );
+    }
+}
+
+#[test]
+fn listing_or_sketch_answers_a_small_bucket_of_long_keys_with_a_sketch() {
+    // Three keys of a sixth of a frame each: a bucket far under min_bucket
+    // whose listing passes the half frame one reply may hold.
+    let long = long_listing(3, MAX_FRAME / 6);
+    assert!(!super::serve::listing_fits(
+        &long,
+        super::serve::AE_LISTING_BUDGET
+    ));
+    let super::serve::ListingOrSketch::Sketch(cells) =
+        super::serve::listing_or_sketch(long.clone(), 384, 6)
+    else {
+        panic!("a listing past half a frame goes out as a sketch");
+    };
+    let mut expected = crate::cluster::sketch::Iblt::new(6);
+    for kv in &long {
+        expected.insert(xxhash_rust::xxh3::xxh3_64(&kv.key), kv.version);
+    }
+    assert_eq!(
+        cells,
+        expected.into_cells(),
+        "the sketch covers every key's hash and version"
+    );
+}
+
+#[test]
+fn listing_or_sketch_keeps_a_listing_that_fills_the_budget_exactly() {
+    let half = super::serve::AE_LISTING_BUDGET / 2 - wire::AE_ENTRY_MAX_WIRE_LEN;
+    let exact = long_listing(2, half);
+    assert!(super::serve::listing_fits(
+        &exact,
+        super::serve::AE_LISTING_BUDGET
+    ));
+    assert_eq!(
+        super::serve::listing_or_sketch(exact.clone(), 384, 6),
+        super::serve::ListingOrSketch::Listing(exact),
+        "a listing of exactly half a frame stays a listing"
+    );
+    let over = long_listing(2, half + 1);
+    assert!(matches!(
+        super::serve::listing_or_sketch(over, 384, 6),
+        super::serve::ListingOrSketch::Sketch(_)
+    ));
+}
+
+#[test]
+fn listing_or_sketch_still_sketches_a_bucket_of_short_keys_past_min_bucket() {
+    let short = long_listing(5, 8);
+    assert!(super::serve::listing_fits(
+        &short,
+        super::serve::AE_LISTING_BUDGET
+    ));
+    assert!(matches!(
+        super::serve::listing_or_sketch(short.clone(), 4, 6),
+        super::serve::ListingOrSketch::Sketch(_)
+    ));
+    assert_eq!(
+        super::serve::listing_or_sketch(short.clone(), 5, 6),
+        super::serve::ListingOrSketch::Listing(short),
+        "short keys within min_bucket stay a listing"
+    );
+}
+
 #[test]
 fn chunk_ae_listing_keeps_every_entry_in_order_across_chunks() {
     let entries: Vec<_> = (0..50).map(|n| listing_entry(n, 16)).collect();

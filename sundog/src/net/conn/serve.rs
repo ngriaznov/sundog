@@ -71,10 +71,11 @@ pub(super) async fn serve_state_transfer(
 /// difference is where `local` comes from. The three-tier responder rule: a
 /// bucket whose local entry count exceeds `handler.ae_part_min_bucket()`
 /// replies with its 64 part digests ([`Msg::AePartDigests`]) without ever
-/// materializing its listing; a smaller mismatched bucket falls back to the
-/// existing rule, an IBLT sketch past `handler.ae_sketch_min_bucket()`
-/// entries or else the full [`Msg::AeBucket`] listing. Does not append the
-/// trailing [`Msg::ReqDone`]; callers add it.
+/// materializing its listing; a smaller mismatched bucket falls back to
+/// [`listing_or_sketch`]: an IBLT sketch past `handler.ae_sketch_min_bucket()`
+/// entries or when its listing would pass [`AE_LISTING_BUDGET`], else the
+/// full [`Msg::AeBucket`] listing. Does not append the trailing
+/// [`Msg::ReqDone`]; callers add it.
 async fn ae_mismatch_replies(
     cache: &SmolStr,
     local: &std::collections::HashMap<u16, u64>,
@@ -608,8 +609,9 @@ pub(super) async fn serve_st_buckets(
 
 /// Serves an `AeParts` request: the part-grained counterpart of
 /// [`serve_ae_digest`]'s classification step, one reply per requested
-/// `(bucket, part)` pair, a part past `handler.ae_sketch_min_bucket()`
-/// entries answered with [`Msg::AePartSketch`], otherwise
+/// `(bucket, part)` pair, answered by [`listing_or_sketch`]'s rule: a part
+/// past `handler.ae_sketch_min_bucket()` entries, or whose listing would pass
+/// [`AE_LISTING_BUDGET`], with [`Msg::AePartSketch`], otherwise
 /// [`Msg::AePart`]. Unlike `AeDigest`, never deferred by
 /// `MeshInner::defers_ae_digest_from`: a part request only ever follows a
 /// part-digest reply the requester already paid to compare.
@@ -630,7 +632,7 @@ pub(super) async fn serve_ae_parts(
 }
 
 /// Each of `parts`' [`Msg::AePart`] listing, or [`Msg::AePartSketch`] once
-/// the listing would outweigh one.
+/// [`listing_or_sketch`] finds the listing too large.
 async fn part_replies(
     cache: &SmolStr,
     parts: Vec<BucketPart>,
@@ -673,15 +675,19 @@ pub(super) enum ListingOrSketch {
 }
 
 /// The one crossover rule for [`serve_ae_digest`] and [`serve_ae_parts`]:
-/// more than `min_bucket` entries answer with a `sketch_cells`-cell sketch
-/// over their `(key_hash, version)` pairs, anything up to it with the
-/// listing itself.
+/// a `sketch_cells`-cell sketch over the `(key_hash, version)` pairs when
+/// there are more than `min_bucket` entries or the listing would not fit
+/// [`AE_LISTING_BUDGET`] ([`listing_fits`]), the listing itself otherwise.
+/// A listing is one frame, so long keys put a small bucket past the budget
+/// where a sketch still costs a fixed size; a requester that cannot decode
+/// the sketch asks for the listing with `AeEntries`, which arrives in
+/// several frames.
 pub(super) fn listing_or_sketch(
     entries: Vec<KeyVersion>,
     min_bucket: usize,
     sketch_cells: usize,
 ) -> ListingOrSketch {
-    if entries.len() > min_bucket {
+    if entries.len() > min_bucket || !listing_fits(&entries, AE_LISTING_BUDGET) {
         let mut iblt = crate::cluster::sketch::Iblt::new(sketch_cells);
         for kv in &entries {
             iblt.insert(xxhash_rust::xxh3::xxh3_64(&kv.key), kv.version);
@@ -692,10 +698,35 @@ pub(super) fn listing_or_sketch(
     }
 }
 
-/// The encoded bytes of keys and versions one [`Msg::AeBucket`] reply to an
-/// `AeEntries` request carries before [`chunk_ae_listing`] starts the next:
-/// half a frame, leaving room for the cache name and the bucket.
+/// The encoded bytes of keys and versions one listing carries: half a frame,
+/// leaving room for the cache name and the bucket. A [`Msg::AeBucket`] reply
+/// to an `AeEntries` request holds this much before [`chunk_ae_listing`]
+/// starts the next, and a listing past it goes out as a sketch instead
+/// ([`listing_or_sketch`]).
 pub(super) const AE_LISTING_BUDGET: usize = MAX_FRAME / 2;
+
+/// What one entry adds to a listing's encoded size at most: its key's bytes
+/// plus [`AE_ENTRY_MAX_WIRE_LEN`]. [`chunk_ae_listing`] and [`listing_fits`]
+/// count a listing by it.
+fn listing_entry_cost(entry: &KeyVersion) -> usize {
+    entry.key.len() + AE_ENTRY_MAX_WIRE_LEN
+}
+
+/// Whether `entries` fit one listing of at most `budget` encoded bytes,
+/// counted by [`chunk_ae_listing`]'s rule: each key's bytes plus
+/// [`AE_ENTRY_MAX_WIRE_LEN`]. An empty listing fits any budget. Stops at the
+/// first entry that takes the total past `budget`. Pure; unit tested
+/// directly.
+pub(super) fn listing_fits(entries: &[KeyVersion], budget: usize) -> bool {
+    let mut used = 0usize;
+    for entry in entries {
+        used = used.saturating_add(listing_entry_cost(entry));
+        if used > budget {
+            return false;
+        }
+    }
+    true
+}
 
 /// Splits one bucket's `entries` into slices whose encoded size stays within
 /// `budget`, in order: a slice holds an entry only while its keys' bytes plus
@@ -707,18 +738,14 @@ pub(super) const AE_LISTING_BUDGET: usize = MAX_FRAME / 2;
 /// A key within a few hundred bytes of [`MAX_FRAME`] fits in no frame, so a
 /// listing that holds one still fails to send.
 pub(super) fn chunk_ae_listing(entries: Vec<KeyVersion>, budget: usize) -> Vec<Vec<KeyVersion>> {
-    let cost = |kv: &KeyVersion| kv.key.len() + AE_ENTRY_MAX_WIRE_LEN;
-    let total = entries
-        .iter()
-        .fold(0usize, |sum, kv| sum.saturating_add(cost(kv)));
-    if total <= budget {
+    if listing_fits(&entries, budget) {
         return vec![entries];
     }
     let mut chunks = Vec::new();
     let mut current = Vec::new();
     let mut used = 0usize;
     for kv in entries {
-        let len = cost(&kv);
+        let len = listing_entry_cost(&kv);
         if used > 0 && used + len > budget {
             chunks.push(std::mem::take(&mut current));
             used = 0;

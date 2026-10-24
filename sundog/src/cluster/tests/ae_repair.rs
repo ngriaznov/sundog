@@ -1233,3 +1233,128 @@ async fn anti_entropy_repairs_a_sketch_fallback_listing_larger_than_one_frame() 
     cluster_a.shutdown().await;
     cluster_b.shutdown().await;
 }
+
+// --- A small bucket of long keys answers with a sketch ---
+
+/// 300 keys of 8 KiB in one bucket: fewer entries than the default
+/// `ae_sketch_min_bucket` (384), and a listing of about 2.4 MB, past the
+/// half frame a listing may take.
+const LONG_KEYS: usize = 300;
+const LONG_KEY_LEN: usize = 8 * 1024;
+
+/// One round of node `a` against node `b`, where `b` holds [`LONG_KEYS`] keys
+/// of [`LONG_KEY_LEN`] bytes in one bucket and `a` holds those `a_lacks`
+/// leaves out. Asserts that `a` ends with every key and the two nodes with
+/// equal digests, and returns how many sketches the round decoded and how
+/// many it listed instead.
+async fn long_key_round(cluster_name: &str, a_lacks: impl Fn(usize) -> bool) -> (usize, usize) {
+    let config = ClusterConfig {
+        ae_interval: Duration::from_hours(1),
+        // Hashing and moving megabytes per round starves gossip on a busy
+        // test runner, and a failure detector that drops the peer for a
+        // moment fails the round with "not a known mesh member".
+        phi_threshold: 1_000.0,
+        ..loopback_config()
+    };
+    assert!(
+        LONG_KEYS <= config.ae_sketch_min_bucket,
+        "the bucket must sit under the count threshold"
+    );
+    let (cluster_a, cluster_b) = two_node_cluster_with_config(cluster_name, config).await;
+    let open = |cluster: &Cluster| {
+        cluster
+            .cache::<Vec<u8>, String>("long")
+            .mode(Mode::Replicated)
+            .open()
+    };
+    let cache_a = open(&cluster_a).await.expect("a opens");
+    let cache_b = open(&cluster_b).await.expect("b opens");
+    let name = SmolStr::new("long");
+    let shard_a = registered_shard(&cluster_a, &name);
+    let shard_b = registered_shard(&cluster_b, &name);
+
+    let keys = fat_keys_in_one_bucket(LONG_KEYS, LONG_KEY_LEN);
+    let writer = NodeId::from(9);
+    let record = |key: &Vec<u8>| WireRecord {
+        key: Bytes::from(postcard::to_stdvec(key).expect("key encodes")),
+        value: Some(Bytes::from(
+            postcard::to_stdvec("v").expect("value encodes"),
+        )),
+        ver: Hlc {
+            wall_ms: 50,
+            logical: 0,
+            node: writer,
+        },
+        expires_at_ms: None,
+    };
+    let mut held_by_a = 0u64;
+    for (i, key) in keys.iter().enumerate() {
+        shard_b.apply_remote(record(key)).await;
+        if !a_lacks(i) {
+            shard_a.apply_remote(record(key)).await;
+            held_by_a += 1;
+        }
+    }
+    assert_eq!(cache_a.entry_count().await, held_by_a);
+    assert_eq!(cache_b.entry_count().await, LONG_KEYS as u64);
+
+    let decoded = Arc::new(AtomicUsize::new(0));
+    let fallback = Arc::new(AtomicUsize::new(0));
+    let _guard = scoped_subscriber(AeSketchOutcomeSubscriber {
+        decoded: Arc::clone(&decoded),
+        fallback: Arc::clone(&fallback),
+    });
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        run_round_against(cluster_a.mesh(), &shard_a, &name, cluster_b.node_id()),
+    )
+    .await
+    .expect("the round completes within the bound");
+
+    assert_eq!(outcome, RoundOutcome::Reconciled);
+    wait_until(
+        Duration::from_secs(10),
+        "a pulls every key it lacked",
+        async || cache_a.entry_count().await == LONG_KEYS as u64,
+    )
+    .await;
+    assert_eq!(shard_a.digests().await, shard_b.digests().await);
+    let counts = (
+        decoded.load(Ordering::SeqCst),
+        fallback.load(Ordering::SeqCst),
+    );
+    cluster_a.shutdown().await;
+    cluster_b.shutdown().await;
+    counts
+}
+
+#[tokio::test]
+async fn anti_entropy_repairs_a_few_missing_long_keys_through_the_sketch_of_a_small_bucket() {
+    // Five of the 300 keys missing: the sketch of the bucket decodes, so the
+    // round never lists it.
+    let (decoded, fallback) =
+        long_key_round("cluster-it-ae-long-keys-decode", |i| i % 60 == 7).await;
+
+    assert_eq!(
+        decoded, 1,
+        "the bucket's listing passes half a frame, so it is sketched"
+    );
+    assert_eq!(
+        fallback, 0,
+        "five missing keys peel at the default sketch size"
+    );
+}
+
+#[tokio::test]
+async fn anti_entropy_repairs_every_missing_long_key_through_the_chunked_listing() {
+    // All 300 keys missing: the sketch cannot peel, so the round asks for the
+    // listing, which arrives in two frames, and pulls the keys in several
+    // batches under the pull request's key-byte cap.
+    let (decoded, fallback) = long_key_round("cluster-it-ae-long-keys-fallback", |_| true).await;
+
+    assert_eq!(decoded, 0);
+    assert_eq!(
+        fallback, 1,
+        "the sketch of 300 differing keys falls back to the listing"
+    );
+}

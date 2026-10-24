@@ -260,9 +260,10 @@ pub struct ClusterConfig {
     /// [`ae_part_min_bucket`](Self::ae_part_min_bucket) has narrowed a
     /// bucket to it. A sketch costs a fixed ~9 KB at the default
     /// `ae_sketch_cells`; a listing costs ~23 bytes per entry, so 384 is the
-    /// crossover for small keys. A listing sent in place of a sketch is one
-    /// frame, so keep this threshold times the largest key under
-    /// [`max_frame`](Self::max_frame).
+    /// crossover for small keys. A listing is one frame, so a listing that
+    /// would pass 2 MiB, half of the largest wire frame, goes out as a sketch
+    /// whatever the bucket's size: a bucket of long keys answers with a
+    /// sketch below this threshold.
     pub ae_sketch_min_bucket: usize,
     /// Cell count of the IBLT sketch built for a bucket past
     /// [`ae_sketch_min_bucket`](Self::ae_sketch_min_bucket). The default of

@@ -99,7 +99,8 @@ pub trait RequestHandler: Send + Sync + 'static {
     }
 
     /// Bucket size above which the responder answers with an IBLT sketch
-    /// instead of its full listing. Mirrors
+    /// instead of its full listing; a listing that would pass half a frame
+    /// goes out as a sketch whatever the size. Mirrors
     /// [`crate::config::ClusterConfig::ae_sketch_min_bucket`].
     fn ae_sketch_min_bucket(&self) -> usize {
         crate::config::ClusterConfig::default().ae_sketch_min_bucket

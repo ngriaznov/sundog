@@ -283,9 +283,10 @@ pub enum Msg {
     /// Anti-entropy round, step 2, large-bucket path: an IBLT sketch over a
     /// mismatched bucket's `(key_hash, version)` pairs, sent instead of
     /// [`Msg::AeBucket`] once the bucket's own listing would cost more on
-    /// the wire than the sketch. The initiator subtracts its own local
-    /// sketch from this one and peels the result; on failure it falls back
-    /// to [`Msg::AeEntries`].
+    /// the wire than the sketch: it holds more entries than
+    /// `ClusterConfig::ae_sketch_min_bucket`, or its listing would pass half
+    /// a frame. The initiator subtracts its own local sketch from this one
+    /// and peels the result; on failure it falls back to [`Msg::AeEntries`].
     AeSketch {
         cache: SmolStr,
         bucket: u16,
@@ -335,8 +336,9 @@ pub enum Msg {
         entries: Vec<(Bytes, Hlc)>,
     },
     /// A part's IBLT sketch, the part-grained counterpart of
-    /// [`Msg::AeSketch`], sent once the part's own entry count passes
-    /// `ClusterConfig::ae_sketch_min_bucket`.
+    /// [`Msg::AeSketch`], sent by the same rule: the part holds more entries
+    /// than `ClusterConfig::ae_sketch_min_bucket`, or its listing would pass
+    /// half a frame.
     AePartSketch {
         cache: SmolStr,
         bucket: u16,

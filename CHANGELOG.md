@@ -82,6 +82,18 @@ All notable changes to this project are documented in this file. Format follows
   row. A debug line logs each shrink, and a warning logs the batch
   reaching one key, since a record then takes longer than the request timeout
   to arrive.
+- **A bucket of long keys answers a digest exchange.** A responder sent a
+  mismatched bucket, or a mismatched part of a large bucket, as one listing
+  frame when it held up to `ae_sketch_min_bucket` entries, 384 by default.
+  Keys averaging above about 10.9 KiB at that count passed the 4 MiB frame
+  cap, the reply failed to encode, the connection closed, and the digest
+  exchange for that cache with that peer failed every round. A listing that
+  would pass 2 MiB, half a frame, now goes out as a sketch whatever the
+  bucket's size. A requester decodes it against its own entries and asks for
+  the listing with `AeEntries` when it does not decode, and that reply
+  arrives in several frames to a requester on protocol 9 or later and as one
+  frame to an older one. The wire stays at protocol 9, and a 0.6.8 requester
+  takes the sketch as it takes one for a large bucket.
 - **A delete in a batch of peer records keeps what it removed out of the
   merges after it.** A replicate, anti-entropy or state-transfer batch that
   carries a delete of a key and then merges into the same key, applied over a

@@ -320,6 +320,91 @@ fn an_undecodable_part_sketch_queues_its_bucket_for_the_whole_bucket_fallback() 
     assert_eq!(out.undecodable_buckets, vec![7]);
 }
 
+/// `count` keys of `len` bytes at distinct versions: a small bucket of long
+/// keys, the shape whose listing a responder sends as a sketch.
+fn long_key_bucket(count: u8, len: usize) -> Vec<(Bytes, Hlc)> {
+    (0..count)
+        .map(|i| {
+            let mut key = vec![0u8; len];
+            key[0] = i;
+            (Bytes::from(key), hlc(u64::from(i) + 1))
+        })
+        .collect()
+}
+
+/// The sketch a responder builds over `entries` with `cells` cells.
+fn sketch_over(entries: &[(Bytes, Hlc)], cells: usize) -> Vec<Cell> {
+    let mut sketch = Iblt::new(cells);
+    for (key, ver) in entries {
+        sketch.insert(xxh3_64(key), *ver);
+    }
+    sketch.into_cells()
+}
+
+/// Classifies `cells` against `local` at bucket scope when `part` is false
+/// and at part scope otherwise, under bucket 7.
+fn classify_sketch(part: bool, cells: Vec<Cell>, local: &[(Bytes, Hlc)]) -> RepairPlan {
+    let cache = SmolStr::new("users");
+    let mut plan = RepairPlan::default();
+    if part {
+        handle_part_sketch_mismatch(&cache, 7, cells, local, &mut plan, false);
+    } else {
+        handle_sketch_mismatch(&cache, 7, cells, local, &mut plan, false);
+    }
+    plan
+}
+
+#[test]
+fn a_sketch_of_a_small_bucket_of_long_keys_decodes_against_the_local_entries() {
+    let bucket = long_key_bucket(6, 16 * 1024);
+    let local = &bucket[..4];
+    let mut missing: Vec<u64> = bucket[4..].iter().map(|(key, _)| xxh3_64(key)).collect();
+    missing.sort_unstable();
+    for part in [false, true] {
+        let plan = classify_sketch(part, sketch_over(&bucket, 240), local);
+        assert!(
+            plan.undecodable_buckets.is_empty(),
+            "part {part}: {:?}",
+            plan.undecodable_buckets
+        );
+        assert!(
+            plan.push_keys.is_empty(),
+            "part {part}: {:?}",
+            plan.push_keys
+        );
+        let [(7, hashes)] = plan.pull_hashes.as_slice() else {
+            panic!("part {part}: one bucket pulls: {:?}", plan.pull_hashes);
+        };
+        let mut hashes = hashes.clone();
+        hashes.sort_unstable();
+        assert_eq!(
+            hashes, missing,
+            "part {part}: pulls exactly the missing keys"
+        );
+    }
+}
+
+#[test]
+fn a_sketch_of_a_small_bucket_of_long_keys_that_does_not_decode_queues_the_listing_fallback() {
+    // Forty keys against a 6-cell sketch and an empty local bucket: past what
+    // the sketch peels, the case of a requester that holds none of them.
+    let bucket = long_key_bucket(40, 4 * 1024);
+    for part in [false, true] {
+        let plan = classify_sketch(part, sketch_over(&bucket, 6), &[]);
+        assert_eq!(plan.undecodable_buckets, vec![7], "part {part}");
+        assert!(
+            plan.push_keys.is_empty(),
+            "part {part}: {:?}",
+            plan.push_keys
+        );
+        assert!(
+            plan.pull_hashes.is_empty(),
+            "part {part}: {:?}",
+            plan.pull_hashes
+        );
+    }
+}
+
 #[test]
 fn settle_bucket_parts_drops_a_bucket_with_an_undecodable_part_and_queues_it_once() {
     let mut gathered: HashMap<u16, RepairPlan> = HashMap::new();
