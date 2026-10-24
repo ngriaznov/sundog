@@ -570,6 +570,11 @@ fn every_batch_that_ends_any_other_way_is_consumed() {
 /// quick to wait out, long enough that a loopback answer never reaches it.
 const SHORT_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// The request timeout of the tests where the answer after a timed-out key
+/// has to be quick, at most a quarter of it, or the batch does not grow: a
+/// loaded runner has 500 ms for a fresh dial and the answer, not 125 ms.
+const ROOMY_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// How long a slow answer waits: past every timeout above, and dropped with
 /// the test's runtime, never waited for.
 const SLOW_ANSWER: Duration = Duration::from_secs(5);
@@ -912,7 +917,7 @@ async fn a_key_that_times_out_alone_is_skipped_and_the_keys_after_it_land() {
     let keys = numbered_keys(0..4);
 
     let (pulled, complete) = pull_within(
-        SHORT_TIMEOUT,
+        ROOMY_TIMEOUT,
         &mesh,
         &shard,
         &name,
@@ -941,7 +946,7 @@ async fn a_hash_that_times_out_alone_is_skipped_and_the_hashes_after_it_land() {
     mesh.set_pull_limit(NodeId::from(2), &name, 1);
 
     let (pulled, complete) = pull_within(
-        SHORT_TIMEOUT,
+        ROOMY_TIMEOUT,
         &mesh,
         &shard,
         &name,
@@ -1109,7 +1114,7 @@ impl Logs {
 }
 
 #[tokio::test]
-async fn a_shrink_logs_at_debug_and_the_limit_reaching_one_warns() {
+async fn a_shrink_logs_at_debug_and_the_limit_reaching_one_warns_once() {
     use tracing_subscriber::layer::SubscriberExt as _;
 
     let logs = Logs::default();
@@ -1168,6 +1173,32 @@ async fn a_shrink_logs_at_debug_and_the_limit_reaching_one_warns() {
         logs.matching(tracing::Level::DEBUG, "shrinking the batch")
             .len(),
         2
+    );
+
+    mesh.set_pull_limit(NodeId::from(2), &name, 4);
+    pull_within(
+        SHORT_TIMEOUT,
+        &mesh,
+        &shard,
+        &name,
+        numbered_keys(20..24),
+        Vec::new(),
+    )
+    .await;
+
+    assert_eq!(peer.requested(), [4, 2, 1, 4, 2]);
+    assert_eq!(mesh.pull_limit(NodeId::from(2), &name), Some(1));
+    assert_eq!(
+        logs.matching(tracing::Level::DEBUG, "shrinking the batch")
+            .len(),
+        4,
+        "a limit that grew back shrinks to one again, and each shrink logs"
+    );
+    assert_eq!(
+        logs.matching(tracing::Level::WARN, "one key at a time")
+            .len(),
+        1,
+        "the warning comes the first time the limit reaches one for the peer and cache"
     );
     mesh.shutdown().await;
     responder.shutdown().await;

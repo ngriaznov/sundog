@@ -410,6 +410,54 @@ async fn pull_limit_is_kept_per_peer_and_cache_and_goes_with_the_peer() {
 }
 
 #[tokio::test]
+async fn first_one_key_warning_fires_once_per_peer_and_cache_and_goes_with_the_peer() {
+    let (mesh, _inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+    let first = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 1));
+    let second = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 2));
+    mesh.update_peers(vec![
+        peer_at(NodeId::from(2), first),
+        peer_at(NodeId::from(3), second),
+    ]);
+
+    assert!(mesh.first_one_key_warning(NodeId::from(2), "users"));
+    assert!(
+        !mesh.first_one_key_warning(NodeId::from(2), "users"),
+        "the same peer and cache warn once"
+    );
+    assert!(
+        mesh.first_one_key_warning(NodeId::from(2), "orders"),
+        "another cache of the same peer"
+    );
+    assert!(
+        mesh.first_one_key_warning(NodeId::from(3), "users"),
+        "the same cache of another peer"
+    );
+    assert!(
+        !mesh.first_one_key_warning(NodeId::from(42), "users"),
+        "a peer the mesh does not know never warns"
+    );
+
+    mesh.update_peers(vec![
+        peer_at(NodeId::from(2), first),
+        peer_at(NodeId::from(3), second),
+    ]);
+    assert!(
+        !mesh.first_one_key_warning(NodeId::from(2), "users"),
+        "an unchanged peer keeps its mark"
+    );
+
+    mesh.update_peers(vec![peer_at(NodeId::from(3), second)]);
+    mesh.update_peers(vec![
+        peer_at(NodeId::from(2), first),
+        peer_at(NodeId::from(3), second),
+    ]);
+    assert!(
+        mesh.first_one_key_warning(NodeId::from(2), "users"),
+        "a peer that left and came back warns again"
+    );
+}
+
+#[tokio::test]
 async fn request_to_an_unknown_peer_errors_instead_of_hanging() {
     let (mesh, _inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
     let err = mesh

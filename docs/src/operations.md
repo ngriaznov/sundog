@@ -355,14 +355,14 @@ a time`, that names the peer and the cache. An anti-entropy pull asks a peer for
 up to 4,096 keys, and the whole exchange, request and reply, has to finish
 within 10 seconds. A pull that times out goes out again with half the keys, and
 the batch to that peer, kept for each cache, shrinks until a pull fits. The
-warning means the batch has reached one key: a record takes longer than 10
-seconds to arrive, or the link to that peer is that slow. The batch doubles
-again after each answer that takes a quarter of the timeout or less, up to 4,096
-keys, so a peer that recovers returns to full batches. A key that times out
-alone waits for the next round, and a round that fails two pulls in a row
-stops pulling. Check the peer's load and the link to it, and the size of the
-values behind the keys; a debug log line for each shrink names the new batch
-size.
+warning appears the first time the batch reaches one key, once for each peer
+and cache, and means a record takes longer than 10 seconds to arrive, or the
+link to that peer is that slow. The batch doubles again after each answer that
+takes a quarter of the timeout or less, up to 4,096 keys, so a peer that
+recovers returns to full batches. A key that times out alone waits for the next
+round, and a round that fails two pulls in a row stops pulling. Check the
+peer's load and the link to it, and the size of the values behind the keys; a
+debug log line for each shrink names the new batch size.
 
 ### A spill tier drops evictions
 

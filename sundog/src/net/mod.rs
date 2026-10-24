@@ -177,6 +177,10 @@ struct PeerHandle {
     /// ([`Mesh::pull_limit`]). A cache absent from the map has not shrunk.
     /// Dropped with this handle when the peer departs.
     pull_limits: Mutex<HashMap<SmolStr, usize>>,
+    /// The caches whose pull limit to this peer has reached one key and
+    /// logged its warning ([`Mesh::first_one_key_warning`]). Dropped with
+    /// this handle when the peer departs.
+    pull_warned: Mutex<HashSet<SmolStr>>,
     /// [`mono_ms`] + 1 of the last `Replicate` frame enqueued, `0` if none.
     /// Read by [`Mesh::replicate_in_flight`].
     last_replicate_enqueued: Arc<AtomicU64>,

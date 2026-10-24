@@ -250,9 +250,9 @@ pub struct ClusterConfig {
     /// the mismatch to whichever parts differ before either side sends
     /// anything at bucket scale. Each mismatched part is then answered
     /// by the same rule [`ae_sketch_min_bucket`](Self::ae_sketch_min_bucket)
-    /// applies at bucket scale: a sketch past that many entries, a listing
-    /// otherwise. Effectively a three-tier responder rule: part digests,
-    /// then sketch, then listing.
+    /// applies at bucket scale: a sketch past that many entries or when its
+    /// listing would pass half a frame, a listing otherwise. Effectively a
+    /// three-tier responder rule: part digests, then sketch, then listing.
     pub ae_part_min_bucket: usize,
     /// Bucket size past which an anti-entropy responder answers a mismatch
     /// with an IBLT sketch instead of the bucket's full listing; the same
@@ -266,7 +266,8 @@ pub struct ClusterConfig {
     /// sketch below this threshold.
     pub ae_sketch_min_bucket: usize,
     /// Cell count of the IBLT sketch built for a bucket past
-    /// [`ae_sketch_min_bucket`](Self::ae_sketch_min_bucket). The default of
+    /// [`ae_sketch_min_bucket`](Self::ae_sketch_min_bucket), and for a bucket
+    /// or part whose listing would pass half a frame. The default of
     /// 240 decodes a difference of up to 100 elements in at least 99% of
     /// cases; an undecodable one falls back to a full listing, which the
     /// responder streams in frames of about 2 MiB. A count whose

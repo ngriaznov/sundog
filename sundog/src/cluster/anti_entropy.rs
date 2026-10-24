@@ -1199,14 +1199,15 @@ async fn pull_repairs(
 }
 
 /// Keeps `new` as the pull limit for `peer` and `cache`, and logs a shrink:
-/// at `debug` for every one, at `warn` when the limit reaches `1`.
+/// at `debug` for every one, and at `warn` the first time the limit reaches
+/// `1` for that peer and cache ([`Mesh::first_one_key_warning`]).
 fn note_pull_limit(mesh: &Mesh, peer: NodeId, cache: &SmolStr, old: usize, new: usize) {
     mesh.set_pull_limit(peer, cache, new);
     if new >= old {
         return;
     }
     tracing::debug!(%peer, %cache, limit = new, "anti-entropy pull timed out; shrinking the batch");
-    if new == 1 {
+    if new == 1 && mesh.first_one_key_warning(peer, cache) {
         tracing::warn!(
             %peer,
             %cache,

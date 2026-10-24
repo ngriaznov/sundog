@@ -37,7 +37,30 @@ async fn two_distributed_co_owners_resolving(
     Arc<dyn ShardOps>,
     Arc<dyn ShardOps>,
 ) {
-    use crate::cluster::test_support::{loopback_config, registered_shard, wait_for_peer_count};
+    two_distributed_co_owners_configured(
+        test_id,
+        name,
+        resolver,
+        crate::cluster::test_support::loopback_config(),
+    )
+    .await
+}
+
+/// [`two_distributed_co_owners_resolving`] with both nodes built under
+/// `config`.
+async fn two_distributed_co_owners_configured(
+    test_id: &str,
+    name: &SmolStr,
+    resolver: Option<Arc<dyn crate::store::ConflictResolver>>,
+    config: crate::config::ClusterConfig,
+) -> (
+    Cluster,
+    Cluster,
+    NodeId,
+    Arc<dyn ShardOps>,
+    Arc<dyn ShardOps>,
+) {
+    use crate::cluster::test_support::{registered_shard, wait_for_peer_count};
     use crate::store::Mode;
 
     let open = |cluster: &Cluster| {
@@ -51,7 +74,7 @@ async fn two_distributed_co_owners_resolving(
     };
     let b = Cluster::builder(format!("cluster-it-{test_id}"))
         .seeds(std::iter::empty())
-        .config(loopback_config())
+        .config(config.clone())
         .build()
         .await
         .expect("b builds");
@@ -60,7 +83,7 @@ async fn two_distributed_co_owners_resolving(
 
     let c = Cluster::builder(format!("cluster-it-{test_id}"))
         .seeds([b.local_gossip_addr()])
-        .config(loopback_config())
+        .config(config)
         .build()
         .await
         .expect("c builds");
@@ -308,8 +331,13 @@ async fn run_round_for_parts_pulls_under_the_limit_kept_for_the_peer() {
     use crate::cluster::test_support::wait_until;
 
     let name = SmolStr::new("scoped-round-pull-limit");
+    // Background anti-entropy is effectively off: it would pull the keys
+    // between two polls and leave the explicit round nothing to pull.
+    let mut config = crate::cluster::test_support::loopback_config();
+    config.ae_interval = Duration::from_secs(3600);
+    config.tombstone_ttl = config.bucket_release_window();
     let (b, c, node_b, shard_b, shard_c) =
-        two_distributed_co_owners("scoped-pull-limit", &name).await;
+        two_distributed_co_owners_configured("scoped-pull-limit", &name, None, config).await;
 
     let keys = keys_in_distinct_buckets(3);
     for &(key, _) in &keys {

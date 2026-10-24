@@ -79,13 +79,13 @@ All notable changes to this project are documented in this file. Format follows
   kept for each peer and cache, doubles after each answer that takes a quarter
   of the timeout or less, and stays within 4,096. A key that times out alone
   waits for the next round, and a round stops pulling after two failures in a
-  row. A debug line logs each shrink, and a warning logs the batch
-  reaching one key, since a record then takes longer than the request timeout
-  to arrive.
+  row. A debug line logs each shrink, and a warning logs the first time the
+  batch for a peer and cache reaches one key, since a record then takes longer
+  than the request timeout to arrive.
 - **A bucket of long keys answers a digest exchange.** A responder sent a
   mismatched bucket, or a mismatched part of a large bucket, as one listing
   frame when it held up to `ae_sketch_min_bucket` entries, 384 by default.
-  Keys averaging above about 10.9 KiB at that count passed the 4 MiB frame
+  Keys averaging above about 10.6 KiB at that count passed the 4 MiB frame
   cap, the reply failed to encode, the connection closed, and the digest
   exchange for that cache with that peer failed every round. A listing that
   would pass 2 MiB, half a frame, now goes out as a sketch whatever the

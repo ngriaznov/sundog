@@ -1,6 +1,6 @@
 //! The broadcast side of [`Mesh`].
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -198,6 +198,7 @@ impl Mesh {
             replicate_tx,
             dirty,
             pull_limits: Mutex::new(HashMap::new()),
+            pull_warned: Mutex::new(HashSet::new()),
             last_replicate_enqueued: Arc::new(AtomicU64::new(0)),
             ae_deferrals: AtomicU32::new(0),
             cancel,
@@ -521,6 +522,29 @@ impl Mesh {
                 .expect("invariant: pull limit lock is never poisoned")
                 .insert(SmolStr::new(cache), limit);
         }
+    }
+
+    /// Whether this is the first time `cache`'s pull limit to `peer` reached
+    /// one key: `true` once for each peer and cache, `false` after, and
+    /// `false` for a peer the mesh does not know. The mark lives with the
+    /// peer's handle, so a peer that left and came back warns again.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the peer-table lock or the peer's warning lock is poisoned.
+    pub(crate) fn first_one_key_warning(&self, peer: NodeId, cache: &str) -> bool {
+        let table = self
+            .inner
+            .peers
+            .read()
+            .expect("invariant: peers lock is never poisoned");
+        table.get(&peer).is_some_and(|handle| {
+            handle
+                .pull_warned
+                .lock()
+                .expect("invariant: pull warning lock is never poisoned")
+                .insert(SmolStr::new(cache))
+        })
     }
 
     /// Returns every peer marked dirty since the last call, clearing their
