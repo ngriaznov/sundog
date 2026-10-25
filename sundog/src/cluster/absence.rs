@@ -340,8 +340,11 @@ impl AbsenceTracker {
 
     /// Every member gone at least `retire_after`, crashed or graceful: the
     /// members whose writer incarnations the CRDT sweep may retire. Reads
-    /// the never-pruned `gone_since` field, so unlike
-    /// [`AbsenceTracker::holding_gc`] it never ages an absence out.
+    /// `gone_since`, which [`AbsenceTracker::holding_gc`] never ages, so
+    /// tombstone collection's bounds do not shorten it. A forgetting pass
+    /// ([`AbsenceTracker::forget_departed`],
+    /// [`AbsenceTracker::prune_gone_older_than`]) clears the field once the
+    /// member has been gone longer than the CRDT fold receipt lifetime.
     pub(crate) fn gone_longer_than(&self, retire_after: Duration) -> Vec<NodeId> {
         let state = self.state();
         let now = Instant::now();
@@ -372,7 +375,8 @@ impl AbsenceTracker {
     }
 
     /// When this member is first observed live; `None` until then, or once
-    /// [`AbsenceTracker::prune_gone_older_than`] forgets it.
+    /// a forgetting pass ([`AbsenceTracker::forget_departed`] or
+    /// [`AbsenceTracker::prune_gone_older_than`]) clears it.
     pub(crate) fn known_since(&self, node: NodeId) -> Option<Instant> {
         self.state().members.get(&node).and_then(|r| r.known_since)
     }

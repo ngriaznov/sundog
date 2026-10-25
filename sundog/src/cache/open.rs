@@ -385,10 +385,10 @@ where
 /// returns its cache.
 ///
 /// Dropped armed, which is what a dropped `open` future does, the guard marks
-/// the name closing on the cluster, cancels the cache's tasks and runs
-/// [`tear_down`] as a task on the cluster, then clears the mark. An `open` of
-/// the name waits for the mark. A drop that finds no runtime releases the name
-/// at once and runs nothing else.
+/// the name closing on the cluster, seals the shard, cancels the cache's tasks
+/// and runs [`tear_down`] as a task on the cluster, then clears the mark. An
+/// `open` of the name waits for the mark. A drop that finds no runtime
+/// releases the name at once and runs nothing else.
 #[must_use = "an armed guard closes the cache it guards as soon as it drops"]
 pub(super) struct OpenGuard<K, V>
 where
@@ -447,17 +447,25 @@ where
             return;
         };
         let mark = registration.cluster.mark_closing(registration.shard.name());
+        // The teardown owns the name's release and the mark's clear from here
+        // on, so a panic below frees the name on its way out of this drop
+        // instead of leaving it closing for good.
+        let teardown = Teardown {
+            registration,
+            mark,
+            completed: false,
+        };
+        let registration = &teardown.registration;
+        // Sealed before the tasks are cancelled, the order `tear_down` keeps:
+        // the fan-out task's last drain then carries the folds and the held
+        // forwards the seal hands it.
+        registration.shard.seal_for_close();
         registration.cancel.cancel();
         tracing::info!(
             cache = %registration.shard.name(),
             "open dropped before it returned; closing the cache it registered"
         );
         let cluster = registration.cluster.clone();
-        let teardown = Teardown {
-            registration,
-            mark,
-            completed: false,
-        };
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => cluster.spawn_tracked_on(&runtime, teardown.run()),
             // No runtime to run on, as at the teardown of one: the drop of
@@ -468,7 +476,8 @@ where
 }
 
 /// A dropped `open`'s teardown. Dropped before it completes, as a runtime that
-/// shuts down drops its tasks, it still releases the name and clears the mark.
+/// shuts down drops its tasks, or by a panic in the guard's drop, it still
+/// releases the name and clears the mark.
 struct Teardown<K, V>
 where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,

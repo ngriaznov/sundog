@@ -4,6 +4,7 @@
 use super::startup::dead_gossip_addr;
 use super::*;
 use crate::cache::open::{OpenGuard, reserve_name};
+use crate::store::FanOutItem;
 
 /// How long a cancelled open runs before its timeout drops it: past the registry insert, inside
 /// the wait for a donor or a pull.
@@ -193,15 +194,22 @@ async fn a_retry_after_a_cancelled_distributed_open_opens_a_working_cache() {
 /// A peer stops seeing the mode and the loader a cancelled open advertised.
 #[tokio::test]
 async fn a_cancelled_open_clears_the_mode_and_loader_it_advertised() {
+    // `a` never opens `x` and declines every pull, so b's open ends on its own once the decline
+    // grace, a fifth of the budget, passes: the budget keeps the open waiting well past the
+    // gossip that carries the advert.
+    let config = ClusterConfig {
+        state_transfer_budget: Duration::from_secs(60),
+        ..loopback_config()
+    };
     let a = Cluster::builder("cache-it-cancelled-advert")
         .seeds(std::iter::empty())
-        .config(loopback_config())
+        .config(config.clone())
         .build()
         .await
         .expect("a builds");
     let b = Cluster::builder("cache-it-cancelled-advert")
         .seeds([a.local_gossip_addr()])
-        .config(loopback_config())
+        .config(config)
         .build()
         .await
         .expect("b builds");
@@ -243,6 +251,27 @@ async fn a_cancelled_open_clears_the_mode_and_loader_it_advertised() {
     a.shutdown().await;
 }
 
+/// Registers `shard` under its name in `cluster` the way `open` does, and returns the token and
+/// the tracker its tasks run under with the guard.
+async fn register_shard<V>(
+    cluster: &Cluster,
+    shard: &Arc<Shard<u32, V>>,
+) -> (CancellationToken, TaskTracker, OpenGuard<u32, V>)
+where
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    let name = SmolStr::new(shard.name());
+    reserve_name(cluster, &name, shard)
+        .await
+        .expect("the name is free");
+    cluster.advertise_cache_mode(&name, Mode::Local);
+    cluster.mark_warm(&name);
+    let cancel = cluster.cancel_token().child_token();
+    let tasks = TaskTracker::new();
+    let guard = OpenGuard::new(cluster, shard, &cancel, &tasks);
+    (cancel, tasks, guard)
+}
+
 /// A shard registered under `name` in `cluster` the way `open` registers one, and its guard.
 struct Registered {
     #[cfg(feature = "spill")]
@@ -253,23 +282,15 @@ struct Registered {
 }
 
 async fn register(cluster: &Cluster, name: &str) -> Registered {
-    let name = SmolStr::new(name);
     let shard = Arc::new(Shard::<u32, String>::new(
-        name.clone(),
+        SmolStr::new(name),
         Mode::Local,
         cluster.node_id(),
         u64::MAX,
         None,
         None,
     ));
-    reserve_name(cluster, &name, &shard)
-        .await
-        .expect("the name is free");
-    cluster.advertise_cache_mode(&name, Mode::Local);
-    cluster.mark_warm(&name);
-    let cancel = cluster.cancel_token().child_token();
-    let tasks = TaskTracker::new();
-    let guard = OpenGuard::new(cluster, &shard, &cancel, &tasks);
+    let (cancel, tasks, guard) = register_shard(cluster, &shard).await;
     Registered {
         #[cfg(feature = "spill")]
         shard,
@@ -335,6 +356,92 @@ async fn a_dropped_guard_closes_the_cache_and_frees_the_name() {
         !cluster.is_closing("g")
     })
     .await;
+    cluster.shutdown().await;
+}
+
+/// The drop seals the shard before it cancels the tasks, the order `tear_down` keeps: a fan-out
+/// task that the cancel wakes drains the backlog on its way out, so a fold pending in a merge
+/// window is in what it drains.
+#[tokio::test]
+async fn a_dropped_guard_flushes_the_pending_merges_before_the_fan_out_task_drains() {
+    let cluster = solo_cluster("cache-it-guard-seal-first").await;
+    let shard = Arc::new(
+        Shard::<u32, PnCounter>::new(
+            SmolStr::new("g"),
+            Mode::Replicated,
+            cluster.node_id(),
+            u64::MAX,
+            None,
+            None,
+        )
+        .with_resolver(Arc::new(PnCounterResolver))
+        .with_merge_coalesce_window(Duration::from_secs(60)),
+    );
+    let (cancel, tasks, guard) = register_shard(&cluster, &shard).await;
+    let writer = WriterId::new(cluster.node_id(), cluster.local_incarnation());
+    shard
+        .merge(1, PnCounter::local_delta(writer, 7))
+        .await
+        .expect("the merge waits in its window");
+    assert_eq!(shard.get(&1).await, None, "the fold is still pending");
+    // Stands in for the fan-out task, which breaks out of its loop on the cancel and drains once.
+    let drained = Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let queue = shard.fan_out_queue();
+        let drained = Arc::clone(&drained);
+        cluster.spawn_tracked_in(&tasks, async move {
+            cancel.cancelled().await;
+            *drained.lock().expect("lock") = queue.drain();
+        });
+    }
+
+    drop(guard);
+
+    wait_until(Duration::from_secs(10), "the name is freed", async || {
+        !is_registered(&cluster, "g")
+    })
+    .await;
+    let drained = std::mem::take(&mut *drained.lock().expect("lock"));
+    assert!(
+        matches!(drained.as_slice(), [FanOutItem::Applied(1, _)]),
+        "the final drain carries the flushed fold: {drained:?}"
+    );
+    cluster.shutdown().await;
+}
+
+/// Wakes by panicking, as a foreign waker parked on the cancel token does.
+struct PanickingWaker;
+
+impl std::task::Wake for PanickingWaker {
+    fn wake(self: Arc<Self>) {
+        panic!("a waker that panics");
+    }
+}
+
+/// A panic inside the drop must not leave the name closing, which would hold every later `open`
+/// of it forever.
+#[tokio::test]
+async fn a_guard_whose_drop_panics_still_frees_the_name_and_clears_the_mark() {
+    let cluster = solo_cluster("cache-it-guard-panics").await;
+    let registered = register(&cluster, "g").await;
+    let waker = std::task::Waker::from(Arc::new(PanickingWaker));
+    let mut parked = Box::pin(registered.cancel.cancelled());
+    assert!(
+        parked
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(&waker))
+            .is_pending(),
+        "the waker is parked on the token"
+    );
+
+    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(registered.guard);
+    }));
+
+    assert!(dropped.is_err(), "the cancel wakes the waker, which panics");
+    assert!(!is_registered(&cluster, "g"), "the name is free");
+    assert!(!cluster.is_closing("g"), "the mark is cleared");
+    assert_nothing_listed(&cluster);
     cluster.shutdown().await;
 }
 

@@ -346,11 +346,14 @@ where
     /// `tokio::time::timeout` or a `select!` branch does, closes the cache it
     /// registered the way [`Cache::close`] does: the background tasks stop,
     /// the spill tier closes (with the checkpoint `SpillConfig::warm_reopen`
-    /// asks for), and the name leaves the cluster with its gossiped mode and
-    /// loader. An `open` of the same name that starts meanwhile waits for that
-    /// close and then proceeds, so a retry after a timeout is not refused with
-    /// [`CacheError::AlreadyOpen`]. [`Cluster::shutdown`] waits for a close
-    /// that is running.
+    /// asks for, when a runtime runs the close), and the name leaves the
+    /// cluster with its gossiped mode and loader. A drop that finds no runtime
+    /// to run the close on, or whose close the runtime drops before it ends,
+    /// frees the name and closes the spill tier without the checkpoint, so the
+    /// next open of a `warm_reopen` cache starts cold. An `open` of the same
+    /// name that starts meanwhile waits for that close and then proceeds, so a
+    /// retry after a timeout is not refused with [`CacheError::AlreadyOpen`].
+    /// [`Cluster::shutdown`] waits for a close that is running.
     ///
     /// # Panics
     ///
