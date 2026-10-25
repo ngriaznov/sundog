@@ -119,7 +119,9 @@ impl SpillConfig {
 
     /// Overrides how long a bulk write or rebalance/replication chunk
     /// apply waits for flush-queue room before the immediate
-    /// `queue_full`/`deferred` refuse. Default two seconds;
+    /// `queue_full`/`deferred` refuse, its waits counted together and the
+    /// time it spends applying and evicting between them left out. Default
+    /// two seconds;
     /// `Duration::ZERO` disables the wait. Set against
     /// `cluster::state_transfer::per_donor_budget`: too large a value can
     /// turn a slow chunk into a spurious rebalance failure.

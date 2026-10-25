@@ -345,18 +345,18 @@ async fn retry_reservation_deficit_keeps_the_batchs_own_entries() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Pins that `retry_reservation_deficit` shares
-/// `reserve_for_batch`'s deadline instead of opening a second, fresh
-/// `spill_wait_timeout` window: the whole `apply_grouped` call stays
-/// bounded by one timeout total. A background task holds the tier's
-/// admission budget for `HOG_HOLD` first, so a shared deadline
-/// (finishes near `SPILL_WAIT_TIMEOUT`) is distinguishable from a
-/// fresh one (`HOG_HOLD` + `SPILL_WAIT_TIMEOUT`).
+/// Pins that `retry_reservation_deficit`'s waits share what
+/// `reserve_for_batch`'s wait left of the budget instead of opening a
+/// second, fresh `spill_wait_timeout` window: the `apply_grouped` call's
+/// waits stay within one timeout total. A background task holds the tier's
+/// admission budget for `HOG_HOLD` first, so a shared budget (finishes
+/// near `SPILL_WAIT_TIMEOUT`) is distinguishable from a fresh one
+/// (`HOG_HOLD` + `SPILL_WAIT_TIMEOUT`).
 #[tokio::test]
 async fn apply_grouped_bounds_its_whole_reservation_wait_to_one_spill_wait_timeout() {
     const SPILL_WAIT_TIMEOUT: Duration = Duration::from_millis(300);
     /// Half the budget, leaving a clear gap between the "shared" and
-    /// "fresh" deadline totals so scheduling jitter cannot blur them.
+    /// "fresh" budget totals so scheduling jitter cannot blur them.
     const HOG_HOLD: Duration = Duration::from_millis(150);
 
     let dir = temp_dir("retry-deficit-shared-budget");
@@ -440,6 +440,159 @@ async fn apply_grouped_bounds_its_whole_reservation_wait_to_one_spill_wait_timeo
          full-budget wait would cost"
     );
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The wait budget a replicated batch's evictions share bounds their waits
+/// for room, not the batch's own work: a batch that is still applying when
+/// `spill_wait_timeout` has passed since it began waits for the flusher
+/// instead of refusing its remaining evictions. The pause stands in for that
+/// work and outlasts the budget; the flusher stays paused a little past it,
+/// so a budget measured from the batch's start would refuse the evictions
+/// into the full queue as `deferred`.
+#[tokio::test]
+async fn a_batch_whose_own_work_outlasts_the_wait_budget_still_waits_for_room() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    const NAME: &str = "retry-work-not-wait";
+    const KEYS: u32 = 20;
+    // Keys 1000.. encode in two bytes and "v" x 10 in eleven.
+    const FIRST_KEY: u32 = 1_000;
+    const SPILL_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+    const WORK: Duration = Duration::from_millis(2_500);
+    const FLUSHER_PAUSED_PAST_WORK: Duration = Duration::from_millis(200);
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let dir = temp_dir(NAME);
+    let record_len = u64::from(crate::store::spill::spill_record_len(2, 11));
+    let cfg = SpillConfig::new(&dir, 1 << 20)
+        .region_bytes(64 * 1024)
+        .flush_queue_bytes(record_len * 4)
+        .spill_wait_timeout(SPILL_WAIT_TIMEOUT);
+    let shard = Shard::<u32, String>::new(
+        SmolStr::new(NAME),
+        Mode::Replicated,
+        NodeId::from(1u64),
+        2,
+        None,
+        None,
+    )
+    .with_spill(&cfg)
+    .expect("tier opens");
+    let tier = Arc::clone(shard.engine.spill().expect("with_spill attaches a tier"));
+    tier.pause_flusher();
+    let resume = std::thread::spawn(move || {
+        std::thread::sleep(WORK + FLUSHER_PAUSED_PAST_WORK);
+        tier.resume_flusher();
+    });
+
+    crate::store::shard_write::RETRY_PAUSE.with(|pause| pause.set(Some(WORK)));
+    let records = (FIRST_KEY..FIRST_KEY + KEYS)
+        .map(|k| wire_record(k, "vvvvvvvvvv", hlc(u64::from(k), 2)))
+        .collect();
+    ShardOps::apply_remote_batch(&shard, records).await;
+    crate::store::shard_write::RETRY_PAUSE.with(|pause| pause.set(None));
+    resume.join().expect("the resume thread finishes");
+
+    let (mut timeouts, mut dropped) = (0, 0);
+    for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+        let of_this_cache = key
+            .key()
+            .labels()
+            .any(|label| label.key() == "cache" && label.value() == NAME);
+        if let (true, DebugValue::Counter(n)) = (of_this_cache, value) {
+            match key.key().name() {
+                "sundog_spill_wait_timeouts_total" => timeouts += n,
+                "sundog_spill_dropped_total" => dropped += n,
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(timeouts, 0, "no wait for room runs out");
+    assert_eq!(
+        dropped, 0,
+        "every eviction waits for the flusher and reaches disk, none refused"
+    );
+    for k in FIRST_KEY..FIRST_KEY + KEYS {
+        assert!(
+            shard.get(&k).await.is_some(),
+            "key {k} is present, resident or spilled"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A tier whose channel takes no job it admits, as one whose flusher is gone,
+/// grants a retry round its reservation at once, from the permits every
+/// abandoned hand-off hands back, and the round frees nothing. The retries
+/// end there and the closing pass runs, instead of the call spinning: the
+/// flush queue holds three records, fewer than one eviction batch takes, and
+/// stripe 0 holds forty entries over the cap, so every round leaves a deficit.
+#[test]
+fn a_retry_over_a_tier_that_takes_no_job_ends() {
+    const NAME: &str = "retry-no-flusher";
+    let dir = temp_dir(NAME);
+    let value = "x".repeat(20);
+    let encoded_len = postcard::to_stdvec(&value)
+        .expect("test value encodes")
+        .len();
+    let stripe = |k: u32| engine::stripe_index_from_hash(engine::hash_key_bytes(&key_bytes(&k)));
+    // Keys of three encoded bytes alike, so one record length fits each.
+    let in_stripe_zero: Vec<u32> = (16_384..2_097_152u32)
+        .filter(|&k| stripe(k) == 0)
+        .take(41)
+        .collect();
+    assert_eq!(
+        in_stripe_zero.len(),
+        41,
+        "41 three-byte keys land in stripe 0"
+    );
+    let record_len = spill::spill_record_len(key_bytes(&in_stripe_zero[0]).len(), encoded_len);
+    let cfg = SpillConfig::new(&dir, 1 << 20)
+        .region_bytes(4096)
+        .flush_queue_bytes(u64::from(record_len) * 3)
+        .spill_wait_timeout(Duration::from_millis(500));
+    let shard = Arc::new(Shard::<u32, String>::new(
+        SmolStr::new(NAME),
+        Mode::Local,
+        NodeId::from(1u64),
+        2,
+        None,
+        None,
+    ));
+    // Published with no flusher attached: the tier admits within its budget
+    // and fails every enqueue, as one whose flusher is gone does.
+    shard.engine.set_spill(Arc::new(
+        spill::SpillTier::open(&cfg, NAME).expect("tier opens"),
+    ));
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = {
+        let shard = Arc::clone(&shard);
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime builds");
+            runtime.block_on(async {
+                for &k in &in_stripe_zero[..40] {
+                    shard.insert(k, value.clone()).await.expect("insert");
+                }
+                shard
+                    .insert_many([(in_stripe_zero[40], value.clone())])
+                    .await
+                    .expect("insert_many");
+            });
+            let _ = done_tx.send(());
+        })
+    };
+
+    // A spinning call never yields, so it is watched from this thread.
+    assert!(
+        done_rx.recv_timeout(Duration::from_secs(30)).is_ok(),
+        "the batch's retries end over a tier that takes no job"
+    );
+    worker.join().expect("the worker does not panic");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1244,11 +1397,11 @@ async fn a_batch_reservation_covers_the_floor_charge_of_small_values() {
             )
         })
         .collect();
-    let (reservation, deadline) = shard
+    let (reservation, wait_left) = shard
         .reserve_for_batch(entries.iter().map(|(key, incoming)| (key, incoming)))
         .await;
 
-    assert!(reservation.is_some() && deadline.is_some());
+    assert!(reservation.is_some() && wait_left.is_some());
     assert_eq!(
         tier.queued_bytes(),
         3 * floor,

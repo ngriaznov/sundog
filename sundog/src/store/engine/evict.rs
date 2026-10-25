@@ -812,6 +812,28 @@ where
         )
     }
 
+    /// [`Engine::enforce_capacity_with_reservation`], also answering the
+    /// weight its passes freed; see [`Engine::evict_down_to_freeing`].
+    /// `Shard::retry_reservation_deficit` reads it to tell a round that
+    /// moved victims from one that only had its hand-offs abandoned.
+    #[cfg(feature = "spill")]
+    pub(crate) fn enforce_capacity_freeing(
+        &self,
+        start_bucket: usize,
+        reservation: Option<&mut Reservation<'_>>,
+        written: &mut Written,
+        now_ms: u64,
+    ) -> (u64, u64) {
+        self.evict_down_to_freeing(
+            self.max_capacity,
+            start_bucket,
+            reservation,
+            written,
+            OnRefusal::TierPolicy,
+            now_ms,
+        )
+    }
+
     /// [`Engine::enforce_capacity_with_reservation`]'s loop, evicting until
     /// `total_weight` plus `pending_spill_weight` is within `limit`, at
     /// most `max_capacity`. [`Engine::promote_locked`] passes the cap less
@@ -830,14 +852,39 @@ where
         &self,
         limit: u64,
         start_bucket: usize,
-        mut reservation: Option<&mut Reservation<'_>>,
+        reservation: Option<&mut Reservation<'_>>,
         written: &mut Written,
         on_refusal: OnRefusal,
         now_ms: u64,
     ) -> u64 {
+        self.evict_down_to_freeing(
+            limit,
+            start_bucket,
+            reservation,
+            written,
+            on_refusal,
+            now_ms,
+        )
+        .0
+    }
+
+    /// [`Engine::evict_down_to`], also answering the weight its passes
+    /// freed, as [`EvictOutcome::removed_weight`] counts it: removed, or
+    /// handed to a flusher that took the job. An abandoned hand-off frees
+    /// nothing.
+    pub(super) fn evict_down_to_freeing(
+        &self,
+        limit: u64,
+        start_bucket: usize,
+        mut reservation: Option<&mut Reservation<'_>>,
+        written: &mut Written,
+        on_refusal: OnRefusal,
+        now_ms: u64,
+    ) -> (u64, u64) {
         if self.max_capacity == u64::MAX {
-            return 0;
+            return (0, 0);
         }
+        let mut freed = 0u64;
         let mut bucket = start_bucket;
         // Whether a scan just found a victim in `bucket`: the one pass that
         // follows samples that stripe, and evicts there only from a full
@@ -848,7 +895,7 @@ where
             let pending = self.pending_spill_weight_or_zero();
             let current = total.saturating_add(pending);
             if current <= limit {
-                return 0;
+                return (0, freed);
             }
             let over_by = current - limit;
             let batch_outcome = self.evict_batch_sampled_with_reservation(
@@ -860,11 +907,15 @@ where
                 on_refusal,
                 now_ms,
             );
+            freed += batch_outcome.removed_weight;
             if batch_outcome.deficit > 0 {
                 let total = self.total_weight.load(Ordering::Relaxed);
                 let pending = self.pending_spill_weight_or_zero();
                 let current = total.saturating_add(pending);
-                return deficit_once_still_over_capacity(current, limit, batch_outcome.deficit);
+                return (
+                    deficit_once_still_over_capacity(current, limit, batch_outcome.deficit),
+                    freed,
+                );
             }
             if batch_outcome.made_no_progress() && !after_scan {
                 if defer_to_flusher(
@@ -873,7 +924,7 @@ where
                     self.pending_spill_weight_or_zero(),
                     limit,
                 ) {
-                    return 0;
+                    return (0, freed);
                 }
                 match self.evict_one_scanning_with_reservation(
                     bucket,
@@ -889,12 +940,15 @@ where
                         bucket = start_bucket;
                         continue;
                     }
-                    None => return 0,
-                    Some((_, outcome)) if outcome.deficit > 0 => return outcome.deficit,
+                    None => return (0, freed),
+                    Some((_, outcome)) if outcome.deficit > 0 => {
+                        return (outcome.deficit, freed + outcome.removed_weight);
+                    }
                     // The scan stopped at a victim refused while a hand-off
                     // is in flight.
-                    Some((_, outcome)) if outcome.made_no_progress() => return 0,
-                    Some((found, _)) => {
+                    Some((_, outcome)) if outcome.made_no_progress() => return (0, freed),
+                    Some((found, outcome)) => {
+                        freed += outcome.removed_weight;
                         bucket = found;
                         after_scan = true;
                         continue;

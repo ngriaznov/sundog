@@ -50,7 +50,8 @@ cache needs a tier to take a `max_capacity` at all.
 | `warm_reopen` | off | whether a clean close checkpoints the tier for a fast restart |
 
 When the flusher falls behind, a batch write's eviction waits up to
-`spill_wait_timeout` for queue room; a single write's or a read's takes
+`spill_wait_timeout` for queue room, its waits counted together and the
+time the batch spends applying left out; a single write's or a read's takes
 room only when it is free. A write's eviction then deletes the victim in a
 `Local` or `Invalidation` cache. A `Replicated` or `Distributed` cache
 keeps it resident for a later pass instead, since deleting it locally

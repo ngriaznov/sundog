@@ -4,7 +4,7 @@ use super::*;
 use crate::store::fan_out::{fan_out_over_capacity, fill_fans_out};
 use crate::store::shard_build::clock_jumped;
 #[cfg(feature = "spill")]
-use crate::store::shard_write::retry_round_is_futile;
+use crate::store::shard_write::{retry_round_freed_nothing, retry_round_is_futile};
 
 /// `xxh3(key_bytes ‖ postcard(ver))` spelled out, the definition
 /// [`entry_fingerprint`] computes.
@@ -227,6 +227,54 @@ fn a_retry_round_is_futile_only_when_the_whole_queue_covered_nothing() {
         !retry_round_is_futile(WHOLE, WHOLE, WHOLE, 0),
         "nothing owed: the loop ends on its own"
     );
+}
+
+#[cfg(feature = "spill")]
+#[test]
+fn a_retry_round_freed_nothing_only_when_it_spent_and_moved_no_weight() {
+    let table = [
+        // (granted, unspent, freed, deficit, expected, why)
+        (
+            900,
+            0,
+            0,
+            1500,
+            true,
+            "spent all, freed nothing, still owing",
+        ),
+        (
+            900,
+            300,
+            0,
+            600,
+            true,
+            "spent some, freed nothing, still owing",
+        ),
+        (900, 0, 3, 600, false, "spent and freed weight: progress"),
+        (
+            900,
+            900,
+            0,
+            1200,
+            false,
+            "spent nothing: the next round asks for more",
+        ),
+        (
+            900,
+            0,
+            0,
+            0,
+            false,
+            "nothing owed: the loop ends on its own",
+        ),
+    ];
+    for (granted, unspent, freed, deficit, expected, why) in table {
+        assert_eq!(
+            retry_round_freed_nothing(granted, unspent, freed, deficit),
+            expected,
+            "{why}"
+        );
+    }
 }
 
 #[test]

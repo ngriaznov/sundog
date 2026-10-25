@@ -114,7 +114,7 @@ where
         // A held-only batch stores a record only as a fold into a key
         // already held, and most of its records store nothing, so it
         // reserves nothing and takes the apply's non-blocking path.
-        let (reservation, deadline) = match scope {
+        let (reservation, wait_left) = match scope {
             engine::ApplyScope::HeldOnly => (None, None),
             engine::ApplyScope::Any => {
                 self.reserve_for_batch(
@@ -172,7 +172,7 @@ where
             deficit
         };
         self.note_ignored_tombstones(written.ignored_tombstones(), hold_skewed);
-        self.retry_reservation_deficit(0, deficit, deadline, &mut written)
+        self.retry_reservation_deficit(0, deficit, wait_left, &mut written)
             .await;
     }
 

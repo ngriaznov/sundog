@@ -115,6 +115,18 @@ All notable changes to this project are documented in this file. Format follows
   under the same `NodeId` is noticed again for its protocol and reported again
   for a mode conflict: a conflict is reported once for each time the peer
   appears with it.
+- **A large batch into a spill cache waits for queue room instead of
+  refusing its evictions.** A batch apply's `spill_wait_timeout` ran on the
+  wall clock from the batch's start, so a batch whose own applying and
+  evicting outlasted it refused the evictions it had left
+  (`sundog_spill_dropped_total{reason="deferred"}` in a `Replicated` or
+  `Distributed` cache, `"queue_full"` otherwise) with no wait for room
+  having run out. A joiner whose anti-entropy push of a whole dataset lands
+  beside its own pull into a small `max_capacity` is such a batch. The
+  timeout bounds the batch's waits for room, counted together, and the time
+  it spends applying between them does not count. A batch over a tier that
+  takes no job it admits, as one whose flusher is gone, stops retrying at
+  the first round that frees nothing.
 - **A pull whose reply cannot arrive in time goes out again smaller.** A pull
   of large records, whose reply took longer than the 10-second request
   timeout, failed the same way every round, and its keys never repaired from

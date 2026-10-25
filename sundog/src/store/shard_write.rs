@@ -46,6 +46,34 @@ pub(super) const fn retry_round_is_futile(
     deficit > 0 && granted == whole_queue && unspent == granted
 }
 
+/// Whether a [`Shard::retry_reservation_deficit`] round shows that the
+/// tier takes no job it admits: it spent some of what it was `granted`
+/// (`unspent` is less), freed no weight (`freed`), and still owes a
+/// `deficit`. Every hand-off it committed came back abandoned, as from a
+/// flusher that is gone or a disk that fails each write, and those hand-offs
+/// returned the permits they took, so the next round would be granted at
+/// once and do the same. A round that spent nothing proves nothing here: its
+/// victim needs more than it asked for, and the next round asks for its
+/// whole deficit. Pure; unit tested directly.
+#[cfg(feature = "spill")]
+pub(super) const fn retry_round_freed_nothing(
+    granted: u32,
+    unspent: u32,
+    freed: u64,
+    deficit: u64,
+) -> bool {
+    deficit > 0 && unspent < granted && freed == 0
+}
+
+#[cfg(all(test, not(feature = "sim")))]
+thread_local! {
+    /// A pause [`Shard::retry_reservation_deficit`] on this thread takes
+    /// before its first round, standing in for an apply whose own work
+    /// outlasts the tier's `spill_wait_timeout`.
+    pub(super) static RETRY_PAUSE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Builds an [`Incoming::Put`], for the bulk-insert closures that reassemble one from a prepared tuple.
 fn put_incoming<V>(value: V, expires_at_ms: Option<u64>, encoded: Bytes) -> Incoming<V> {
     Incoming::Put {
@@ -533,10 +561,11 @@ where
     /// [`Shard::apply_grouped`]/[`ShardOps::apply_remote_batch`] call, before
     /// any stripe lock: sums `SpillTier::admit_charge` over every
     /// `Incoming::Put`, then makes one `SpillTier::reserve` call bounded by
-    /// the tier's `spill_wait_timeout`. Also returns that wait's deadline so
-    /// [`Shard::retry_reservation_deficit`] shares the same budget instead of
-    /// starting a fresh one. `None` for both when no spill tier is attached
-    /// or the reserve times out; the caller then falls back to
+    /// the tier's `spill_wait_timeout`. Also returns what that wait left of
+    /// the timeout, so [`Shard::retry_reservation_deficit`]'s waits share the
+    /// same budget instead of starting a fresh one. `None` for both when no
+    /// spill tier is attached; no reservation when the reserve times out, and
+    /// the caller then falls back to
     /// [`engine::Engine::apply_many_with_reservation`]'s non-blocking path.
     #[cfg_attr(
         not(feature = "spill"),
@@ -549,7 +578,7 @@ where
     pub(super) async fn reserve_for_batch<'e>(
         &self,
         entries: impl Iterator<Item = (&'e Bytes, &'e Incoming<V>)>,
-    ) -> (Option<Reservation<'_>>, Option<std::time::Instant>)
+    ) -> (Option<Reservation<'_>>, Option<Duration>)
     where
         V: 'e,
     {
@@ -568,9 +597,9 @@ where
                 .sum();
             let reserved = u32::try_from(reserved).unwrap_or(u32::MAX);
             let budget = tier.spill_wait_timeout_value();
-            let deadline = std::time::Instant::now() + budget;
+            let started = std::time::Instant::now();
             let reservation = tier.reserve(reserved, budget).await.ok();
-            (reservation, Some(deadline))
+            (reservation, Some(budget.saturating_sub(started.elapsed())))
         }
         #[cfg(not(feature = "spill"))]
         {
@@ -584,19 +613,29 @@ where
     /// resident (never dropped) when the call's one `Reservation` ran out.
     /// Retries with a fresh [`SpillTier::reserve`] for the remainder, then
     /// another `enforce_capacity_with_reservation` pass, until the deficit
-    /// clears or `deadline` passes. `deadline` is the same one
-    /// [`Shard::reserve_for_batch`] measured, not a fresh budget, so the
-    /// whole call stays bounded by one `spill_wait_timeout` rather than `2x`
-    /// it. A no-op when `deficit` is `0`. Once the budget runs out with a
-    /// deficit still outstanding, this makes one closing
-    /// [`engine::Engine::enforce_capacity`] call (`reservation: None`) so the
-    /// deficit is resolved before this call returns, not deferred to
-    /// whatever write happens to touch this shard next. A round that held
-    /// the whole flush queue and spent none of it ends the retries at once
-    /// (see [`retry_round_is_futile`]): the victim it stopped at needs more
-    /// than the whole queue, so no later reservation could cover it either.
-    /// Every pass leaves the entries `written` holds, the batch's own, for
-    /// last.
+    /// clears or a wait runs out. `wait_left` is what
+    /// [`Shard::reserve_for_batch`]'s wait left of the tier's
+    /// `spill_wait_timeout`, not a fresh budget, so the call's waits together
+    /// stay within one timeout rather than `2x` it. The timeout bounds
+    /// waiting for room: the time the call spends applying and evicting
+    /// between its waits does not count against it, so a large batch, whose
+    /// evictions alone outlast the timeout, still waits for the flusher
+    /// rather than refusing them. With the budget spent, a round's reserve is
+    /// one non-blocking check, and one that finds no room counts in
+    /// `sundog_spill_wait_timeouts_total`. A no-op when `deficit` is `0`.
+    /// Once a wait runs out with a deficit still outstanding, this makes one
+    /// closing [`engine::Engine::enforce_capacity`] call
+    /// (`reservation: None`) so the deficit is resolved before this call
+    /// returns, not deferred to whatever write happens to touch this shard
+    /// next. A round that held the whole flush queue and spent none of it
+    /// ends the retries at once (see [`retry_round_is_futile`]): the victim
+    /// it stopped at needs more than the whole queue, so no later
+    /// reservation could cover it either. So does a round that spent some of
+    /// its reservation and freed nothing (see [`retry_round_freed_nothing`]):
+    /// the tier takes no job it admits, and the permits its abandoned
+    /// hand-offs return would grant every later round at once. Both go to
+    /// the closing pass with no wait run out. Every pass leaves the entries
+    /// `written` holds, the batch's own, for last.
     #[cfg_attr(
         not(feature = "spill"),
         allow(
@@ -609,7 +648,7 @@ where
         &self,
         start_bucket: usize,
         deficit: u64,
-        deadline: Option<std::time::Instant>,
+        wait_left: Option<Duration>,
         written: &mut engine::Written,
     ) {
         #[cfg(feature = "spill")]
@@ -620,35 +659,39 @@ where
             let Some(tier) = self.engine.spill() else {
                 return;
             };
-            let Some(deadline) = deadline else {
+            let Some(mut wait_left) = wait_left else {
                 self.engine
                     .enforce_capacity(start_bucket, written, self.now_ms());
                 return;
             };
+            #[cfg(all(test, not(feature = "sim")))]
+            if let Some(pause) = RETRY_PAUSE.with(std::cell::Cell::get) {
+                std::thread::sleep(pause);
+            }
             let mut deficit = deficit;
             while deficit > 0 {
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
-                    // Budget already spent (initial wait or an earlier
-                    // iteration): skip straight to the closing fallback.
-                    break;
-                }
                 let bytes = u32::try_from(deficit).unwrap_or(u32::MAX);
-                match tier.reserve(bytes, remaining).await {
+                let waiting = std::time::Instant::now();
+                let reserved = tier.reserve(bytes, wait_left).await;
+                wait_left = wait_left.saturating_sub(waiting.elapsed());
+                match reserved {
                     Ok(mut reservation) => {
                         let granted = reservation.remaining();
-                        deficit = self.engine.enforce_capacity_with_reservation(
+                        let freed;
+                        (deficit, freed) = self.engine.enforce_capacity_freeing(
                             start_bucket,
                             Some(&mut reservation),
                             written,
                             self.now_ms(),
                         );
+                        let unspent = reservation.remaining();
                         if retry_round_is_futile(
                             granted,
                             tier.whole_queue_permits(),
-                            reservation.remaining(),
+                            unspent,
                             deficit,
-                        ) {
+                        ) || retry_round_freed_nothing(granted, unspent, freed, deficit)
+                        {
                             break;
                         }
                     }
@@ -664,7 +707,7 @@ where
         }
         #[cfg(not(feature = "spill"))]
         {
-            let _ = (start_bucket, deficit, deadline, written);
+            let _ = (start_bucket, deficit, wait_left, written);
         }
     }
 
@@ -674,7 +717,7 @@ where
     /// [`Shard::reserve_for_batch`], threading the `Reservation` through
     /// every bucket's [`engine::Engine::apply_many_with_reservation`] call.
     /// [`Shard::retry_reservation_deficit`] then pays down any deficit,
-    /// sharing the same deadline rather than a fresh budget.
+    /// sharing the same wait budget rather than a fresh one.
     ///
     /// # Errors
     ///
@@ -688,7 +731,7 @@ where
         let batch_entries: Vec<(u64, K, Bytes, Hlc, Incoming<V>)> =
             prepared.into_iter().map(to_batch_entry).collect();
 
-        let (reservation, deadline) = self
+        let (reservation, wait_left) = self
             .reserve_for_batch(
                 batch_entries
                     .iter()
@@ -750,7 +793,7 @@ where
             deficit
         };
         self.hand_off_bulk(&mut applied_keys, true);
-        self.retry_reservation_deficit(0, deficit, deadline, &mut written)
+        self.retry_reservation_deficit(0, deficit, wait_left, &mut written)
             .await;
         first_refusal_in_call_order(&stripe_of, &first_refused)
             .map_or(Ok(()), |size| Err(self.merge_too_large(size)))
