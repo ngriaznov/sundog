@@ -639,6 +639,89 @@ async fn open_warm(cluster: &Cluster, dir: &std::path::Path) -> Cache<u32, Strin
         .expect("opens")
 }
 
+/// A spill cache that is opening is registered before its spill tier runs, so a peer's frames
+/// reach it in that window. It drops them, as a cache that is not open does, and applies the
+/// ones that arrive once the open returns. A pause inside the tier's attach holds the open in
+/// the window while another thread delivers a batch to the registered shard.
+#[cfg(not(feature = "sim"))]
+#[tokio::test]
+async fn a_spill_cache_drops_peer_frames_until_its_tier_runs() {
+    const NAME: &str = "attach-holds-inbound";
+    let dir = fresh_spill_dir(NAME);
+    let cluster = solo_cluster_for("cache-it-attach-holds-inbound").await;
+    let record = |key: u32, value: &str| crate::wire::WireRecord {
+        key: bytes::Bytes::from(postcard::to_stdvec(&key).expect("key encodes")),
+        value: Some(bytes::Bytes::from(
+            postcard::to_stdvec(&value.to_string()).expect("value encodes"),
+        )),
+        ver: crate::hlc::Hlc {
+            wall_ms: 1,
+            logical: 0,
+            node: NodeId::from(99u64),
+        },
+        expires_at_ms: None,
+    };
+    let registered = |cluster: &Cluster| {
+        cluster
+            .shards()
+            .read()
+            .expect("invariant: shard registry lock is never poisoned")
+            .get(NAME)
+            .cloned()
+    };
+    let delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let peer = {
+        let (cluster, delivered) = (cluster.clone(), Arc::clone(&delivered));
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime builds");
+            runtime.block_on(async {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let shard = loop {
+                    if let Some(shard) = registered(&cluster) {
+                        break shard;
+                    }
+                    assert!(Instant::now() < deadline, "the open registers the cache");
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                shard.apply_remote_batch(vec![record(1, "early")]).await;
+                delivered.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+        })
+    };
+
+    crate::store::spill::ATTACH_PAUSE.with(|pause| pause.set(Some(Duration::from_secs(2))));
+    let cache = cluster
+        .cache::<u32, String>(NAME)
+        .mode(Mode::Replicated)
+        .spill(SpillConfig::new(&dir, 1 << 20).region_bytes(4096))
+        .open()
+        .await
+        .expect("opens");
+    crate::store::spill::ATTACH_PAUSE.with(|pause| pause.set(None));
+    peer.join().expect("the peer thread does not panic");
+
+    assert!(
+        delivered.load(std::sync::atomic::Ordering::SeqCst),
+        "the batch arrived while the open attached its tier"
+    );
+    assert_eq!(
+        cache.get(&1).await,
+        None,
+        "the cache dropped the batch it got before its tier ran"
+    );
+    registered(&cluster)
+        .expect("the open cache is registered")
+        .apply_remote_batch(vec![record(1, "late")])
+        .await;
+    assert_eq!(cache.get(&1).await.as_deref(), Some("late"));
+    cache.close().await;
+    cluster.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 async fn solo_cluster_for(label: &'static str) -> Cluster {
     Cluster::builder(label)
         .seeds(std::iter::empty())

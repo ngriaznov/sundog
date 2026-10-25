@@ -115,6 +115,18 @@ All notable changes to this project are documented in this file. Format follows
   under the same `NodeId` is noticed again for its protocol and reported again
   for a mode conflict: a conflict is reported once for each time the peer
   appears with it.
+- **A spill cache that is opening applies no peer record batch before its
+  spill tier runs.** The open registers the cache before it attaches the
+  tier, so a peer's replication, forwards and anti-entropy pushes reached it
+  during the attach and were applied to a cache with no tier. Their evictions
+  deleted replicated entries instead of spilling them, and one landing as the
+  tier was published but before its flusher started was refused into
+  `sundog_spill_dropped_total`. The cache drops those batches until the tier
+  runs, as it does before the open registers it. A `Replicated` or
+  `Distributed` open's state transfer or anti-entropy brings that data; an
+  `Invalidation` cache loses it as it loses any frame it misses, its TTL the
+  bound on staleness. Invalidations apply throughout. The tier is published
+  only after its flusher has started.
 - **A large batch into a spill cache waits for queue room instead of
   refusing its evictions.** A batch apply's `spill_wait_timeout` ran on the
   wall clock from the batch's start, so a batch whose own applying and

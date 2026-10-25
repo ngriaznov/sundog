@@ -65,6 +65,15 @@ where
     /// dropped (see [`Shard::hold_skewed`]). Every other refusal drops the
     /// record, because the sender still holds it.
     pub(super) async fn apply_inbound(&self, recs: Vec<WireRecord>, hold_skewed: bool) {
+        #[cfg(feature = "spill")]
+        if self.inbound_held() {
+            tracing::trace!(
+                cache = %self.name,
+                records = recs.len(),
+                "inbound batch for a cache still attaching its spill tier; dropped"
+            );
+            return;
+        }
         // The inbound-apply guard: a `Mode::Distributed` shard never
         // applies a record for a bucket its own *current* view does not
         // own: strict current-view ownership, before decoding, is the

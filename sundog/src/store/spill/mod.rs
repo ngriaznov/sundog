@@ -63,6 +63,8 @@ use flusher::flusher_loop;
 #[cfg(doc)]
 use rules::{FLUSH_QUEUE_CAPACITY, record_too_large, refusal_drop_reason};
 
+#[cfg(all(test, not(feature = "sim")))]
+pub(crate) use flusher::ATTACH_PAUSE;
 use record::{decode_record, pread_exact};
 #[cfg(test)]
 pub(crate) use rules::flush_queue_slots;
@@ -608,6 +610,12 @@ impl SpillTier {
     #[cfg(all(test, not(feature = "sim")))]
     pub(crate) fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::Acquire)
+    }
+
+    /// Whether a flusher takes this tier's jobs.
+    #[cfg(all(test, not(feature = "sim")))]
+    pub(crate) fn has_flusher(&self) -> bool {
+        self.sender.lock().is_some()
     }
 }
 

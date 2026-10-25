@@ -736,7 +736,8 @@ where
     /// [`super::Shard::attach_spill`], through `&self`: `spill` and
     /// `spill_entries_gauge` are `OnceLock`s so this can run after the
     /// engine is already `Arc`-shared. It attaches only once this shard
-    /// has won its name in the cluster's shard registry.
+    /// has won its name in the cluster's shard registry, and the tier's
+    /// flusher has started before this publishes the tier.
     ///
     /// # Panics
     ///

@@ -43,6 +43,8 @@ mod pause_guard;
 mod pending_merge;
 mod read_through;
 mod skew_hold;
+#[cfg(all(feature = "spill", not(feature = "sim")))]
+mod spill_attach;
 #[cfg(feature = "spill")]
 mod spill_lifecycle;
 /// `Shard`-layer coverage of the spill read path: every method here

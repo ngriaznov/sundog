@@ -661,6 +661,18 @@ where
     /// that matters.
     #[cfg(feature = "spill")]
     spill_read: OnceLock<SpillRead>,
+    /// Set while `CacheBuilder::open` attaches a spill tier, from before the
+    /// shard is registered until [`Shard::attach_spill`] has the tier
+    /// running. A registered shard receives its peers' frames, and an inbound
+    /// record batch applied before the tier runs evicts past a tier that is
+    /// not there or has no flusher yet: [`Shard::apply_inbound`] drops a
+    /// batch while this is set, as the cluster drops one for a cache that is
+    /// not open. A `Replicated` or `Distributed` open's state transfer or
+    /// anti-entropy brings that data; an `Invalidation` cache, which runs
+    /// neither, loses it as it loses any frame it misses, its TTL the bound
+    /// on staleness. An invalidation, which never evicts, applies throughout.
+    #[cfg(feature = "spill")]
+    inbound_held: AtomicBool,
 }
 
 /// [`Shard::with_spill`]'s read-side counterpart to the tier itself: the

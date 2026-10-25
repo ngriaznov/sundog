@@ -218,6 +218,8 @@ where
             residency: None,
             #[cfg(feature = "spill")]
             spill_read: OnceLock::new(),
+            #[cfg(feature = "spill")]
+            inbound_held: AtomicBool::new(false),
         }
     }
 

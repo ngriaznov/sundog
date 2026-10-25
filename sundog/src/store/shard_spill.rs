@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::hash::Hash;
 use std::sync::Arc;
-#[cfg(all(test, feature = "spill"))]
+#[cfg(feature = "spill")]
 use std::sync::atomic::Ordering;
 #[cfg(all(feature = "spill", not(feature = "sim"), test))]
 use std::time::Duration;
@@ -123,7 +123,9 @@ where
     /// replayed, so a later local write or remove stamps after every
     /// replayed entry, even when the system clock restarted behind those
     /// stamps. Nothing stamps on the shard before this returns: the cache is
-    /// not advertised and no handle to it exists yet.
+    /// not advertised and no handle to it exists yet. A peer's frames reach
+    /// the shard once it is registered; one held by
+    /// [`Shard::hold_inbound_until_attached`] drops them until this returns.
     /// # Errors
     ///
     /// Returns the underlying [`std::io::Error`] if the tier's directory or
@@ -203,8 +205,11 @@ where
             self.mode,
             Mode::Replicated | Mode::Distributed { .. }
         ));
-        self.engine.set_spill(Arc::clone(&tier));
+        // The flusher starts before the tier is published, so an eviction
+        // that finds the tier through the engine finds the flusher's sender
+        // already in place.
         tier.attach(Arc::downgrade(&sink));
+        self.engine.set_spill(Arc::clone(&tier));
         self.spill_read
             .set(SpillRead {
                 semaphore: Arc::new(tokio::sync::Semaphore::new(cfg.read_concurrency_value())),
@@ -230,9 +235,25 @@ where
                 ),
             })
             .unwrap_or_else(|_| panic!("invariant: attach_spill runs at most once per shard"));
+        self.inbound_held.store(false, Ordering::Release);
         Ok(AttachSpillOutcome {
             warm_parts: outcome.warm_parts,
         })
+    }
+
+    /// Drops inbound batches until [`Shard::attach_spill`] has the tier
+    /// running; see `Shard::inbound_held`. `CacheBuilder::open` calls this
+    /// before it registers a shard it attaches a tier to.
+    #[cfg(feature = "spill")]
+    pub(crate) fn hold_inbound_until_attached(&self) {
+        self.inbound_held.store(true, Ordering::Release);
+    }
+
+    /// Whether [`Shard::apply_inbound`] drops a batch: the shard's open is
+    /// still attaching its spill tier.
+    #[cfg(feature = "spill")]
+    pub(crate) fn inbound_held(&self) -> bool {
+        self.inbound_held.load(Ordering::Acquire)
     }
 
     /// After a RAM miss, checks whether `key` is currently spilled and, if

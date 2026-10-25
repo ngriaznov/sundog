@@ -497,6 +497,12 @@ where
 
         let cancel = cluster.cancel_token().child_token();
         let tasks = TaskTracker::new();
+        // Registered, the shard receives its peers' record batches before its
+        // spill tier runs; it drops them until `attach_spill` returns.
+        #[cfg(feature = "spill")]
+        if spill.is_some() {
+            shard.hold_inbound_until_attached();
+        }
         reserve_name(&cluster, &name, &shard).await?;
         let guard = OpenGuard::new(&cluster, &shard, &cancel, &tasks);
 

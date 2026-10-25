@@ -49,11 +49,24 @@ impl SpillTier {
             .name(name)
             .spawn(move || flusher_loop(&inner, &rx, &sink))
             .ok();
+        #[cfg(all(test, not(feature = "sim")))]
+        if let Some(pause) = ATTACH_PAUSE.with(std::cell::Cell::get) {
+            thread::sleep(pause);
+        }
         if let Some(handle) = handle {
             *self.sender.lock() = Some(tx);
             *self.flusher_handle.lock() = Some(handle);
         }
     }
+}
+
+#[cfg(all(test, not(feature = "sim")))]
+thread_local! {
+    /// A pause [`SpillTier::attach`] on this thread takes after it spawns the
+    /// flusher and before the tier holds the flusher's sender, for a test that
+    /// watches what the tier's publication shows meanwhile.
+    pub(crate) static ATTACH_PAUSE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
 }
 
 pub(super) fn flusher_loop(
