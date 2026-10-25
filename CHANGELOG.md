@@ -85,12 +85,11 @@ All notable changes to this project are documented in this file. Format follows
   a requester pulled from it and never dropped one. Each restart under a
   random `NodeId` and each new peer added up to 65,536 rows for each cache
   across the donors, so the node's memory grew with the cluster's restart
-  history. The
-  node now drops the rows of a requester when the requester leaves its peer
-  table, drops a row once it is older than `rebalance_ack_window` (a sweep at
-  most once per window, on an ack insert), and returns the memory. An
-  acknowledgment only saves a confirming anti-entropy round, so a dropped row
-  costs at most that round.
+  history. The node now drops the rows of a requester when the requester
+  leaves its peer table, drops a row once it is older than
+  `rebalance_ack_window` (a sweep at most once per window, on an ack insert),
+  and returns the memory. An acknowledgment only saves a confirming
+  anti-entropy round, so a dropped row costs at most that round.
 - **A node forgets the members that left, whatever its caches do.** The
   tracker of absent members kept one record for every peer incarnation it had
   seen live, and only the CRDT sweep, which runs for a cache with a merging

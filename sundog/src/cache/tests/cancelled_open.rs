@@ -359,9 +359,30 @@ async fn a_dropped_guard_closes_the_cache_and_frees_the_name() {
     cluster.shutdown().await;
 }
 
+/// Drains a fan-out queue the moment it is woken, as a fan-out task that the cancel wakes drains
+/// the backlog on its way out, and keeps what the first wake drained.
+struct DrainingWaker {
+    queue: Arc<crate::store::FanOutQueue<FanOutItem<u32>>>,
+    drained: std::sync::Mutex<Option<Vec<FanOutItem<u32>>>>,
+}
+
+impl std::task::Wake for DrainingWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let mut drained = self.drained.lock().expect("lock");
+        if drained.is_none() {
+            *drained = Some(self.queue.drain());
+        }
+    }
+}
+
 /// The drop seals the shard before it cancels the tasks, the order `tear_down` keeps: a fan-out
 /// task that the cancel wakes drains the backlog on its way out, so a fold pending in a merge
-/// window is in what it drains.
+/// window is in what it drains. The drain runs inside the cancel's wake, so a cancel ahead of
+/// the seal drains the backlog before the fold joins it.
 #[tokio::test]
 async fn a_dropped_guard_flushes_the_pending_merges_before_the_fan_out_task_drains() {
     let cluster = solo_cluster("cache-it-guard-seal-first").await;
@@ -377,35 +398,39 @@ async fn a_dropped_guard_flushes_the_pending_merges_before_the_fan_out_task_drai
         .with_resolver(Arc::new(PnCounterResolver))
         .with_merge_coalesce_window(Duration::from_secs(60)),
     );
-    let (cancel, tasks, guard) = register_shard(&cluster, &shard).await;
+    let (cancel, _tasks, guard) = register_shard(&cluster, &shard).await;
     let writer = WriterId::new(cluster.node_id(), cluster.local_incarnation());
     shard
         .merge(1, PnCounter::local_delta(writer, 7))
         .await
         .expect("the merge waits in its window");
     assert_eq!(shard.get(&1).await, None, "the fold is still pending");
-    // Stands in for the fan-out task, which breaks out of its loop on the cancel and drains once.
-    let drained = Arc::new(std::sync::Mutex::new(Vec::new()));
-    {
-        let queue = shard.fan_out_queue();
-        let drained = Arc::clone(&drained);
-        cluster.spawn_tracked_in(&tasks, async move {
-            cancel.cancelled().await;
-            *drained.lock().expect("lock") = queue.drain();
-        });
-    }
+    let waker = Arc::new(DrainingWaker {
+        queue: shard.fan_out_queue(),
+        drained: std::sync::Mutex::new(None),
+    });
+    let mut parked = Box::pin(cancel.cancelled());
+    assert!(
+        parked
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(
+                &std::task::Waker::from(Arc::clone(&waker))
+            ))
+            .is_pending(),
+        "the drain is parked on the token"
+    );
 
     drop(guard);
 
+    let drained = waker.drained.lock().expect("lock").take();
+    assert!(
+        matches!(drained.as_deref(), Some([FanOutItem::Applied(1, _)])),
+        "the drain the cancel wakes carries the flushed fold: {drained:?}"
+    );
     wait_until(Duration::from_secs(10), "the name is freed", async || {
         !is_registered(&cluster, "g")
     })
     .await;
-    let drained = std::mem::take(&mut *drained.lock().expect("lock"));
-    assert!(
-        matches!(drained.as_slice(), [FanOutItem::Applied(1, _)]),
-        "the final drain carries the flushed fold: {drained:?}"
-    );
     cluster.shutdown().await;
 }
 
@@ -675,6 +700,94 @@ mod spill {
             snapshot_under(&dir).is_file(),
             "the close checkpointed the tier for a warm reopen"
         );
+        cluster.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Whether a snapshot file lies anywhere under `dir`.
+    fn holds_a_snapshot(dir: &std::path::Path) -> bool {
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(next) = pending.pop() {
+            for entry in std::fs::read_dir(next).expect("the spill directory lists") {
+                let path = entry.expect("a directory entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.file_name().is_some_and(|name| name == "snapshot") {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// A shard registered under `name` with a warm-reopen tier under `dir` that holds one entry.
+    async fn register_with_tier(
+        cluster: &Cluster,
+        name: &str,
+        dir: &std::path::Path,
+    ) -> Registered {
+        let registered = register(cluster, name).await;
+        registered
+            .shard
+            .attach_spill(&warm_config(dir))
+            .expect("the tier attaches");
+        registered
+            .shard
+            .insert(1, "one".to_string())
+            .await
+            .expect("insert");
+        assert!(
+            !registered.shard.spill_tier_closed(),
+            "the tier starts open"
+        );
+        registered
+    }
+
+    /// A drop with no runtime to run the teardown on closes the tier before it returns, without
+    /// the checkpoint, so the next open of a `warm_reopen` cache starts cold.
+    #[tokio::test]
+    async fn a_guard_dropped_with_no_runtime_closes_the_spill_tier_without_a_checkpoint() {
+        let dir = fresh_spill_dir("guard-no-runtime");
+        let cluster = solo_cluster("cache-it-guard-spill-no-runtime").await;
+        let Registered { shard, guard, .. } = register_with_tier(&cluster, "g", &dir).await;
+
+        std::thread::spawn(move || drop(guard))
+            .join()
+            .expect("the drop does not panic");
+
+        assert!(!is_registered(&cluster, "g"));
+        assert!(
+            shard.spill_tier_closed(),
+            "the tier is closed when the drop returns"
+        );
+        assert!(!holds_a_snapshot(&dir), "nothing checkpointed the tier");
+        cluster.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A teardown its runtime drops before it runs still closes the tier, without the checkpoint.
+    #[tokio::test]
+    async fn a_teardown_dropped_before_it_runs_closes_the_spill_tier_without_a_checkpoint() {
+        let dir = fresh_spill_dir("guard-runtime-gone");
+        let cluster = solo_cluster("cache-it-guard-spill-runtime-gone").await;
+        let Registered { shard, guard, .. } = register_with_tier(&cluster, "g", &dir).await;
+
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("a runtime builds");
+            runtime.block_on(async move { drop(guard) });
+            drop(runtime);
+        })
+        .join()
+        .expect("the drop does not panic");
+
+        assert!(!is_registered(&cluster, "g"));
+        assert!(
+            shard.spill_tier_closed(),
+            "the tier is closed once the runtime is gone"
+        );
+        assert!(!holds_a_snapshot(&dir), "nothing checkpointed the tier");
         cluster.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
