@@ -8,8 +8,8 @@ All notable changes to this project are documented in this file. Format follows
 ### Added
 
 - **`Cache::merge_sequenced` and `Cache::merge_sequenced_with_ttl`.** They
-  draw this cache's next sequence number and call a closure with it and
-  `Cache::writer_id`, which builds the value to merge, as in
+  call a closure with `Cache::writer_id` and this cache's next sequence
+  number, and the closure builds the value to merge, as in
   `cache.merge_sequenced(key, |w, seq| OrSet::add(w, seq, element))`. The
   numbers start at 1 for each cache name when the cluster starts, rise by one
   per call and never repeat; a cache that closes and opens again carries on
@@ -21,9 +21,10 @@ All notable changes to this project are documented in this file. Format follows
   shard-level forms and take the writer as an argument.
 - **`sundog_merge_refused_total{cache, reason}` and
   `sundog_sync_skipped_total{cache, reason}`.** The first counts merges
-  refused for passing the frame limit, with `reason="too_large"`, whether the
-  caller got the error or not, and CRDT compaction rewrites refused for the
-  same reason; the second counts records that anti-entropy, state transfer and
+  refused because the merged value would pass the frame limit and be larger
+  than the value it replaces, with `reason="too_large"`, whether the caller
+  got the error or not, and CRDT compaction rewrites refused for the same
+  reason; the second counts records that anti-entropy, state transfer and
   rebalance leave out because one frame cannot hold them. Each logs a `warn`,
   at most once a minute for each cache. The first warns for a merge from a
   peer, a flushed fold and a compaction pass, since a local caller gets
@@ -42,28 +43,36 @@ All notable changes to this project are documented in this file. Format follows
   4 MiB by default. A value the resolver builds is counted as the forward an
   owner sends its co-owners; the value a call passes, and a merge result that
   is that value, over a lapsed stored value or under a resolver that keeps
-  it, is counted as the replicate frame `insert` counts. A
-  `merge`, `merge_with_ttl`, `merge_sequenced`, `merge_sequenced_with_ttl` or
-  `insert` under a merging resolver whose result would pass that limit and be
-  larger than the value it replaces fails with `ValueTooLarge` and changes
-  nothing. A merge whose own value fits a frame and that leaves the value no
-  larger is accepted, so a merge can shrink a value that is already over the
-  limit. The remove an `OrSet` builds carries the remaining tags of every
-  writer it touches, so a set one writer filled cannot be shrunk with it once
-  it is over the limit, and `Cache::remove` is the way. A merge from a peer
-  follows the same rule and is refused, counted and logged. With a `merge_coalesce_window`, the call that would overflow its
-  own pending fold gets the error, and a fold that overflows the stored value
-  at its flush is refused there, counted and logged. An `OrSet` that is only
-  added to reaches the limit; the resolver guide says how to bound one.
-- **A responder leaves out a record that does not fit a frame.** A record
-  larger than one wire frame, 4 MiB, stays on its node and out of state
-  transfer, anti-entropy and rebalance chunks, which carry every other key as
-  usual, where the record failed the exchange it was part of. A merge never
-  builds such a value and an upgrade can leave one behind; it keeps serving
-  reads, a `Distributed` fetch of it fails, and it cannot grow. A merge that
-  removes content and fits a frame, or `Cache::remove`, brings it back under
-  the limit. A value past a lowered `max_frame` fits a frame and syncs
-  as any other.
+  it, is counted as the replicate frame `insert` counts. A `merge`,
+  `merge_with_ttl`, `merge_sequenced` or `merge_sequenced_with_ttl`, or an
+  `insert`, `insert_sync`, `insert_with_ttl`, `insert_many` or
+  `insert_many_with_ttl` under a merging resolver, whose result would pass
+  that limit and be larger than the value it replaces fails with
+  `ValueTooLarge` and changes nothing. `insert_many` and
+  `insert_many_with_ttl` apply the entries around a refused one and return
+  the first refusal in the order given. A `Distributed` call for a key the
+  node does not own returns before the owners apply it, so the caller gets
+  no error and an owner counts and logs the refusal. A merge whose own value
+  fits a frame and that leaves the value no larger is accepted, so a merge
+  can shrink a value that is already over the limit. The remove an `OrSet`
+  builds carries the remaining tags of every writer it touches, so a set one
+  writer filled cannot be shrunk with it once it is over the limit;
+  `Cache::remove` deletes such a set. A merge from a peer follows the same
+  rule and is refused, counted and logged. With a `merge_coalesce_window`,
+  the call that would overflow its own pending fold gets the error, and a
+  fold that overflows the stored value at its flush is refused there, counted
+  and logged. An `OrSet` that is only added to reaches the limit; the
+  resolver guide says how to bound one.
+- **A sync leaves out a record that does not fit a frame.** A record larger
+  than one wire frame, 4 MiB, stays on its node and out of state transfer,
+  anti-entropy and rebalance chunks, which carry every other key as usual,
+  where the record failed the exchange it was part of. A merge never builds
+  such a value and an upgrade can leave one behind; it keeps serving reads, a
+  `Distributed` fetch of it fails, and it cannot grow. A `Distributed` node
+  that stops owning its part drops it when the part releases. A merge that
+  shrinks it to fit a frame brings it back under the limit, and
+  `Cache::remove` deletes it. A value past a lowered `max_frame` fits a frame
+  and syncs as any other.
 - **A round of anti-entropy goes on after a failed pull.** `pull_repairs`
   asks for the next batch after one fails, and stops after two failures in a
   row. A pull batch holds at most 512 KiB of keys beside its 4,096 keys, so a
@@ -86,10 +95,12 @@ All notable changes to this project are documented in this file. Format follows
   random `NodeId` and each new peer added up to 65,536 rows for each cache
   across the donors, so the node's memory grew with the cluster's restart
   history. The node now drops the rows of a requester when the requester
-  leaves its peer table, drops a row once it is older than
-  `rebalance_ack_window` (a sweep at most once per window, on an ack insert),
-  and returns the memory. An acknowledgment only saves a confirming
-  anti-entropy round, so a dropped row costs at most that round.
+  leaves its peer table, drops a row once it is older than the ack window
+  `ClusterConfig::rebalance_ack_window_value` returns (a sweep at most once
+  per window, on an ack insert), and returns the memory. An acknowledgment
+  saves a confirming anti-entropy round, so a dropped row costs at most that
+  round, and for an owner that does not answer it a later release of the
+  part; it never releases a part early.
 - **A node forgets the members that left, whatever its caches do.** The
   tracker of absent members kept one record for every peer incarnation it had
   seen live, and only the CRDT sweep, which runs for a cache with a merging
@@ -103,18 +114,19 @@ All notable changes to this project are documented in this file. Format follows
   sweep and the check for a part owned alone read nothing inside those spans
   differently.
 - **Four per-peer maps forget the peers that left.** The stamp of each peer's
-  last inbound replicate traffic, the anti-entropy scheduler's skip count for
-  each peer, the protocol notice already logged for a peer and the cache mode
-  conflict already reported for a peer each gained an entry for every peer
-  incarnation and never lost one, so a node that outlived many peer restarts
-  grew by a few tens of bytes for each. Each is now pruned against the live
-  view, and never by the write that fills it: a membership view change drops
-  the inbound stamps and the notices, each scheduler round drops the skip
-  counts of peers outside the live set, and each mode conflict sweep drops the
-  conflicts of peers the view no longer lists. A peer that leaves and returns
-  under the same `NodeId` is noticed again for its protocol and reported again
-  for a mode conflict: a conflict is reported once for each time the peer
-  appears with it.
+  last inbound replicate traffic and the anti-entropy scheduler's skip count
+  for each peer gained an entry for every peer incarnation, and the protocol
+  notice already logged for a peer and the cache mode conflict already
+  reported for a peer gained one for every peer whose protocol is out of
+  range or whose mode conflicts. None lost an entry, so a node that outlived
+  many peer restarts grew by a few tens of bytes for each. Each is now pruned
+  against the live view, and never by the write that fills it: a membership
+  view change drops the inbound stamps and the notices, each scheduler round
+  drops the skip counts of peers outside the live set, and each mode conflict
+  sweep drops the conflicts of peers the view no longer lists. A peer that
+  leaves and returns under the same `NodeId` is noticed again for an
+  out-of-range protocol and reported again for a mode conflict: a conflict is
+  reported once for each time the peer appears with it.
 - **A spill cache that is opening applies no peer record batch before its
   spill tier runs.** The open registers the cache before it attaches the
   tier, so a peer's replication, forwards and anti-entropy pushes reached it
@@ -133,12 +145,12 @@ All notable changes to this project are documented in this file. Format follows
   evicting outlasted it refused the evictions it had left
   (`sundog_spill_dropped_total{reason="deferred"}` in a `Replicated` or
   `Distributed` cache, `"queue_full"` otherwise) with no wait for room
-  having run out. A joiner whose anti-entropy push of a whole dataset lands
-  beside its own pull into a small `max_capacity` is such a batch. The
-  timeout bounds the batch's waits for room, counted together, and the time
-  it spends applying between them does not count. A batch over a tier that
-  takes no job it admits, as one whose flusher is gone, stops retrying at
-  the first round that frees nothing.
+  having run out. A donor's anti-entropy push of a whole dataset, applied by
+  a joiner beside its own pull into a small `max_capacity`, is such a batch.
+  The timeout bounds the batch's waits for room, counted together, and the
+  time it spends applying between them does not count. A batch over a tier
+  that takes no job it admits, as one whose flusher is gone, stops retrying
+  at the first round that frees nothing.
 - **A pull whose reply cannot arrive in time goes out again smaller.** A pull
   of large records, whose reply took longer than the 10-second request
   timeout, failed the same way every round, and its keys never repaired from
@@ -148,8 +160,8 @@ All notable changes to this project are documented in this file. Format follows
   of the timeout or less, and stays within 4,096. A key that times out alone
   waits for the next round, and a round stops pulling after two failures in a
   row. A debug line logs each shrink, and a warning logs the first time the
-  batch for a peer and cache reaches one key, since a record then takes longer
-  than the request timeout to arrive.
+  batch for a peer and cache reaches one key, which a timed-out batch of up
+  to three records brings it to.
 - **A bucket of long keys answers a digest exchange.** A responder sent a
   mismatched bucket, or a mismatched part of a large bucket, as one listing
   frame when it held up to `ae_sketch_min_bucket` entries, 384 by default.
@@ -163,10 +175,11 @@ All notable changes to this project are documented in this file. Format follows
   frame to an older one. The wire stays at protocol 9, and a 0.6.8 requester
   takes the sketch as it takes one for a large bucket.
 - **A delete in a batch of peer records keeps what it removed out of the
-  merges after it.** A replicate, anti-entropy or state-transfer batch that
-  carries a delete of a key and then merges into the same key, applied over a
-  value already stored under a merging resolver, folded those merges from the
-  value stored before the batch, so the elements the delete removed came back.
+  merges after it.** A run of a peer's replicate frames or forwards, which can
+  include an anti-entropy push, that carried a delete of a key and then
+  merges into the same key, applied over a value already stored under a
+  merging resolver, folded those merges from the value stored before the run,
+  so the elements the delete removed came back.
   The batch pre-fold now folds a key only up to its first tombstone; the
   entries after it apply one by one, as sequential application applies them.
 - **An `OrSet` add could be lost to a remove that had not observed it.**
@@ -185,7 +198,8 @@ All notable changes to this project are documented in this file. Format follows
   replica ahead of a lower one, and are named in the guide: an ownership
   change while a `Distributed` writer's forwards are in flight, a forward an
   owner holds for clock skew (overtaken as the clock crosses the bound, or
-  dropped when the hold is full), an entry evicted or expired between two
+  dropped when the hold is full or its stamp is past the hold's horizon), an
+  entry evicted or expired between two
   adds, and a copy that has not caught up, such as a new owner's part that is
   still being pulled.
 - **A merged value that outgrew a frame stalled anti-entropy.** A value built
@@ -228,8 +242,8 @@ All notable changes to this project are documented in this file. Format follows
   shuts down reconciles every part it owns with each live co-owner. A failed
   round or a `Stale` reply, which a membership change causes, no longer ends
   the hand-off with that co-owner: the node waits 100 ms and runs the round
-  again, and only completed rounds count against the three each co-owner
-  gets. Each (cache, co-owner) group has an equal share of the time left in
+  again, and only completed rounds count against the three each (cache,
+  co-owner) group gets. Each group has an equal share of the time left in
   `state_transfer_budget`, and the time a quick group leaves unused passes to
   the groups after it, so one unreachable co-owner that is still live does not
   use up the budget of the others. A co-owner that leaves the live set ends
