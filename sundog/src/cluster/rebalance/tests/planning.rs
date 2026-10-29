@@ -617,3 +617,285 @@ fn a_retry_counts_a_timeout_and_restarts_the_tick_only_for_a_pull_that_ran() {
     );
     assert_eq!(effects(RetryEnd::Cancelled), (false, false));
 }
+
+/// A peer node on its own runtime and its own thread, so a test can freeze
+/// the whole node, as a SIGSTOP would, and thaw it later.
+struct FreezablePeer {
+    node: NodeId,
+    commands: tokio::sync::mpsc::UnboundedSender<PeerCmd>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+enum PeerCmd {
+    Freeze(std::sync::mpsc::Receiver<()>),
+    Stop,
+}
+
+impl FreezablePeer {
+    /// Builds a member of cluster `name` seeded from `seed`, and waits until
+    /// `observer` sees it live.
+    async fn join(
+        name: &'static str,
+        seed: std::net::SocketAddr,
+        config: crate::config::ClusterConfig,
+        observer: &crate::cluster::Cluster,
+    ) -> Self {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<NodeId>();
+        let (commands, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<PeerCmd>();
+        let thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async move {
+                let peer = crate::cluster::Cluster::builder(name)
+                    .seeds([seed])
+                    .config(config)
+                    .build()
+                    .await
+                    .expect("the peer builds");
+                ready_tx.send(peer.node_id()).expect("test alive");
+                while let Some(cmd) = cmd_rx.recv().await {
+                    match cmd {
+                        // Blocks this node's only runtime thread.
+                        PeerCmd::Freeze(thaw) => drop(thaw.recv()),
+                        PeerCmd::Stop => break,
+                    }
+                }
+                peer.shutdown().await;
+            });
+        });
+        let node = ready_rx.await.expect("the peer is up");
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !observer.peers().iter().any(|peer| peer.node == node) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the peer is live in gossip");
+        Self {
+            node,
+            commands,
+            thread,
+        }
+    }
+
+    /// Freezes the peer until the returned sender sends or drops.
+    fn freeze(&self) -> std::sync::mpsc::Sender<()> {
+        let (thaw_tx, thaw_rx) = std::sync::mpsc::channel::<()>();
+        self.commands
+            .send(PeerCmd::Freeze(thaw_rx))
+            .expect("the peer is alive");
+        thaw_tx
+    }
+
+    fn stop(self) {
+        self.commands
+            .send(PeerCmd::Stop)
+            .expect("the peer is alive");
+        self.thread.join().expect("the peer's thread ends");
+    }
+}
+
+/// Stores one entry in `part` on `shard`, so a wipe of the part shows.
+async fn hold_an_entry_in(shard: &Arc<dyn ShardOps>, part: PartId) {
+    let key = (0..1_000_000u32)
+        .find(|key| PartId::of_key(&postcard::to_stdvec(key).expect("encodes")) == part)
+        .expect("some key hashes into the part");
+    shard
+        .apply_remote_batch(vec![crate::wire::WireRecord {
+            key: bytes::Bytes::from(postcard::to_stdvec(&key).expect("encodes")),
+            value: Some(bytes::Bytes::from(
+                postcard::to_stdvec(&7u32).expect("encodes"),
+            )),
+            ver: crate::hlc::Hlc {
+                wall_ms: 1,
+                logical: 0,
+                node: NodeId::from(9),
+            },
+            expires_at_ms: None,
+        }])
+        .await;
+    assert_eq!(shard.held_parts().await, vec![part]);
+}
+
+/// Polls `cond` every 10 ms until it holds, failing the test after 15 s.
+async fn poll_until(what: &str, mut cond: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !cond() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what} within 15 s"));
+}
+
+/// A part A lost to B comes due while B is frozen, so the tick's hand-off
+/// round to B stalls; a view published meanwhile gives the part back to A
+/// alone. Once B thaws and the round ends, the release planned under the
+/// earlier view must not delete A's copy.
+#[tokio::test]
+async fn a_part_a_view_returns_during_the_hand_off_rounds_is_not_released() {
+    const CLUSTER: &str = "regained-during-hand-off";
+    let config = crate::config::ClusterConfig {
+        gossip_bind_addr: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+        data_bind_addr: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+        ae_interval: Duration::from_millis(50),
+        ..crate::config::ClusterConfig::default()
+    };
+    let cluster = crate::cluster::Cluster::builder(CLUSTER)
+        .seeds(std::iter::empty())
+        .config(config.clone())
+        .build()
+        .await
+        .expect("a builds");
+    let b = FreezablePeer::join(CLUSTER, cluster.local_gossip_addr(), config, &cluster).await;
+
+    let name = SmolStr::new("prices");
+    let k = NonZeroU8::new(2).expect("nonzero");
+    let (tracker, tx) = OwnershipTracker::seed(
+        cluster.node_id(),
+        &cluster.peers(),
+        &cluster.advertised_cache_modes(),
+        &name,
+        k,
+    );
+    let shard = empty_shard();
+    let residency = Arc::new(ResidencySet::new());
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn(rebalance_task(
+        cluster.clone(),
+        Arc::clone(&shard),
+        tracker,
+        Arc::clone(&residency),
+        name.clone(),
+        Duration::from_millis(400),
+        4,
+        cancel.clone(),
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // B stops answering; A then loses part X to it.
+    let thaw = b.freeze();
+    let v1 = Arc::new(view(cluster.node_id(), vec![cluster.node_id(), b.node], 1));
+    let part = PartId::all()
+        .find(|&p| !v1.owns(p))
+        .expect("a two-node, k=1 split leaves parts unowned here");
+    tx.send(Arc::clone(&v1)).expect("tracker keeps the channel");
+    poll_until("A marks the part releasing", || {
+        residency.is_releasing(part)
+    })
+    .await;
+    hold_an_entry_in(&shard, part).await;
+
+    // The grace passes and the tick's hand-off round to the frozen B
+    // starts; meanwhile A regains X as its sole owner.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        shard.held_parts().await,
+        vec![part],
+        "not released before V2"
+    );
+    let v2 = Arc::new(view(cluster.node_id(), vec![cluster.node_id()], 2));
+    assert!(v2.owns(part));
+    tx.send(v2).expect("tracker keeps the channel");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(shard.held_parts().await, vec![part], "round still stalled");
+    thaw.send(()).expect("b is frozen");
+    // The view arm unmarks the regained part only once the tick that held
+    // it returns, whichever way that tick decided.
+    poll_until("the tick returns and V2 is planned", || {
+        !residency.is_releasing(part)
+    })
+    .await;
+
+    let held = shard.held_parts().await;
+    cancel.cancel();
+    let _ = task.await;
+    b.stop();
+    cluster.shutdown().await;
+    assert_eq!(
+        held,
+        vec![part],
+        "A owns X alone again; a release planned under the earlier view must not wipe it"
+    );
+}
+
+/// A part this node lost is held past the hand-off cutoff, a tombstone
+/// retention less one interval, while its new owner never answers: the tick
+/// drops it without a round, long before its disown grace would.
+#[tokio::test]
+async fn a_lost_part_held_past_the_hand_off_cutoff_is_released_without_a_round() {
+    let config = crate::config::ClusterConfig {
+        gossip_bind_addr: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+        data_bind_addr: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+        ae_interval: Duration::from_millis(50),
+        tombstone_ttl: Duration::from_millis(150),
+        ..crate::config::ClusterConfig::default()
+    };
+    let cutoff = hand_off_cutoff(config.tombstone_ttl, config.ae_interval);
+    let grace = Duration::from_secs(10);
+    assert!(
+        cutoff < grace,
+        "only the cutoff can release within the test"
+    );
+    let cluster = crate::cluster::Cluster::builder("released-past-the-cutoff")
+        .seeds(std::iter::empty())
+        .config(config)
+        .build()
+        .await
+        .expect("a builds");
+
+    let name = SmolStr::new("prices");
+    let k = NonZeroU8::new(1).expect("nonzero");
+    let (tracker, tx) = OwnershipTracker::seed(
+        cluster.node_id(),
+        &cluster.peers(),
+        &cluster.advertised_cache_modes(),
+        &name,
+        k,
+    );
+    let shard = empty_shard();
+    let residency = Arc::new(ResidencySet::new());
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn(rebalance_task(
+        cluster.clone(),
+        Arc::clone(&shard),
+        tracker,
+        Arc::clone(&residency),
+        name.clone(),
+        grace,
+        4,
+        cancel.clone(),
+    ));
+
+    // A node gossip never saw takes part of the space: it answers nothing.
+    let ghost = NodeId::from(0xD0D0);
+    let lost = Arc::new(view(cluster.node_id(), vec![cluster.node_id(), ghost], 1));
+    let part = PartId::all()
+        .find(|&p| !lost.owns(p))
+        .expect("a two-node, k=1 split gives the ghost parts");
+    // The entry lands while this node still owns everything, so the release
+    // cannot run before it.
+    hold_an_entry_in(&shard, part).await;
+    tx.send(lost).expect("tracker keeps the channel");
+
+    // With the owner unreachable, a hand-off release waits for twice the
+    // grace; the cutoff comes far sooner.
+    let dropped = tokio::time::timeout(Duration::from_secs(5), async {
+        while !shard.held_parts().await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    let releasing = residency.is_releasing(part);
+    cancel.cancel();
+    let _ = task.await;
+    cluster.shutdown().await;
+    assert!(
+        dropped,
+        "the copy past the cutoff is dropped without a round"
+    );
+    assert!(!releasing, "and the part leaves residency");
+}

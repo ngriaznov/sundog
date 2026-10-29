@@ -189,7 +189,8 @@ fn parts_to_release_holds_a_bucket_until_every_owner_answered_or_it_is_overdue()
     let self_node = NodeId::from(1);
     let eligible: Vec<NodeId> = (1..=5u64).map(NodeId::from).collect();
     let view = view(self_node, eligible, 2);
-    let due: Vec<PartId> = PartId::all().take(256).collect();
+    // Due parts are parts this node lost: the view gives them to others.
+    let due: Vec<PartId> = PartId::all().filter(|&p| !view.owns(p)).take(256).collect();
 
     let none: HashSet<NodeId> = HashSet::new();
     let no_acked: HashMap<PartId, HashSet<NodeId>> = HashMap::new();
@@ -202,14 +203,12 @@ fn parts_to_release_holds_a_bucket_until_every_owner_answered_or_it_is_overdue()
         &no_acked,
         &none,
     );
-    for &bucket in &held {
-        assert!(
-            view.owners_of(bucket).iter().all(|o| *o == self_node),
-            "with no owner answered, only a bucket owned by self alone is released: {bucket}"
-        );
-    }
+    assert!(
+        held.is_empty(),
+        "with no owner answered, nothing is released"
+    );
 
-    let answered: HashSet<NodeId> = [NodeId::from(2)].into_iter().collect();
+    let answered: HashSet<NodeId> = [NodeId::from(2), NodeId::from(3)].into_iter().collect();
     let released = parts_to_release(
         &view,
         self_node,
@@ -233,6 +232,10 @@ fn parts_to_release_holds_a_bucket_until_every_owner_answered_or_it_is_overdue()
     assert!(
         released.len() < due.len(),
         "some bucket waits on an owner that did not answer"
+    );
+    assert!(
+        !released.is_empty(),
+        "some bucket whose owners both answered is released"
     );
 
     // Overdue: a stale owner still holds the bucket, an unreachable
@@ -267,47 +270,40 @@ fn parts_to_release_accepts_an_acked_owner_without_a_confirming_ae_round() {
     let self_node = NodeId::from(1);
     let eligible: Vec<NodeId> = (1..=3u64).map(NodeId::from).collect();
     let view = view(self_node, eligible, 2);
-    let due: Vec<PartId> = PartId::all().take(256).collect();
-    let bucket = due
-        .iter()
-        .copied()
-        .find(|&b| view.owners_of(b).contains(&self_node) && view.owners_of(b).len() == 2)
-        .expect("some bucket is co-owned by exactly one other node at k=2");
-    let other = *view
-        .owners_of(bucket)
-        .iter()
-        .find(|&&o| o != self_node)
-        .expect("a co-owned bucket has another owner");
+    // A bucket this node lost: the other two nodes own it.
+    let bucket = PartId::all()
+        .take(256)
+        .find(|&b| !view.owns(b) && view.owners_of(b).len() == 2)
+        .expect("some bucket is owned by the other two nodes at k=2");
+    let (first, second) = (view.owners_of(bucket)[0], view.owners_of(bucket)[1]);
 
     let none: HashSet<NodeId> = HashSet::new();
     let no_acked: HashMap<PartId, HashSet<NodeId>> = HashMap::new();
-    assert!(
-        !parts_to_release(
-            &view,
-            self_node,
-            &[bucket],
-            &PartSet::new(),
-            &none,
-            &no_acked,
-            &none
-        )
-        .contains(&bucket),
-        "with no ack and no round, the bucket stays resident"
-    );
-
-    let acked: HashMap<PartId, HashSet<NodeId>> = HashMap::from([(bucket, HashSet::from([other]))]);
-    assert!(
+    let release = |reconciled: &HashSet<NodeId>, acked: &HashMap<PartId, HashSet<NodeId>>| {
         parts_to_release(
             &view,
             self_node,
             &[bucket],
             &PartSet::new(),
+            reconciled,
+            acked,
             &none,
-            &acked,
-            &none
         )
-        .contains(&bucket),
-        "an owner who acked this bucket releases it without a confirming AE round against it"
+        .contains(&bucket)
+    };
+    assert!(
+        !release(&none, &no_acked),
+        "with no ack and no round, the bucket stays resident"
+    );
+
+    let acked: HashMap<PartId, HashSet<NodeId>> = HashMap::from([(bucket, HashSet::from([first]))]);
+    assert!(
+        !release(&none, &acked),
+        "one owner's ack does not cover the bucket's other owner"
+    );
+    assert!(
+        release(&HashSet::from([second]), &acked),
+        "an owner who acked this bucket counts as reconciled for it without a confirming AE round"
     );
 }
 
@@ -318,20 +314,12 @@ fn parts_to_release_never_releases_a_co_owned_bucket_whose_owner_only_acked_a_di
     let self_node = NodeId::from(1);
     let eligible: Vec<NodeId> = (1..=3u64).map(NodeId::from).collect();
     let view = view(self_node, eligible, 2);
-    let due: Vec<PartId> = PartId::all()
+    // Buckets this node lost: with three nodes and two owners, each is
+    // owned by nodes 2 and 3.
+    let (other, rest) = (NodeId::from(2), NodeId::from(3));
+    let owner_due: Vec<PartId> = PartId::all()
         .take(256)
-        .filter(|&b| view.owners_of(b).contains(&self_node) && view.owners_of(b).len() == 2)
-        .collect();
-    let other = *view
-        .owners_of(due[0])
-        .iter()
-        .find(|&&o| o != self_node)
-        .expect("a co-owned bucket has another owner");
-    // Two distinct due buckets `other` co-owns alongside self.
-    let owner_due: Vec<PartId> = due
-        .iter()
-        .copied()
-        .filter(|&b| view.owners_of(b).contains(&other))
+        .filter(|&b| !view.owns(b) && view.owners_of(b).contains(&other))
         .take(2)
         .collect();
     assert_eq!(
@@ -342,6 +330,8 @@ fn parts_to_release_never_releases_a_co_owned_bucket_whose_owner_only_acked_a_di
     let (bucket_acked, bucket_unacked) = (owner_due[0], owner_due[1]);
 
     let none: HashSet<NodeId> = HashSet::new();
+    // The buckets' other owner is reconciled, so only `other`'s acks decide.
+    let reconciled: HashSet<NodeId> = HashSet::from([rest]);
     // `other` acked `bucket_acked` only.
     let acked: HashMap<PartId, HashSet<NodeId>> =
         HashMap::from([(bucket_acked, HashSet::from([other]))]);
@@ -350,7 +340,7 @@ fn parts_to_release_never_releases_a_co_owned_bucket_whose_owner_only_acked_a_di
         self_node,
         &[bucket_acked, bucket_unacked],
         &PartSet::new(),
-        &none,
+        &reconciled,
         &acked,
         &none,
     );
@@ -458,4 +448,85 @@ fn acked_by_part_rekeys_each_id_by_the_parts_it_names() {
         HashMap::from([(part.raw(), HashSet::from([a, b]))]),
     );
     assert_eq!(by_part, HashMap::from([(part, HashSet::from([a, b]))]));
+}
+
+#[test]
+fn parts_to_release_never_releases_a_part_the_view_gives_this_node_again() {
+    let self_node = NodeId::from(1);
+    let none: HashSet<NodeId> = HashSet::new();
+    let no_acked: HashMap<PartId, HashSet<NodeId>> = HashMap::new();
+
+    // This node is the part's only owner again: no other owner has anything
+    // to answer, so only the ownership check holds the part.
+    let alone = view(self_node, vec![self_node], 2);
+    let regained: Vec<PartId> = PartId::all().take(8).collect();
+    let overdue: PartSet = regained.iter().copied().collect();
+    let everyone: HashSet<NodeId> = (2..=5u64).map(NodeId::from).collect();
+    assert!(
+        parts_to_release(
+            &alone, self_node, &regained, &overdue, &everyone, &no_acked, &everyone
+        )
+        .is_empty(),
+        "a part this node owns alone is regained, never released"
+    );
+
+    // This node co-owns the part again, and its other owner answered.
+    let pair = view(self_node, vec![self_node, NodeId::from(2)], 2);
+    let co_owned: Vec<PartId> = PartId::all().filter(|&p| pair.owns(p)).take(8).collect();
+    assert_eq!(co_owned.len(), 8, "both nodes own every part at k=2");
+    let answered: HashSet<NodeId> = HashSet::from([NodeId::from(2)]);
+    assert!(
+        parts_to_release(
+            &pair,
+            self_node,
+            &co_owned,
+            &PartSet::new(),
+            &answered,
+            &no_acked,
+            &none
+        )
+        .is_empty(),
+        "a part this node co-owns is regained, however its other owner answered"
+    );
+}
+
+#[test]
+fn view_moved_tells_a_view_published_during_the_rounds_from_the_one_they_ran_under() {
+    let self_node = NodeId::from(1);
+    let pair: Vec<NodeId> = vec![self_node, NodeId::from(2)];
+    let planned = view(self_node, pair.clone(), 2);
+    assert!(
+        !view_moved(&planned, &view(self_node, pair, 2)),
+        "a view of the same eligible set is the one the rounds ran under"
+    );
+    assert!(
+        view_moved(&planned, &view(self_node, vec![self_node], 2)),
+        "a view that dropped a node moved past the rounds"
+    );
+    assert!(
+        view_moved(
+            &planned,
+            &view(self_node, (1..=3u64).map(NodeId::from).collect(), 2)
+        ),
+        "a view that gained a node moved past the rounds"
+    );
+}
+
+#[test]
+fn not_owned_keeps_only_the_parts_the_view_gives_other_nodes() {
+    let self_node = NodeId::from(1);
+    let three = view(self_node, (1..=3u64).map(NodeId::from).collect(), 2);
+    let parts: Vec<PartId> = PartId::all().take(64).collect();
+    let kept = not_owned(&three, parts.clone());
+    assert!(
+        !kept.is_empty() && kept.len() < parts.len(),
+        "a three-node view owns some of them"
+    );
+    for &part in &parts {
+        assert_eq!(kept.contains(&part), !three.owns(part), "part {part}");
+    }
+    assert!(
+        not_owned(&view(self_node, vec![self_node], 2), parts).is_empty(),
+        "a node that owns everything releases nothing without a hand-off"
+    );
 }

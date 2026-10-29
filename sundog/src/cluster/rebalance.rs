@@ -984,13 +984,15 @@ fn acked_by_part(
     out
 }
 
-/// The parts in `due` a release may drop now: those whose every other
-/// current owner is in `reconciled` (its round completed since the part came
-/// due), has acked that specific part per `acked` (keyed by part, never
-/// treated as reconciling any other part that owner holds), or, once
-/// `overdue`, is in `unreachable`. An owner whose view still differs from
-/// this node's is none of these, so the part stays resident until the views
-/// converge.
+/// The parts in `due` a release may drop now: those `view` does not give
+/// this node and whose every current owner is in `reconciled` (its round
+/// completed since the part came due), has acked that specific part per
+/// `acked` (keyed by part, never treated as reconciling any other part that
+/// owner holds), or, once `overdue`, is in `unreachable`. An owner whose view
+/// still differs from this node's is none of these, so the part stays
+/// resident until the views converge. A part `view` gives this node again is
+/// regained, not released, even where this node is its only owner and no
+/// other owner has anything to answer.
 pub(crate) fn parts_to_release(
     view: &OwnershipView,
     self_node: NodeId,
@@ -1003,16 +1005,34 @@ pub(crate) fn parts_to_release(
     due.iter()
         .copied()
         .filter(|&part| {
-            view.owners_of(part).iter().all(|owner| {
-                *owner == self_node
-                    || reconciled.contains(owner)
-                    || acked
-                        .get(&part)
-                        .is_some_and(|owners| owners.contains(owner))
-                    || (overdue.contains(part) && unreachable.contains(owner))
-            })
+            !view.owns(part)
+                && view.owners_of(part).iter().all(|owner| {
+                    *owner == self_node
+                        || reconciled.contains(owner)
+                        || acked
+                            .get(&part)
+                            .is_some_and(|owners| owners.contains(owner))
+                        || (overdue.contains(part) && unreachable.contains(owner))
+                })
         })
         .collect()
+}
+
+/// Whether a view published while a tick ran its hand-off rounds moved past
+/// `planned`, the view the rounds and [`parts_to_release`] judged by. The
+/// owners it names and the acks recorded under its hash need not hold under
+/// `current`, which can also give a released part back to this node, so the
+/// tick holds its release and the view change is planned first.
+pub(crate) fn view_moved(planned: &OwnershipView, current: &OwnershipView) -> bool {
+    planned.view_hash() != current.view_hash()
+}
+
+/// The parts of `parts` that `view` does not give this node: the ones a
+/// release that waits on no owner may drop. A part `view` gives this node
+/// was regained after it came due, and the view change that regained it
+/// unmarks it.
+pub(crate) fn not_owned(view: &OwnershipView, parts: Vec<PartId>) -> Vec<PartId> {
+    parts.into_iter().filter(|&part| !view.owns(part)).collect()
 }
 
 /// Which of `hand_off_owners`'s `owners` still need a confirming
@@ -1057,7 +1077,11 @@ fn owners_needing_confirmation(
 /// on `ae_interval`, hands off whichever parts' disown grace has elapsed to
 /// their live current owners ([`hand_off_owners`]), then calls
 /// [`ShardOps::release_parts`] for the parts every owner answered
-/// ([`parts_to_release`]); an owner that never answers keeps the part
+/// ([`parts_to_release`]), unless a view published during the rounds moved
+/// past the one they ran under ([`view_moved`]): that tick releases none of
+/// the parts it handed off, and the view change replans first. A part released past the hand-off
+/// cutoff without a round is still one the current view does not give this
+/// node ([`not_owned`]). An owner that never answers keeps the part
 /// resident until it is reachable again or its view converges. An owner that
 /// acked a specific due part, within the ack window and current view hash,
 /// counts as reconciled for that part without a redundant confirming round;
@@ -1246,7 +1270,7 @@ pub(crate) async fn rebalance_task(
                         }
                     }
                 }
-                let past_cutoff = residency.expired(cutoff);
+                let past_cutoff = not_owned(&ownership.current(), residency.expired(cutoff));
                 release_without_hand_off(shard.as_ref(), &residency, &cache, &past_cutoff).await;
                 let past_cutoff: PartSet = past_cutoff.into_iter().collect();
                 let due: Vec<PartId> = residency
@@ -1307,7 +1331,12 @@ pub(crate) async fn rebalance_task(
                         &acked,
                         &unreachable,
                     );
-                    if due.is_empty() {
+                    if view_moved(&view, &ownership.current()) {
+                        tracing::debug!(
+                            cache = %cache,
+                            "the ownership view changed during the hand-off rounds; holding the release until the change is planned"
+                        );
+                    } else if due.is_empty() {
                         tracing::debug!(
                             cache = %cache,
                             reconciled = reconciled.len(),

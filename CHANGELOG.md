@@ -3,6 +3,24 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **A `Distributed` node no longer deletes a part a view gives back to it
+  during the hand-off.** The rebalance tick read the ownership view once, ran
+  its hand-off rounds and released against that view. A newer view that
+  returned the part during the rounds, as one that dropped its new owner does,
+  was not consulted, so the node deleted its own copy: reads of the part went
+  cold until a pull from a co-owner landed, and where the node was the part's
+  only owner again the writes it held were lost. A release now drops only
+  parts the view does not give this node, and a tick whose rounds a newer view
+  overtook releases none of the parts it handed off, so the view change is
+  planned first. A view that lands while the release is deleting the part acts
+  as one that lands just after it: the node pulls the part back as a gained
+  one. A part released past the hand-off cutoff without a round is still one
+  the current view gives to other nodes.
+
 ## [0.6.9] – 2026-10-29
 
 ### Added
