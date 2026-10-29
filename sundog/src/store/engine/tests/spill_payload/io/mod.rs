@@ -250,6 +250,90 @@ fn install_new_creates_a_fresh_spilled_entry_readable_via_read_at_and_folds_the_
 }
 
 #[test]
+fn drop_unreadable_spilled_drops_only_the_entry_still_spilled_at_that_pointer() {
+    // No tier is read: the entry points wherever install_new says it does.
+    let engine = Engine::<u32, String>::new(u64::MAX, None, None, None);
+    let key = 7u32;
+    let kb = key_bytes(key);
+    let hash = hash_key_bytes(kb.as_ref());
+    let bucket = stripe_index_from_hash(hash);
+    let ver = hlc(1, 1);
+    let loc = SpillLoc {
+        region: 0,
+        offset: 64,
+        len: 32,
+        generation: 1,
+    };
+    let digest_before = engine.digests();
+    assert!(SpillSink::install_new(
+        &engine, bucket, &kb, hash, ver, None, loc, 1
+    ));
+    assert_eq!(engine.debug_totals().0, 1);
+    assert_eq!(engine.debug_spill_entries_count(), 1);
+
+    let moved = SpillLoc { offset: 96, ..loc };
+    assert!(
+        !engine.drop_unreadable_spilled(kb.as_ref(), hash, moved),
+        "an entry spilled again elsewhere since the read is kept"
+    );
+    let rotated = SpillLoc {
+        generation: 2,
+        ..loc
+    };
+    assert!(
+        !engine.drop_unreadable_spilled(kb.as_ref(), hash, rotated),
+        "a pointer into a later generation of the region names another record"
+    );
+    let other = key_bytes(8);
+    assert!(
+        !engine.drop_unreadable_spilled(other.as_ref(), hash, loc),
+        "another key's read never drops this entry"
+    );
+    assert_eq!(engine.debug_totals().0, 1, "nothing dropped yet");
+
+    assert!(engine.drop_unreadable_spilled(kb.as_ref(), hash, loc));
+    assert_eq!(
+        engine.debug_totals(),
+        (0, 0),
+        "the entry leaves the live count"
+    );
+    assert_eq!(engine.debug_spill_entries_count(), 0, "and the spill gauge");
+    assert_eq!(
+        engine.digests(),
+        digest_before,
+        "and the digest, so a peer's copy no longer compares equal"
+    );
+    assert_eq!(
+        engine.digests(),
+        engine.recompute_digests_paired(),
+        "the incremental digest matches a full recompute"
+    );
+    assert!(!engine.contains_key(&key, 0), "the key is gone");
+    assert_eq!(
+        engine.tombstone_count(),
+        0,
+        "with no tombstone to delete a peer's copy"
+    );
+    assert!(
+        !engine.drop_unreadable_spilled(kb.as_ref(), hash, loc),
+        "a second drop finds nothing"
+    );
+
+    // A resident entry at the key is never an unreadable spilled one.
+    let _ = put(
+        &engine,
+        key,
+        kb.clone(),
+        "resident".to_string(),
+        hlc(2, 0),
+        None,
+        0,
+    );
+    assert!(!engine.drop_unreadable_spilled(kb.as_ref(), hash, loc));
+    assert_eq!(engine.get(&key, 0), Some("resident".to_string()));
+}
+
+#[test]
 fn evict_one_sampled_abandons_the_victim_when_the_flush_queue_channel_is_full() {
     let dir = temp_dir("enqueue-err-abandon");
     // A generous flush_queue_bytes exercises the channel's

@@ -17,6 +17,8 @@ use serde::de::DeserializeOwned;
 
 use super::Shard;
 #[cfg(feature = "spill")]
+use super::spill::SpillReadAt;
+#[cfg(feature = "spill")]
 use super::{Mode, PartId, SmolStr, SpillRead, encode_key, engine, now_ms, spill};
 #[cfg(feature = "spill")]
 use crate::hlc::Hlc;
@@ -211,29 +213,7 @@ where
         tier.attach(Arc::downgrade(&sink));
         self.engine.set_spill(Arc::clone(&tier));
         self.spill_read
-            .set(SpillRead {
-                semaphore: Arc::new(tokio::sync::Semaphore::new(cfg.read_concurrency_value())),
-                reads_hit: metrics::counter!(
-                    "sundog_spill_reads_total",
-                    "cache" => self.name.to_string(), "outcome" => "hit",
-                ),
-                reads_stale: metrics::counter!(
-                    "sundog_spill_reads_total",
-                    "cache" => self.name.to_string(), "outcome" => "stale",
-                ),
-                reads_io_error: metrics::counter!(
-                    "sundog_spill_reads_total",
-                    "cache" => self.name.to_string(), "outcome" => "io_error",
-                ),
-                promotions: metrics::counter!(
-                    "sundog_spill_promotions_total",
-                    "cache" => self.name.to_string(),
-                ),
-                read_duration: metrics::histogram!(
-                    "sundog_spill_read_duration_seconds",
-                    "cache" => self.name.to_string(),
-                ),
-            })
+            .set(SpillRead::new(&self.name, cfg.read_concurrency_value()))
             .unwrap_or_else(|_| panic!("invariant: attach_spill runs at most once per shard"));
         self.inbound_held.store(false, Ordering::Release);
         Ok(AttachSpillOutcome {
@@ -306,7 +286,11 @@ where
     /// Reads the key's currently spilled value off disk, without promoting
     /// it: the version it was spilled at, the value, and its encoded bytes.
     /// `None` for a key not spilled here, and for a read that fails or finds
-    /// the record rotated out, each counted in the spill read metrics.
+    /// the record rotated out, each counted in the spill read metrics. A
+    /// record that fails its checksum, lies past the end of its region file
+    /// or no longer decodes as `V` also drops the entry, so the node stops
+    /// counting and advertising a key it cannot serve; any other I/O error
+    /// keeps it for the next read to try again.
     #[cfg(feature = "spill")]
     pub(super) async fn read_spilled_by_bytes(
         &self,
@@ -323,13 +307,25 @@ where
             .ok()?;
         let read = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            tier.read_at(loc)
+            tier.read_record(loc)
         })
         .await;
         let bytes = match read {
-            Ok(Ok(Some(bytes))) => bytes,
-            Ok(Ok(None)) => {
+            Ok(Ok(SpillReadAt::Found(bytes))) => bytes,
+            Ok(Ok(SpillReadAt::Rotated)) => {
                 spill_read.finish(&spill_read.reads_stale, started);
+                return None;
+            }
+            Ok(Ok(SpillReadAt::Corrupt)) => {
+                spill_read.finish(&spill_read.reads_corrupt, started);
+                spill_read.drop_unreadable(
+                    &self.engine,
+                    &self.name,
+                    key_bytes,
+                    hash,
+                    loc,
+                    "is damaged or cut short on disk",
+                );
                 return None;
             }
             Ok(Err(err)) => {
@@ -347,7 +343,15 @@ where
             }
         };
         let Ok(value) = postcard::from_bytes::<V>(&bytes.encoded) else {
-            spill_read.finish(&spill_read.reads_io_error, started);
+            spill_read.finish(&spill_read.reads_corrupt, started);
+            spill_read.drop_unreadable(
+                &self.engine,
+                &self.name,
+                key_bytes,
+                hash,
+                loc,
+                "does not decode as the cache's value type",
+            );
             return None;
         };
         spill_read.finish(&spill_read.reads_hit, started);

@@ -2,6 +2,7 @@
 
 mod fan_out;
 mod pressure;
+mod unreadable;
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;

@@ -1,4 +1,4 @@
-//! The engine side of the spill tier's flusher callbacks: installing a flushed record, abandoning a pending one and reclaiming a rotated-out region.
+//! The engine side of the spill tier's flusher callbacks: installing a flushed record, abandoning a pending one and reclaiming a rotated-out region; and dropping a spilled entry a read found unreadable.
 
 use std::hash::Hash;
 use std::sync::atomic::Ordering;
@@ -14,7 +14,7 @@ use crate::store::spill::SpillTier;
 use crate::store::spill::{ReclaimRef, SpillLoc, SpillSink, spilled_is_current};
 
 use super::expiry::encode_expiry;
-use super::keys::{digest_slot, hasher_for, part_index_from_hash};
+use super::keys::{digest_slot, hasher_for, part_index_from_hash, stripe_index_from_hash};
 use super::record::{build_key_only_record, record_key, set_record};
 use super::{Engine, EntryState, Live, SlabEntry};
 
@@ -172,43 +172,82 @@ where
     fn reclaim(&self, region: u32, generation: u32, rows: &[ReclaimRef]) -> usize {
         let mut removed = 0usize;
         for row in rows {
-            let bucket = usize::from(row.stripe);
-            let removed_this = {
-                let mut stripe = self.stripes[bucket].write();
-                // Location identifies the entry: one record occupies one
-                // offset of one region generation, so no key compare is
-                // needed, and an entry since overwritten, promoted or
-                // spilled again elsewhere no longer matches.
-                let SlabEntry::Occupied(occ) = stripe.live.entry(
-                    row.hash,
-                    |l| {
-                        matches!(
-                            &l.state,
-                            EntryState::Spilled(loc) if loc.region == region
-                                && loc.generation == generation
-                                && loc.offset == row.offset
-                        )
-                    },
-                    hasher_for,
-                ) else {
-                    continue;
-                };
-                let (removed_entry, _vacant) = occ.remove();
-                let key_bytes = record_key(&removed_entry.record);
-                stripe.long_ttl.remove(key_bytes);
-                let part = part_index_from_hash(row.hash);
-                self.digest[digest_slot(bucket, part)].fetch_xor(
-                    entry_fingerprint(key_bytes, removed_entry.ver()),
-                    Ordering::Relaxed,
-                );
-                true
-            };
+            // Location identifies the entry: one record occupies one offset
+            // of one region generation, so no key compare is needed, and an
+            // entry since overwritten, promoted or spilled again elsewhere no
+            // longer matches.
+            let removed_this = self.remove_spilled_where(usize::from(row.stripe), row.hash, |l| {
+                matches!(
+                    &l.state,
+                    EntryState::Spilled(loc) if loc.region == region
+                        && loc.generation == generation
+                        && loc.offset == row.offset
+                )
+            });
             if removed_this {
-                self.live_count.fetch_sub(1, Ordering::Relaxed);
                 removed += 1;
             }
         }
         self.note_spill_departures(removed);
         removed
+    }
+}
+
+#[cfg(feature = "spill")]
+impl<K, V> Engine<K, V>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    /// Drops `key_bytes`'s entry, found by `hash`, if it is still spilled at
+    /// `loc`, the pointer a read found unreadable: its record fails its
+    /// checksum or no longer decodes. The entry leaves the digests, the live
+    /// count and the spill gauge as a reclaimed one does, and no tombstone is
+    /// written, so a peer that holds the key can supply it again. An entry
+    /// since overwritten, promoted, removed or spilled again elsewhere no
+    /// longer matches and is kept. Returns whether it dropped the entry.
+    pub(crate) fn drop_unreadable_spilled(
+        &self,
+        key_bytes: &[u8],
+        hash: u64,
+        loc: SpillLoc,
+    ) -> bool {
+        let dropped = self.remove_spilled_where(stripe_index_from_hash(hash), hash, |l| {
+            matches!(&l.state, EntryState::Spilled(at) if *at == loc)
+                && record_key(&l.record) == key_bytes
+        });
+        if dropped {
+            self.note_spill_departures(1);
+        }
+        dropped
+    }
+
+    /// Removes the spilled entry in stripe `bucket` that `hash` and `is_it`
+    /// pick out, under the stripe write lock, together with its long-TTL row,
+    /// its digest fingerprint and its share of the live count. Writes no
+    /// tombstone and leaves the spill gauge to the caller, which counts its
+    /// departures once. Returns whether it removed one.
+    fn remove_spilled_where(
+        &self,
+        bucket: usize,
+        hash: u64,
+        is_it: impl Fn(&Live<K, V>) -> bool,
+    ) -> bool {
+        {
+            let mut stripe = self.stripes[bucket].write();
+            let SlabEntry::Occupied(occ) = stripe.live.entry(hash, is_it, hasher_for) else {
+                return false;
+            };
+            let (removed_entry, _vacant) = occ.remove();
+            let key_bytes = record_key(&removed_entry.record);
+            stripe.long_ttl.remove(key_bytes);
+            let part = part_index_from_hash(hash);
+            self.digest[digest_slot(bucket, part)].fetch_xor(
+                entry_fingerprint(key_bytes, removed_entry.ver()),
+                Ordering::Relaxed,
+            );
+        }
+        self.live_count.fetch_sub(1, Ordering::Relaxed);
+        true
     }
 }

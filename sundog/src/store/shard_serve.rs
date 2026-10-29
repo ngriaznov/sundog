@@ -17,6 +17,8 @@ use super::resolver::exchanges_both_records;
 use super::shard_ops::MaskedDigest;
 use super::shard_oversize::Refused;
 #[cfg(feature = "spill")]
+use super::spill::SpillReadAt;
+#[cfg(feature = "spill")]
 use super::spilled_needs_read;
 use super::{
     BUCKET_COUNT, BucketDigest, BucketEntries, BucketLen, BucketPart, BucketPartDigests,
@@ -566,9 +568,13 @@ where
 /// [`ShardOps::records_for`], the AE-pull-reply path, and
 /// [`ShardOps::snapshot_chunks`] both fold spilled entries in this way. A
 /// pointer read that fails, whether from a stale generation, a checksum
-/// mismatch, or a genuine I/O error, is dropped like an absent key;
-/// nothing here promotes. Returns `Vec::new()` with no read attempted if
-/// this shard never attached a tier.
+/// mismatch, a value that does not decode as `V`, or an I/O error, is left
+/// out like an absent key. A checksum mismatch or an undecodable value also
+/// drops the entry, as [`Shard::get`]'s read does, so the node stops
+/// advertising a key it cannot serve and a peer is not sent bytes it cannot
+/// use. Nothing here promotes.
+/// Returns `Vec::new()` with no read attempted if this shard never attached
+/// a tier.
 #[cfg(feature = "spill")]
 pub(super) async fn read_spilled_batch<K, V>(
     engine: &engine::Engine<K, V>,
@@ -590,16 +596,23 @@ where
     let Ok(permit) = Arc::clone(&spill_read.semaphore).acquire_owned().await else {
         return Vec::new();
     };
-    let spill_read = spill_read.clone();
-    let cache_name = cache_name.to_string();
-    tokio::task::spawn_blocking(move || {
+    let reader = spill_read.clone();
+    let name = cache_name.to_string();
+    let (out, corrupt) = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let mut out = Vec::with_capacity(spilled.len());
+        let mut corrupt = Vec::new();
         for (key_bytes, ver, expires_at_ms, loc) in spilled {
             let started = std::time::Instant::now();
-            match tier.read_at(loc) {
-                Ok(Some(bytes)) => {
-                    spill_read.finish(&spill_read.reads_hit, started);
+            match tier.read_record(loc) {
+                Ok(SpillReadAt::Found(bytes))
+                    if postcard::from_bytes::<V>(&bytes.encoded).is_err() =>
+                {
+                    reader.finish(&reader.reads_corrupt, started);
+                    corrupt.push((key_bytes, loc, "does not decode as the cache's value type"));
+                }
+                Ok(SpillReadAt::Found(bytes)) => {
+                    reader.finish(&reader.reads_hit, started);
                     out.push(WireRecord {
                         key: key_bytes,
                         value: Some(bytes.encoded),
@@ -607,23 +620,32 @@ where
                         expires_at_ms,
                     });
                 }
-                Ok(None) => {
-                    spill_read.finish(&spill_read.reads_stale, started);
+                Ok(SpillReadAt::Rotated) => {
+                    reader.finish(&reader.reads_stale, started);
+                }
+                Ok(SpillReadAt::Corrupt) => {
+                    reader.finish(&reader.reads_corrupt, started);
+                    corrupt.push((key_bytes, loc, "is damaged or cut short on disk"));
                 }
                 Err(err) => {
                     tracing::warn!(
-                        cache = %cache_name,
+                        cache = %name,
                         error = %err,
                         "sundog spill: anti-entropy/snapshot read failed"
                     );
-                    spill_read.finish(&spill_read.reads_io_error, started);
+                    reader.finish(&reader.reads_io_error, started);
                 }
             }
         }
-        out
+        (out, corrupt)
     })
     .await
-    .unwrap_or_default()
+    .unwrap_or_default();
+    for (key_bytes, loc, why) in corrupt {
+        let hash = engine::hash_key_bytes(&key_bytes);
+        spill_read.drop_unreadable(engine, cache_name, &key_bytes, hash, loc, why);
+    }
+    out
 }
 
 impl<K, V> ShardOps for Shard<K, V>

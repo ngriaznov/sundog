@@ -26,10 +26,18 @@ impl SpillTier {
         self.inner.checkpoint_flushes.load(Ordering::Relaxed)
     }
 
-    /// Test-only: how many times [`SpillTier::read_at`] has been called.
+    /// Test-only: how many times [`SpillTier::read_record`] has been called,
+    /// [`SpillTier::read_at`]'s reads included.
     #[cfg(test)]
     pub(crate) fn read_calls(&self) -> u64 {
         self.inner.read_calls.load(Ordering::Relaxed)
+    }
+
+    /// Test-only: makes every later [`SpillTier::read_record`] fail with an
+    /// I/O error while `fail` holds.
+    #[cfg(test)]
+    pub(crate) fn fail_reads(&self, fail: bool) {
+        self.inner.fail_reads.store(fail, Ordering::Relaxed);
     }
 
     /// The checkpoint half of a warm-reopen-enabled close: blocks until the

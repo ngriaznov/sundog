@@ -5,6 +5,15 @@ All notable changes to this project are documented in this file. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **`sundog_spill_reads_total{outcome="corrupt"}`.** A spilled record that
+  fails its checksum, which counted as `stale`, or that lies past the end of a
+  region file cut short or whose bytes do not decode as the cache's value
+  type, which counted as `io_error`, now counts as `corrupt`. `stale` counts
+  only a read the region rotated past, and `io_error` only a positional read
+  that failed any other way.
+
 ### Fixed
 
 - **A `Distributed` node no longer deletes a part a view gives back to it
@@ -20,6 +29,21 @@ All notable changes to this project are documented in this file. Format follows
   as one that lands just after it: the node pulls the part back as a gained
   one. A part released past the hand-off cutoff without a round is still one
   the current view gives to other nodes.
+- **A spilled entry whose record cannot be read leaves the cache.** A record
+  that failed its checksum, lay past the end of a region file cut short, or no
+  longer decoded as the cache's value type, as after a value type change
+  across a warm reopen, read as a miss while the node still counted, listed
+  and advertised the entry. A peer holding the same version compared equal, so
+  anti-entropy never repaired it, and a `Distributed` owner answered a fetch
+  for it with a definitive miss. The read now drops the entry, with no
+  tombstone, so a `Replicated` or `Distributed` peer that holds the key
+  supplies it again through anti-entropy; until then a `Distributed` owner
+  still answers a fetch for it with a miss. A `get`, an anti-entropy or
+  state-transfer read and a fetch answer all drop it, and the first drop in a
+  cache logs a warning. A read that fails with any other I/O error keeps the
+  entry for the next read to try again. A conflict resolution's read of the
+  stored value, under a merging resolver, still treats such a record as one
+  with no value, and the next of those reads drops the entry.
 
 ## [0.6.9] – 2026-10-29
 

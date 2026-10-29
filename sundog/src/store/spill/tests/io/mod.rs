@@ -233,6 +233,11 @@ fn read_at_returns_none_for_a_stale_generation() {
 
     let loc_a = sink.installs.lock().unwrap()[0].3;
     assert_eq!(tier.read_at(loc_a).unwrap(), None);
+    assert_eq!(
+        tier.read_record(loc_a).unwrap(),
+        SpillReadAt::Rotated,
+        "a pointer the region rotated past is gone, not corrupt"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -258,6 +263,67 @@ fn read_at_returns_none_for_a_corrupted_record() {
     pwrite_all(&file, b"!", corrupt_offset).unwrap();
 
     assert_eq!(tier.read_at(loc).unwrap(), None);
+    assert_eq!(
+        tier.read_record(loc).unwrap(),
+        SpillReadAt::Corrupt,
+        "a current pointer to bytes that fail the checksum is corrupt, not rotated"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn read_record_finds_a_record_past_the_end_of_a_region_cut_short_corrupt() {
+    let dir = temp_dir("cut-short");
+    let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+    let tier = SpillTier::open(&cfg, "cache-a").unwrap();
+    let sink = Arc::new(RecordingSink::default());
+    tier.attach(Arc::downgrade(&(Arc::clone(&sink) as Arc<dyn SpillSink>)));
+
+    assert!(tier.try_spill(job("k", b"original-value", hlc(1, 0))));
+    assert!(poll_until(POLL_TIMEOUT, || sink.install_count() == 1));
+    let loc = sink.installs.lock().unwrap()[0].3;
+
+    let region_path = dir.join("cache-a").join(region_file_name(loc.region));
+    OpenOptions::new()
+        .write(true)
+        .open(&region_path)
+        .unwrap()
+        .set_len(u64::from(loc.offset))
+        .unwrap();
+
+    assert_eq!(
+        tier.read_record(loc).unwrap(),
+        SpillReadAt::Corrupt,
+        "bytes the region file no longer holds are gone, not an I/O error to retry"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn read_record_reports_any_other_io_failure_as_an_error() {
+    let dir = temp_dir("io-failure");
+    let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+    let tier = SpillTier::open(&cfg, "cache-a").unwrap();
+    let sink = Arc::new(RecordingSink::default());
+    tier.attach(Arc::downgrade(&(Arc::clone(&sink) as Arc<dyn SpillSink>)));
+
+    assert!(tier.try_spill(job("k", b"original-value", hlc(1, 0))));
+    assert!(poll_until(POLL_TIMEOUT, || sink.install_count() == 1));
+    let loc = sink.installs.lock().unwrap()[0].3;
+
+    tier.fail_reads(true);
+    assert!(
+        tier.read_record(loc).is_err(),
+        "the failure reaches the caller"
+    );
+    assert!(tier.read_at(loc).is_err(), "through read_at too");
+    tier.fail_reads(false);
+    assert!(
+        matches!(tier.read_record(loc).unwrap(), SpillReadAt::Found(_)),
+        "and the record is intact for the next read"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }

@@ -6,8 +6,9 @@
 //! scratch every call. One region is active, appending new records at its
 //! `write_cursor`; when a record doesn't fit, the next region rotates in,
 //! purging its still-current keys via `SpillSink::reclaim` first. A
-//! `generation` counter per region lets `SpillTier::read_at` recognize a
-//! pointer into a region that has since rotated out from under it.
+//! `generation` counter per region lets `SpillTier::read_record` recognize a
+//! pointer into a region that has since rotated out from under it, and tell
+//! it from a current pointer to a record that fails its checksum.
 //!
 //! One dedicated flusher thread, fed by a bounded channel, batches writes
 //! into one positional write per region touched and installs each record
@@ -164,6 +165,19 @@ pub(crate) struct SpilledBytes {
     pub(crate) ver: Hlc,
     pub(crate) expires_at_ms: Option<u64>,
     pub(crate) encoded: Bytes,
+}
+
+/// What [`SpillTier::read_record`] found at a pointer.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SpillReadAt {
+    /// The record, intact.
+    Found(SpilledBytes),
+    /// The region rotated past the pointer: the entry that pointed there was
+    /// reclaimed, or moved on before the read.
+    Rotated,
+    /// The pointer is current, and the bytes at it fail their checksum, do
+    /// not frame a record, or lie past the end of the region file.
+    Corrupt,
 }
 
 /// The engine-side callback surface the flusher drives. `Engine<K, V>`
@@ -339,10 +353,15 @@ struct Inner {
     /// so a test can show a checkpoint ran once.
     #[cfg(test)]
     checkpoint_flushes: AtomicU64,
-    /// Test-only: how many times [`SpillTier::read_at`] has been called, so a
-    /// test can show a code path reads nothing from disk.
+    /// Test-only: how many times [`SpillTier::read_record`] has been called,
+    /// [`SpillTier::read_at`]'s reads included, so a test can show a code path
+    /// reads nothing from disk.
     #[cfg(test)]
     read_calls: AtomicU64,
+    /// Test-only: whether [`SpillTier::read_record`] fails every read with an
+    /// I/O error, as a device that returns `EIO` does.
+    #[cfg(test)]
+    fail_reads: AtomicBool,
     /// Lifetime count of jobs [`flusher_loop`] pulled off its channel.
     /// [`SpillTier::checkpoint_flush`] diffs this around its join to
     /// report this drain's count.
@@ -466,7 +485,7 @@ pub(crate) struct CheckpointFlushOutcome {
 /// A FIFO ring of fixed-size region files extending a cache's resident
 /// capacity onto disk. See the module docs for the write/read/rotation
 /// mechanics. Opaque: constructed with [`SpillTier::open`], driven through
-/// [`SpillTier::attach`]/[`SpillTier::try_spill`]/[`SpillTier::read_at`], torn
+/// [`SpillTier::attach`]/[`SpillTier::try_spill`]/[`SpillTier::read_record`], torn
 /// down with [`SpillTier::close`].
 pub(crate) struct SpillTier {
     inner: Arc<Inner>,
@@ -541,36 +560,66 @@ impl Drop for Reservation<'_> {
 }
 
 impl SpillTier {
-    /// One positional read of the record at `loc`. `Ok(None)` when the
-    /// region's generation has moved past `loc.generation`, since it
-    /// rotated out from under this pointer, or the record fails its
-    /// checksum, from a torn write or corruption. Both are ordinary,
-    /// expected outcomes, not errors. `Err` only for a genuine I/O
-    /// failure. Blocking: call from `spawn_blocking` or a dedicated
-    /// thread, never inline in async code.
+    /// One positional read of the record at `loc`, and what it found:
+    /// [`SpillReadAt::Rotated`] when the region's generation has moved past
+    /// `loc.generation`, since it rotated out from under this pointer, and
+    /// [`SpillReadAt::Corrupt`] when the pointer is current and the bytes at
+    /// it fail their checksum, or the region file ends before them. A pointer
+    /// is installed only once its record's write returned, so a current
+    /// pointer to bytes that are missing or fail the checksum means the
+    /// region file was damaged after the write. `Err` only for any other I/O
+    /// failure, which a later read may not meet. Blocking: call from
+    /// `spawn_blocking` or a dedicated thread, never inline in async code.
     ///
     /// # Errors
     ///
     /// Returns the underlying [`io::Error`] if the positional read itself
     /// fails.
-    pub(crate) fn read_at(&self, loc: SpillLoc) -> io::Result<Option<SpilledBytes>> {
+    pub(crate) fn read_record(&self, loc: SpillLoc) -> io::Result<SpillReadAt> {
         #[cfg(test)]
         self.inner.read_calls.fetch_add(1, Ordering::Relaxed);
         let Some(region) = self.inner.regions.get(loc.region as usize) else {
-            return Ok(None);
+            return Ok(SpillReadAt::Rotated);
         };
         if region.generation.load(Ordering::Acquire) != loc.generation {
-            return Ok(None);
+            return Ok(SpillReadAt::Rotated);
         }
         let mut buf = vec![0u8; loc.len as usize];
-        pread_exact(&region.file, &mut buf, u64::from(loc.offset))?;
+        #[cfg(test)]
+        let read = if self.inner.fail_reads.load(Ordering::Relaxed) {
+            Err(io::Error::other("a test failed this read"))
+        } else {
+            pread_exact(&region.file, &mut buf, u64::from(loc.offset))
+        };
+        #[cfg(not(test))]
+        let read = pread_exact(&region.file, &mut buf, u64::from(loc.offset));
         // The region may rotate while this read is in flight; a generation
         // bump after the fact means these bytes may already belong to an
         // unrelated later record.
         if region.generation.load(Ordering::Acquire) != loc.generation {
-            return Ok(None);
+            return Ok(SpillReadAt::Rotated);
         }
-        Ok(decode_record(&buf))
+        match read {
+            Ok(()) => Ok(decode_record(&buf).map_or(SpillReadAt::Corrupt, SpillReadAt::Found)),
+            // The region file ends before the record does: its bytes are not
+            // there for a later read to find.
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => Ok(SpillReadAt::Corrupt),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// [`SpillTier::read_record`]'s bytes, `Ok(None)` for a record it found
+    /// rotated or corrupt alike: for a caller that degrades the same way
+    /// either way, such as a conflict resolution's read under a stripe lock.
+    ///
+    /// # Errors
+    ///
+    /// As [`SpillTier::read_record`].
+    pub(crate) fn read_at(&self, loc: SpillLoc) -> io::Result<Option<SpilledBytes>> {
+        Ok(match self.read_record(loc)? {
+            SpillReadAt::Found(bytes) => Some(bytes),
+            SpillReadAt::Rotated | SpillReadAt::Corrupt => None,
+        })
     }
 
     /// Live, un-reclaimed, bytes across all regions.

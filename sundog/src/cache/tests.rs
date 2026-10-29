@@ -24,6 +24,8 @@ mod pause_guard;
 mod rules;
 #[cfg(feature = "spill")]
 mod spill_gate;
+#[cfg(feature = "spill")]
+mod spill_unreadable;
 mod stale_close;
 mod startup;
 mod tti_clock;

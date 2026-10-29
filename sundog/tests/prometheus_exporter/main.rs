@@ -580,7 +580,17 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
             Some(1.0),
             "expected exactly one disk hit; got body:\n{body}"
         );
-        let disk_reads: f64 = ["hit", "stale", "io_error"]
+        assert_eq!(
+            scraped_metric_value(
+                &body,
+                "sundog_spill_reads_total",
+                &[("cache", "spilled"), ("outcome", "corrupt")]
+            ),
+            Some(0.0),
+            "the corrupt outcome is exported from the tier's attach, and no read found an \
+             unreadable record; got body:\n{body}"
+        );
+        let disk_reads: f64 = ["hit", "stale", "corrupt", "io_error"]
             .iter()
             .filter_map(|&outcome| {
                 scraped_metric_value(

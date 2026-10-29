@@ -678,10 +678,10 @@ where
 /// [`Shard::with_spill`]'s read-side counterpart to the tier itself: the
 /// semaphore [`Shard::get`]/[`Shard::get_or_load`]'s disk reads acquire a
 /// permit from before `spawn_blocking`-ing a positional read, bounded by
-/// the configured `read_concurrency`, plus the four `Counter` handles and
+/// the configured `read_concurrency`, plus the five `Counter` handles and
 /// the `Histogram` handle those reads and the batched read path count and
 /// time against, precomputed for the same reason `Shard::hits`/`Shard::misses`
-/// are.
+/// are, and the flag that limits the unreadable-entry warning to one.
 #[cfg(feature = "spill")]
 #[derive(Clone)]
 struct SpillRead {
@@ -689,13 +689,20 @@ struct SpillRead {
     /// `sundog_spill_reads_total{cache,outcome="hit"}`.
     reads_hit: metrics::Counter,
     /// `sundog_spill_reads_total{cache,outcome="stale"}`: a generation
-    /// mismatch, meaning the region rotated out from under the pointer, or
-    /// a checksum failure.
+    /// mismatch, meaning the region rotated out from under the pointer.
     reads_stale: metrics::Counter,
+    /// `sundog_spill_reads_total{cache,outcome="corrupt"}`: the record at a
+    /// current pointer fails its checksum or lies past the end of its region
+    /// file, or its bytes no longer decode as `V`. The read drops the entry
+    /// ([`SpillRead::drop_unreadable`]).
+    reads_corrupt: metrics::Counter,
     /// `sundog_spill_reads_total{cache,outcome="io_error"}`: the positional
-    /// read itself failed, or the bytes it returned failed to postcard-decode
-    /// as `V`.
+    /// read failed with an error other than reaching the end of the region
+    /// file. The entry stays, and the next read tries again.
     reads_io_error: metrics::Counter,
+    /// Whether this cache has logged a drop of an unreadable spilled entry
+    /// at `warn`: the first drop warns, later ones log at `debug`.
+    unreadable_warned: Arc<AtomicBool>,
     /// `sundog_spill_promotions_total{cache}`.
     promotions: metrics::Counter,
     /// `sundog_spill_read_duration_seconds{cache}`: every disk read
@@ -709,11 +716,80 @@ struct SpillRead {
 
 #[cfg(feature = "spill")]
 impl SpillRead {
+    /// The read side of cache `name`'s tier: `read_concurrency` permits and
+    /// its metric handles, bound to the recorder installed now.
+    fn new(name: &str, read_concurrency: usize) -> Self {
+        let reads = |outcome: &'static str| {
+            metrics::counter!(
+                "sundog_spill_reads_total",
+                "cache" => name.to_string(), "outcome" => outcome,
+            )
+        };
+        Self {
+            semaphore: Arc::new(tokio::sync::Semaphore::new(read_concurrency)),
+            reads_hit: reads("hit"),
+            reads_stale: reads("stale"),
+            reads_corrupt: reads("corrupt"),
+            reads_io_error: reads("io_error"),
+            unreadable_warned: Arc::new(AtomicBool::new(false)),
+            promotions: metrics::counter!(
+                "sundog_spill_promotions_total",
+                "cache" => name.to_string(),
+            ),
+            read_duration: metrics::histogram!(
+                "sundog_spill_read_duration_seconds",
+                "cache" => name.to_string(),
+            ),
+        }
+    }
+
     /// Counts one disk read's `outcome` and records its duration since
     /// `started`.
     fn finish(&self, outcome: &metrics::Counter, started: std::time::Instant) {
         outcome.increment(1);
         self.read_duration.record(started.elapsed());
+    }
+
+    /// Drops `key_bytes`'s entry, found by `hash`, if it still points at
+    /// `loc`, whose record a read found unreadable for the reason `why`
+    /// ([`engine::Engine::drop_unreadable_spilled`]), and logs the drop: at
+    /// `warn` the first time for this cache, at `debug` after. The log names
+    /// the cache and the key's length, not the key.
+    fn drop_unreadable<K, V>(
+        &self,
+        engine: &engine::Engine<K, V>,
+        cache: &str,
+        key_bytes: &[u8],
+        hash: u64,
+        loc: spill::SpillLoc,
+        why: &'static str,
+    ) where
+        K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+        V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    {
+        if !engine.drop_unreadable_spilled(key_bytes, hash, loc) {
+            return;
+        }
+        if self
+            .unreadable_warned
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::debug!(
+                cache,
+                key_len = key_bytes.len(),
+                why,
+                "dropped an unreadable spilled entry"
+            );
+        } else {
+            tracing::warn!(
+                cache,
+                key_len = key_bytes.len(),
+                why,
+                "dropped a spilled entry whose record cannot be read; a Replicated or \
+                 Distributed peer's copy returns through anti-entropy. \
+                 sundog_spill_reads_total{{outcome=\"corrupt\"}} counts every such read"
+            );
+        }
     }
 }
 

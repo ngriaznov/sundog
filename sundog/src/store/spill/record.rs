@@ -80,8 +80,9 @@ pub(super) fn split_record(buf: &[u8]) -> Option<(SpillRecordHeader, &[u8], &[u8
 /// Parses `buf`, one record's bytes as read off disk, into
 /// [`SpilledBytes`], or `None` for anything that doesn't check out: a short
 /// buffer, a bad magic, a length mismatch, or a checksum mismatch. Every
-/// one of these is treated identically. A corrupted or torn record reads
-/// like one that is never there.
+/// one of these is treated identically: the record cannot be used. Whether
+/// that means it was never written or it was damaged is the caller's to
+/// tell, as [`SpillTier::read_record`] does from the pointer's generation.
 pub(super) fn decode_record(buf: &[u8]) -> Option<SpilledBytes> {
     decode_record_with_key(buf).map(|(_, sb)| sb)
 }

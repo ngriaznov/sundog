@@ -109,7 +109,7 @@ addresses once it forms, under `cluster formed`.
 | `sundog_spill_entries{cache}` | entries whose values live on disk |
 | `sundog_spill_bytes_used{cache}` | bytes the region files hold |
 | `sundog_spill_writes_total{cache}` | values written to disk |
-| `sundog_spill_reads_total{cache, outcome}` | disk reads: `hit`, `stale` or `io_error` |
+| `sundog_spill_reads_total{cache, outcome}` | disk reads: `hit`; `stale`, the region rotated past the entry; `corrupt`, the record failed its checksum, was cut short or did not decode, and the entry is dropped; or `io_error` |
 | `sundog_spill_read_duration_seconds{cache}` | histogram of the duration of every disk read `sundog_spill_reads_total` counts |
 | `sundog_spill_promotions_total{cache}` | spilled entries promoted back to RAM |
 | `sundog_spill_region_reclaims_total{cache}` | regions reclaimed as the ring wrapped |
