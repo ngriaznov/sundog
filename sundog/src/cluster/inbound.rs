@@ -300,19 +300,22 @@ pub(super) fn reforward_groups(
     if hops >= MAX_FORWARD_HOPS || sender_view_hash == view.view_hash() {
         return None;
     }
-    let groups: Vec<fan_out::OwnerGroup> =
-        fan_out::group_by_owner_set(view, self_node, records.to_vec())
+    let groups: Vec<fan_out::OwnerGroup> = fan_out::group_by_owner_set(
+        view,
+        self_node,
+        records.iter().map(WireRecord::detached).collect(),
+    )
+    .into_iter()
+    .map(|group| fan_out::OwnerGroup {
+        owners: group
+            .owners
             .into_iter()
-            .map(|group| fan_out::OwnerGroup {
-                owners: group
-                    .owners
-                    .into_iter()
-                    .filter(|&n| n != from)
-                    .collect::<Vec<_>>(),
-                records: group.records,
-            })
-            .filter(|group| !group.owners.is_empty())
-            .collect();
+            .filter(|&n| n != from)
+            .collect::<Vec<_>>(),
+        records: group.records,
+    })
+    .filter(|group| !group.owners.is_empty())
+    .collect();
     Some(groups)
 }
 
@@ -387,10 +390,10 @@ fn reforward_stale_view(reforwarder: &mut Reforwarder, batch: ReforwardBatch<'_>
     }
 }
 
-/// The frame bytes a lane may hold toward one peer: a batch is a few hundred
-/// kilobytes at most, so this is a few hundred batches queued behind a peer
-/// that stopped reading. Bytes, not batches, bound the memory; the decoded
-/// messages beside the frames are not counted.
+/// The bytes a lane may hold toward one peer, its frames counted encoded and
+/// decoded ([`OutFrame::resident_bytes`]): a batch is a few hundred kilobytes
+/// at most, so this is a hundred batches or more queued behind a peer that
+/// stopped reading. Bytes, not batches, bound the memory.
 pub(super) const REFORWARD_LANE_BYTES: usize = 64 * 1024 * 1024;
 
 /// How long [`Reforwarder::shutdown`] lets the lanes hand their batches to
@@ -420,9 +423,9 @@ pub(super) fn warn_due(last_warn: Option<Instant>, now: Instant) -> bool {
     last_warn.is_none_or(|at| now.saturating_duration_since(at) >= REFORWARD_WARN_SPACING)
 }
 
-/// The encoded bytes of `frames`.
+/// The bytes `frames` hold, encoded and decoded.
 fn frames_bytes(frames: &[OutFrame]) -> usize {
-    frames.iter().map(|frame| frame.frame.len()).sum()
+    frames.iter().map(OutFrame::resident_bytes).sum()
 }
 
 /// One batch of frames waiting in a lane, with the bytes it counts for.

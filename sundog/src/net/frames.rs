@@ -27,6 +27,31 @@ impl OutFrame {
         let frame = wire::encode(&msg)?;
         Ok(Self { msg, frame })
     }
+
+    /// The memory a queued copy of this frame holds: its encoded bytes, its
+    /// decoded message, and each record the message carries, its struct and
+    /// its key and value bytes. Shared bytes count once per frame. A record
+    /// this node received and sends on is detached from the frame it came in
+    /// first ([`WireRecord::detached`]), so its bytes are its own and the
+    /// figure bounds what the frame keeps alive. For a run of small records
+    /// the decoded message outweighs the encoded bytes several times over.
+    /// Pure; unit tested directly.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        let record = |rec: &WireRecord| {
+            std::mem::size_of::<WireRecord>()
+                + rec.key.len()
+                + rec.value.as_ref().map_or(0, Bytes::len)
+        };
+        let decoded = match &self.msg {
+            Msg::Replicate { rec, .. } => record(rec),
+            Msg::ReplicateBatch { recs, .. } | Msg::ForwardBatch { recs, .. } => {
+                recs.iter().map(record).sum()
+            }
+            Msg::Invalidate { key, .. } => key.len(),
+            _ => 0,
+        };
+        std::mem::size_of::<Msg>() + self.frame.len() + decoded
+    }
 }
 
 /// Process-wide wire-frame counters, incremented at [`super::conn::send_msg`], the

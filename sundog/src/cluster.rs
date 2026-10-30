@@ -1255,6 +1255,11 @@ fn validate_config(config: &ClusterConfig) -> Result<(), JoinError> {
             "ClusterConfig::fan_out_backlog_capacity must be nonzero".to_string(),
         ));
     }
+    if config.outbox_bytes == 0 {
+        return Err(JoinError::InvalidConfig(
+            "ClusterConfig::outbox_bytes must be nonzero".to_string(),
+        ));
+    }
     if config.fan_out_stall_timeout.is_zero() {
         return Err(JoinError::InvalidConfig(
             "ClusterConfig::fan_out_stall_timeout must be nonzero".to_string(),

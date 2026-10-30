@@ -184,4 +184,7 @@ predict, plus the fan-out backlog: each cache queues up to
 `fan_out_backlog_capacity` keys, 262,144 by default, while peers are slow,
 and past it while writes wait out `fan_out_wait_timeout`. A `Distributed`
 owner that stops reading holds the backlog until it has taken nothing for
-`fan_out_stall_timeout`.
+`fan_out_stall_timeout`. Each peer's replicate outbox and its invalidate
+queue each hold up to `outbox_bytes` of queued records, encoded and decoded,
+64 MiB by default, and the re-forward lane toward it up to 64 MiB more;
+allow that much per peer that can fall behind at once.

@@ -558,9 +558,22 @@ fn fan_out_no_room_waits_again_only_for_a_live_peer_before_its_deadline() {
 
 #[test]
 fn stall_latch_sets_on_a_stall_clears_on_a_whole_batch_and_leaves_a_departure() {
-    assert_eq!(stall_latch(SendEnd::Stalled), Some(true));
-    assert_eq!(stall_latch(SendEnd::Placed), Some(false));
-    assert_eq!(stall_latch(SendEnd::Departed), None);
+    // (how the send ended, the writer took a frame since the latch, latch)
+    let table = [
+        (SendEnd::Stalled, false, Some(true)),
+        (SendEnd::Stalled, true, Some(true)),
+        (SendEnd::Placed, true, Some(false)),
+        (SendEnd::Placed, false, None),
+        (SendEnd::Departed, true, None),
+        (SendEnd::Departed, false, None),
+    ];
+    for (end, taken_since, latch) in table {
+        assert_eq!(
+            stall_latch(end, taken_since),
+            latch,
+            "{end:?}, taken since {taken_since}"
+        );
+    }
 }
 
 /// Each counter's total over its series since the last checkpoint: a
@@ -602,8 +615,8 @@ async fn count_forwarded(inbound: &mut mpsc::Receiver<InboundMsg>, wait: Duratio
     count
 }
 
-/// The `dirty` and `stalled` flags of `peer`'s handle in `mesh`.
-fn peer_flags(mesh: &Mesh, peer: NodeId) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
+/// The `dirty` flag and the stall latch of `peer`'s handle in `mesh`.
+fn peer_flags(mesh: &Mesh, peer: NodeId) -> (Arc<AtomicBool>, Arc<AtomicU64>) {
     let table = mesh.inner.peers.read().expect("lock");
     let handle = table.get(&peer).expect("peer registered");
     (Arc::clone(&handle.dirty), Arc::clone(&handle.stalled))
@@ -667,7 +680,7 @@ async fn a_bounded_send_drops_past_its_budget_and_latches_a_live_peer_that_stopp
     );
     assert!(dirty.load(Ordering::Relaxed), "a drop marks the peer dirty");
     assert!(
-        stalled.load(Ordering::Relaxed),
+        stalled.load(Ordering::Relaxed) != 0,
         "the peer is latched stalled"
     );
     let totals = counter_totals(&snapshotter);
@@ -697,7 +710,7 @@ async fn a_bounded_send_drops_past_its_budget_and_latches_a_live_peer_that_stopp
         dirty.load(Ordering::Relaxed),
         "every drop marks the peer dirty"
     );
-    assert!(stalled.load(Ordering::Relaxed), "the latch holds");
+    assert!(stalled.load(Ordering::Relaxed) != 0, "the latch holds");
     assert_eq!(
         sender
             .send_frames_within(
@@ -709,7 +722,7 @@ async fn a_bounded_send_drops_past_its_budget_and_latches_a_live_peer_that_stopp
         0
     );
     assert!(
-        stalled.load(Ordering::Relaxed),
+        stalled.load(Ordering::Relaxed) != 0,
         "a send with no frames places none, so it does not clear the latch"
     );
     let totals = counter_totals(&snapshotter);
@@ -721,25 +734,235 @@ async fn a_bounded_send_drops_past_its_budget_and_latches_a_live_peer_that_stopp
     assert_eq!(total(&totals, "sundog_backlog_dropped_total"), 2);
 }
 
-/// Pins how a latch clears: a bounded send that places every frame clears
-/// it and marks the peer dirty again, since the anti-entropy round the
-/// stall's mark steered may have run while the peer could not answer; a
-/// whole batch to a peer not latched marks nothing.
+#[test]
+fn a_frame_s_resident_bytes_count_its_encoding_its_message_and_each_record() {
+    let rec = sample_record(1);
+    let per_record = std::mem::size_of::<WireRecord>()
+        + rec.key.len()
+        + rec.value.as_ref().map_or(0, Bytes::len);
+    let base = std::mem::size_of::<Msg>();
+    for n in [1u8, 10, 100] {
+        let frame = OutFrame::new(
+            batch_forward(
+                &SmolStr::new("users"),
+                7,
+                0,
+                (0..n).map(|_| sample_record(1)).collect(),
+            )
+            .remove(0),
+        )
+        .expect("encodes");
+        assert_eq!(
+            frame.resident_bytes(),
+            base + frame.frame.len() + usize::from(n) * per_record,
+            "{n} records"
+        );
+    }
+    let single = OutFrame::new(Msg::Replicate {
+        cache: SmolStr::new("users"),
+        rec,
+    })
+    .expect("encodes");
+    assert_eq!(
+        single.resident_bytes(),
+        base + single.frame.len() + per_record
+    );
+    let invalidation = OutFrame::new(Msg::Invalidate {
+        cache: SmolStr::new("users"),
+        key: Bytes::from_static(b"abc"),
+        ver: sample_record(1).ver,
+    })
+    .expect("encodes");
+    assert_eq!(
+        invalidation.resident_bytes(),
+        base + invalidation.frame.len() + 3
+    );
+    let small = OutFrame::new(
+        batch_forward(
+            &SmolStr::new("users"),
+            7,
+            0,
+            (0..100).map(|_| sample_record(1)).collect(),
+        )
+        .remove(0),
+    )
+    .expect("encodes");
+    assert!(
+        small.resident_bytes() > 3 * small.frame.len(),
+        "small records' decoded copies outweigh their encoding several times over"
+    );
+}
+
+/// A mesh whose peer 2 never takes a frame, under an outbox of 100 frame
+/// slots and room in bytes for `frames` of [`forward_frames`]' frames.
+async fn mesh_with_a_byte_bounded_stalled_peer(frames: usize) -> Mesh {
+    let frame_len = forward_frames(1)[0].resident_bytes();
+    let config = ClusterConfig {
+        outbox_capacity: 100,
+        outbox_bytes: frame_len * frames,
+        ..ClusterConfig::default()
+    };
+    let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid loopback addr");
+    let (mesh, _inbound) = Mesh::spawn(addr, NodeId::from(1), 1, &config, empty_handler())
+        .await
+        .expect("bind loopback");
+    let dead_peer: SocketAddr = "127.0.0.1:1".parse().expect("valid unroutable addr");
+    mesh.update_peers(vec![peer_at(NodeId::from(2), dead_peer)]);
+    mesh
+}
+
+/// Pins the byte bound on the drop-newest path: once a peer's queued frames
+/// fill `outbox_bytes`, the next is dropped and counted, though frame slots
+/// are left.
+#[tokio::test]
+async fn a_replicate_send_drops_past_the_outbox_byte_budget_with_frame_slots_free() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let sender = mesh_with_a_byte_bounded_stalled_peer(3).await;
+    let (dirty, _stalled) = peer_flags(&sender, NodeId::from(2));
+
+    assert!(
+        !sender.send_frames(NodeId::from(2), MsgClass::Replicate, forward_frames(5)),
+        "two of the five frames find no room"
+    );
+    assert!(dirty.load(Ordering::Relaxed), "a drop marks the peer dirty");
+    assert_eq!(
+        total(
+            &counter_totals(&snapshotter),
+            "sundog_backlog_dropped_total"
+        ),
+        2,
+        "three frames fill the byte budget and the other two are dropped"
+    );
+    let table = sender.inner.peers.read().expect("lock");
+    let handle = table.get(&NodeId::from(2)).expect("peer registered");
+    assert_eq!(
+        handle.replicate_tx.max_capacity() - handle.replicate_tx.capacity(),
+        3,
+        "97 of 100 frame slots are still free"
+    );
+}
+
+/// Pins the byte bound on the waiting path: a fan-out send places what the
+/// byte budget holds and then waits for bytes as it waits for slots, so a
+/// peer that takes nothing stalls it.
+#[tokio::test]
+async fn a_bounded_send_waits_for_outbox_bytes_and_stalls_on_a_peer_that_takes_nothing() {
+    let sender = mesh_with_a_byte_bounded_stalled_peer(3).await;
+    let (_dirty, stalled) = peer_flags(&sender, NodeId::from(2));
+
+    let placed = tokio::time::timeout(
+        Duration::from_secs(5),
+        sender.send_frames_within(
+            NodeId::from(2),
+            forward_frames(5),
+            SendBudget::Idle(Duration::from_millis(300)),
+        ),
+    )
+    .await
+    .expect("the send ends at its idle budget");
+    assert_eq!(placed, 3, "the byte budget holds three frames");
+    assert!(
+        stalled.load(Ordering::Relaxed) != 0,
+        "a peer that takes nothing latches"
+    );
+}
+
+/// Pins that leftover byte room is not a peer reading: a latched peer that
+/// takes nothing keeps its latch when a batch small enough for the room
+/// left fits whole, so the next batch waits for nothing either.
+#[tokio::test]
+async fn a_small_batch_fitting_a_latched_peer_s_leftover_room_keeps_the_latch() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let frame_len = forward_frames(1)[0].resident_bytes();
+    let small = OutFrame::new(Msg::Invalidate {
+        cache: SmolStr::new("users"),
+        key: Bytes::from_static(b"k"),
+        ver: sample_record(1).ver,
+    })
+    .expect("encodes");
+    assert!(small.resident_bytes() < frame_len / 2);
+    let config = ClusterConfig {
+        outbox_capacity: 100,
+        outbox_bytes: frame_len * 3 + frame_len / 2,
+        ..ClusterConfig::default()
+    };
+    let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid loopback addr");
+    let (sender, _inbound) = Mesh::spawn(addr, NodeId::from(1), 1, &config, empty_handler())
+        .await
+        .expect("bind loopback");
+    let dead_peer: SocketAddr = "127.0.0.1:1".parse().expect("valid unroutable addr");
+    sender.update_peers(vec![peer_at(NodeId::from(2), dead_peer)]);
+    let (dirty, stalled) = peer_flags(&sender, NodeId::from(2));
+    let idle = || SendBudget::Idle(Duration::from_millis(300));
+
+    let placed = sender
+        .send_frames_within(NodeId::from(2), forward_frames(5), idle())
+        .await;
+    assert_eq!(placed, 3, "half a frame's room is left");
+    assert!(stalled.load(Ordering::Relaxed) != 0, "the peer latches");
+    dirty.store(false, Ordering::Relaxed);
+
+    let placed = sender
+        .send_frames_within(NodeId::from(2), vec![small], idle())
+        .await;
+    assert_eq!(placed, 1, "the small batch fits the room left whole");
+    assert!(
+        stalled.load(Ordering::Relaxed) != 0,
+        "the writer took nothing, so the latch holds"
+    );
+    assert!(
+        !dirty.load(Ordering::Relaxed),
+        "a latch that holds marks nothing again"
+    );
+    let started = tokio::time::Instant::now();
+    sender
+        .send_frames_within(NodeId::from(2), forward_frames(1), idle())
+        .await;
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "the next batch waits for nothing: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        total(&counter_totals(&snapshotter), "sundog_fan_out_stalls_total"),
+        1,
+        "one stall, never cleared and set again"
+    );
+}
+
+/// Pins how a latch clears: once the peer's writer has taken a frame since
+/// the latch was set, a bounded send that places every frame clears it and
+/// marks the peer dirty again, since the anti-entropy round the stall's mark
+/// steered may have run while the peer could not answer; a whole batch to a
+/// peer not latched marks nothing.
 #[tokio::test]
 async fn a_bounded_send_that_places_every_frame_clears_the_latch_and_marks_the_peer_again() {
     let (receiver, mut inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
     let (sender, _sender_inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
     sender.update_peers(vec![peer_at(NodeId::from(2), receiver.local_addr())]);
     let (_dirty, stalled) = peer_flags(&sender, NodeId::from(2));
-    let _ = sender.take_dirty_peers();
-    stalled.store(true, Ordering::Relaxed);
-
     let budget = || SendBudget::Idle(Duration::from_secs(10));
+    // Latched before the writer took its first frame, which it then takes.
+    stalled.store(1, Ordering::Relaxed);
+    sender
+        .send_frames_within(NodeId::from(2), forward_frames(1), budget())
+        .await;
+    assert_eq!(
+        count_forwarded(&mut inbound, Duration::from_secs(3)).await,
+        1
+    );
+    stalled.store(1, Ordering::Relaxed);
+    let _ = sender.take_dirty_peers();
+
     let placed = sender
         .send_frames_within(NodeId::from(2), forward_frames(3), budget())
         .await;
     assert_eq!(placed, 3, "an outbox with room takes every frame");
-    assert!(!stalled.load(Ordering::Relaxed), "the latch clears");
+    assert_eq!(stalled.load(Ordering::Relaxed), 0, "the latch clears");
     assert_eq!(sender.take_dirty_peers(), vec![NodeId::from(2)]);
     assert_eq!(
         count_forwarded(&mut inbound, Duration::from_secs(3)).await,
@@ -878,7 +1101,7 @@ async fn a_bounded_send_keeps_waiting_while_a_slow_peer_keeps_taking_frames() {
         "the send outlasts its idle time, so what it bounds is silence: {took:?}"
     );
     assert!(
-        !stalled.load(Ordering::Relaxed),
+        stalled.load(Ordering::Relaxed) == 0,
         "a reading peer is not latched"
     );
     assert!(!dirty.load(Ordering::Relaxed), "nothing was dropped");
@@ -917,7 +1140,7 @@ async fn send_frames_awaiting_waits_past_one_deadline_for_a_still_live_peer() {
     );
 
     let (_dirty, stalled) = peer_flags(&sender, NodeId::from(2));
-    stalled.store(true, Ordering::Relaxed);
+    stalled.store(1, Ordering::Relaxed);
 
     let frames: Vec<OutFrame> = replicate_msgs(3)
         .into_iter()
@@ -1015,4 +1238,366 @@ async fn send_frames_awaiting_drops_once_the_peer_leaves_the_table_mid_wait() {
         dirty_flag.load(Ordering::Relaxed),
         "a peer that leaves mid-wait drops its remaining frames and is marked dirty"
     );
+}
+
+/// The latch holds one past the frames the writer had taken when it set, so
+/// zero stays the clear latch, and a send skips waiting only while the
+/// writer has taken nothing since.
+#[test]
+fn the_latch_marks_the_frames_taken_and_is_waited_out_only_while_the_writer_takes_none() {
+    assert_eq!(latch_mark(0), 1);
+    assert_eq!(latch_mark(5), 6);
+    assert_eq!(latch_mark(u64::MAX), u64::MAX, "the mark saturates");
+    // (latch, frames taken, a frame taken since the latch, waited out)
+    let table = [
+        (0, 0, false, false),
+        (0, 9, false, false),
+        (1, 0, false, true),
+        (6, 5, false, true),
+        (6, 6, true, false),
+        (6, 9, true, false),
+    ];
+    for (latched_at, taken, since, waited_out) in table {
+        assert_eq!(
+            taken_since_latch(latched_at, taken),
+            since,
+            "latch {latched_at}, taken {taken}"
+        );
+        assert_eq!(
+            waits_out_latch(latched_at, taken),
+            waited_out,
+            "latch {latched_at}, taken {taken}"
+        );
+    }
+}
+
+/// Pins the latch's baseline for a writer that took frames before its peer
+/// stopped reading: the latch sets one past them, a whole batch with nothing
+/// taken since keeps it, a stall again moves it to the frames taken by then
+/// without counting a second stall, and it clears, marking the peer again,
+/// only once the writer has taken a frame past the baseline.
+#[test]
+fn settle_stall_latch_counts_from_the_frames_the_writer_had_taken() {
+    use crate::net::mesh::settle_stall_latch;
+
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let peer = NodeId::from(2);
+    let (stalled, dirty) = (AtomicU64::new(0), AtomicBool::new(false));
+
+    settle_stall_latch(peer, SendEnd::Stalled, 3, 5, &stalled, &dirty);
+    assert_eq!(stalled.load(Ordering::Relaxed), 6, "one past five taken");
+    settle_stall_latch(peer, SendEnd::Placed, 0, 5, &stalled, &dirty);
+    assert_eq!(
+        stalled.load(Ordering::Relaxed),
+        6,
+        "nothing taken since, so a whole batch keeps it"
+    );
+    settle_stall_latch(peer, SendEnd::Stalled, 1, 8, &stalled, &dirty);
+    assert_eq!(
+        stalled.load(Ordering::Relaxed),
+        9,
+        "a stall again moves the baseline"
+    );
+    settle_stall_latch(peer, SendEnd::Placed, 0, 8, &stalled, &dirty);
+    assert_eq!(stalled.load(Ordering::Relaxed), 9);
+    assert!(
+        !dirty.load(Ordering::Relaxed),
+        "a latch that holds marks nothing"
+    );
+    settle_stall_latch(peer, SendEnd::Placed, 0, 9, &stalled, &dirty);
+    assert_eq!(stalled.load(Ordering::Relaxed), 0, "the latch clears");
+    assert!(
+        dirty.load(Ordering::Relaxed),
+        "clearing marks the peer again"
+    );
+    assert_eq!(
+        total(&counter_totals(&snapshotter), "sundog_fan_out_stalls_total"),
+        1,
+        "counted once, when it first set"
+    );
+
+    settle_stall_latch(peer, SendEnd::Stalled, 2, 9, &stalled, &dirty);
+    settle_stall_latch(peer, SendEnd::Departed, 4, 12, &stalled, &dirty);
+    assert_eq!(
+        stalled.load(Ordering::Relaxed),
+        10,
+        "a departure leaves the latch alone"
+    );
+}
+
+/// A one-record `ForwardBatch` frame for key `n` whose value is `len` bytes.
+fn forward_frame_of(n: u8, len: usize) -> OutFrame {
+    let rec = WireRecord {
+        value: Some(Bytes::from(vec![n; len])),
+        ..sample_record(n)
+    };
+    let msg = batch_forward(&SmolStr::new("users"), 7, 0, vec![rec])
+        .pop()
+        .expect("one record, one frame");
+    OutFrame::new(msg).expect("encodes")
+}
+
+/// A sender with `config` whose peer 2 reads its connection at `rate` bytes
+/// a second, however its reads split.
+async fn mesh_with_a_slow_reader(config: &ClusterConfig, rate: u64) -> Mesh {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let peer_addr = listener.local_addr().expect("listener has a local addr");
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("the writer dials the peer");
+        let mut buf = vec![0u8; 64 * 1024];
+        let started = tokio::time::Instant::now();
+        let mut total = 0u64;
+        while let Ok(read) = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await
+            && read > 0
+        {
+            total += u64::try_from(read).expect("a read fits in u64");
+            let due = Duration::from_micros(total * 1_000_000 / rate);
+            tokio::time::sleep_until(started + due).await;
+        }
+    });
+    let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid loopback addr");
+    let (sender, _inbound) = Mesh::spawn(addr, NodeId::from(1), 1, config, empty_handler())
+        .await
+        .expect("bind loopback");
+    sender.update_peers(vec![peer_at(NodeId::from(2), peer_addr)]);
+    sender
+}
+
+/// Pins that the idle wait measures the writer's silence: a frame that
+/// weighs four of the frames queued ahead of it waits for the writer to take
+/// four of them, two seconds at the peer's pace, past the idle time, and
+/// goes in because each frame the writer takes renews the wait.
+#[tokio::test]
+async fn a_heavy_frame_waits_while_the_writer_keeps_taking_the_frames_ahead_of_it() {
+    let light = forward_frame_of(0, 1024 * 1024).resident_bytes();
+    let config = ClusterConfig {
+        outbox_capacity: 100,
+        outbox_bytes: light * 6,
+        ..ClusterConfig::default()
+    };
+    // 2 MiB/s: a 1 MiB frame half a second.
+    let sender = mesh_with_a_slow_reader(&config, 2 * 1024 * 1024).await;
+    let (dirty, stalled) = peer_flags(&sender, NodeId::from(2));
+    let _ = sender.take_dirty_peers();
+    // 20 MiB ahead fills the loopback socket buffers and then the outbox.
+    let mut frames: Vec<OutFrame> = (0..20u8)
+        .map(|n| forward_frame_of(n, 1024 * 1024))
+        .collect();
+    let heavy = forward_frame_of(20, 3_900 * 1024);
+    assert!(heavy.resident_bytes() > light * 7 / 2);
+    frames.push(heavy);
+    frames.push(forward_frame_of(21, 1024 * 1024));
+
+    let placed = tokio::time::timeout(
+        Duration::from_secs(120),
+        sender.send_frames_within(
+            NodeId::from(2),
+            frames,
+            SendBudget::Idle(Duration::from_millis(1_250)),
+        ),
+    )
+    .await
+    .expect("a peer that keeps reading takes the whole send");
+    assert_eq!(placed, 22, "every frame goes in, the heavy one too");
+    assert_eq!(
+        stalled.load(Ordering::Relaxed),
+        0,
+        "a reading peer is not latched"
+    );
+    assert!(!dirty.load(Ordering::Relaxed), "nothing was dropped");
+}
+
+/// The frames `peer`'s writer has taken from its replicate outbox.
+fn writer_taken(mesh: &Mesh, peer: NodeId) -> u64 {
+    let table = mesh.inner.peers.read().expect("lock");
+    table
+        .get(&peer)
+        .expect("peer registered")
+        .replicate_tx
+        .taken()
+}
+
+/// Pins that a latched peer whose writer reads again is waited on: a batch
+/// heavier than the whole byte budget places whole as the writer drains the
+/// outbox, which clears the latch and marks the peer again, where a send
+/// that took only the room free at once would drop the rest every time.
+#[tokio::test]
+async fn a_latched_peer_that_reads_again_takes_a_batch_heavier_than_its_outbox() {
+    let (receiver, mut inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+    let frame_len = forward_frames(1)[0].resident_bytes();
+    let config = ClusterConfig {
+        outbox_capacity: 100,
+        outbox_bytes: frame_len * 2,
+        ..ClusterConfig::default()
+    };
+    let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid loopback addr");
+    let (sender, _sender_inbound) = Mesh::spawn(addr, NodeId::from(1), 1, &config, empty_handler())
+        .await
+        .expect("bind loopback");
+    sender.update_peers(vec![peer_at(NodeId::from(2), receiver.local_addr())]);
+    let (_dirty, stalled) = peer_flags(&sender, NodeId::from(2));
+    let budget = || SendBudget::Idle(Duration::from_secs(10));
+    // Latched as a stall leaves it, then the writer takes a frame.
+    stalled.store(
+        latch_mark(writer_taken(&sender, NodeId::from(2))),
+        Ordering::Relaxed,
+    );
+    sender
+        .send_frames_within(NodeId::from(2), forward_frames(1), budget())
+        .await;
+    assert_eq!(
+        count_forwarded(&mut inbound, Duration::from_secs(3)).await,
+        1
+    );
+    let _ = sender.take_dirty_peers();
+
+    let placed = sender
+        .send_frames_within(NodeId::from(2), forward_frames(6), budget())
+        .await;
+    assert_eq!(placed, 6, "the batch places whole as the writer drains");
+    assert_eq!(stalled.load(Ordering::Relaxed), 0, "the latch clears");
+    assert_eq!(sender.take_dirty_peers(), vec![NodeId::from(2)]);
+    assert_eq!(
+        count_forwarded(&mut inbound, Duration::from_secs(3)).await,
+        6
+    );
+    for mesh in [sender, receiver] {
+        mesh.shutdown().await;
+    }
+}
+
+/// Pins the invalidate queue's byte bound: past `outbox_bytes`, a push
+/// drops the oldest queued frames until the new one fits, counts each in
+/// `sundog_backlog_dropped_total` and marks the peer dirty.
+#[tokio::test]
+async fn an_invalidate_send_past_the_byte_budget_drops_the_oldest_and_counts_each() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let small = forward_frame_of(0, 100);
+    let config = ClusterConfig {
+        outbox_capacity: 100,
+        outbox_bytes: small.resident_bytes() * 3,
+        ..ClusterConfig::default()
+    };
+    let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid loopback addr");
+    let (sender, _inbound) = Mesh::spawn(addr, NodeId::from(1), 1, &config, empty_handler())
+        .await
+        .expect("bind loopback");
+    let dead_peer: SocketAddr = "127.0.0.1:1".parse().expect("valid unroutable addr");
+    sender.update_peers(vec![peer_at(NodeId::from(2), dead_peer)]);
+    let (dirty, _stalled) = peer_flags(&sender, NodeId::from(2));
+
+    sender.send_frames(
+        NodeId::from(2),
+        MsgClass::Invalidate,
+        (0..3).map(|_| small.clone()),
+    );
+    assert!(!dirty.load(Ordering::Relaxed), "three fit");
+    let heavy = forward_frame_of(1, 1000);
+    assert!(heavy.resident_bytes() > small.resident_bytes() * 2);
+    sender.send_frames(NodeId::from(2), MsgClass::Invalidate, [heavy]);
+
+    assert!(dirty.load(Ordering::Relaxed));
+    assert_eq!(
+        total(
+            &counter_totals(&snapshotter),
+            "sundog_backlog_dropped_total"
+        ),
+        3,
+        "a frame over twice the size of each queued one drops all three"
+    );
+    let table = sender.inner.peers.read().expect("lock");
+    let queue = &table.get(&NodeId::from(2)).expect("peer").invalidate;
+    assert_eq!(queue.len(), 1);
+}
+
+/// A detached record holds bytes of its own: neither its key nor its value
+/// points into the buffer the record was sliced from, which a frame it
+/// travels on would otherwise keep alive whole.
+#[test]
+fn a_detached_record_owns_its_bytes() {
+    let buffer = Bytes::from(vec![7u8; 4096]);
+    let rec = WireRecord {
+        key: buffer.slice(0..8),
+        value: Some(buffer.slice(8..64)),
+        ..sample_record(1)
+    };
+    let within = |bytes: &Bytes| buffer.as_ptr_range().contains(&bytes.as_ptr());
+    assert!(within(&rec.key));
+
+    let detached = rec.detached();
+    assert_eq!(detached, rec);
+    assert!(!within(&detached.key));
+    assert!(!within(detached.value.as_ref().expect("a value")));
+}
+
+/// Pins that a frame keeps its place in the queue for the outbox's bytes
+/// from one wait slice to the next: a heavy frame that has waited across a
+/// slice boundary since a light frame started waiting still takes the bytes
+/// the writer frees first, so a stream of light frames cannot starve it.
+#[tokio::test(start_paused = true)]
+async fn a_waiting_frame_keeps_its_place_for_the_outbox_bytes_across_slices() {
+    let light = forward_frame_of(0, 100);
+    let weight = light.resident_bytes();
+    let heavy = forward_frame_of(9, weight * 2);
+    assert!(
+        heavy.resident_bytes() > weight * 3,
+        "it needs the outbox empty"
+    );
+    let mesh = mesh_with_a_stalled_peer(100, 0).await;
+    // An outbox whose writer this test plays.
+    let (tx, mut rx) = crate::net::replicate_outbox(100, weight * 4);
+    mesh.inner
+        .peers
+        .write()
+        .expect("lock")
+        .get_mut(&NodeId::from(2))
+        .expect("peer registered")
+        .replicate_tx = tx;
+    for _ in 0..4 {
+        assert!(mesh.send_frames(NodeId::from(2), MsgClass::Replicate, [light.clone()]));
+    }
+
+    let start = tokio::time::Instant::now();
+    let heavy_send = tokio::spawn({
+        let mesh = mesh.clone();
+        async move {
+            mesh.send_frames_within(NodeId::from(2), vec![heavy], SendBudget::Unbounded)
+                .await
+        }
+    });
+    // The heavy frame's first slice ends before the light frames start
+    // waiting, and its second ends after they started and before their
+    // first does, when the writer frees the bytes.
+    tokio::time::sleep_until(start + FAN_OUT_SEND_DEADLINE + Duration::from_millis(100)).await;
+    let light_send = tokio::spawn({
+        let mesh = mesh.clone();
+        let lights: Vec<OutFrame> = (1..4u8).map(|n| forward_frame_of(n, 100)).collect();
+        async move {
+            mesh.send_frames_within(NodeId::from(2), lights, SendBudget::Unbounded)
+                .await
+        }
+    });
+    tokio::time::sleep_until(start + FAN_OUT_SEND_DEADLINE * 2 + Duration::from_millis(50)).await;
+
+    let mut order = Vec::new();
+    for _ in 0..8 {
+        let frame = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("a frame within the timeout")
+            .expect("the sends keep the outbox open");
+        order.push(frame.resident_bytes() > weight * 3);
+    }
+    assert_eq!(
+        order,
+        [false, false, false, false, true, false, false, false],
+        "the heavy frame goes in as soon as the four ahead of it leave"
+    );
+    assert_eq!(heavy_send.await.expect("no panic"), 1);
+    assert_eq!(light_send.await.expect("no panic"), 3);
 }

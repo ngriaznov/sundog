@@ -362,6 +362,57 @@ fn reforward_groups_exclude_self_and_sender_and_stop_at_the_hop_cap() {
     );
 }
 
+/// A re-forwarded record is detached from the frame it arrived in, so the
+/// frames it travels on next hold its own bytes, not the inbound buffer.
+#[test]
+fn reforward_groups_detach_their_records_from_the_inbound_buffer() {
+    let self_node = NodeId::from(1);
+    let view = OwnershipView::compute(
+        self_node,
+        (1..=3u64).map(NodeId::from).collect(),
+        std::num::NonZeroU8::new(2).expect("nonzero"),
+    );
+    let records: Vec<WireRecord> = (0u32..50).map(wire_record_for_u32).collect();
+    let mut buffer = Vec::new();
+    for rec in &records {
+        buffer.extend_from_slice(&rec.key);
+        buffer.extend_from_slice(rec.value.as_deref().expect("a value"));
+    }
+    let buffer = Bytes::from(buffer);
+    let mut at = 0;
+    let sliced: Vec<WireRecord> = records
+        .iter()
+        .map(|rec| {
+            let (key_len, value_len) = (rec.key.len(), rec.value.as_ref().map_or(0, Bytes::len));
+            let sliced = WireRecord {
+                key: buffer.slice(at..at + key_len),
+                value: Some(buffer.slice(at + key_len..at + key_len + value_len)),
+                ..rec.clone()
+            };
+            at += key_len + value_len;
+            sliced
+        })
+        .collect();
+
+    let groups = reforward_groups(
+        &view,
+        self_node,
+        NodeId::from(2),
+        view.view_hash() ^ 1,
+        0,
+        &sliced,
+    )
+    .expect("a hop-zero batch under another view re-forwards");
+    let within = |bytes: &Bytes| buffer.as_ptr_range().contains(&bytes.as_ptr());
+    let mut seen = 0;
+    for rec in groups.iter().flat_map(|group| &group.records) {
+        assert!(!within(&rec.key) && !within(rec.value.as_ref().expect("a value")));
+        assert!(records.contains(rec), "the same record, bytes and all");
+        seen += 1;
+    }
+    assert!(seen > 0, "some record re-forwards");
+}
+
 #[tokio::test]
 async fn report_mode_conflicts_logs_a_late_conflict_against_a_live_peer() {
     let cluster = solo_cluster("cluster-it-mode-conflict-log").await;

@@ -20,6 +20,7 @@ Cache-level settings, `mode`, `max_capacity`, `max_resident_bytes`, `ttl`,
 | `advertise_ip` | probed | peers must dial an address other than the node's own interface |
 | `max_frame` | 4 MiB | never raise it past `wire::MAX_FRAME`; lower it to cap single messages and the merged values a cache stores, and set the same on every node |
 | `outbox_capacity` | 8,192 frames | a peer's link is slow and bursts need more room per peer |
+| `outbox_bytes` | 64 MiB | a peer that reads slowly, or not at all, should hold more or less of this node's memory in queued records, counted encoded and decoded. It bounds each peer's replicate outbox and its invalidate queue alike. A `Replicated` write past it is dropped for anti-entropy to repair, a `Distributed` fan-out waits for room, and the invalidate queue drops its oldest frames |
 | `mesh_keepalive` | 30 s | a data-plane connection should be released sooner, or later, after its peer's host vanished without closing it; a silent one goes about twice this after the peer stops answering, and one with unacknowledged data at the kernel's retransmission timeout. 1 s to 32,767 s; `None` turns TCP keepalive off |
 
 ## Failure detection

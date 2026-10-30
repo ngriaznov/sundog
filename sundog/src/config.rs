@@ -177,6 +177,21 @@ pub struct ClusterConfig {
     pub crdt_sweep_interval: Option<Duration>,
     /// Bounded capacity of each per-peer outbox (`mpsc`) on the data plane.
     pub outbox_capacity: usize,
+    /// How much memory each of a peer's two outboxes holds, its replicate
+    /// outbox and its invalidate queue, alongside
+    /// [`outbox_capacity`](Self::outbox_capacity)'s bound in frames: what bounds
+    /// the memory one peer's queued records take while it reads slower than
+    /// this node writes, or not at all. A queued frame counts its encoded bytes
+    /// and its decoded records, each record's struct and its key and value
+    /// bytes. A `Replicated` write that finds the replicate outbox full is
+    /// dropped and left to anti-entropy, as one that finds every frame slot
+    /// taken is; a `Distributed` fan-out waits for room, up to
+    /// [`fan_out_stall_timeout`](Self::fan_out_stall_timeout). An invalidation,
+    /// or an `Invalidation` cache's merged records, that finds the invalidate
+    /// queue full drops its oldest frames instead. A frame that weighs more than
+    /// this goes in alone. Must be nonzero: `ClusterBuilder::build` rejects
+    /// zero. Default: 64 MiB.
+    pub outbox_bytes: usize,
     /// How long a data-plane connection may stay silent before the kernel
     /// probes the peer: TCP keepalive on every connection this node dials or
     /// accepts. Probes then repeat every third of this, three times, where
@@ -360,7 +375,8 @@ pub struct ClusterConfig {
     /// takes none for this long while gossip still has it live has the rest
     /// of its frames dropped and is marked dirty for anti-entropy, counted
     /// once per stall in `sundog_fan_out_stalls_total`, and later batches
-    /// send it what fits without waiting until one fits whole. A forwarded
+    /// send it what fits without waiting until it reads a frame again. A
+    /// forwarded
     /// write that no owner took, and a departed write's invalidation an owner
     /// missed, are lost, counted in `sundog_fan_out_lost_writes_total{cache}`.
     /// `Duration::MAX` waits for as long as the owner stays live. Must be
@@ -478,6 +494,7 @@ impl Default for ClusterConfig {
             crdt_compact_batch: 4_096,
             crdt_sweep_interval: None,
             outbox_capacity: 8_192,
+            outbox_bytes: 64 * 1024 * 1024,
             mesh_keepalive: Some(Duration::from_secs(30)),
             max_frame: MAX_FRAME,
             gossip_bind_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
@@ -787,6 +804,11 @@ mod tests {
             ClusterConfig::default().fan_out_wait_timeout,
             Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn default_outbox_bytes_is_64_mebibytes() {
+        assert_eq!(ClusterConfig::default().outbox_bytes, 64 * 1024 * 1024);
     }
 
     #[test]

@@ -1,48 +1,97 @@
-//! The `Invalidate`-class per-peer outbox: a bounded FIFO that drops the
-//! oldest queued entry on overflow rather than rejecting the newest. An
-//! invalidation storm on a dead peer must never stall writers.
-//! `Replicate`-class traffic uses a plain `tokio::sync::mpsc` channel
-//! instead (`net::conn`), whose drop-the-newest overflow is what `try_send`
-//! already gives.
+//! The per-peer outboxes. The `Invalidate` class's is a FIFO bounded in
+//! entries and in the memory they hold that drops the oldest queued entries
+//! on overflow rather than rejecting the newest: an invalidation storm on a
+//! dead peer must never stall writers. The `Replicate` class's is a channel
+//! bounded in frames and in the memory its queued frames hold
+//! ([`replicate_outbox`]). A queued frame weighs what it keeps alive
+//! ([`OutFrame::resident_bytes`]), so a peer that stops reading holds at
+//! most two such bounds of this node's memory.
 //!
-//! Generic over the queued element type `T` so this drop-policy logic stays
+//! [`DropOldestQueue`] is generic over the queued element type `T`, which
+//! says what it weighs ([`Weighed`]), so its drop-policy logic stays
 //! independent of what is queued.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use tokio::sync::Notify;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 
-/// A bounded queue that discards its oldest entry rather than rejecting a
-/// push once full. `push` is synchronous and non-blocking; `pop` is the
-/// async side the per-peer writer task awaits.
-pub(super) struct DropOldestQueue<T> {
-    inner: Mutex<VecDeque<T>>,
-    notify: Notify,
-    capacity: usize,
+use super::OutFrame;
+
+/// What a queued entry weighs against its queue's byte budget.
+pub(super) trait Weighed {
+    /// The bytes a queued copy of this entry holds.
+    fn weight(&self) -> usize;
 }
 
-impl<T> DropOldestQueue<T> {
-    pub(super) fn new(capacity: usize) -> Self {
+impl Weighed for OutFrame {
+    fn weight(&self) -> usize {
+        self.resident_bytes()
+    }
+}
+
+/// The entries of a [`DropOldestQueue`], each with the weight it counts for,
+/// and their total.
+struct Weighted<T> {
+    entries: VecDeque<(T, usize)>,
+    bytes: usize,
+}
+
+impl<T> Weighted<T> {
+    fn pop_front(&mut self) -> Option<T> {
+        let (item, weight) = self.entries.pop_front()?;
+        self.bytes -= weight;
+        Some(item)
+    }
+}
+
+/// A queue bounded in entries and in the bytes they weigh that discards its
+/// oldest entries rather than rejecting a push once full. `push` is
+/// synchronous and non-blocking; `pop` is the async side the per-peer writer
+/// task awaits.
+pub(super) struct DropOldestQueue<T> {
+    inner: Mutex<Weighted<T>>,
+    notify: Notify,
+    capacity: usize,
+    budget: usize,
+}
+
+impl<T: Weighed> DropOldestQueue<T> {
+    /// A queue of at most `capacity` entries weighing at most `budget` bytes
+    /// together.
+    pub(super) fn new(capacity: usize, budget: usize) -> Self {
         Self {
-            inner: Mutex::new(VecDeque::with_capacity(capacity.min(1024))),
+            inner: Mutex::new(Weighted {
+                entries: VecDeque::with_capacity(capacity.min(1024)),
+                bytes: 0,
+            }),
             notify: Notify::new(),
             capacity,
+            budget,
         }
     }
 
-    /// Enqueues `item`, dropping the oldest entry first if already at
-    /// capacity. Answers whether it dropped one.
-    pub(super) fn push(&self, item: T) -> bool {
+    /// Enqueues `item`, dropping the oldest entries first while the queue is
+    /// at capacity or `item` would take its weight past the budget. An entry
+    /// heavier than the budget weighs the budget, so it goes in alone rather
+    /// than never. Answers how many entries it dropped.
+    pub(super) fn push(&self, item: T) -> u64 {
+        let weight = item.weight().min(self.budget);
         let mut queue = self
             .inner
             .lock()
             .expect("invariant: outbox mutex is never held across a panic");
-        let evicted = queue.len() >= self.capacity;
-        if evicted {
+        let mut evicted = 0u64;
+        while !queue.entries.is_empty()
+            && (queue.entries.len() >= self.capacity
+                || queue.bytes.saturating_add(weight) > self.budget)
+        {
             queue.pop_front();
+            evicted += 1;
         }
-        queue.push_back(item);
+        queue.entries.push_back((item, weight));
+        queue.bytes += weight;
         drop(queue);
         self.notify.notify_one();
         evicted
@@ -62,7 +111,17 @@ impl<T> DropOldestQueue<T> {
         self.inner
             .lock()
             .expect("invariant: outbox mutex is never held across a panic")
+            .entries
             .len()
+    }
+
+    /// The bytes the queued entries weigh, which never exceed the budget.
+    #[cfg(test)]
+    pub(super) fn bytes(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("invariant: outbox mutex is never held across a panic")
+            .bytes
     }
 
     /// Waits for and removes the oldest queued entry.
@@ -83,24 +142,346 @@ impl<T> DropOldestQueue<T> {
     }
 }
 
+/// A peer's `Replicate`-class outbox: at most `frames` frames and `bytes` of
+/// memory queued at once, the sending half and the receiving half its writer
+/// drains. A frame weighs what a queued copy of it holds
+/// ([`OutFrame::resident_bytes`]), and one heavier than `bytes` weighs
+/// `bytes`, so it goes in alone rather than never.
+pub(super) fn replicate_outbox(frames: usize, bytes: usize) -> (OutboxTx, OutboxRx) {
+    let (tx, rx) = mpsc::channel(frames);
+    let budget = bytes.clamp(1, Semaphore::MAX_PERMITS);
+    let taken = Arc::new(AtomicU64::new(0));
+    (
+        OutboxTx {
+            tx,
+            bytes: Arc::new(Semaphore::new(budget)),
+            budget,
+            taken: Arc::clone(&taken),
+        },
+        OutboxRx { rx, taken },
+    )
+}
+
+/// A queued frame and the bytes it holds of its outbox's budget, given back
+/// when the writer takes the frame.
+struct Queued {
+    frame: OutFrame,
+    _bytes: OwnedSemaphorePermit,
+}
+
+/// The sending half of a [`replicate_outbox`].
+#[derive(Clone)]
+pub(super) struct OutboxTx {
+    tx: mpsc::Sender<Queued>,
+    bytes: Arc<Semaphore>,
+    budget: usize,
+    /// Frames the writer has taken, shared with the [`OutboxRx`].
+    taken: Arc<AtomicU64>,
+}
+
+/// A frame slot and the bytes for one frame, held in a [`replicate_outbox`]
+/// until [`OutboxPermit::send`] queues the frame or the permit drops.
+pub(super) struct OutboxPermit<'a> {
+    slot: mpsc::Permit<'a, Queued>,
+    bytes: OwnedSemaphorePermit,
+}
+
+impl OutboxPermit<'_> {
+    /// Queues `frame` in the slot and bytes this permit holds.
+    pub(super) fn send(self, frame: OutFrame) {
+        self.slot.send(Queued {
+            frame,
+            _bytes: self.bytes,
+        });
+    }
+}
+
+/// Why a [`replicate_outbox`] took no frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OutboxFull {
+    /// Every frame slot, or the byte budget a frame needs, is taken.
+    Full,
+    /// The writer ended and dropped the receiving half.
+    Closed,
+}
+
+impl OutboxTx {
+    /// `len` bytes as a weight against the budget: the budget at most, so
+    /// a heavier frame goes in alone, in the permits one acquire takes.
+    fn weight(&self, len: usize) -> u32 {
+        u32::try_from(len.min(self.budget)).unwrap_or(u32::MAX)
+    }
+
+    /// Takes a slot and `len` bytes, a frame's [`OutFrame::resident_bytes`],
+    /// if both are free now.
+    pub(super) fn try_reserve(&self, len: usize) -> Result<OutboxPermit<'_>, OutboxFull> {
+        let bytes = Arc::clone(&self.bytes)
+            .try_acquire_many_owned(self.weight(len))
+            .map_err(|_| OutboxFull::Full)?;
+        match self.tx.try_reserve() {
+            Ok(slot) => Ok(OutboxPermit { slot, bytes }),
+            Err(mpsc::error::TrySendError::Full(())) => Err(OutboxFull::Full),
+            Err(mpsc::error::TrySendError::Closed(())) => Err(OutboxFull::Closed),
+        }
+    }
+
+    /// Waits for `len` bytes and then a slot. A dropped future holds
+    /// neither.
+    pub(super) async fn reserve(&self, len: usize) -> Result<OutboxPermit<'_>, OutboxFull> {
+        let bytes = Arc::clone(&self.bytes)
+            .acquire_many_owned(self.weight(len))
+            .await
+            .map_err(|_| OutboxFull::Closed)?;
+        let slot = self.tx.reserve().await.map_err(|_| OutboxFull::Closed)?;
+        Ok(OutboxPermit { slot, bytes })
+    }
+
+    /// Waits for a slot and `frame`'s bytes, then queues it.
+    #[cfg(test)]
+    pub(super) async fn send(&self, frame: OutFrame) -> Result<(), OutboxFull> {
+        self.reserve(frame.resident_bytes()).await?.send(frame);
+        Ok(())
+    }
+
+    /// Queues `frame` if a slot and its bytes are free now.
+    pub(super) fn try_send(&self, frame: OutFrame) -> Result<(), OutboxFull> {
+        self.try_reserve(frame.resident_bytes())?.send(frame);
+        Ok(())
+    }
+
+    /// How many frames the writer has taken from the outbox so far: what
+    /// tells a peer that reads, however little, from one that reads nothing.
+    pub(super) fn taken(&self) -> u64 {
+        self.taken.load(Ordering::Relaxed)
+    }
+
+    /// Free frame slots.
+    pub(super) fn capacity(&self) -> usize {
+        self.tx.capacity()
+    }
+
+    /// The outbox's bound in frames.
+    pub(super) fn max_capacity(&self) -> usize {
+        self.tx.max_capacity()
+    }
+
+    /// Bytes of the budget queued frames or reservations hold.
+    #[cfg(test)]
+    pub(super) fn bytes_held(&self) -> usize {
+        self.budget - self.bytes.available_permits()
+    }
+
+    /// The outbox's bound in bytes.
+    #[cfg(test)]
+    pub(super) fn byte_budget(&self) -> usize {
+        self.budget
+    }
+}
+
+/// The receiving half of a [`replicate_outbox`]: taking a frame gives its
+/// bytes back. Dropping it drops the frames still queued, and their bytes
+/// with them.
+pub(super) struct OutboxRx {
+    rx: mpsc::Receiver<Queued>,
+    taken: Arc<AtomicU64>,
+}
+
+impl OutboxRx {
+    /// Waits for the next frame; `None` once every sender is gone.
+    pub(super) async fn recv(&mut self) -> Option<OutFrame> {
+        let queued = self.rx.recv().await?;
+        Some(self.take(queued))
+    }
+
+    /// The next frame, if one is queued.
+    pub(super) fn try_recv(&mut self) -> Result<OutFrame, mpsc::error::TryRecvError> {
+        self.rx.try_recv().map(|queued| self.take(queued))
+    }
+
+    /// Counts `queued` taken and gives its bytes back.
+    fn take(&self, queued: Queued) -> OutFrame {
+        self.taken.fetch_add(1, Ordering::Relaxed);
+        queued.frame
+    }
+
+    /// Frames queued.
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.rx.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A frame of about `bytes` encoded bytes.
+    fn frame_of(bytes: usize) -> OutFrame {
+        OutFrame::new(crate::wire::Msg::Invalidate {
+            cache: smol_str::SmolStr::new("c"),
+            key: bytes::Bytes::from(vec![7u8; bytes]),
+            ver: crate::hlc::Hlc {
+                wall_ms: 1,
+                logical: 0,
+                node: crate::node::NodeId::from(1),
+            },
+        })
+        .expect("encodes")
+    }
+
+    #[test]
+    fn a_replicate_outbox_refuses_a_frame_past_its_byte_budget_with_slots_free() {
+        let len = frame_of(1_000).resident_bytes();
+        let (tx, mut rx) = replicate_outbox(100, len * 3);
+        for _ in 0..3 {
+            tx.try_send(frame_of(1_000))
+                .expect("three frames fit the budget");
+        }
+        assert_eq!(tx.bytes_held(), len * 3);
+        assert!(tx.capacity() > 0, "frame slots are left");
+        assert_eq!(
+            tx.try_send(frame_of(1_000)),
+            Err(OutboxFull::Full),
+            "a fourth frame passes the byte budget"
+        );
+        assert_eq!(tx.taken(), 0);
+        rx.try_recv().expect("a queued frame");
+        assert_eq!(tx.taken(), 1, "taking a frame counts it taken");
+        assert_eq!(
+            tx.bytes_held(),
+            len * 2,
+            "taking a frame gives its bytes back"
+        );
+        tx.try_send(frame_of(1_000))
+            .expect("the freed bytes take a frame again");
+    }
+
+    #[test]
+    fn a_replicate_outbox_refuses_a_frame_past_its_frame_bound_with_bytes_free() {
+        let (tx, _rx) = replicate_outbox(2, 1 << 20);
+        tx.try_send(frame_of(10)).expect("room");
+        tx.try_send(frame_of(10)).expect("room");
+        assert_eq!(tx.try_send(frame_of(10)), Err(OutboxFull::Full));
+        assert_eq!(
+            tx.bytes_held(),
+            2 * frame_of(10).resident_bytes(),
+            "the refused frame holds nothing"
+        );
+    }
+
+    #[test]
+    fn a_byte_budget_past_four_gibibytes_is_kept_whole() {
+        let budget = 5 * 1024 * 1024 * 1024;
+        let (tx, _rx) = replicate_outbox(4, budget);
+        assert_eq!(tx.byte_budget(), budget, "as the invalidate queue keeps it");
+        assert_eq!(tx.bytes_held(), 0);
+        assert_eq!(tx.weight(3 * 1024 * 1024 * 1024), 3 * 1024 * 1024 * 1024);
+        let (tx, _rx) = replicate_outbox(4, 0);
+        assert_eq!(tx.byte_budget(), 1, "a zero budget still takes a frame");
+    }
+
+    #[test]
+    fn a_frame_longer_than_the_budget_goes_in_alone() {
+        let (tx, mut rx) = replicate_outbox(8, 100);
+        tx.try_send(frame_of(1_000))
+            .expect("an oversized frame takes the whole budget");
+        assert_eq!(tx.bytes_held(), 100);
+        assert_eq!(tx.try_send(frame_of(1)), Err(OutboxFull::Full));
+        rx.try_recv().expect("the oversized frame");
+        tx.try_send(frame_of(1)).expect("and gives the budget back");
+    }
+
+    #[tokio::test]
+    async fn reserve_waits_for_bytes_the_writer_gives_back() {
+        let len = frame_of(1_000).resident_bytes();
+        let (tx, mut rx) = replicate_outbox(100, len);
+        tx.try_send(frame_of(1_000)).expect("fits");
+        let waiting = tx.reserve(len);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut waiting)
+                .await
+                .is_err(),
+            "no bytes are free until the writer takes a frame"
+        );
+        rx.recv().await.expect("the queued frame");
+        assert_eq!(tx.taken(), 1);
+        waiting
+            .await
+            .expect("the bytes come back")
+            .send(frame_of(1_000));
+        assert_eq!(rx.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_receiver_gives_the_bytes_back_and_closes_the_outbox() {
+        let len = frame_of(1_000).resident_bytes();
+        let (tx, rx) = replicate_outbox(100, len);
+        tx.try_send(frame_of(1_000)).expect("fits");
+        drop(rx);
+        assert_eq!(
+            tx.bytes_held(),
+            0,
+            "the dropped frames give their bytes back"
+        );
+        assert!(matches!(tx.reserve(len).await, Err(OutboxFull::Closed)));
+        assert!(matches!(tx.try_reserve(len), Err(OutboxFull::Closed)));
+    }
+
+    /// A test entry weighs its value in bytes.
+    impl Weighed for u64 {
+        fn weight(&self) -> usize {
+            usize::try_from(*self).expect("a test weight fits in usize")
+        }
+    }
+
     #[tokio::test]
     async fn overflow_drops_the_oldest_entry() {
-        let queue = DropOldestQueue::new(2);
-        assert!(!queue.push(1u64), "room left: nothing dropped");
-        assert!(!queue.push(2u64), "room left: nothing dropped");
-        assert!(queue.push(3u64), "the push at capacity drops the oldest"); // drops 1, not 3
+        let queue = DropOldestQueue::new(2, usize::MAX);
+        assert_eq!(queue.push(1u64), 0, "room left: nothing dropped");
+        assert_eq!(queue.push(2u64), 0, "room left: nothing dropped");
+        assert_eq!(queue.push(3u64), 1, "the push at capacity drops the oldest"); // drops 1, not 3
 
         assert_eq!(queue.pop().await, 2);
         assert_eq!(queue.pop().await, 3);
     }
 
+    /// Past the byte budget, a push drops the oldest entries until the new
+    /// one fits, however many entries that takes, and the pops give their
+    /// weight back.
+    #[tokio::test]
+    async fn a_push_past_the_byte_budget_drops_the_oldest_until_it_fits() {
+        let queue = DropOldestQueue::new(100, 10);
+        assert_eq!(queue.push(3u64), 0);
+        assert_eq!(queue.push(3u64), 0);
+        assert_eq!(queue.push(4u64), 0, "exactly the budget fits");
+        assert_eq!(queue.bytes(), 10);
+        assert_eq!(queue.push(5u64), 2, "the two oldest make room for it");
+        assert_eq!(queue.bytes(), 9);
+        assert_eq!(queue.pop().await, 4);
+        assert_eq!(queue.bytes(), 5, "a pop gives its weight back");
+        assert_eq!(queue.try_pop(), Some(5));
+        assert_eq!(queue.bytes(), 0);
+    }
+
+    /// An entry heavier than the whole budget empties the queue and goes in
+    /// alone, counted as the budget, so it is not refused forever and the
+    /// next push drops it.
+    #[test]
+    fn an_entry_heavier_than_the_budget_goes_in_alone() {
+        let queue = DropOldestQueue::new(100, 10);
+        assert_eq!(queue.push(2u64), 0);
+        assert_eq!(queue.push(2u64), 0);
+        assert_eq!(queue.push(50u64), 2, "it takes the whole queue");
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.bytes(), 10, "it weighs the budget");
+        assert_eq!(queue.push(1u64), 1, "the next push drops it");
+        assert_eq!(queue.try_pop(), Some(1));
+    }
+
     #[test]
     fn try_pop_drains_without_waiting_then_returns_none() {
-        let queue = DropOldestQueue::new(4);
+        let queue = DropOldestQueue::new(4, usize::MAX);
         assert!(queue.try_pop().is_none());
         queue.push(1u64);
         queue.push(2u64);
@@ -111,7 +492,7 @@ mod tests {
 
     #[test]
     fn len_counts_the_queued_entries_and_stops_at_the_capacity() {
-        let queue = DropOldestQueue::new(3);
+        let queue = DropOldestQueue::new(3, usize::MAX);
         assert_eq!(queue.len(), 0, "a new queue is empty");
         queue.push(1u64);
         queue.push(2u64);
@@ -131,7 +512,7 @@ mod tests {
 
     #[tokio::test]
     async fn pop_waits_for_a_push() {
-        let queue = std::sync::Arc::new(DropOldestQueue::new(4));
+        let queue = std::sync::Arc::new(DropOldestQueue::new(4, usize::MAX));
         let waiter = tokio::spawn({
             let queue = queue.clone();
             async move { queue.pop().await }

@@ -12,6 +12,10 @@ All notable changes to this project are documented in this file. Format follows
   the kernel then probes every third of that, three times, where the
   platform lets a socket set the interval and count. `build` accepts 1 to
   32,767 seconds. `None` turns it off.
+- **`ClusterConfig::outbox_bytes`.** The bound in memory of each peer's
+  replicate outbox and, apart from it, its invalidate queue, queued frames
+  counted encoded and decoded, 64 MiB by default, alongside
+  `outbox_capacity`'s bound in frames.
 - **`ClusterConfig::fan_out_stall_timeout`.** How long a `Distributed` fan-out
   batch waits on an owner that stays live but whose outbox takes nothing, 10
   seconds by default. `sundog_fan_out_stalls_total` counts each owner that
@@ -31,6 +35,27 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **A peer that stops reading holds a bounded share of memory.** A peer's
+  replicate outbox was bounded only in frames, 8,192 by default, and a frame
+  carries up to 256 KiB of records and keeps them decoded as well, so a peer
+  whose host stopped reading its connection while gossip kept it live could
+  pin gigabytes on every node writing to it: three testnodes with one data
+  port dropped grew the writer past 5 GiB in 75 seconds. The outbox now holds
+  at most `ClusterConfig::outbox_bytes` of queued frames as well, counted
+  encoded and decoded, and the writer stayed between 200 and 235 MiB for the
+  two minutes of the same test, back near 100 MiB once the peer read again. A
+  `Replicated` write that finds it full is dropped and counted in
+  `sundog_backlog_dropped_total`, and anti-entropy repairs it; a
+  `Distributed` fan-out waits for room as it waits for a frame slot, and its
+  wait renews whenever the peer's writer takes a frame, so a heavy frame
+  waits for the lighter ones ahead of it to leave. The invalidate queue, which
+  also carries an `Invalidation` cache's merged records, drops its oldest
+  frames past the same bound, and a re-forward lane counts its frames the
+  same way. A record this node received and sends on is copied out of the
+  frame it arrived in, so a queued frame holds only its own bytes. A stalled
+  peer is waited on again once its writer takes a frame, and its latch clears
+  when a batch then places whole, not when a small batch fits the room a peer
+  that reads nothing left.
 - **A stalled `Distributed` owner no longer holds the fan-out backlog.** A
   batch sent to one owner at a time and waited for each owner's outbox for as
   long as gossip had the owner live, so an owner that stopped reading while
@@ -43,7 +68,7 @@ All notable changes to this project are documented in this file. Format follows
   outbox at once; once one has taken nothing for
   `ClusterConfig::fan_out_stall_timeout`, the frames left for it are dropped,
   it is marked for anti-entropy, and later batches send it what fits without
-  waiting until one fits whole.
+  waiting until it reads a frame again.
 - **`Cluster::shutdown` no longer hangs on a stalled `Distributed` owner.**
   Shutdown waits for every cache's fan-out task to send what it holds, and
   gossip stops updating the peer table once shutdown starts, so a fan-out

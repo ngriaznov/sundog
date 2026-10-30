@@ -71,8 +71,8 @@ addresses once it forms, under `cluster formed`.
 | `sundog_bytes_sent_total` | data-plane bytes sent |
 | `sundog_accept_dropped_total{reason}` | data-plane connections this node closed before they sent a hello: `hello_timeout` (no complete hello within 10 seconds of the connection's handler first running, TLS handshake included) or `over_cap` (512 connections from addresses that are not a peer's already waited for their hello) |
 | `sundog_fan_out_wait_seconds_total{peer}` | whole seconds writers spent waiting for a live peer's full outbox |
-| `sundog_fan_out_stalls_total` | live peers whose outbox took no fan-out frame for `fan_out_stall_timeout`: the rest of their frames were dropped, and fan-out sends to each took only free slots until one batch fit whole |
-| `sundog_backlog_dropped_total{peer}` | frames dropped before reaching the peer's connection: an outbox that stayed full, the oldest invalidation displaced by a newer one, a message that failed to encode, a re-forward lane that already held 64 MiB for a live peer, or the peer leaving the mesh. Each drop marks the peer for the next anti-entropy round, which repairs a record the dropping node owns but not one it only passed on. A broken connection drops a frame only if the writer cannot send it again: the writer resends the burst whose send failed and the frames it wrote in the last second, up to 1 MiB |
+| `sundog_fan_out_stalls_total` | live peers whose outbox took no fan-out frame for `fan_out_stall_timeout`: the rest of their frames were dropped, and fan-out sends to each took only free room until the peer read a frame again |
+| `sundog_backlog_dropped_total{peer}` | frames dropped before reaching the peer's connection: an outbox that stayed full, in frames (`outbox_capacity`) or in bytes (`outbox_bytes`), the oldest invalidations displaced by a newer one, in frames or bytes alike, a message that failed to encode, a re-forward lane that already held 64 MiB, encoded and decoded, for a live peer, or the peer leaving the mesh. Each drop marks the peer for the next anti-entropy round, which repairs a record the dropping node owns but not one it only passed on. A broken connection drops a frame only if the writer cannot send it again: the writer resends the burst whose send failed and the frames it wrote in the last second, up to 1 MiB |
 
 ### Distributed caches
 
@@ -193,12 +193,12 @@ most 1 MiB at a time, as fast as the owner reads. One that stays live but
 takes nothing for `fan_out_stall_timeout`, 10 seconds by default, has the
 frames left for it dropped and counted in `sundog_backlog_dropped_total`, is
 marked for the next anti-entropy round, and `sundog_fan_out_stalls_total`
-counts the stall, with a warning naming the peer. Until one batch fits its
-outbox whole, later batches send it what fits without waiting, so the other
-owners and the backlog keep moving; the batch that fits marks it for
-anti-entropy again. A write this node owns reaches the stalled owner through
-anti-entropy. A forwarded write that no owner took, and a departed write's
-invalidation an owner missed, are lost, counted in
+counts the stall, with a warning naming the peer. Until it reads a frame
+again, later batches send it what fits without waiting, so the other owners
+and the backlog keep moving; once it reads, batches wait on it again, and the
+first one that places whole marks it for anti-entropy again. A write this node owns reaches the stalled
+owner through anti-entropy. A forwarded write that no owner took, and a
+departed write's invalidation an owner missed, are lost, counted in
 `sundog_fan_out_lost_writes_total{cache}` and logged at `warn` (see
 [guarantees](guarantees.md#per-mode)). A peer that stops reading delays only
 the writes and re-forwards aimed at it: a node keeps applying what every other

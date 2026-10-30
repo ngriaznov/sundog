@@ -243,7 +243,8 @@ where
     }
 
     /// Hands `redirected`, records for a part this node's view does not own,
-    /// to the fan-out as forwards, which send them on to the part's current
+    /// to the fan-out as forwards, each detached from the frame it came in
+    /// ([`WireRecord::detached`]), which send them on to the part's current
     /// owners; `why` names the reason in the log. Counted in
     /// `sundog_forwarded_writes_total`. A refusal means the cache is closing:
     /// nothing forwards from a node on its way out.
@@ -262,9 +263,11 @@ where
             why,
             "forwarded records this node does not own on to the part's current owners"
         );
-        let _ = self
-            .fan_out
-            .extend(redirected.into_iter().map(FanOutItem::Forward));
+        let _ = self.fan_out.extend(
+            redirected
+                .into_iter()
+                .map(|rec| FanOutItem::Forward(rec.detached())),
+        );
     }
 
     /// The inbound-apply guard, applied to a batch before decoding: keeps

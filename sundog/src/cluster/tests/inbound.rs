@@ -622,7 +622,7 @@ mod reforwarder {
         let mesh = mesh_with_a_full_wedged_peer().await;
         let wedged = NodeId::from(WEDGED);
         let one = vec![forward_frame(1)];
-        let batch_bytes: usize = one.iter().map(|frame| frame.frame.len()).sum();
+        let batch_bytes: usize = one.iter().map(OutFrame::resident_bytes).sum();
         let mut reforwarder = Reforwarder::with_lane_bytes(mesh.clone(), 3 * batch_bytes);
 
         for _ in 0..3 {

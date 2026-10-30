@@ -193,6 +193,22 @@ impl WireRecord {
     pub const fn is_tombstone(&self) -> bool {
         self.value.is_none()
     }
+
+    /// This record with its key and value copied into bytes of their own. A
+    /// record decoded from a frame shares the frame's buffer, which stays
+    /// allocated while any slice of it lives: a record kept past its apply,
+    /// in a re-forward, a redirect to a part's owners or the skew hold, is
+    /// detached first, so it holds its own bytes and not the whole frame
+    /// it came in.
+    #[must_use]
+    pub(crate) fn detached(&self) -> Self {
+        Self {
+            key: Bytes::copy_from_slice(&self.key),
+            value: self.value.as_deref().map(Bytes::copy_from_slice),
+            ver: self.ver,
+            expires_at_ms: self.expires_at_ms,
+        }
+    }
 }
 
 /// Every message exchanged on the data-plane mesh. `#[non_exhaustive]`: new

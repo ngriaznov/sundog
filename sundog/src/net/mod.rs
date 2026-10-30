@@ -74,14 +74,13 @@ use std::time::{Duration, Instant};
 
 use smol_str::SmolStr;
 use tcp::TcpListener;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::ClusterConfig;
 use crate::error::JoinError;
 use crate::node::NodeId;
 use crate::wire::{self, Msg};
-use outbox::DropOldestQueue;
+use outbox::{DropOldestQueue, OutboxFull, OutboxPermit, OutboxRx, OutboxTx, replicate_outbox};
 
 #[cfg(all(feature = "tls", not(feature = "sim")))]
 pub use tls::MESH_SERVER_NAME;
@@ -159,13 +158,14 @@ pub(crate) const FAN_OUT_SEND_DEADLINE: Duration = Duration::from_secs(2);
 pub(crate) enum SendBudget {
     /// For as long as the peer stays in the peer table.
     Unbounded,
-    /// While the peer's outbox takes a frame at least this often, and not
-    /// at all toward a peer latched stalled.
+    /// While the peer's outbox takes a frame at least this often, and,
+    /// toward a peer latched stalled, not at all until its writer takes a
+    /// frame again ([`waits_out_latch`]).
     Idle(Duration),
 }
 
-/// When a send under `budget` stops waiting if no frame goes in after
-/// `now`: `None` waits for as long as the peer stays in the table, as an
+/// When a send under `budget` stops waiting if no frame goes in, and the
+/// peer's writer takes none, after `now`: `None` waits for as long as the peer stays in the table, as an
 /// unbounded budget does, and an idle one past the clock's range, as
 /// `Duration::MAX` is. Pure; unit tested directly.
 pub(crate) fn idle_deadline(
@@ -178,20 +178,21 @@ pub(crate) fn idle_deadline(
     }
 }
 
-/// How the next frame of a [`Mesh::send_frames_within`] waits for an
-/// outbox slot.
+/// How the next frame of a [`Mesh::send_frames_within`] waits for room in
+/// the outbox: a free slot and the bytes the frame weighs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RoomWait {
-    /// Takes a free slot or none, without waiting.
+    /// Takes the room that is free now, or none, without waiting.
     TryOnly,
-    /// Waits for a slot until this instant.
+    /// Waits for room until this instant.
     Until(tokio::time::Instant),
 }
 
 /// How the next frame waits at `now`, given the send's [`idle_deadline`]:
 /// one [`FAN_OUT_SEND_DEADLINE`] slice, cut short at the deadline, or no
-/// wait at all once the deadline passed or the peer is latched stalled. A
-/// send with no deadline ignores the latch. Pure; unit tested directly.
+/// wait at all once the deadline passed or the peer is latched stalled and
+/// has not read since ([`waits_out_latch`]). A send with no deadline ignores
+/// the latch. Pure; unit tested directly.
 pub(crate) fn fan_out_room_wait(
     deadline: Option<tokio::time::Instant>,
     stalled: bool,
@@ -205,8 +206,8 @@ pub(crate) fn fan_out_room_wait(
     }
 }
 
-/// What a [`Mesh::send_frames_within`] does with a frame that found no
-/// outbox slot within `wait`.
+/// What a [`Mesh::send_frames_within`] does with a frame that found no room
+/// in the outbox within `wait`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NoRoom {
     /// Waits another slice for the same frame.
@@ -218,7 +219,7 @@ pub(crate) enum NoRoom {
     Stalled,
 }
 
-/// What follows a frame finding no slot within `wait` at `now`: a send with
+/// What follows a frame finding no room within `wait` at `now`: a send with
 /// no deadline waits again while `peer_live`; one with a deadline waits
 /// again only until it and while no other send latched the peer
 /// (`stalled`), so a second cache's wait ends within a slice of the first
@@ -257,15 +258,42 @@ pub(crate) enum SendEnd {
 }
 
 /// What a bounded send that ended at `end` sets the peer's stall latch to:
-/// set once it dropped frames for a stall, cleared once it placed every
-/// frame, and left alone when the peer departed, since its handle leaves the
-/// table with it. Pure; unit tested directly.
-pub(crate) const fn stall_latch(end: SendEnd) -> Option<bool> {
+/// set once it dropped frames for a stall; cleared once it placed every
+/// frame and the peer's writer has taken a frame since the latch was set
+/// (`taken_since`), since an outbox the peer does not read can still have
+/// room for a small batch; and left alone otherwise, as when the peer
+/// departed, its handle leaving the table with it. Pure; unit tested
+/// directly.
+pub(crate) const fn stall_latch(end: SendEnd, taken_since: bool) -> Option<bool> {
     match end {
-        SendEnd::Placed => Some(false),
+        SendEnd::Placed if taken_since => Some(false),
         SendEnd::Stalled => Some(true),
-        SendEnd::Departed => None,
+        SendEnd::Placed | SendEnd::Departed => None,
     }
+}
+
+/// The stall latch's value when set as the peer's writer has taken `taken`
+/// frames: one more than that count, so zero stays the clear latch. Pure;
+/// unit tested directly.
+pub(crate) const fn latch_mark(taken: u64) -> u64 {
+    taken.saturating_add(1)
+}
+
+/// Whether the writer of a peer whose stall latch reads `latched_at` has
+/// taken a frame since the latch was set, having taken `taken` frames in
+/// all: false for a clear latch. Pure; unit tested directly.
+pub(crate) const fn taken_since_latch(latched_at: u64, taken: u64) -> bool {
+    latched_at != 0 && taken >= latched_at
+}
+
+/// Whether a bounded send treats a peer whose stall latch reads
+/// `latched_at` as stalled, its writer having taken `taken` frames: the latch
+/// is set and the writer has taken nothing since. A latched peer whose writer
+/// reads again is waited on like any other, so a batch heavier than its
+/// outbox still places whole and clears the latch. Pure; unit tested
+/// directly.
+pub(crate) const fn waits_out_latch(latched_at: u64, taken: u64) -> bool {
+    latched_at != 0 && !taken_since_latch(latched_at, taken)
 }
 
 /// Milliseconds since the first call in this process, a monotonic stamp
@@ -282,16 +310,19 @@ fn duration_to_ms(d: Duration) -> u64 {
 struct PeerHandle {
     data_addr: SocketAddr,
     invalidate: Arc<DropOldestQueue<OutFrame>>,
-    replicate_tx: mpsc::Sender<OutFrame>,
+    replicate_tx: OutboxTx,
     /// Set when the peer's next anti-entropy round should come first: an
     /// outbox dropped a message for it, or its writer redialed after a
     /// connection that carried frames broke ([`Mesh::take_dirty_peers`]).
     dirty: Arc<AtomicBool>,
-    /// Set once the peer's replicate outbox took nothing for a fan-out
-    /// send's idle budget ([`Mesh::send_frames_within`]): every cache's
-    /// bounded send to it then takes free slots only, without waiting, until
-    /// one places all its frames.
-    stalled: Arc<AtomicBool>,
+    /// The peer's stall latch: nonzero once its replicate outbox took
+    /// nothing for a fan-out send's idle budget ([`Mesh::send_frames_within`]),
+    /// holding one more than the frames its writer had taken then
+    /// ([`OutboxTx::taken`], [`latch_mark`]). Every cache's bounded send to it
+    /// takes the room that is free, without waiting, until the writer takes a
+    /// frame again ([`waits_out_latch`]); the latch clears once a send then
+    /// places all its frames ([`stall_latch`]).
+    stalled: Arc<AtomicU64>,
     /// The most keys or hashes the next anti-entropy pull from this peer
     /// asks for, per cache, once a pull to it has timed out
     /// ([`Mesh::pull_limit`]). A cache absent from the map has not shrunk.
@@ -334,6 +365,11 @@ struct MeshInner {
     /// accepted one.
     cluster: u64,
     outbox_capacity: usize,
+    /// `ClusterConfig::outbox_bytes`: the bound of each of a peer's outboxes
+    /// in the bytes its queued frames hold, encoded and decoded
+    /// ([`OutFrame::resident_bytes`]), alongside `outbox_capacity`'s in
+    /// frames.
+    outbox_bytes: usize,
     peers: RwLock<HashMap<NodeId, PeerHandle>>,
     accept_cancel: CancellationToken,
     tls: TlsCtx,
@@ -654,6 +690,7 @@ impl MeshInner {
             incarnation: 1,
             cluster: wire::UNNAMED_CLUSTER,
             outbox_capacity: DEFAULT_CHANNEL_CAPACITY,
+            outbox_bytes: ClusterConfig::default().outbox_bytes,
             peers: RwLock::new(HashMap::new()),
             accept_cancel,
             tls,

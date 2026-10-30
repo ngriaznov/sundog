@@ -218,16 +218,34 @@ async fn apply_remote_batch_forwards_a_record_for_a_releasing_bucket_on_instead_
     residency.mark_releasing(&whole(unowned_bucket));
 
     let rec = wire_record(unowned_key, "redirected", hlc(1, 9));
-    ShardOps::apply_remote_batch(&s, vec![rec.clone()]).await;
+    // As decoded from a frame: the key and value are slices of its buffer.
+    let mut frame = rec.key.to_vec();
+    frame.extend_from_slice(rec.value.as_deref().expect("a value"));
+    let frame = Bytes::from(frame);
+    let sliced = WireRecord {
+        key: frame.slice(..rec.key.len()),
+        value: Some(frame.slice(rec.key.len()..)),
+        ..rec.clone()
+    };
+    ShardOps::apply_remote_batch(&s, vec![sliced]).await;
 
     assert!(
         s.get(&unowned_key).await.is_none(),
         "residency never widens what the inbound-apply guard applies"
     );
+    let queued = s.fan_out_queue().drain();
     assert_eq!(
-        s.fan_out_queue().drain(),
+        queued,
         vec![FanOutItem::Forward(rec)],
         "the record is queued for the bucket's current owners"
+    );
+    let [FanOutItem::Forward(queued)] = queued.as_slice() else {
+        unreachable!("checked above");
+    };
+    let within = |bytes: &Bytes| frame.as_ptr_range().contains(&bytes.as_ptr());
+    assert!(
+        !within(&queued.key) && !within(queued.value.as_ref().expect("a value")),
+        "detached from the frame it came in"
     );
 
     // A bucket this node never held is still dropped outright.

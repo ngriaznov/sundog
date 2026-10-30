@@ -146,7 +146,6 @@ mod scripted {
 
     use bytes::BytesMut;
     use futures::{Sink, Stream};
-    use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
     use super::super::writer::{
@@ -220,19 +219,19 @@ mod scripted {
         state: WriterState,
         dirty: Arc<AtomicBool>,
         invalidate: Arc<DropOldestQueue<OutFrame>>,
-        replicate_tx: mpsc::Sender<OutFrame>,
-        replicate_rx: mpsc::Receiver<OutFrame>,
+        replicate_tx: crate::net::OutboxTx,
+        replicate_rx: crate::net::OutboxRx,
         cancel: CancellationToken,
     }
 
     impl Rig {
         fn new() -> Self {
-            let (replicate_tx, replicate_rx) = mpsc::channel(16);
+            let (replicate_tx, replicate_rx) = crate::net::replicate_outbox(16, 1 << 30);
             let dirty = Arc::new(AtomicBool::new(false));
             Self {
                 state: WriterState::new(NodeId::from(2), Arc::clone(&dirty)),
                 dirty,
-                invalidate: Arc::new(DropOldestQueue::new(16)),
+                invalidate: Arc::new(DropOldestQueue::new(16, usize::MAX)),
                 replicate_tx,
                 replicate_rx,
                 cancel: CancellationToken::new(),
@@ -277,7 +276,7 @@ mod scripted {
 
     #[tokio::test]
     async fn drain_burst_takes_frames_up_to_the_byte_limit_and_always_the_first() {
-        let (tx, mut rx) = mpsc::channel(32);
+        let (tx, mut rx) = crate::net::replicate_outbox(32, 1 << 30);
         for n in 0..10 {
             tx.send(big_forward(n, WRITER_BURST_BYTES / 4))
                 .await
@@ -451,7 +450,10 @@ mod scripted {
         let mut link = ScriptedLink::default();
         let Rig { replicate_tx, .. } = &mut rig;
         // The sender is the rig's only one: dropping a clone is not enough.
-        drop(std::mem::replace(replicate_tx, mpsc::channel(1).0));
+        drop(std::mem::replace(
+            replicate_tx,
+            crate::net::replicate_outbox(1, 1 << 20).0,
+        ));
         assert_eq!(rig.drive(&mut link).await, LinkEnd::PeerGone);
     }
 
@@ -592,22 +594,21 @@ mod sockets {
 
     use futures::StreamExt as _;
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::mpsc;
     use tokio::task::JoinHandle;
     use tokio_util::codec::{Framed, LengthDelimitedCodec};
     use tokio_util::sync::CancellationToken;
 
     use super::super::tests::no_tls;
     use super::*;
+    use crate::net::Greeting;
     use crate::net::outbox::DropOldestQueue;
-    use crate::net::{Greeting, OutFrame};
     use crate::wire::{self, MAX_FRAME};
 
     type Conn = Framed<TcpStream, LengthDelimitedCodec>;
 
     struct Writer {
         listener: TcpListener,
-        replicate_tx: mpsc::Sender<OutFrame>,
+        replicate_tx: crate::net::OutboxTx,
         dirty: Arc<AtomicBool>,
         cancel: CancellationToken,
         handle: JoinHandle<()>,
@@ -662,7 +663,7 @@ mod sockets {
         /// Starts a writer that dials `listener`.
         fn start_on(listener: TcpListener) -> Self {
             let addr = listener.local_addr().expect("listener has a local addr");
-            let (replicate_tx, replicate_rx) = mpsc::channel(8);
+            let (replicate_tx, replicate_rx) = crate::net::replicate_outbox(8, 1 << 30);
             let dirty = Arc::new(AtomicBool::new(false));
             let cancel = CancellationToken::new();
             let handle = tokio::spawn(super::super::writer::run_peer_writer(
@@ -678,7 +679,7 @@ mod sockets {
                     tls: no_tls(),
                     keepalive: None,
                 },
-                Arc::new(DropOldestQueue::new(4)),
+                Arc::new(DropOldestQueue::new(4, usize::MAX)),
                 replicate_rx,
                 cancel.clone(),
             ));

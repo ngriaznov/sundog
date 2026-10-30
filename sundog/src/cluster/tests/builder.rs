@@ -121,6 +121,23 @@ async fn build_rejects_a_zero_fan_out_backlog_capacity() {
 }
 
 #[tokio::test]
+async fn build_rejects_a_zero_outbox_bytes() {
+    let mut config = loopback_config();
+    config.outbox_bytes = 0;
+
+    let err = Cluster::builder("cluster-it-outbox-bytes-guard")
+        .seeds(std::iter::empty())
+        .config(config)
+        .build()
+        .await
+        .expect_err("a zero outbox_bytes must be rejected at build() time");
+    assert!(
+        matches!(err, JoinError::InvalidConfig(ref msg) if msg.contains("outbox_bytes")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
 async fn build_rejects_a_zero_fan_out_stall_timeout() {
     let mut config = loopback_config();
     config.fan_out_stall_timeout = Duration::ZERO;

@@ -13,7 +13,6 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use futures::{Sink, Stream, StreamExt as _};
 use smol_str::SmolStr;
-use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -23,7 +22,7 @@ use super::framing::{
 use crate::error::CodecError;
 use crate::net::outbox::DropOldestQueue;
 use crate::net::tcp::TcpStream;
-use crate::net::{Greeting, OutFrame, TlsCtx};
+use crate::net::{Greeting, OutFrame, OutboxRx, TlsCtx};
 use crate::node::NodeId;
 use crate::wire::{self, Msg};
 
@@ -46,7 +45,7 @@ pub(super) const WRITER_BURST_BYTES: usize = 1024 * 1024;
 /// `first` and the frames after it in `rx`, up to [`WRITER_BURST_BYTES`] of
 /// encoded bytes counted from `first`: the frame that reaches the limit is
 /// the last one taken, and the rest stay in the outbox for the next burst.
-pub(super) fn drain_burst(first: OutFrame, rx: &mut mpsc::Receiver<OutFrame>) -> Vec<OutFrame> {
+pub(super) fn drain_burst(first: OutFrame, rx: &mut OutboxRx) -> Vec<OutFrame> {
     let mut bytes = first.frame.len();
     let mut drained = vec![first];
     while bytes < WRITER_BURST_BYTES
@@ -476,7 +475,7 @@ pub(super) async fn drive_connection<L>(
     link: &mut L,
     state: &mut WriterState,
     invalidate: &DropOldestQueue<OutFrame>,
-    replicate_rx: &mut mpsc::Receiver<OutFrame>,
+    replicate_rx: &mut OutboxRx,
     cancel: &CancellationToken,
 ) -> LinkEnd
 where
@@ -566,7 +565,7 @@ pub(in crate::net) struct PeerTarget {
 pub(in crate::net) async fn run_peer_writer(
     target: PeerTarget,
     invalidate: Arc<DropOldestQueue<OutFrame>>,
-    mut replicate_rx: mpsc::Receiver<OutFrame>,
+    mut replicate_rx: OutboxRx,
     cancel: CancellationToken,
 ) {
     let PeerTarget {

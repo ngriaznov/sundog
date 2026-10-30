@@ -1460,8 +1460,8 @@ async fn run_peer_writer_exits_promptly_when_cancelled_while_retrying() {
     // immediately, so the writer cycles through its reconnect backoff
     // instead of hanging on a slow connect.
     let unreachable: SocketAddr = "127.0.0.1:1".parse().expect("valid addr");
-    let invalidate = Arc::new(crate::net::outbox::DropOldestQueue::new(4));
-    let (_replicate_tx, replicate_rx) = mpsc::channel(4);
+    let invalidate = Arc::new(crate::net::outbox::DropOldestQueue::new(4, usize::MAX));
+    let (_replicate_tx, replicate_rx) = crate::net::replicate_outbox(4, 1 << 20);
     let cancel = CancellationToken::new();
     let greeting = crate::net::Greeting {
         node: NodeId::from(1),
