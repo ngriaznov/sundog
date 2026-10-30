@@ -17,7 +17,7 @@ use serde::de::DeserializeOwned;
 
 use super::Shard;
 #[cfg(feature = "spill")]
-use super::spill::SpillReadAt;
+use super::spill::{SpillReadAt, Unreadable};
 #[cfg(feature = "spill")]
 use super::{Mode, PartId, SmolStr, SpillRead, encode_key, engine, now_ms, spill};
 #[cfg(feature = "spill")]
@@ -318,14 +318,8 @@ where
             }
             Ok(Ok(SpillReadAt::Corrupt)) => {
                 spill_read.finish(&spill_read.reads_corrupt, started);
-                spill_read.drop_unreadable(
-                    &self.engine,
-                    &self.name,
-                    key_bytes,
-                    hash,
-                    loc,
-                    "is damaged or cut short on disk",
-                );
+                self.engine
+                    .drop_unreadable_spilled(key_bytes, hash, loc, Unreadable::Damaged);
                 return None;
             }
             Ok(Err(err)) => {
@@ -344,14 +338,8 @@ where
         };
         let Ok(value) = postcard::from_bytes::<V>(&bytes.encoded) else {
             spill_read.finish(&spill_read.reads_corrupt, started);
-            spill_read.drop_unreadable(
-                &self.engine,
-                &self.name,
-                key_bytes,
-                hash,
-                loc,
-                "does not decode as the cache's value type",
-            );
+            self.engine
+                .drop_unreadable_spilled(key_bytes, hash, loc, Unreadable::Undecodable);
             return None;
         };
         spill_read.finish(&spill_read.reads_hit, started);

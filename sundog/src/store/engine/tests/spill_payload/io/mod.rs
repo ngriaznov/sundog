@@ -3,12 +3,14 @@
 use std::time::{Duration, Instant};
 
 use super::*;
+use crate::store::spill::{SpillReadAt, Unreadable};
 
 mod flush_slots;
 mod held_only;
 mod refusal;
 mod reservation;
 mod tombstone_arrival;
+mod unreadable;
 
 fn temp_dir(label: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -149,7 +151,7 @@ fn eviction_hands_off_weight_immediately_and_install_never_double_subtracts_it()
 }
 
 #[test]
-fn install_new_creates_a_fresh_spilled_entry_readable_via_read_at_and_folds_the_digest() {
+fn install_new_creates_a_fresh_spilled_entry_readable_via_read_record_and_folds_the_digest() {
     let dir = temp_dir("install-new");
     let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
     let tier = Arc::new(SpillTier::open(&cfg, "install-new").expect("tier opens"));
@@ -215,12 +217,11 @@ fn install_new_creates_a_fresh_spilled_entry_readable_via_read_at_and_folds_the_
         assert_eq!(live.weight, 0, "a Spilled entry always carries weight 0");
     }
 
-    // Readable via read_at, since install_new never re-writes
+    // Readable via read_record, since install_new never re-writes
     // or copies the value bytes itself.
-    let read_back = tier
-        .read_at(loc)
-        .expect("read_at succeeds")
-        .expect("the record is still there");
+    let SpillReadAt::Found(read_back) = tier.read_record(loc).expect("read_record succeeds") else {
+        panic!("the record is still there");
+    };
     assert_eq!(read_back.ver, ver);
     assert_eq!(read_back.expires_at_ms, Some(999));
     assert_eq!(decode_value::<String>(&read_back.encoded), "spilled-value");
@@ -273,7 +274,7 @@ fn drop_unreadable_spilled_drops_only_the_entry_still_spilled_at_that_pointer() 
 
     let moved = SpillLoc { offset: 96, ..loc };
     assert!(
-        !engine.drop_unreadable_spilled(kb.as_ref(), hash, moved),
+        !engine.drop_unreadable_spilled(kb.as_ref(), hash, moved, Unreadable::Damaged),
         "an entry spilled again elsewhere since the read is kept"
     );
     let rotated = SpillLoc {
@@ -281,17 +282,17 @@ fn drop_unreadable_spilled_drops_only_the_entry_still_spilled_at_that_pointer() 
         ..loc
     };
     assert!(
-        !engine.drop_unreadable_spilled(kb.as_ref(), hash, rotated),
+        !engine.drop_unreadable_spilled(kb.as_ref(), hash, rotated, Unreadable::Damaged),
         "a pointer into a later generation of the region names another record"
     );
     let other = key_bytes(8);
     assert!(
-        !engine.drop_unreadable_spilled(other.as_ref(), hash, loc),
+        !engine.drop_unreadable_spilled(other.as_ref(), hash, loc, Unreadable::Damaged),
         "another key's read never drops this entry"
     );
     assert_eq!(engine.debug_totals().0, 1, "nothing dropped yet");
 
-    assert!(engine.drop_unreadable_spilled(kb.as_ref(), hash, loc));
+    assert!(engine.drop_unreadable_spilled(kb.as_ref(), hash, loc, Unreadable::Damaged));
     assert_eq!(
         engine.debug_totals(),
         (0, 0),
@@ -315,7 +316,7 @@ fn drop_unreadable_spilled_drops_only_the_entry_still_spilled_at_that_pointer() 
         "with no tombstone to delete a peer's copy"
     );
     assert!(
-        !engine.drop_unreadable_spilled(kb.as_ref(), hash, loc),
+        !engine.drop_unreadable_spilled(kb.as_ref(), hash, loc, Unreadable::Damaged),
         "a second drop finds nothing"
     );
 
@@ -329,7 +330,7 @@ fn drop_unreadable_spilled_drops_only_the_entry_still_spilled_at_that_pointer() 
         None,
         0,
     );
-    assert!(!engine.drop_unreadable_spilled(kb.as_ref(), hash, loc));
+    assert!(!engine.drop_unreadable_spilled(kb.as_ref(), hash, loc, Unreadable::Damaged));
     assert_eq!(engine.get(&key, 0), Some("resident".to_string()));
 }
 

@@ -138,6 +138,7 @@ impl SpillTier {
             spill_wait_timeout: cfg.spill_wait_timeout_value(),
             admit: Semaphore::new(admit_permits),
             keep_resident_when_refused: AtomicBool::new(false),
+            unreadable_warned: AtomicBool::new(false),
             #[cfg(test)]
             flusher_paused: AtomicBool::new(false),
             #[cfg(test)]
@@ -317,6 +318,7 @@ impl SpillTier {
             spill_wait_timeout: cfg.spill_wait_timeout_value(),
             admit: Semaphore::new(admit_permits),
             keep_resident_when_refused: AtomicBool::new(false),
+            unreadable_warned: AtomicBool::new(false),
             #[cfg(test)]
             flusher_paused: AtomicBool::new(false),
             #[cfg(test)]

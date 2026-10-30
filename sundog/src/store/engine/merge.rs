@@ -109,16 +109,18 @@ pub(crate) fn fold_sides(
 /// When [`ConflictResolver::merges`] is `true` and `incoming` is a put,
 /// [`fold_sides`] decides which content survives. [`Fold::Both`] runs
 /// [`ConflictResolver::merge`], which needs a real value on both sides: a
-/// tombstone or an unreadable spilled side never reaches it, and
-/// [`ConflictResolver::winner`] decides instead. [`Fold::Incoming`] keeps
-/// the incoming record without reading the stored side's bytes, and
-/// [`Fold::Stored`] keeps the stored record. A lapsed side never folds into
-/// a merge, so no resolver merges a dead value into a live one. No side is
-/// ever merged against a fabricated value: [`apply_locked`] reads a spilled
-/// side's real bytes through [`read_spilled_for_conflict`] first, so a
-/// readable spilled side merges like a resident one. `stored_absent` is
-/// `true` when the stored entry reads as absent on this node, and `false`
-/// for a tombstone.
+/// tombstone, or a spilled side whose read finds no bytes because its region
+/// rotated past it or the read failed with an I/O error, never reaches it,
+/// and [`ConflictResolver::winner`] decides instead.
+/// [`Fold::Incoming`] keeps the incoming record without reading the stored
+/// side's bytes, and [`Fold::Stored`] keeps the stored record. A lapsed side
+/// never folds into a merge, so no resolver merges a dead value into a live
+/// one. No side is ever merged against a fabricated value: [`apply_locked`]
+/// reads a spilled side's real bytes through [`read_spilled_for_conflict`]
+/// first, so a readable spilled side merges like a resident one, and a side
+/// whose record cannot be read is dropped before the collision.
+/// `stored_absent` is `true` when the stored entry reads as absent on this
+/// node, and `false` for a tombstone.
 #[allow(
     clippy::too_many_arguments,
     reason = "the two sides of a collision, each with its version, bytes and deadline, plus the resolver and key"

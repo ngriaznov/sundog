@@ -11,7 +11,7 @@ use crate::hlc::Hlc;
 use crate::store::entry_fingerprint;
 #[cfg(doc)]
 use crate::store::spill::SpillTier;
-use crate::store::spill::{ReclaimRef, SpillLoc, SpillSink, spilled_is_current};
+use crate::store::spill::{ReclaimRef, SpillLoc, SpillSink, Unreadable, spilled_is_current};
 
 use super::expiry::encode_expiry;
 use super::keys::{digest_slot, hasher_for, part_index_from_hash, stripe_index_from_hash};
@@ -200,17 +200,19 @@ where
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
     /// Drops `key_bytes`'s entry, found by `hash`, if it is still spilled at
-    /// `loc`, the pointer a read found unreadable: its record fails its
-    /// checksum or no longer decodes. The entry leaves the digests, the live
-    /// count and the spill gauge as a reclaimed one does, and no tombstone is
-    /// written, so a peer that holds the key can supply it again. An entry
-    /// since overwritten, promoted, removed or spilled again elsewhere no
-    /// longer matches and is kept. Returns whether it dropped the entry.
+    /// `loc`, the pointer a read found unreadable for the reason `why`. The
+    /// entry leaves the digests, the live count and the spill gauge as a
+    /// reclaimed one does, and no tombstone is written, so a peer that holds
+    /// the key can supply it again. The drop is logged through the tier
+    /// ([`SpillTier::log_unreadable_drop`]). An entry since overwritten,
+    /// promoted, removed or spilled again elsewhere no longer matches and is
+    /// kept. Returns whether it dropped the entry.
     pub(crate) fn drop_unreadable_spilled(
         &self,
         key_bytes: &[u8],
         hash: u64,
         loc: SpillLoc,
+        why: Unreadable,
     ) -> bool {
         let dropped = self.remove_spilled_where(stripe_index_from_hash(hash), hash, |l| {
             matches!(&l.state, EntryState::Spilled(at) if *at == loc)
@@ -218,6 +220,9 @@ where
         });
         if dropped {
             self.note_spill_departures(1);
+            if let Some(tier) = self.spill() {
+                tier.log_unreadable_drop(key_bytes.len(), why);
+            }
         }
         dropped
     }

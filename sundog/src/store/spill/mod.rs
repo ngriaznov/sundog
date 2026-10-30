@@ -180,6 +180,27 @@ pub(crate) enum SpillReadAt {
     Corrupt,
 }
 
+/// Why the record a spilled entry points at cannot be read, as the log of
+/// the entry's drop names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unreadable {
+    /// The record fails its checksum or lies past the end of its region file
+    /// ([`SpillReadAt::Corrupt`]).
+    Damaged,
+    /// The record's value bytes do not decode as the cache's value type.
+    Undecodable,
+}
+
+impl Unreadable {
+    /// The reason, as a clause on "the record".
+    pub(crate) const fn why(self) -> &'static str {
+        match self {
+            Self::Damaged => "is damaged or cut short on disk",
+            Self::Undecodable => "does not decode as the cache's value type",
+        }
+    }
+}
+
 /// The engine-side callback surface the flusher drives. `Engine<K, V>`
 /// implements this; the flusher holds only a `Weak<dyn SpillSink>` and exits
 /// once the upgrade fails.
@@ -344,6 +365,9 @@ struct Inner {
     /// a local delete would have anti-entropy repair the entry back in from
     /// every peer that still holds it.
     keep_resident_when_refused: AtomicBool,
+    /// Whether [`SpillTier::log_unreadable_drop`] has logged at `warn` for
+    /// this cache: the first drop warns, later ones log at `debug`.
+    unreadable_warned: AtomicBool,
     /// Test-only: [`flusher_loop`] blocks here instead of pulling its next
     /// job, so a test can hold a job queued, and its bytes counted against
     /// `flush_queue_bytes`, for as long as it needs to.
@@ -354,8 +378,7 @@ struct Inner {
     #[cfg(test)]
     checkpoint_flushes: AtomicU64,
     /// Test-only: how many times [`SpillTier::read_record`] has been called,
-    /// [`SpillTier::read_at`]'s reads included, so a test can show a code path
-    /// reads nothing from disk.
+    /// so a test can show a code path reads nothing from disk.
     #[cfg(test)]
     read_calls: AtomicU64,
     /// Test-only: whether [`SpillTier::read_record`] fails every read with an
@@ -608,20 +631,6 @@ impl SpillTier {
         }
     }
 
-    /// [`SpillTier::read_record`]'s bytes, `Ok(None)` for a record it found
-    /// rotated or corrupt alike: for a caller that degrades the same way
-    /// either way, such as a conflict resolution's read under a stripe lock.
-    ///
-    /// # Errors
-    ///
-    /// As [`SpillTier::read_record`].
-    pub(crate) fn read_at(&self, loc: SpillLoc) -> io::Result<Option<SpilledBytes>> {
-        Ok(match self.read_record(loc)? {
-            SpillReadAt::Found(bytes) => Some(bytes),
-            SpillReadAt::Rotated | SpillReadAt::Corrupt => None,
-        })
-    }
-
     /// Live, un-reclaimed, bytes across all regions.
     pub(crate) fn bytes_used(&self) -> u64 {
         self.inner.bytes_used.load(Ordering::Acquire)
@@ -632,6 +641,27 @@ impl SpillTier {
     /// `engine::Engine`, publishes carries.
     pub(crate) fn cache_name(&self) -> &str {
         &self.inner.cache_name
+    }
+
+    /// Logs the drop of a spilled entry whose record cannot be read for the
+    /// reason `why`: at `warn` the first time for this cache, at `debug`
+    /// after. The log names the cache and the key's length, `key_len`, not
+    /// the key.
+    pub(crate) fn log_unreadable_drop(&self, key_len: usize, why: Unreadable) {
+        let cache = self.cache_name();
+        let why = why.why();
+        if self.inner.unreadable_warned.swap(true, Ordering::Relaxed) {
+            tracing::debug!(cache, key_len, why, "dropped an unreadable spilled entry");
+        } else {
+            tracing::warn!(
+                cache,
+                key_len,
+                why,
+                "dropped a spilled entry whose record cannot be read; a Replicated or \
+                 Distributed peer's copy returns through anti-entropy. Later drops in \
+                 this cache log at debug"
+            );
+        }
     }
 
     /// Stops accepting new spills and drops the flusher's sender, so its

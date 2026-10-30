@@ -183,7 +183,7 @@ fn job(key: &str, value: &[u8], ver: Hlc) -> SpillJob {
 }
 
 #[test]
-fn flushed_job_installs_and_read_at_returns_the_same_bytes_ver_and_expiry() {
+fn flushed_job_installs_and_read_record_returns_the_same_bytes_ver_and_expiry() {
     let dir = temp_dir("roundtrip");
     let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
     let tier = SpillTier::open(&cfg, "cache-a").unwrap();
@@ -197,10 +197,9 @@ fn flushed_job_installs_and_read_at_returns_the_same_bytes_ver_and_expiry() {
     assert!(poll_until(POLL_TIMEOUT, || sink.install_count() == 1));
     let loc = sink.installs.lock().unwrap()[0].3;
 
-    let bytes = tier
-        .read_at(loc)
-        .unwrap()
-        .expect("record should be present");
+    let SpillReadAt::Found(bytes) = tier.read_record(loc).unwrap() else {
+        panic!("record should be present");
+    };
     assert_eq!(bytes.ver, ver);
     assert_eq!(bytes.expires_at_ms, Some(999));
     assert_eq!(bytes.encoded.as_ref(), b"world-value");
@@ -209,7 +208,7 @@ fn flushed_job_installs_and_read_at_returns_the_same_bytes_ver_and_expiry() {
 }
 
 #[test]
-fn read_at_returns_none_for_a_stale_generation() {
+fn read_record_reports_a_stale_generation_as_rotated() {
     // Each region holds one record, so writing a third job rotates
     // region 0 out from under the first job's pointer. Waiting for
     // each job's install before sending the next keeps this
@@ -232,7 +231,6 @@ fn read_at_returns_none_for_a_stale_generation() {
     assert!(poll_until(POLL_TIMEOUT, || sink.install_count() == 3));
 
     let loc_a = sink.installs.lock().unwrap()[0].3;
-    assert_eq!(tier.read_at(loc_a).unwrap(), None);
     assert_eq!(
         tier.read_record(loc_a).unwrap(),
         SpillReadAt::Rotated,
@@ -243,7 +241,7 @@ fn read_at_returns_none_for_a_stale_generation() {
 }
 
 #[test]
-fn read_at_returns_none_for_a_corrupted_record() {
+fn read_record_reports_a_corrupted_record_as_corrupt() {
     let dir = temp_dir("corrupt");
     let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
     let tier = SpillTier::open(&cfg, "cache-a").unwrap();
@@ -262,7 +260,6 @@ fn read_at_returns_none_for_a_corrupted_record() {
     let corrupt_offset = u64::from(loc.offset) + HEADER_LEN as u64 + 1 /* key len */;
     pwrite_all(&file, b"!", corrupt_offset).unwrap();
 
-    assert_eq!(tier.read_at(loc).unwrap(), None);
     assert_eq!(
         tier.read_record(loc).unwrap(),
         SpillReadAt::Corrupt,
@@ -318,7 +315,6 @@ fn read_record_reports_any_other_io_failure_as_an_error() {
         tier.read_record(loc).is_err(),
         "the failure reaches the caller"
     );
-    assert!(tier.read_at(loc).is_err(), "through read_at too");
     tier.fail_reads(false);
     assert!(
         matches!(tier.read_record(loc).unwrap(), SpillReadAt::Found(_)),
@@ -409,10 +405,9 @@ fn flush_batch_spanning_a_rotation_installs_correctly_on_both_sides() {
     );
     for (idx, (_, key_bytes, _, loc)) in installs.iter().enumerate() {
         assert_eq!(key_bytes.as_ref(), format!("key-{idx:02}").as_bytes());
-        let bytes = tier
-            .read_at(*loc)
-            .unwrap()
-            .expect("record present on both sides of the rotation");
+        let SpillReadAt::Found(bytes) = tier.read_record(*loc).unwrap() else {
+            panic!("record present on both sides of the rotation");
+        };
         assert_eq!(bytes.encoded.as_ref(), b"1234");
     }
 
@@ -652,10 +647,9 @@ fn flusher_batches_two_thousand_records_and_installs_every_one_byte_exact() {
             expected_key.as_bytes(),
             "installs land in the order jobs were sent, batched or not"
         );
-        let bytes = tier
-            .read_at(*loc)
-            .unwrap()
-            .expect("every installed record reads back");
+        let SpillReadAt::Found(bytes) = tier.read_record(*loc).unwrap() else {
+            panic!("every installed record reads back");
+        };
         assert_eq!(bytes.encoded.as_ref(), expected_value.as_slice());
     }
 

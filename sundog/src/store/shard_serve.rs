@@ -17,7 +17,7 @@ use super::resolver::exchanges_both_records;
 use super::shard_ops::MaskedDigest;
 use super::shard_oversize::Refused;
 #[cfg(feature = "spill")]
-use super::spill::SpillReadAt;
+use super::spill::{SpillReadAt, Unreadable};
 #[cfg(feature = "spill")]
 use super::spilled_needs_read;
 use super::{
@@ -609,7 +609,7 @@ where
                     if postcard::from_bytes::<V>(&bytes.encoded).is_err() =>
                 {
                     reader.finish(&reader.reads_corrupt, started);
-                    corrupt.push((key_bytes, loc, "does not decode as the cache's value type"));
+                    corrupt.push((key_bytes, loc, Unreadable::Undecodable));
                 }
                 Ok(SpillReadAt::Found(bytes)) => {
                     reader.finish(&reader.reads_hit, started);
@@ -625,7 +625,7 @@ where
                 }
                 Ok(SpillReadAt::Corrupt) => {
                     reader.finish(&reader.reads_corrupt, started);
-                    corrupt.push((key_bytes, loc, "is damaged or cut short on disk"));
+                    corrupt.push((key_bytes, loc, Unreadable::Damaged));
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -643,7 +643,7 @@ where
     .unwrap_or_default();
     for (key_bytes, loc, why) in corrupt {
         let hash = engine::hash_key_bytes(&key_bytes);
-        spill_read.drop_unreadable(engine, cache_name, &key_bytes, hash, loc, why);
+        engine.drop_unreadable_spilled(&key_bytes, hash, loc, why);
     }
     out
 }

@@ -39,11 +39,12 @@ All notable changes to this project are documented in this file. Format follows
   tombstone, so a `Replicated` or `Distributed` peer that holds the key
   supplies it again through anti-entropy; until then a `Distributed` owner
   still answers a fetch for it with a miss. A `get`, an anti-entropy or
-  state-transfer read and a fetch answer all drop it, and the first drop in a
+  state-transfer read, a fetch answer and the read of a conflict resolution
+  whose resolver reads values all drop it, so a write no longer loses a
+  collision to a record with no value to show; an entry that has expired or
+  gone idle keeps its version, as a readable one does. The first drop in a
   cache logs a warning. A read that fails with any other I/O error keeps the
-  entry for the next read to try again. A conflict resolution's read of the
-  stored value, under a merging resolver, still treats such a record as one
-  with no value, and the next of those reads drops the entry.
+  entry for the next read to try again.
 
 ## [0.6.9] – 2026-10-29
 

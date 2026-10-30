@@ -26,8 +26,7 @@ impl SpillTier {
         self.inner.checkpoint_flushes.load(Ordering::Relaxed)
     }
 
-    /// Test-only: how many times [`SpillTier::read_record`] has been called,
-    /// [`SpillTier::read_at`]'s reads included.
+    /// Test-only: how many times [`SpillTier::read_record`] has been called.
     #[cfg(test)]
     pub(crate) fn read_calls(&self) -> u64 {
         self.inner.read_calls.load(Ordering::Relaxed)

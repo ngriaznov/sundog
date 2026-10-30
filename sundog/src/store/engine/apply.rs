@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 
 use crate::hlc::Hlc;
 #[cfg(feature = "spill")]
-use crate::store::spill::{SpillLoc, SpillTier};
+use crate::store::spill::{SpillLoc, SpillReadAt, SpillTier, Unreadable};
 use crate::store::{ConflictResolver, Incoming, Tombstone, Weigher, entry_fingerprint};
 
 #[cfg(feature = "spill")]
@@ -43,15 +43,26 @@ use super::{ApplyOutcome, Engine, Live, Reservation, Stripe, Written, remove_liv
 /// this pointer, since losing a real value to a stale prefetch would
 /// violate [`resolve_conflict`]'s never-drop-a-real-value guarantee.
 ///
-/// `None` on anything [`SpillTier::read_at`] treats as an ordinary outcome
-/// (a torn write, a failed checksum, a rotated-past generation, a genuine
-/// I/O error): degrades like a value-less stored side, never panics.
+/// `Ok(Some)` holds bytes that decode as `V`. `Ok(None)` is a pointer its
+/// region rotated past, or a read that failed with an I/O error a later read
+/// can get past: the stored side degrades like a value-less one. `Err` is a
+/// record that cannot be read: it fails its checksum, lies past the end of
+/// its region file, or does not decode as `V`, and [`apply_locked`] drops a
+/// visible entry that points at it ([`drop_unreadable_locked`]). Never
+/// panics.
 #[cfg(feature = "spill")]
-pub(super) fn read_spilled_for_conflict(tier: &SpillTier, loc: SpillLoc) -> Option<Bytes> {
-    tier.read_at(loc)
-        .ok()
-        .flatten()
-        .map(|spilled| spilled.encoded)
+pub(super) fn read_spilled_for_conflict<V: DeserializeOwned>(
+    tier: &SpillTier,
+    loc: SpillLoc,
+) -> Result<Option<Bytes>, Unreadable> {
+    match tier.read_record(loc) {
+        Ok(SpillReadAt::Found(spilled)) if postcard::from_bytes::<V>(&spilled.encoded).is_err() => {
+            Err(Unreadable::Undecodable)
+        }
+        Ok(SpillReadAt::Found(spilled)) => Ok(Some(spilled.encoded)),
+        Ok(SpillReadAt::Corrupt) => Err(Unreadable::Damaged),
+        Ok(SpillReadAt::Rotated) | Err(_) => Ok(None),
+    }
 }
 
 /// Reads back, off any stripe lock, the value bytes of every currently-
@@ -63,8 +74,11 @@ pub(super) fn read_spilled_for_conflict(tier: &SpillTier, loc: SpillLoc) -> Opti
 /// keyed by [`SpillLoc`] so a moved entry misses rather than serving stale
 /// content. A merging `resolver` never folds a record that reads as absent
 /// at `now_ms` (expired, or idle for `tti_ms`), so that record is not read;
-/// any other resolver sees every spilled record's bytes. Skips the read lock
-/// entirely when `resolver` never inspects stored bytes
+/// any other resolver sees every spilled record's bytes. A read that finds
+/// no bytes to fold, a record that cannot be read among them, is left out,
+/// so the apply reads that pointer again under the write lock, where an
+/// unreadable record's entry is dropped. Skips the read lock entirely when
+/// `resolver` never inspects stored bytes
 /// ([`ConflictResolver::needs_value_bytes`] is `false`) or no tier is
 /// attached.
 #[cfg(feature = "spill")]
@@ -75,7 +89,10 @@ pub(super) fn prefetch_spilled_conflict_bytes<'a, K, V>(
     spill: Option<&SpillTier>,
     tti_ms: Option<u64>,
     now_ms: u64,
-) -> HashMap<SpillLoc, Bytes> {
+) -> HashMap<SpillLoc, Bytes>
+where
+    V: DeserializeOwned,
+{
     let Some(tier) = spill.filter(|_| resolver.needs_value_bytes()) else {
         return HashMap::new();
     };
@@ -99,7 +116,12 @@ pub(super) fn prefetch_spilled_conflict_bytes<'a, K, V>(
         }
     }
     locs.into_iter()
-        .filter_map(|loc| read_spilled_for_conflict(tier, loc).map(|bytes| (loc, bytes)))
+        .filter_map(|loc| {
+            read_spilled_for_conflict::<V>(tier, loc)
+                .ok()
+                .flatten()
+                .map(|bytes| (loc, bytes))
+        })
         .collect()
 }
 
@@ -205,6 +227,12 @@ pub(super) struct StoredLive {
     /// over it counts as a creation, the same as after a sweep, but it never
     /// folds into a merge.
     pub(super) visible: bool,
+    /// Why the record a visible spilled entry points at cannot be read, when
+    /// the read under the write lock found it so
+    /// ([`read_spilled_for_conflict`]): [`apply_locked`] then drops the entry
+    /// before the collision.
+    #[cfg(feature = "spill")]
+    pub(super) unreadable: Option<Unreadable>,
 }
 
 /// `key_bytes`' live entry in `stripe`, if any. A currently-spilled entry
@@ -212,26 +240,40 @@ pub(super) struct StoredLive {
 /// `prefetched_spilled` and the off-lock/under-lock read split. A spilled
 /// entry that is not visible is not read when the resolver merges, since a
 /// dead side never folds; any other resolver sees its bytes as it sees a
-/// resident entry's.
+/// resident entry's. A spilled entry the prefetch holds no bytes for is read
+/// here, under the lock. A visible one whose record cannot be read comes back
+/// with [`StoredLive::unreadable`] set; one that is not visible comes back
+/// with no bytes and keeps its version, so it still orders the write and the
+/// sweep leaves its expiry tombstone.
 pub(super) fn read_stored_live<K, V>(
     stripe: &Stripe<K, V>,
     ctx: &ApplyCtx<'_, K, V>,
     hash: u64,
     key_bytes: &[u8],
-) -> Option<StoredLive> {
+) -> Option<StoredLive>
+where
+    V: DeserializeOwned,
+{
     let live = stripe
         .live
         .find(hash, |l| record_key(&l.record) == key_bytes)?;
     let visible = !absent_at(live, key_bytes, &stripe.long_ttl, ctx.tti_ms, ctx.now_ms);
     #[cfg(feature = "spill")]
-    let encoded = match &live.state {
-        EntryState::Resident => Some(record_value_bytes(&live.record)),
-        EntryState::Spilled(_) if !visible && ctx.resolver.merges() => None,
-        EntryState::Spilled(loc) => ctx.prefetched_spilled.get(loc).cloned().or_else(|| {
-            ctx.spill
+    let (encoded, unreadable) = match &live.state {
+        EntryState::Resident => (Some(record_value_bytes(&live.record)), None),
+        EntryState::Spilled(_) if !visible && ctx.resolver.merges() => (None, None),
+        EntryState::Spilled(loc) => match ctx.prefetched_spilled.get(loc) {
+            Some(bytes) => (Some(bytes.clone()), None),
+            None => match ctx
+                .spill
                 .filter(|_| ctx.resolver.needs_value_bytes())
-                .and_then(|tier| read_spilled_for_conflict(tier, *loc))
-        }),
+                .map(|tier| read_spilled_for_conflict::<V>(tier, *loc))
+            {
+                Some(Ok(bytes)) => (bytes, None),
+                Some(Err(why)) if visible => (None, Some(why)),
+                Some(Err(_)) | None => (None, None),
+            },
+        },
     };
     #[cfg(not(feature = "spill"))]
     let encoded = Some(record_value_bytes(&live.record));
@@ -240,6 +282,8 @@ pub(super) fn read_stored_live<K, V>(
         encoded,
         expires_at_ms: decode_expiry(live.wall_ms, live.expiry, key_bytes, &stripe.long_ttl),
         visible,
+        #[cfg(feature = "spill")]
+        unreadable,
     })
 }
 
@@ -259,12 +303,14 @@ pub(super) fn read_stored_live<K, V>(
 /// [`reject_unheld`]. A merge whose result would pass [`ApplyCtx::merge_cap`]
 /// and be larger than the record it replaces is [`ApplyOutcome::TooLarge`]
 /// and stores nothing either; see [`merge_fits`]. Synchronous under the
-/// caller's write lock on `stripe`; no disk I/O of its own. `prefetched_spilled` (`spill` builds) is
+/// caller's write lock on `stripe`. `prefetched_spilled` (`spill` builds) is
 /// [`prefetch_spilled_conflict_bytes`]'s off-lock read of the stored side's
 /// bytes; a lookup miss falls back to [`read_spilled_for_conflict`] under
-/// this lock rather than treating the side as value-less. Returns whether
-/// this displaced a [`EntryState::Spilled`] entry (`false` for `Rejected`);
-/// see [`Engine::note_spill_departure`].
+/// this lock rather than treating the side as value-less, its one disk read.
+/// A visible stored side whose record that read finds unreadable is dropped
+/// first ([`drop_unreadable_locked`]), as a `get`'s read drops it, so the
+/// write meets no stored side. Returns whether this displaced or dropped a
+/// [`EntryState::Spilled`] entry; see [`Engine::note_spill_departure`].
 #[expect(
     clippy::too_many_lines,
     reason = "the versioned-apply decision reads best whole: the gates that refuse a write, the collision, then the write"
@@ -300,6 +346,19 @@ where
     } else {
         None
     };
+    #[cfg(feature = "spill")]
+    let (stored_live, dropped_unreadable) = match stored_live {
+        Some(StoredLive {
+            unreadable: Some(why),
+            ..
+        }) => (
+            None,
+            drop_unreadable_locked(stripe, ctx, hash, key_bytes.as_ref(), why),
+        ),
+        stored_live => (stored_live, false),
+    };
+    #[cfg(not(feature = "spill"))]
+    let dropped_unreadable = false;
     let stored_ver = prior_tombstone
         .map(|t| t.ver)
         .or_else(|| stored_live.as_ref().map(|s| s.ver));
@@ -314,7 +373,7 @@ where
             &incoming,
             holds,
         ) {
-            return (ApplyOutcome::Rejected, false);
+            return (ApplyOutcome::Rejected, dropped_unreadable);
         }
     }
 
@@ -361,7 +420,7 @@ where
         key,
         key_bytes,
     };
-    match incoming {
+    let (outcome, displaced_spilled) = match incoming {
         Incoming::Put {
             value,
             expires_at_ms,
@@ -389,7 +448,36 @@ where
             };
             apply_tombstone(stripe, ctx, entry, tombstone, had_live)
         }
+    };
+    (outcome, displaced_spilled || dropped_unreadable)
+}
+
+/// Drops `key_bytes`' live entry from `stripe`, under the write lock the
+/// caller holds, because the record it points at cannot be read for the
+/// reason `why`. As with [`Engine::drop_unreadable_spilled`], the entry
+/// leaves the stripe with its long-TTL row, the digest bucket and the live
+/// count, a spilled entry carrying no weight, and no tombstone is written.
+/// The drop is logged through the tier ([`SpillTier::log_unreadable_drop`]),
+/// and the caller counts the spill gauge's departure. Returns whether an
+/// entry was there to drop.
+#[cfg(feature = "spill")]
+fn drop_unreadable_locked<K, V>(
+    stripe: &mut Stripe<K, V>,
+    ctx: &ApplyCtx<'_, K, V>,
+    hash: u64,
+    key_bytes: &[u8],
+    why: Unreadable,
+) -> bool {
+    let Some(removed) = remove_live(stripe, hash, key_bytes) else {
+        return false;
+    };
+    ctx.digest_bucket
+        .fetch_xor(entry_fingerprint(key_bytes, removed.ver), Ordering::Relaxed);
+    ctx.live_count.fetch_sub(1, Ordering::Relaxed);
+    if let Some(tier) = ctx.spill {
+        tier.log_unreadable_drop(key_bytes.len(), why);
     }
+    true
 }
 
 /// Folds a write at `ver` into the digest bucket: subtracts whatever it

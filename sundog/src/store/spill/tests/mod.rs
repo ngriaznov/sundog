@@ -15,6 +15,15 @@ use super::*;
 // --- Pure functions: no I/O, no tokio, safe under every feature combo. ---
 
 #[test]
+fn unreadable_names_each_reason_as_a_clause_on_the_record() {
+    assert_eq!(Unreadable::Damaged.why(), "is damaged or cut short on disk");
+    assert_eq!(
+        Unreadable::Undecodable.why(),
+        "does not decode as the cache's value type"
+    );
+}
+
+#[test]
 fn a_reclaim_row_is_sixteen_bytes_and_keeps_its_stripe() {
     assert_eq!(size_of::<ReclaimRef>(), 16);
     let row = ReclaimRef::new(crate::store::BUCKET_COUNT - 1, 0xDEAD_BEEF, 4096);

@@ -72,12 +72,15 @@ fail their checksum, lie past the end of a region file cut short, or no
 longer decode as the cache's value type, as after a value type change across
 a warm reopen. A `get` drops it, and so do the reads anti-entropy, state
 transfer and a fetch answer make. The read is a miss, and the node stops
-counting and advertising the key. No tombstone is written, so a `Replicated`
-or `Distributed` peer that holds the key supplies it again through
-anti-entropy; in a `Local` or `Invalidation` cache the drop is a plain miss.
-A read that fails with any other I/O error keeps the entry, and the next read
-tries again. `sundog_spill_reads_total` counts the first as `corrupt` and the
-second as `io_error`, and the first drop in a cache logs a warning.
+counting and advertising the key. A conflict resolution whose resolver reads
+values drops it too, and the incoming write meets no stored side; an entry
+that has expired or gone idle keeps its version instead, as a readable one
+does. No tombstone is written, so a `Replicated` or `Distributed` peer that
+holds the key supplies it again through anti-entropy; in a `Local` or
+`Invalidation` cache the drop is a plain miss. A read that fails with any other I/O error
+keeps the entry, and the next read tries again. `sundog_spill_reads_total`
+counts the first as `corrupt` and the second as `io_error`, a conflict
+resolution's reads aside, and the first drop in a cache logs a warning.
 
 ### Warm reopen
 

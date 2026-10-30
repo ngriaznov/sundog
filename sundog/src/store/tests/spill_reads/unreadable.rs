@@ -13,6 +13,14 @@ use super::*;
 /// `2 => "two"` with exactly one of them spilled, and the spilled one.
 async fn replicated_with_one_spilled(label: &str) -> (Shard<u32, String>, u32, String, PathBuf) {
     let (shard, dir) = spill_shard_in(label, "unreadable", Mode::Replicated, 1);
+    let (shard, key, value) = with_one_spilled(shard).await;
+    (shard, key, value, dir)
+}
+
+/// `shard`, a spilling shard that holds one entry in RAM, holding `1 =>
+/// "one"` and `2 => "two"` with exactly one of them spilled, and the spilled
+/// one.
+async fn with_one_spilled(shard: Shard<u32, String>) -> (Shard<u32, String>, u32, String) {
     shard.insert(1, "one".to_string()).await.expect("insert 1");
     shard.insert(2, "two".to_string()).await.expect("insert 2");
     assert!(
@@ -26,9 +34,9 @@ async fn replicated_with_one_spilled(label: &str) -> (Shard<u32, String>, u32, S
         "one key spills"
     );
     if shard.get_sync(&1).is_none() {
-        (shard, 1, "one".to_string(), dir)
+        (shard, 1, "one".to_string())
     } else {
-        (shard, 2, "two".to_string(), dir)
+        (shard, 2, "two".to_string())
     }
 }
 
@@ -412,6 +420,130 @@ async fn the_first_unreadable_drop_in_a_cache_warns_and_later_ones_log_at_debug(
             !event.fields.contains_key("key"),
             "and never the key: {event:?}"
         );
+        assert_eq!(
+            event.fields.get("why"),
+            Some(&format!(
+                "{:?}",
+                "does not decode as the cache's value type"
+            )),
+            "and the reason"
+        );
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A resolver that reads both records' values, as a value-aware one does,
+/// and keeps the greater version, so a conflict resolution reads a spilled
+/// stored side off disk.
+struct ReadsValues;
+
+impl ConflictResolver for ReadsValues {
+    fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
+        if a.ver >= b.ver { Winner::A } else { Winner::B }
+    }
+}
+
+/// `key`'s version on `shard`, where it is spilled.
+fn spilled_ver<V>(shard: &Shard<u32, V>, key: u32) -> Hlc
+where
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    let kb = key_bytes(&key);
+    shard
+        .engine
+        .spilled_loc(kb.as_ref(), engine::hash_key_bytes(&kb), shard.now_ms())
+        .expect("the key is spilled")
+        .0
+}
+
+/// A peer's record of `key` holding `value`, one millisecond older than
+/// `ver`.
+fn older_record(key: u32, value: &str, ver: Hlc) -> WireRecord {
+    WireRecord {
+        key: key_bytes(&key),
+        value: Some(Bytes::from(postcard::to_stdvec(value).expect("encodes"))),
+        ver: Hlc {
+            wall_ms: ver.wall_ms - 1,
+            ..ver
+        },
+        expires_at_ms: None,
+    }
+}
+
+/// The reason, the `why` field, of each `warn` event in `log` that reports a
+/// dropped spilled entry.
+fn drop_warnings(log: &Log) -> Vec<String> {
+    log.0
+        .lock()
+        .expect("lock")
+        .iter()
+        .filter(|event| {
+            event.level == tracing::Level::WARN
+                && event
+                    .fields
+                    .get("message")
+                    .is_some_and(|message| message.contains("spilled entry"))
+        })
+        .map(|event| event.fields.get("why").cloned().unwrap_or_default())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_peer_write_below_a_spilled_record_that_fails_its_checksum_drops_it_and_lands() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let log = Log::default();
+    let _subscriber = crate::cluster::test_support::scoped_subscriber(
+        tracing_subscriber::registry().with(log.clone()),
+    );
+    let (shard, dir) = spill_shard_in("checksum-conflict", "unreadable", Mode::Replicated, 1);
+    let (shard, key, value) = with_one_spilled(shard.with_resolver(Arc::new(ReadsValues))).await;
+    corrupt_on_disk(&dir, &value);
+    let ver = spilled_ver(&shard, key);
+    let _ = snapshotter.snapshot();
+
+    ShardOps::apply_remote_batch(&shard, vec![older_record(key, "older", ver)]).await;
+    assert_eq!(
+        reads(&snapshotter),
+        HashMap::new(),
+        "a conflict resolution's read is not counted"
+    );
+    assert_eq!(
+        drop_warnings(&log),
+        [format!("{:?}", "is damaged or cut short on disk")],
+        "the drop is logged once, with its reason"
+    );
+    assert_eq!(
+        shard.get(&key).await,
+        Some("older".to_string()),
+        "the peer's write lands, where the record no read can use would win"
+    );
+    assert_eq!(shard.engine.debug_totals().0, 2, "each key counts once");
+    assert_digest_matches_full_recompute(&shard).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_peer_write_below_a_spilled_record_of_another_value_type_drops_it_and_lands() {
+    let (cfg, dir) = warm_config("value-type-conflict");
+    let after = reopened_across_a_value_type_change(&cfg, "type-change-conflict", &[5])
+        .await
+        .with_resolver(Arc::new(ReadsValues));
+    let ver = spilled_ver(&after, 5);
+
+    ShardOps::apply_remote_batch(&after, vec![older_record(5, "older", ver)]).await;
+    assert_eq!(
+        after.get(&5).await,
+        Some("older".to_string()),
+        "the peer's write lands, where the record of the old type would win"
+    );
+    assert_eq!(after.engine.debug_totals().0, 1);
+    assert_eq!(
+        after.engine.debug_spill_entries_count(),
+        0,
+        "the spill gauge counts the dropped entry out"
+    );
+    assert_digest_matches_full_recompute(&after).await;
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -38,7 +38,7 @@ pub(super) fn build_header(job: &SpillJob, key_len: u32, value_len: u32) -> Spil
 /// Parses `buf`, one record's bytes as read off disk, into its key bytes
 /// alongside [`SpilledBytes`], or `None` for a bad buffer, magic, length,
 /// or checksum. [`decode_record`] wraps this, discarding the key, for
-/// [`SpillTier::read_at`]'s caller, which already knows the key; reopen's
+/// [`SpillTier::read_record`]'s caller, which already knows the key; reopen's
 /// region scan does not.
 pub(super) fn decode_record_with_key(buf: &[u8]) -> Option<(Bytes, SpilledBytes)> {
     let (header, key_bytes, value_bytes) = split_record(buf)?;

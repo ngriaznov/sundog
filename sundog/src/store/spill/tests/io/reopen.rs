@@ -224,11 +224,9 @@ fn reopen_warm_reload_recovers_a_record_written_before_a_clean_close() {
         .get(&Bytes::from_static(b"hello"))
         .expect("the record replayed");
     assert_eq!(recovered_ver, ver);
-    let bytes = outcome
-        .tier
-        .read_at(loc)
-        .unwrap()
-        .expect("the reopened tier still serves the record's original on-disk bytes");
+    let SpillReadAt::Found(bytes) = outcome.tier.read_record(loc).unwrap() else {
+        panic!("the reopened tier still serves the record's original on-disk bytes");
+    };
     assert_eq!(bytes.encoded.as_ref(), b"world");
     assert!(
         !snapshot_path(&cache_dir).exists(),
