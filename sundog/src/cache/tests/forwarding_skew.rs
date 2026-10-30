@@ -2,12 +2,19 @@
 
 use super::*;
 
-/// How far the writer's clock runs ahead of the owners'.
-const LEAD_MS: u64 = 3_000;
+/// How far the writer's clock runs ahead of the owners'. The window an owner
+/// refuses a stamp in, `LEAD_MS - SKEW_MS`, is ten seconds, so a forward that
+/// a loaded runner delivers seconds late still arrives inside it and is held
+/// rather than applied at once.
+const LEAD_MS: u64 = 11_000;
 
 /// The owners' `max_clock_skew`: a stamp `LEAD_MS` ahead is `LEAD_MS - SKEW_MS`
 /// past the bound.
 const SKEW_MS: u64 = 1_000;
+
+/// How long a test waits for the owners to apply a write they refused at
+/// first: past the refusal window, with room for a late delivery.
+const CONVERGE_BUDGET: Duration = Duration::from_secs(30);
 
 /// Three `Mode::Distributed` nodes whose `max_clock_skew` is `SKEW_MS`, the
 /// third with a clock `LEAD_MS` ahead of the other two.
@@ -102,10 +109,11 @@ impl SkewRig {
         ]
     }
 
-    /// Waits until both owners read `expected` for `key`.
+    /// Waits until both owners read `expected` for `key`, a wait that may
+    /// span the whole refusal window.
     async fn owners_converge_on(&self, key: u32, expected: Option<&str>) {
         wait_until(
-            Duration::from_secs(10),
+            CONVERGE_BUDGET,
             "both owners read the forwarded write once their clocks are within the bound",
             async || {
                 self.owners_read(key)
@@ -292,7 +300,7 @@ async fn an_owners_write_refused_for_clock_skew_is_not_held_and_anti_entropy_del
         );
     }
     wait_until(
-        Duration::from_secs(10),
+        CONVERGE_BUDGET,
         "anti-entropy delivers the owner's write once the clocks are within the bound",
         async || {
             let mut all = true;
@@ -375,7 +383,7 @@ async fn closing_an_owner_hands_its_held_forwards_to_the_other_owner() {
     )
     .await;
     wait_until(
-        Duration::from_secs(10),
+        CONVERGE_BUDGET,
         "the other owner applies it once its clock is within the bound",
         async || cache_b.get(&key).await.as_deref() == Some("handed"),
     )
@@ -438,16 +446,17 @@ async fn the_release_task_applies_a_record_when_it_comes_due_and_ends_on_cancel(
     let cancel = CancellationToken::new();
     let task = tokio::spawn(skew_hold_task(Arc::clone(&shard), cancel.clone()));
 
-    // Due in about 300 ms; a second record due in an hour stays held.
+    // Due once the refusal window passes; a second record due in an hour
+    // stays held.
     let mut soon = test_record(1, "soon", NodeId::from(77));
-    soon.ver.wall_ms = now_ms() + SKEW_MS + 300;
+    soon.ver.wall_ms = now_ms() + LEAD_MS;
     let mut later = test_record(2, "later", NodeId::from(77));
     later.ver.wall_ms = now_ms() + SKEW_MS + 3_600_000;
     ShardOps::apply_forwarded_batch(shard.as_ref(), vec![soon, later]).await;
     assert_eq!(shard.get(&1).await, None);
 
     wait_until(
-        Duration::from_secs(5),
+        CONVERGE_BUDGET,
         "the task applies the record once its clock is within the bound",
         async || shard.get(&1).await.as_deref() == Some("soon"),
     )
