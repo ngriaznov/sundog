@@ -10,8 +10,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::admit::{Admit, HELLO_TIMEOUT, accept_backoff, accept_error_backs_off};
 use super::framing::{
-    PeerFramed, disable_nagle, establish_accept, new_framed_pre_hello, recv_msg,
-    send_batch_or_cancelled,
+    PeerFramed, establish_accept, new_framed_pre_hello, recv_msg, send_batch_or_cancelled,
+    tune_socket,
 };
 use super::pool::{REQ_CONN_IDLE_TIMEOUT, REQ_CONN_MAX_REQUESTS};
 use super::serve::{
@@ -125,7 +125,7 @@ pub(super) async fn accept_loop_over<S: ConnSource>(
                 continue;
             }
         };
-        disable_nagle(&stream);
+        tune_socket(&stream, mesh.keepalive);
         tokio::spawn(handle_accepted(
             stream,
             inbound_tx.clone(),

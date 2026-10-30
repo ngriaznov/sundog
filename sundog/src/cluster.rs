@@ -1243,6 +1243,13 @@ fn validate_config(config: &ClusterConfig) -> Result<(), JoinError> {
             config.max_frame
         )));
     }
+    if let Some(idle) = config.mesh_keepalive
+        && !(crate::config::MESH_KEEPALIVE_MIN..=crate::config::MESH_KEEPALIVE_MAX).contains(&idle)
+    {
+        return Err(JoinError::InvalidConfig(format!(
+            "ClusterConfig::mesh_keepalive ({idle:?}) must be between 1 s and 32767 s"
+        )));
+    }
     if config.fan_out_backlog_capacity == 0 {
         return Err(JoinError::InvalidConfig(
             "ClusterConfig::fan_out_backlog_capacity must be nonzero".to_string(),

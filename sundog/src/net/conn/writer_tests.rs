@@ -606,6 +606,7 @@ mod sockets {
                     addr,
                     dirty: Arc::clone(&dirty),
                     tls: no_tls(),
+                    keepalive: None,
                 },
                 Arc::new(DropOldestQueue::new(4)),
                 replicate_rx,

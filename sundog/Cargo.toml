@@ -45,6 +45,7 @@ rand = "0.10.2"
 rustls = { version = "0.23.43", optional = true }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 smol_str = { version = "0.3.6", features = ["serde"] }
+socket2 = { version = "0.6.5", features = ["all"] }
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util", "signal"] }
 tokio-rustls = { version = "0.26.4", optional = true }
@@ -93,3 +94,6 @@ fuzzing = ["dep:arbitrary"]
 # build without it has no region file and no flusher thread. No new
 # dependency.
 spill = []
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2.189"

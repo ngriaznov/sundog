@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`ClusterConfig::mesh_keepalive`.** TCP keepalive on every data-plane
+  connection a node dials or accepts, at 30 seconds of silence by default:
+  the kernel then probes every third of that, three times, where the
+  platform lets a socket set the interval and count. `build` accepts 1 to
+  32,767 seconds. `None` turns it off.
+
 ### Changed
 
 - **`sundog_spill_reads_total{outcome="corrupt"}`.** A spilled record that
@@ -16,6 +24,15 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **A data-plane link whose peer vanished is released.** A node held each
+  connection a peer had dialed to it until the peer closed it, and never
+  wrote on a broadcast link, so a peer whose host lost power, whose VM was
+  reclaimed, or whose network dropped the connection without a FIN or RST
+  reaching this node left the link, its task and its socket on every
+  surviving node for the life of the process: one per such loss, toward the
+  process's descriptor limit. Every connection now runs TCP keepalive at
+  `ClusterConfig::mesh_keepalive`, so such a link errors and closes about a
+  minute after its peer stops answering.
 - **The mDNS daemon stops with its cluster.** A cluster or observer built
   with the default mDNS discovery started an `mdns-sd` daemon thread that
   nothing stopped: `Cluster::shutdown`, `Cluster::crash`, `Observer::shutdown`

@@ -176,8 +176,14 @@ impl Mesh {
                 conn::ReusedProbe::Stale => {}
             }
         }
-        let framed =
-            conn::dial_with_hello_and(addr, self.inner.greeting(), &self.inner.tls, first).await?;
+        let framed = conn::dial_with_hello_and(
+            addr,
+            self.inner.greeting(),
+            &self.inner.tls,
+            self.inner.keepalive,
+            first,
+        )
+        .await?;
         Ok((framed, pool, None))
     }
 

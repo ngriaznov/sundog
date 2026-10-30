@@ -27,6 +27,8 @@ use xxhash_rust::xxh3::xxh3_64;
 mod anti_entropy;
 mod distribution;
 mod fan_out;
+#[cfg(all(target_os = "linux", not(feature = "sim")))]
+pub(super) mod keepalive;
 mod peers;
 mod state_transfer;
 

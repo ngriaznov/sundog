@@ -1313,7 +1313,7 @@ async fn req_done_and_ae_bucket_after_hello_are_not_served_or_forwarded() {
 
 #[cfg(all(unix, not(feature = "sim")))]
 #[tokio::test]
-async fn disable_nagle_logs_and_does_not_panic_when_set_nodelay_fails() {
+async fn tune_socket_logs_and_does_not_panic_when_the_socket_is_gone() {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -1331,8 +1331,126 @@ async fn disable_nagle_logs_and_does_not_panic_when_set_nodelay_fails() {
     // stream is forgotten below so its own `Drop` never double-closes it.
     drop(unsafe { OwnedFd::from_raw_fd(fd) });
 
-    super::framing::disable_nagle(&stream); // must log, not panic
+    super::framing::tune_socket(&stream, Some(Duration::from_secs(30))); // must log, not panic
     std::mem::forget(stream);
+}
+
+#[cfg(not(feature = "sim"))]
+#[test]
+fn keepalive_timing_probes_a_third_of_the_idle_apart_three_times() {
+    use super::framing::{KeepaliveTiming, keepalive_timing};
+
+    assert_eq!(
+        keepalive_timing(Duration::from_secs(30)),
+        KeepaliveTiming {
+            idle: Duration::from_secs(30),
+            interval: Duration::from_secs(10),
+            retries: 3,
+        }
+    );
+    assert_eq!(
+        keepalive_timing(Duration::from_secs(2)).interval,
+        Duration::from_secs(1),
+        "probes are at least a second apart"
+    );
+    assert_eq!(
+        keepalive_timing(Duration::from_millis(500)),
+        KeepaliveTiming {
+            idle: Duration::from_secs(1),
+            interval: Duration::from_secs(1),
+            retries: 3,
+        },
+        "no kernel takes a sub-second idle or interval"
+    );
+    assert_eq!(
+        keepalive_timing(Duration::MAX),
+        KeepaliveTiming {
+            idle: Duration::from_secs(32_767),
+            interval: Duration::from_secs(32_767) / 3,
+            retries: 3,
+        },
+        "nor one past 32,767 seconds"
+    );
+}
+
+/// A connected pair of loopback sockets: the dialed end and the accepted end.
+#[cfg(not(feature = "sim"))]
+async fn loopback_pair() -> (TcpStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("listener has a local addr");
+    let (dialed, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+    (dialed.expect("connect"), accepted.expect("accept").0)
+}
+
+#[cfg(all(target_os = "linux", not(feature = "sim")))]
+#[tokio::test]
+async fn a_request_connection_runs_keepalive_at_the_configured_idle() {
+    use std::os::fd::AsRawFd as _;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("listener has a local addr");
+    let greeting = crate::net::Greeting {
+        node: NodeId::from(1),
+        incarnation: 1,
+        cluster: wire::UNNAMED_CLUSTER,
+    };
+    let tls = no_tls();
+    let (dialed, accepted) = tokio::join!(
+        super::writer::dial_with_hello_and(
+            addr,
+            greeting,
+            &tls,
+            Some(Duration::from_secs(9)),
+            Msg::ReqDone,
+        ),
+        listener.accept(),
+    );
+    let framed = dialed.expect("dials and sends its first message");
+    let _accepted = accepted.expect("accept");
+    #[cfg(feature = "tls")]
+    let crate::net::MeshStream::Plain(stream) = framed.get_ref() else {
+        panic!("no TLS context, so a plain stream");
+    };
+    #[cfg(not(feature = "tls"))]
+    let stream = framed.get_ref();
+    assert_eq!(
+        crate::net::tests::keepalive::keepalive_settings(stream.as_raw_fd()),
+        Some((9, 3, 3))
+    );
+}
+
+#[cfg(not(feature = "sim"))]
+#[tokio::test]
+async fn tune_socket_turns_keepalive_on_at_the_configured_idle_and_none_leaves_it_off() {
+    let (with, without) = loopback_pair().await;
+    super::framing::tune_socket(&with, Some(Duration::from_secs(45)));
+    super::framing::tune_socket(&without, None);
+
+    assert!(
+        socket2::SockRef::from(&with)
+            .keepalive()
+            .expect("reads SO_KEEPALIVE")
+    );
+    assert!(with.nodelay().expect("reads TCP_NODELAY"));
+    assert!(
+        !socket2::SockRef::from(&without)
+            .keepalive()
+            .expect("reads SO_KEEPALIVE")
+    );
+    assert!(without.nodelay().expect("reads TCP_NODELAY"));
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd as _;
+        assert_eq!(
+            crate::net::tests::keepalive::keepalive_settings(with.as_raw_fd()),
+            Some((45, 15, 3)),
+            "idle, interval and probe count in seconds"
+        );
+    }
 }
 
 #[cfg(not(feature = "sim"))]
@@ -1357,6 +1475,7 @@ async fn run_peer_writer_exits_promptly_when_cancelled_while_retrying() {
             addr: unreachable,
             dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tls: no_tls(),
+            keepalive: None,
         },
         invalidate,
         replicate_rx,

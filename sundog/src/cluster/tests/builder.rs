@@ -70,6 +70,40 @@ async fn build_rejects_a_sketch_that_cannot_fit_one_frame() {
 }
 
 #[tokio::test]
+async fn build_rejects_a_mesh_keepalive_no_kernel_accepts_and_takes_the_bounds() {
+    for idle in [
+        Duration::ZERO,
+        Duration::from_millis(999),
+        Duration::from_secs(32_768),
+        Duration::MAX,
+    ] {
+        let mut config = loopback_config();
+        config.mesh_keepalive = Some(idle);
+        let err = Cluster::builder("cluster-it-mesh-keepalive-guard")
+            .seeds(std::iter::empty())
+            .config(config)
+            .build()
+            .await
+            .expect_err("a mesh_keepalive outside 1 s to 32767 s must be rejected at build()");
+        assert!(
+            matches!(err, JoinError::InvalidConfig(ref msg) if msg.contains("mesh_keepalive")),
+            "{idle:?}: {err:?}"
+        );
+    }
+    for idle in [Duration::from_secs(1), Duration::from_secs(32_767)] {
+        let mut config = loopback_config();
+        config.mesh_keepalive = Some(idle);
+        let cluster = Cluster::builder("cluster-it-mesh-keepalive-bounds")
+            .seeds(std::iter::empty())
+            .config(config)
+            .build()
+            .await
+            .unwrap_or_else(|err| panic!("{idle:?} is in range: {err:?}"));
+        cluster.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn build_rejects_a_zero_fan_out_backlog_capacity() {
     let mut config = loopback_config();
     config.fan_out_backlog_capacity = 0;

@@ -1231,6 +1231,7 @@ dependencies = [
  "rand",
  "serde",
  "smol_str",
+ "socket2",
  "thiserror",
  "tokio",
  "tokio-stream",

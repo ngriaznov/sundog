@@ -217,6 +217,9 @@ struct MeshInner {
     peers: RwLock<HashMap<NodeId, PeerHandle>>,
     accept_cancel: CancellationToken,
     tls: TlsCtx,
+    /// `ClusterConfig::mesh_keepalive`: the TCP keepalive every connection
+    /// this mesh dials or accepts runs with.
+    keepalive: Option<Duration>,
     /// Admission of the connections the data-plane listener accepts.
     admission: conn::Admission,
     /// Bucket acks from `Msg::StBucketAck`, written by
@@ -541,6 +544,7 @@ impl MeshInner {
             peers: RwLock::new(HashMap::new()),
             accept_cancel,
             tls,
+            keepalive: Some(Duration::from_secs(30)),
             admission,
             acked_buckets: RwLock::new(HashMap::new()),
             ack_window,

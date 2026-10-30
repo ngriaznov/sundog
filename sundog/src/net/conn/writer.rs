@@ -18,7 +18,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::framing::{
-    PeerFramed, disable_nagle, establish_dial, new_framed, send_batch, send_frames, send_msg,
+    PeerFramed, establish_dial, new_framed, send_batch, send_frames, send_msg, tune_socket,
 };
 use crate::error::CodecError;
 use crate::net::outbox::DropOldestQueue;
@@ -156,9 +156,10 @@ pub(super) async fn dial_with_hello(
     addr: SocketAddr,
     greeting: Greeting,
     tls: &TlsCtx,
+    keepalive: Option<Duration>,
 ) -> Result<PeerFramed, CodecError> {
     let stream = TcpStream::connect(addr).await?;
-    disable_nagle(&stream);
+    tune_socket(&stream, keepalive);
     let stream = establish_dial(stream, tls).await?;
     let mut framed = new_framed(stream);
     send_msg(&mut framed, &greeting.hello()).await?;
@@ -171,10 +172,11 @@ pub(in crate::net) async fn dial_with_hello_and(
     addr: SocketAddr,
     greeting: Greeting,
     tls: &TlsCtx,
+    keepalive: Option<Duration>,
     first: Msg,
 ) -> Result<PeerFramed, CodecError> {
     let stream = TcpStream::connect(addr).await?;
-    disable_nagle(&stream);
+    tune_socket(&stream, keepalive);
     let stream = establish_dial(stream, tls).await?;
     let mut framed = new_framed(stream);
     send_batch(&mut framed, &[greeting.hello(), first]).await?;
@@ -521,6 +523,8 @@ pub(in crate::net) struct PeerTarget {
     /// The peer's dirty flag, shared with its `PeerHandle`.
     pub(in crate::net) dirty: Arc<AtomicBool>,
     pub(in crate::net) tls: TlsCtx,
+    /// `ClusterConfig::mesh_keepalive`, for every connection this writer dials.
+    pub(in crate::net) keepalive: Option<Duration>,
 }
 
 /// The long-lived per-peer writer: connects with a fixed backoff, sends
@@ -551,13 +555,14 @@ pub(in crate::net) async fn run_peer_writer(
         addr,
         dirty,
         tls,
+        keepalive,
     } = target;
     let mut state = WriterState::new(peer, Arc::clone(&dirty));
     loop {
         let mut link = tokio::select! {
             biased;
             () = cancel.cancelled() => return,
-            connected = connect_with_hello(addr, greeting, &tls, &cancel) => match connected {
+            connected = connect_with_hello(addr, greeting, &tls, keepalive, &cancel) => match connected {
                 Some(link) => link,
                 None => return, // cancelled while retrying
             },
@@ -598,10 +603,11 @@ async fn connect_with_hello(
     addr: SocketAddr,
     greeting: Greeting,
     tls: &TlsCtx,
+    keepalive: Option<Duration>,
     cancel: &CancellationToken,
 ) -> Option<PeerFramed> {
     loop {
-        if let Ok(framed) = dial_with_hello(addr, greeting, tls).await {
+        if let Ok(framed) = dial_with_hello(addr, greeting, tls, keepalive).await {
             return Some(framed);
         }
         tokio::select! {

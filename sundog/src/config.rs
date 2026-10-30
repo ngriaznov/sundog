@@ -177,6 +177,20 @@ pub struct ClusterConfig {
     pub crdt_sweep_interval: Option<Duration>,
     /// Bounded capacity of each per-peer outbox (`mpsc`) on the data plane.
     pub outbox_capacity: usize,
+    /// How long a data-plane connection may stay silent before the kernel
+    /// probes the peer: TCP keepalive on every connection this node dials or
+    /// accepts. Probes then repeat every third of this, three times, where
+    /// the platform lets a socket set the interval and count; elsewhere the
+    /// system's own apply. A silent connection to a host that vanished
+    /// without closing it, through a power loss, a lost VM or a partition,
+    /// errors and is released after about twice this. A connection that only
+    /// receives would otherwise be held until the process exits. One with
+    /// data the peer has not acknowledged is not probed: the kernel's
+    /// retransmission timeout, about 15 minutes on Linux, releases it
+    /// instead. Must be between 1 second and 32,767 seconds, the whole
+    /// seconds a kernel accepts: `ClusterBuilder::build` rejects any other
+    /// value. `None` leaves keepalive off. Defaults to 30 seconds.
+    pub mesh_keepalive: Option<Duration>,
     /// Hard cap on a single wire frame, in bytes. Must not exceed
     /// [`crate::wire::MAX_FRAME`]; `build()` rejects a higher value with
     /// [`crate::error::JoinError::InvalidConfig`]. A write whose record
@@ -433,6 +447,13 @@ impl ClusterConfig {
     }
 }
 
+/// The shortest [`ClusterConfig::mesh_keepalive`] `ClusterBuilder::build`
+/// accepts.
+pub(crate) const MESH_KEEPALIVE_MIN: Duration = Duration::from_secs(1);
+/// The longest [`ClusterConfig::mesh_keepalive`] `ClusterBuilder::build`
+/// accepts: Linux's `MAX_TCP_KEEPIDLE`.
+pub(crate) const MESH_KEEPALIVE_MAX: Duration = Duration::from_secs(32_767);
+
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
@@ -444,6 +465,7 @@ impl Default for ClusterConfig {
             crdt_compact_batch: 4_096,
             crdt_sweep_interval: None,
             outbox_capacity: 8_192,
+            mesh_keepalive: Some(Duration::from_secs(30)),
             max_frame: MAX_FRAME,
             gossip_bind_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
             data_bind_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
@@ -543,6 +565,14 @@ mod tests {
     #[test]
     fn default_advertise_ip_is_none() {
         assert_eq!(ClusterConfig::default().advertise_ip, None);
+    }
+
+    #[test]
+    fn default_mesh_keepalive_is_thirty_seconds() {
+        assert_eq!(
+            ClusterConfig::default().mesh_keepalive,
+            Some(Duration::from_secs(30))
+        );
     }
 
     #[test]

@@ -8,6 +8,8 @@ use futures::{Sink, SinkExt as _, StreamExt as _};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(not(feature = "sim"))]
+use crate::config::{MESH_KEEPALIVE_MAX, MESH_KEEPALIVE_MIN};
 use crate::error::CodecError;
 use crate::hlc::Hlc;
 use crate::net::tcp::TcpStream;
@@ -17,14 +19,90 @@ use crate::wire::{self, MAX_FRAME, Msg};
 
 pub(in crate::net) type PeerFramed = Framed<MeshStream, LengthDelimitedCodec>;
 
-/// Disables Nagle's algorithm on a freshly dialed/accepted socket. Every
-/// wire message here is already a deliberately-sized batch, and Nagle's
-/// interaction with delayed ACKs is a classic multi-millisecond stall.
-/// Best-effort: a failure here surfaces on the next real read/write instead.
-pub(super) fn disable_nagle(stream: &TcpStream) {
+/// When the kernel probes a silent connection and how often it gives up:
+/// [`keepalive_timing`]'s result for one `ClusterConfig::mesh_keepalive`.
+#[cfg(not(feature = "sim"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::net) struct KeepaliveTiming {
+    /// Silence before the first probe.
+    pub(in crate::net) idle: std::time::Duration,
+    /// The gap between two unanswered probes.
+    pub(in crate::net) interval: std::time::Duration,
+    /// Unanswered probes before the kernel drops the connection.
+    pub(in crate::net) retries: u32,
+}
+
+/// The keepalive timing for an `idle` of silence: probes every third of
+/// `idle`, three times, so a peer that stopped answering is dropped about
+/// `2 * idle` after it went silent. The idle and the interval are held
+/// within [`MESH_KEEPALIVE_MIN`] and [`MESH_KEEPALIVE_MAX`], the whole
+/// seconds a kernel accepts for either. Pure; unit tested directly.
+#[cfg(not(feature = "sim"))]
+pub(in crate::net) fn keepalive_timing(idle: std::time::Duration) -> KeepaliveTiming {
+    let bounded = |d: std::time::Duration| d.clamp(MESH_KEEPALIVE_MIN, MESH_KEEPALIVE_MAX);
+    let idle = bounded(idle);
+    KeepaliveTiming {
+        idle,
+        interval: bounded(idle / 3),
+        retries: 3,
+    }
+}
+
+/// Readies a freshly dialed or accepted socket. Disables Nagle's
+/// algorithm: every wire message here is already a deliberately-sized
+/// batch, and Nagle's interaction with delayed ACKs is a classic
+/// multi-millisecond stall. Turns on TCP keepalive at `keepalive`'s timing
+/// ([`keepalive_timing`]), so a connection whose peer vanished without
+/// closing it errors instead of waiting forever; `None` leaves it off, as
+/// does the `sim` transport, which has no kernel socket. Best-effort: a
+/// setting the platform refuses is logged, and the socket keeps what the
+/// system applied.
+pub(super) fn tune_socket(stream: &TcpStream, keepalive: Option<std::time::Duration>) {
     if let Err(error) = stream.set_nodelay(true) {
         tracing::debug!(%error, "set_nodelay failed; leaving Nagle's algorithm enabled");
     }
+    #[cfg(not(feature = "sim"))]
+    if let Some(idle) = keepalive
+        && let Err(error) = enable_keepalive(stream, keepalive_timing(idle))
+    {
+        tracing::debug!(
+            %error,
+            "TCP keepalive not fully set; the socket keeps the system's settings for the rest"
+        );
+    }
+    #[cfg(feature = "sim")]
+    let _ = keepalive;
+}
+
+/// Turns on TCP keepalive at `timing` on `stream`, setting the probe
+/// interval and count where the platform lets a socket choose them.
+#[cfg(not(feature = "sim"))]
+fn enable_keepalive(stream: &TcpStream, timing: KeepaliveTiming) -> std::io::Result<()> {
+    let params = socket2::TcpKeepalive::new().with_time(timing.idle);
+    // The platforms socket2 sets an interval and a probe count on.
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "emscripten",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "visionos",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "windows",
+        target_os = "cygwin",
+        target_os = "nuttx",
+        all(target_os = "wasi", not(target_env = "p1")),
+    ))]
+    let params = params
+        .with_interval(timing.interval)
+        .with_retries(timing.retries);
+    socket2::SockRef::from(stream).set_tcp_keepalive(&params)
 }
 
 pub(super) fn new_framed(stream: MeshStream) -> PeerFramed {
