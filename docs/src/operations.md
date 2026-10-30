@@ -308,12 +308,14 @@ naming the writer and how far ahead its stamp was. One node's clock runs
 fast, or this node's runs slow: compare each host's time against NTP. A
 refused write stays on the node that made it until the other clocks reach
 its stamp. A `Distributed` write forwarded by a non-owner has no copy on the
-writer, so the owner that refuses it holds it: `sundog_clock_skew_held` and
-`sundog_clock_skew_held_bytes` show what waits, and the write lands once this
+writer, so the owner that refuses it holds it, as it holds a forward another
+node relays or one sent under a view it does not hold: `sundog_clock_skew_held`
+and `sundog_clock_skew_held_bytes` show what waits, and the write lands once this
 node's clock is within `max_clock_skew` of its stamp. The wait is the stamp's
-lead minus the bound, and fixing the writer's clock does not shorten it. A
-non-zero `sundog_clock_skew_hold_dropped_total` means writes were lost: the
-`full` reason is a hold at its 16,384 records or 32 MiB, and `horizon` a
+lead minus the bound, and fixing the writer's clock does not shorten it.
+`sundog_clock_skew_hold_dropped_total` counts the forwards the hold dropped,
+each a lost write unless its writer kept a copy for anti-entropy to offer
+again: the `full` reason is a hold at its 16,384 records or 32 MiB, and `horizon` a
 record that would wait longer than a day (or `tombstone_max_ttl`, if
 shorter), a stamp ahead by more than `max_clock_skew` plus that limit, which
 no clock skew explains. A node that logs that its clock is behind its own last

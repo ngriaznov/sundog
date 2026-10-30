@@ -172,11 +172,14 @@ async fn a_shard_without_an_ownership_view_or_a_bound_holds_nothing() {
     assert_eq!(replicated.skew_held(), (0, 0));
 }
 
-/// An owner forwards each of its writes to its co-owners, and keeps its own
-/// copy, which anti-entropy offers again: only a writer that is no owner of
-/// the part leaves the frame as the only copy.
+/// The shard holds every forward it is handed through
+/// `apply_forwarded_batch`, whichever node wrote it: whether the writer kept
+/// a copy is the inbound loop's call (see `cluster::inbound::writer_kept`),
+/// from the sender and the view the record came under. A writer that owns
+/// the part under this node's view may have owned nothing under the view it
+/// wrote in, and kept nothing.
 #[tokio::test]
-async fn a_forward_from_a_co_owner_is_not_held() {
+async fn a_forward_whose_writer_owns_the_part_here_is_held() {
     let clock = TestClock::at(START_MS);
     let (s, view, _tx, _residency) = skew_shard::<String>(&clock);
     let key = owned_key(&view);
@@ -197,23 +200,45 @@ async fn a_forward_from_a_co_owner_is_not_held() {
     );
 
     ShardOps::apply_forwarded_batch(&s, vec![rec]).await;
-    assert_eq!(s.skew_held(), (0, 0), "the co-owner kept its own copy");
+    assert_eq!(s.skew_held().0, 1, "held although its writer owns the part");
+    clock.set(START_MS + 9_000);
+    s.release_due_skewed().await;
+    assert_eq!(s.get(&key).await.as_deref(), Some("from an owner"));
+}
 
-    // An eligible node that is not among this part's owners is held.
-    let non_owner = (1..=5u64)
-        .map(NodeId::from)
-        .find(|node| !view.owners_of(part).contains(node))
-        .expect("a node that does not own the part");
-    let rec = wire_record(
-        key,
-        "from a non-owner",
-        Hlc {
-            node: non_owner,
-            ..hlc(START_MS + 10_000, 1)
-        },
-    );
-    ShardOps::apply_forwarded_batch(&s, vec![rec]).await;
+/// A held record refused again on release is held again even when its writer
+/// has become an owner of the part since: the hold took it as a record whose
+/// writer kept nothing, and a later view does not change what the writer
+/// kept.
+#[tokio::test]
+async fn a_held_record_is_held_again_after_its_writer_becomes_an_owner() {
+    let clock = TestClock::at(START_MS);
+    let (s, view, tx, _residency) = skew_shard::<String>(&clock);
+    let joined = Arc::new(OwnershipView::compute(
+        NodeId::from(1),
+        (1..=5u64).chain([OUTSIDER]).map(NodeId::from).collect(),
+        NonZeroU8::new(2).expect("nonzero"),
+    ));
+    let key = (0..1_000_000u32)
+        .find(|key| {
+            let part = PartId::of_key(&key_bytes(key));
+            view.owns(part)
+                && joined.owns(part)
+                && joined.owners_of(part).contains(&NodeId::from(OUTSIDER))
+        })
+        .expect("a part node 1 keeps and the outsider joins as owner");
+    ShardOps::apply_forwarded_batch(&s, vec![forward(key, "joined", 10_000)]).await;
     assert_eq!(s.skew_held().0, 1);
+
+    tx.send(joined).expect("receiver alive");
+    clock.set(START_MS + 9_000);
+    clock.script([START_MS + 9_000, START_MS + 100]);
+    s.release_due_skewed().await;
+    assert_eq!(s.get(&key).await, None);
+    assert_eq!(s.skew_held().0, 1, "held again, not dropped");
+
+    s.release_due_skewed().await;
+    assert_eq!(s.get(&key).await.as_deref(), Some("joined"));
 }
 
 /// A forwarded remove the owner refuses deletes on release, over a live
@@ -599,6 +624,39 @@ async fn closing_hands_the_held_records_to_the_fan_out() {
     clock.set(START_MS + 20_000);
     s.release_due_skewed().await;
     assert_eq!(s.get(&key).await, None);
+}
+
+/// A held record is detached from the frame it came in: the hold, and the
+/// forward a close hands it to, keep the record's own bytes, so the hold's
+/// byte cap bounds the memory it keeps alive.
+#[tokio::test]
+async fn a_held_record_is_detached_from_the_frame_it_came_in() {
+    let clock = TestClock::at(START_MS);
+    let (s, view, _tx, _residency) = skew_shard::<String>(&clock);
+    let key = owned_key(&view);
+    let rec = forward(key, "held", 10_000);
+    // As decoded from a frame: the key and value are slices of its buffer.
+    let mut frame = rec.key.to_vec();
+    frame.extend_from_slice(rec.value.as_deref().expect("a value"));
+    frame.resize(64 * 1024, 0);
+    let frame = Bytes::from(frame);
+    let value_len = rec.value.as_ref().map_or(0, Bytes::len);
+    let sliced = WireRecord {
+        key: frame.slice(..rec.key.len()),
+        value: Some(frame.slice(rec.key.len()..rec.key.len() + value_len)),
+        ..rec.clone()
+    };
+    ShardOps::apply_forwarded_batch(&s, vec![sliced]).await;
+    assert_eq!(s.skew_held().0, 1);
+
+    s.seal_for_close();
+    let items = s.fan_out_queue().drain();
+    let [FanOutItem::Forward(handed)] = items.as_slice() else {
+        panic!("the held record is queued as a forward: {items:?}");
+    };
+    assert_eq!(handed, &rec);
+    let within = |bytes: &Bytes| frame.as_ptr_range().contains(&bytes.as_ptr());
+    assert!(!within(&handed.key) && !within(handed.value.as_ref().expect("a value")));
 }
 
 /// The `reason` label of `sundog_clock_skew_hold_dropped_total` for each way

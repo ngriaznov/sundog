@@ -35,6 +35,16 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **A `Distributed` owner holds a skewed forward its writer may not have
+  kept.** An owner that refused a forwarded write for clock skew held it only
+  when the writer owned none of the write's part under the owner's own view,
+  and otherwise dropped it as a write the writer kept. What the writer kept
+  follows the view it sent under, and views differ while membership changes:
+  a closing owner's hand-off of the forwards it held, a write relayed by a
+  node that did not make it, or a write sent under a view the owner did not
+  hold reached an owner whose view made the writer an owner, and the write
+  was lost. An owner now drops a refused forward only when its writer sent it
+  under the owner's own view and owns its part there, and holds every other.
 - **A peer that stops reading holds a bounded share of memory.** A peer's
   replicate outbox was bounded only in frames, 8,192 by default, and a frame
   carries up to 256 KiB of records and keeps them decoded as well, so a peer

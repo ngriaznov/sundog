@@ -91,11 +91,13 @@ pub trait ShardOps: Send + Sync {
     fn apply_remote_batch(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, ()>;
 
     /// [`ShardOps::apply_remote_batch`] for the records of a
-    /// [`crate::wire::Msg::ForwardBatch`]. A `Mode::Distributed` writer that is
-    /// not an owner of a record's part keeps no copy of the write it forwards,
-    /// so a record this shard refuses for a stamp further ahead of its clock
-    /// than `max_clock_skew` is held in memory and applied once the clock is
-    /// within the bound, where `apply_remote_batch` drops it (its sender still
+    /// [`crate::wire::Msg::ForwardBatch`] whose writer may have kept no copy:
+    /// a `Mode::Distributed` writer keeps none of a write to a part it does
+    /// not own, and a record another node relays, or one sent under a view
+    /// this node does not hold, may be such a write. A record this shard
+    /// refuses for a stamp further ahead of its clock than `max_clock_skew`
+    /// is held in memory and applied once the clock is within the bound,
+    /// where `apply_remote_batch` drops it (its sender, or its writer, still
     /// holds the record and offers it again). The hold is bounded and lost on
     /// a crash; a graceful close hands it to the other owners. Default:
     /// `apply_remote_batch`, for a shard that holds nothing.

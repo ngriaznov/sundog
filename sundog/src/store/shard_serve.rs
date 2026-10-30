@@ -62,10 +62,10 @@ where
 {
     /// The body of [`ShardOps::apply_remote_batch`] and
     /// [`ShardOps::apply_forwarded_batch`]. `hold_skewed` says the records
-    /// came in a `ForwardBatch`: one the stamp refuses, from a writer that is
-    /// not an owner of its part, goes to the skew hold instead of being
-    /// dropped (see [`Shard::hold_skewed`]). Every other refusal drops the
-    /// record, because the sender still holds it.
+    /// came in a forward whose writer may have kept no copy: one the stamp
+    /// refuses goes to the skew hold instead of being dropped (see
+    /// [`Shard::hold_skewed`]). Every other refusal drops the record, because
+    /// its sender or its writer still holds it.
     pub(super) async fn apply_inbound(&self, recs: Vec<WireRecord>, hold_skewed: bool) {
         #[cfg(feature = "spill")]
         if self.inbound_held() {
@@ -103,7 +103,7 @@ where
         for rec in recs {
             if !self.observe_remote(rec.ver) {
                 if hold_skewed {
-                    self.hold_skewed(rec);
+                    self.hold_skewed(&rec);
                 }
                 continue;
             }

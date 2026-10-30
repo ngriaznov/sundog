@@ -55,11 +55,15 @@ plus that limit, is a broken clock rather than skew, and is dropped and
 counted with reason `horizon`. Both count in
 `sundog_clock_skew_hold_dropped_total{cache, reason}`. The hold is in memory:
 a crash loses it, and a cache that closes hands its held records to the other
-owners of their parts, which hold them in turn. A forward whose writer is an
-owner of the part is not held, because that owner kept its record and
-anti-entropy offers it again. Rebalance and state transfer do
-not hold what they are refused: a record a receiver refuses for skew is not
-applied there, and a donor that finishes its round can release the part.
+owners of their parts, which hold them in turn. A forward its writer sent
+under the receiver's own ownership view, for a part the writer owns in that
+view, is not held, because the writer kept its record and anti-entropy offers
+it again. Every other forward is held: one another node relays, such as a
+closing owner's hand-off, and one sent under a view the receiver does not
+hold, whose writer may have owned nothing of the part when it wrote. Rebalance
+and state transfer do not hold what they are refused: a record a receiver
+refuses for skew is not applied there, and a donor that finishes its round can
+release the part.
 
 A restart that replays a spill snapshot resumes the node's clock at or past
 the replayed stamps, so a clock that steps back across a restart does not

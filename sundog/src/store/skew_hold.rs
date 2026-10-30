@@ -18,7 +18,6 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::hlc::Hlc;
-use crate::node::NodeId;
 use crate::wire::WireRecord;
 
 /// The most records one shard holds for clock skew.
@@ -69,16 +68,6 @@ pub(super) fn skew_hold_wait(next_due_ms: Option<u64>, now_ms: u64) -> Option<Du
     next_due_ms.map(|due_ms| {
         Duration::from_millis(due_ms.saturating_sub(now_ms).max(1)).min(SKEW_RELEASE_POLL)
     })
-}
-
-/// Whether a refused record is held. Only a record from a forward is: a
-/// replication, anti-entropy or state-transfer refusal leaves the sender
-/// holding the record, and so does an owner's forward to a co-owner, since
-/// the stamp's writer kept the record in its own engine and anti-entropy
-/// repairs the refusal. Only a writer that is not among the part's `owners`
-/// kept nothing.
-pub(super) fn should_hold(hold_skewed: bool, owners: &[NodeId], writer: NodeId) -> bool {
-    hold_skewed && !owners.contains(&writer)
 }
 
 /// What [`SkewHold::hold`] did with a record.
@@ -245,6 +234,7 @@ impl SkewHold {
 mod tests {
     use super::*;
     use crate::hlc::exceeds_skew;
+    use crate::node::NodeId;
 
     fn node(n: u64) -> NodeId {
         NodeId::from(n)
@@ -335,21 +325,6 @@ mod tests {
             Some(SKEW_RELEASE_POLL),
             "a long wait is cut to a poll slice"
         );
-    }
-
-    #[test]
-    fn should_hold_needs_a_forward_from_a_writer_that_is_not_an_owner() {
-        let owners = [node(1), node(2)];
-        assert!(should_hold(true, &owners, node(3)));
-        assert!(
-            !should_hold(true, &owners, node(2)),
-            "an owner kept the record in its own engine"
-        );
-        assert!(
-            !should_hold(false, &owners, node(3)),
-            "only a forward is held"
-        );
-        assert!(should_hold(true, &[], node(3)), "no owners, no retention");
     }
 
     #[test]

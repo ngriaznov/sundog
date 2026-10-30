@@ -22,8 +22,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::skew_hold::{
-    HoldOutcome, SkewHold, beyond_horizon, should_hold, skew_due_ms, skew_hold_horizon_ms,
-    skew_hold_wait,
+    HoldOutcome, SkewHold, beyond_horizon, skew_due_ms, skew_hold_horizon_ms, skew_hold_wait,
 };
 use super::{FanOutItem, PartId, Shard};
 use crate::wire::WireRecord;
@@ -69,24 +68,20 @@ where
     }
 
     /// Parks `rec`, which [`Shard::observe_remote`] refused as stamped past
-    /// `max_clock_skew`, when it came in a forward from a writer that is not
-    /// an owner of its part under the current view; see [`should_hold`]. A
-    /// record whose wait would pass the horizon, or that the hold's caps
-    /// refuse, is dropped and counted in
-    /// `sundog_clock_skew_hold_dropped_total{cache,reason}`.
-    pub(super) fn hold_skewed(&self, rec: WireRecord) {
-        let (Some(max_skew_ms), Some(tracker)) = (self.max_clock_skew_ms, self.ownership.as_ref())
-        else {
+    /// `max_clock_skew`, a forwarded record whose writer may have kept no
+    /// copy. Whether the writer kept one is the inbound loop's call, from the
+    /// sender and the view the record came under, not this node's current
+    /// view: the writer's ownership when it sent the record decides it, and
+    /// a view that moved since names other owners. A record whose wait would
+    /// pass the horizon, or that the hold's caps refuse, is dropped and
+    /// counted in `sundog_clock_skew_hold_dropped_total{cache,reason}`. A
+    /// held record is detached from the frame it came in
+    /// ([`WireRecord::detached`]), so the hold's byte cap bounds what it
+    /// keeps alive.
+    pub(super) fn hold_skewed(&self, rec: &WireRecord) {
+        let (Some(max_skew_ms), Some(_)) = (self.max_clock_skew_ms, self.ownership.as_ref()) else {
             return;
         };
-        let view = tracker.current();
-        if !should_hold(
-            true,
-            view.owners_of(PartId::of_key(rec.key.as_ref())),
-            rec.ver.node,
-        ) {
-            return;
-        }
         let writer = rec.ver.node;
         let due_ms = skew_due_ms(rec.ver.wall_ms, max_skew_ms);
         if beyond_horizon(
@@ -102,7 +97,7 @@ where
                 .skew_hold
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            let outcome = hold.hold(rec, max_skew_ms, self.resolver.merges());
+            let outcome = hold.hold(rec.detached(), max_skew_ms, self.resolver.merges());
             self.publish_skew_hold(&hold);
             outcome
         };
@@ -131,8 +126,9 @@ where
                 %writer,
                 reason = reason.label(),
                 "dropped a forwarded write refused for clock skew instead of holding it: its stamp \
-                 is past the hold's horizon, or the hold is full. The writer kept no copy, so the \
-                 write is lost. sundog_clock_skew_hold_dropped_total counts every drop"
+                 is past the hold's horizon, or the hold is full. A write its writer kept no copy \
+                 of is lost; one it kept returns through anti-entropy. \
+                 sundog_clock_skew_hold_dropped_total counts every drop"
             );
         }
     }

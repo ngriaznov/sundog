@@ -9,7 +9,6 @@
 //! invalidation of the version written, so a peer that receives it stops
 //! serving the value the write replaced.
 
-use std::collections::HashSet;
 use std::hash::Hash;
 use std::sync::Arc;
 
@@ -474,7 +473,9 @@ pub(crate) async fn fan_out_batch<K, V>(
         mut records,
         departed,
     } = shard.fan_out_records(&applied).await;
-    let applied_keys_bytes: HashSet<Bytes> = records.iter().map(|rec| rec.key.clone()).collect();
+    // `records[read_back..]` are the forwarded records, which this node has
+    // not applied.
+    let read_back = records.len();
     records.extend(forwarded);
     if records.is_empty() && departed.is_empty() {
         return;
@@ -495,13 +496,12 @@ pub(crate) async fn fan_out_batch<K, V>(
         // the time the queue drains, lands here too: sending it only to
         // the other owners (or nobody, if this node is the sole owner)
         // would lose the one copy that exists. It applies as a forward, so a
-        // stamp this node's clock refuses is held rather than dropped.
-        let mine: Vec<WireRecord> = records
+        // stamp this node's clock refuses is held rather than dropped. A
+        // local write of the same key in the drain does not stand in for
+        // it: the co-owners take the record as one this node kept.
+        let mine: Vec<WireRecord> = records[read_back..]
             .iter()
-            .filter(|rec| {
-                view.owns(PartId::of_key(rec.key.as_ref()))
-                    && !applied_keys_bytes.contains(rec.key.as_ref())
-            })
+            .filter(|rec| view.owns(PartId::of_key(rec.key.as_ref())))
             .cloned()
             .collect();
         if !mine.is_empty() {

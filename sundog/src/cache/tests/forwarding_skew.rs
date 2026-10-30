@@ -269,6 +269,68 @@ async fn a_forward_drained_by_its_new_owner_is_held_when_its_stamp_is_refused() 
     cluster.shutdown().await;
 }
 
+/// A forward drained with a local write of the same key still applies on the
+/// node that now owns the part: the local write is in its engine, the
+/// forward is not, and the co-owners take both as records this node kept.
+/// Here the forward's stamp is refused, so it is held.
+#[tokio::test]
+async fn a_forward_drained_with_a_local_write_of_its_key_applies_too() {
+    use crate::cluster::fan_out::fan_out_batch;
+    use crate::ownership::{OwnershipTracker, ResidencySet};
+    use crate::store::FanOutItem;
+
+    let name = "cache-it-forward-skew-drain-same-key";
+    let cluster = Cluster::builder(name)
+        .seeds(std::iter::empty())
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("cluster builds");
+    let (tracker, _tx) = OwnershipTracker::seed(
+        cluster.node_id(),
+        &[],
+        &std::collections::HashMap::new(),
+        &SmolStr::new(name),
+        NonZeroU8::new(2).expect("nonzero"),
+    );
+    let shard = Shard::<u32, String>::new(
+        SmolStr::new(name),
+        Mode::distributed(),
+        cluster.node_id(),
+        u64::MAX,
+        None,
+        None,
+    )
+    .with_max_clock_skew(Some(Duration::from_millis(SKEW_MS)))
+    .with_ownership(tracker, Arc::new(ResidencySet::new()));
+    shard
+        .insert(1, "local".into())
+        .await
+        .expect("the owner writes");
+    let mut items = shard.fan_out_queue().drain();
+    assert!(matches!(items.as_slice(), [FanOutItem::Applied(1, _)]));
+    let mut rec = test_record(1, "forwarded", NodeId::from(77));
+    rec.ver.wall_ms = now_ms() + 3_600_000;
+    items.push(FanOutItem::Forward(rec));
+
+    fan_out_batch(
+        &shard,
+        &cluster,
+        &SmolStr::new(name),
+        Mode::distributed(),
+        items,
+    )
+    .await;
+
+    assert_eq!(shard.get(&1).await.as_deref(), Some("local"));
+    assert_eq!(
+        shard.skew_held().0,
+        1,
+        "the forward applied here, and its refused stamp is held"
+    );
+    cluster.shutdown().await;
+}
+
 /// An owner's own write reaches its co-owners as a `ForwardBatch` too. A
 /// co-owner that refuses its stamp for skew does not hold it: the owner kept
 /// the record, and anti-entropy offers it again until the clocks agree.
@@ -325,6 +387,22 @@ impl SkewRig {
         view_hash: u64,
         hops: u8,
     ) {
+        self.relay_skewed_forward(2, to, key, value, view_hash, hops)
+            .await;
+    }
+
+    /// Sends from node `from` a `ForwardBatch` of one record for `key` the
+    /// writer stamped skewed, to owner `to` (0 or 1), under `view_hash`, at
+    /// `hops`.
+    async fn relay_skewed_forward(
+        &self,
+        from: usize,
+        to: usize,
+        key: u32,
+        value: &str,
+        view_hash: u64,
+        hops: u8,
+    ) {
         use crate::net::OutFrame;
         use crate::wire::Msg;
 
@@ -338,11 +416,22 @@ impl SkewRig {
             recs: vec![rec],
         })
         .expect("encodes");
-        self.nodes[2]
+        self.nodes[from]
             .mesh()
             .clone()
             .send_frames_awaiting(self.nodes[to].node_id(), vec![frame])
             .await;
+    }
+
+    /// A key owned by the writer and owner `owner` (0 or 1).
+    fn key_the_writer_owns_with(&self, owner: usize) -> u32 {
+        let (writer, owner) = (self.nodes[2].node_id(), self.nodes[owner].node_id());
+        (0..10_000u32)
+            .find(|key| {
+                let owners = self.writer.owners_of(key);
+                owners.contains(&writer) && owners.contains(&owner)
+            })
+            .expect("a key the writer owns with the owner")
     }
 
     async fn wait_held(&self, owner: usize, held: usize) {
@@ -376,8 +465,12 @@ async fn closing_an_owner_hands_its_held_forwards_to_the_other_owner() {
         writer,
     } = rig;
     cache_a.close().await;
+    // The hand-off goes to the owners under the closing node's view. A view
+    // that dropped the other owner for a moment sends it to the writer
+    // instead, now an owner there, and the other owner then takes it through
+    // anti-entropy once its clock is within the bound.
     wait_until(
-        Duration::from_secs(10),
+        CONVERGE_BUDGET,
         "the other owner takes the hand-off",
         async || cache_b.shard.skew_held().0 == 1 || cache_b.get(&key).await.is_some(),
     )
@@ -412,6 +505,59 @@ async fn a_skewed_forward_re_forwarded_under_a_stale_view_is_held_at_the_final_o
     rig.wait_held(1, 1).await;
     rig.wait_held(0, 1).await;
     rig.owners_converge_on(key, Some("relayed")).await;
+    rig.shutdown().await;
+}
+
+/// A skewed forward relayed by a node that did not write it is held even
+/// when its writer owns the part under the receiver's view: a closing
+/// owner's hand-off, a releasing owner's redirect or a stale-view re-forward
+/// carries a record whose writer may have owned nothing when it wrote, and
+/// kept nothing. Here the writer never stored the record.
+#[tokio::test]
+async fn a_skewed_forward_relayed_by_another_node_is_held_though_its_writer_owns_the_part() {
+    let rig = SkewRig::open("cache-it-forward-skew-relayed-owner").await;
+    let key = rig.key_the_writer_owns_with(1);
+    let hash = rig.owners[1]
+        .shard
+        .ownership_view_hash()
+        .expect("distributed");
+    rig.relay_skewed_forward(0, 1, key, "relayed", hash, 0)
+        .await;
+
+    rig.wait_held(1, 1).await;
+    wait_until(
+        CONVERGE_BUDGET,
+        "the owner applies it once its clock is within the bound",
+        async || rig.owners[1].get(&key).await.as_deref() == Some("relayed"),
+    )
+    .await;
+    rig.shutdown().await;
+}
+
+/// A skewed forward its writer sent under a view other than the receiver's
+/// is held even when the writer owns the part under the receiver's view:
+/// what the writer kept follows the view it sent under, which the receiver
+/// does not hold. A writer whose view lags a membership change, or that
+/// dropped a peer from its view under load, sends so.
+#[tokio::test]
+async fn a_skewed_forward_its_writer_sent_under_another_view_is_held() {
+    let rig = SkewRig::open("cache-it-forward-skew-other-view").await;
+    let key = rig.key_the_writer_owns_with(1);
+    let other = rig.owners[1]
+        .shard
+        .ownership_view_hash()
+        .expect("distributed")
+        ^ 1;
+    rig.send_skewed_forward(1, key, "other-view", other, 0)
+        .await;
+
+    rig.wait_held(1, 1).await;
+    wait_until(
+        CONVERGE_BUDGET,
+        "the owner applies it once its clock is within the bound",
+        async || rig.owners[1].get(&key).await.as_deref() == Some("other-view"),
+    )
+    .await;
     rig.shutdown().await;
 }
 

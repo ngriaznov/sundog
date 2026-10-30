@@ -871,6 +871,100 @@ async fn a_re_forwarded_batch_at_the_hop_cap_applies_as_a_forward() {
     assert_eq!(applied, [Applied::Forwarded(2)]);
 }
 
+/// A `ForwardBatch` from node 2 under `view_hash`, a record for each
+/// `(key, writer)` of `writes`.
+fn forward_from_two(view_hash: u64, writes: &[(u32, u64)]) -> InboundMsg {
+    InboundMsg {
+        from: NodeId::from(2),
+        msg: Msg::ForwardBatch {
+            cache: SmolStr::new("users"),
+            view_hash,
+            hops: 0,
+            recs: writes
+                .iter()
+                .map(|&(key, writer)| WireRecord {
+                    ver: Hlc {
+                        wall_ms: 1,
+                        logical: 0,
+                        node: NodeId::from(writer),
+                    },
+                    ..wire_record_for_u32(key)
+                })
+                .collect(),
+        },
+    }
+}
+
+/// A run of forwards applies the records their writer kept (sent by the
+/// writer itself, under this node's view, for a part it owns there) through
+/// `apply_remote_batch`, where a refusal for clock skew drops them, and the
+/// rest through `apply_forwarded_batch`, which holds them: a record node 2
+/// relays for node 1, and one node 2 wrote but sent under another view.
+#[tokio::test]
+async fn a_forward_run_applies_the_records_their_writer_kept_as_replicates() {
+    let view_hash = OwnershipView::compute(
+        NodeId::from(1),
+        vec![NodeId::from(1), NodeId::from(2)],
+        std::num::NonZeroU8::new(2).expect("nonzero"),
+    )
+    .view_hash();
+    let applied = applied_from_one_burst(vec![
+        forward_from_two(view_hash, &[(0, 2), (1, 2)]),
+        forward_from_two(view_hash, &[(2, 1), (3, 2)]),
+        forward_from_two(view_hash ^ 1, &[(4, 2)]),
+    ])
+    .await;
+    assert_eq!(
+        applied,
+        [Applied::Replicated(3), Applied::Forwarded(2)],
+        "keys 0, 1 and 3 kept; key 2 relayed and key 4 under another view held"
+    );
+}
+
+/// The writer kept a forwarded record only when it sent it itself, under
+/// the receiver's view, and owns the record's part there.
+#[test]
+fn writer_kept_needs_the_writer_as_sender_an_equal_view_and_ownership() {
+    use crate::cluster::inbound::writer_kept;
+    use crate::store::PartId;
+
+    let view = OwnershipView::compute(
+        NodeId::from(1),
+        (1..=3u64).map(NodeId::from).collect(),
+        std::num::NonZeroU8::new(2).expect("nonzero"),
+    );
+    let key = (0..10_000u32)
+        .find(|key| {
+            let part = PartId::of_key(&postcard::to_stdvec(key).expect("encodes"));
+            !view.owners_of(part).contains(&NodeId::from(1))
+        })
+        .expect("a part nodes 2 and 3 own");
+    let written_by = |writer: u64| WireRecord {
+        ver: Hlc {
+            wall_ms: 1,
+            logical: 0,
+            node: NodeId::from(writer),
+        },
+        ..wire_record_for_u32(key)
+    };
+    let hash = view.view_hash();
+    let (owner, co_owner, outsider) = (NodeId::from(2), NodeId::from(3), NodeId::from(1));
+
+    assert!(writer_kept(&view, owner, hash, &written_by(2)));
+    assert!(
+        !writer_kept(&view, owner, hash ^ 1, &written_by(2)),
+        "sent under a view this node does not hold"
+    );
+    assert!(
+        !writer_kept(&view, co_owner, hash, &written_by(2)),
+        "relayed by another node"
+    );
+    assert!(
+        !writer_kept(&view, outsider, hash, &written_by(1)),
+        "written by a node that owns nothing of the part"
+    );
+}
+
 #[test]
 fn same_run_joins_only_the_same_cache_and_the_same_kind() {
     use crate::cluster::inbound::same_run;

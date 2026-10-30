@@ -15,7 +15,7 @@ use super::{InboundActivity, ShardRegistry, ShardRegistryExt, fan_out};
 use crate::net::{InboundMsg, Mesh, OutFrame, batch_forward};
 use crate::node::NodeId;
 use crate::ownership::OwnershipView;
-use crate::store::ShardOps;
+use crate::store::{PartId, ShardOps};
 use crate::wire::{Msg, WireRecord};
 
 fn lookup_shard(shards: &ShardRegistry, cache: &SmolStr) -> Option<Arc<dyn ShardOps>> {
@@ -25,15 +25,19 @@ fn lookup_shard(shards: &ShardRegistry, cache: &SmolStr) -> Option<Arc<dyn Shard
 /// Cap on how many queued inbound messages [`inbound_loop`] drains per wake.
 const INBOUND_DRAIN_CAP: usize = 1024;
 
-/// One accumulated run of records bound for one shard in one call: the
-/// records of consecutive `Replicate`/`ReplicateBatch` messages for a cache,
-/// or of consecutive `ForwardBatch` messages for it.
+/// One accumulated run of records bound for one shard: the records of
+/// consecutive `Replicate`/`ReplicateBatch` messages for a cache, or of
+/// consecutive `ForwardBatch` messages for it.
 struct PendingRun {
     cache: SmolStr,
     /// Whether the records came in a `ForwardBatch`, which the shard applies
     /// through [`ShardOps::apply_forwarded_batch`].
     forwarded: bool,
     recs: Vec<WireRecord>,
+    /// The records of a forward run whose writer kept a copy (see
+    /// [`writer_kept`]), which the shard applies through
+    /// [`ShardOps::apply_remote_batch`]. Empty for a replicate run.
+    kept: Vec<WireRecord>,
 }
 
 /// Whether a message for `cache` (`forwarded` says it is a `ForwardBatch`)
@@ -50,8 +54,9 @@ pub(super) fn same_run(
     })
 }
 
-/// Applies one accumulated run under one `apply_remote_batch` call, or one
-/// `apply_forwarded_batch` call for a run of forwards. `shard_cache`
+/// Applies one accumulated run under one `apply_remote_batch` call, or, for
+/// a run of forwards, its kept records under one `apply_remote_batch` call
+/// and the rest under one `apply_forwarded_batch` call. `shard_cache`
 /// memoizes the lookup per drained batch, so a cache name costs at most one
 /// lock acquisition.
 async fn apply_pending_run(
@@ -63,30 +68,37 @@ async fn apply_pending_run(
         cache,
         forwarded,
         recs,
+        kept,
     } = run;
     let shard = shard_cache
         .entry(cache.clone())
         .or_insert_with(|| lookup_shard(shards, &cache));
     if let Some(shard) = shard {
-        if forwarded {
-            shard.apply_forwarded_batch(recs).await;
-        } else {
+        if !forwarded {
             shard.apply_remote_batch(recs).await;
+            return;
+        }
+        if !kept.is_empty() {
+            shard.apply_remote_batch(kept).await;
+        }
+        if !recs.is_empty() {
+            shard.apply_forwarded_batch(recs).await;
         }
     } else {
         tracing::trace!(%cache, "replicate batch for unknown cache; dropped");
     }
 }
 
-/// Appends `recs` to the pending run for `cache`, or applies the run in
-/// progress first when `cache` or `forwarded` differs and starts a new one.
+/// Appends `recs` and `kept` to the pending run for `cache`, or applies the
+/// run in progress first when `cache` or `forwarded` differs and starts a
+/// new one.
 async fn queue_run(
     shards: &ShardRegistry,
     shard_cache: &mut HashMap<SmolStr, Option<Arc<dyn ShardOps>>>,
     pending: &mut Option<PendingRun>,
     cache: SmolStr,
     forwarded: bool,
-    mut recs: Vec<WireRecord>,
+    (mut recs, mut kept): (Vec<WireRecord>, Vec<WireRecord>),
 ) {
     let joins = same_run(
         pending.as_ref().map(|run| (&run.cache, run.forwarded)),
@@ -94,7 +106,10 @@ async fn queue_run(
         forwarded,
     );
     match pending {
-        Some(run) if joins => run.recs.append(&mut recs),
+        Some(run) if joins => {
+            run.recs.append(&mut recs);
+            run.kept.append(&mut kept);
+        }
         _ => {
             if let Some(old) = pending.take() {
                 apply_pending_run(shards, shard_cache, old).await;
@@ -103,9 +118,34 @@ async fn queue_run(
                 cache,
                 forwarded,
                 recs,
+                kept,
             });
         }
     }
+}
+
+/// Whether the writer of `rec`, which arrived in a `ForwardBatch` from
+/// `from` stamped with view hash `sent_under`, kept the record in its own
+/// engine, so that this node can drop it when it refuses the stamp for clock
+/// skew and leave the repair to anti-entropy: the writer sent the record
+/// itself, under `view`, this node's own view, and owns the record's part
+/// there. A node forwards a record of a part it owns under the view it sends
+/// with only after applying it. Any other forward may be the only copy: a
+/// non-owner's write, a record relayed by a closing owner's hand-off, a
+/// releasing owner's redirect or a stale-view re-forward, or one sent under
+/// a view this node does not hold, whose owners this node cannot know. Pure;
+/// unit tested directly.
+pub(super) fn writer_kept(
+    view: &OwnershipView,
+    from: NodeId,
+    sent_under: u64,
+    rec: &WireRecord,
+) -> bool {
+    rec.ver.node == from
+        && sent_under == view.view_hash()
+        && view
+            .owners_of(PartId::of_key(rec.key.as_ref()))
+            .contains(&from)
 }
 
 /// Notes every peer with a record-carrying message in `drained` as
@@ -144,7 +184,9 @@ fn burst_shard<'a>(
 /// Drains a bounded batch per wake with `recv_many`, so a run of same-cache
 /// messages coalesces into one `apply_remote_batch` call, and a run of
 /// `ForwardBatch` messages into one `apply_forwarded_batch` call, which holds a
-/// record the shard refuses for clock skew instead of dropping it. A `ForwardBatch`
+/// record the shard refuses for clock skew instead of dropping it, plus one
+/// `apply_remote_batch` call for the records whose writer kept a copy (see
+/// [`writer_kept`]). A `ForwardBatch`
 /// under a stale view hash is handed to the [`Reforwarder`], which sends it
 /// on to its records' current owners from a lane per peer, then applied like
 /// any other: the loop waits on no socket, so a peer that stops reading
@@ -191,12 +233,20 @@ pub(super) async fn inbound_loop(
                         &mut pending,
                         cache,
                         false,
-                        vec![rec],
+                        (vec![rec], Vec::new()),
                     )
                     .await;
                 }
                 Msg::ReplicateBatch { cache, recs } => {
-                    queue_run(&shards, &mut shard_cache, &mut pending, cache, false, recs).await;
+                    queue_run(
+                        &shards,
+                        &mut shard_cache,
+                        &mut pending,
+                        cache,
+                        false,
+                        (recs, Vec::new()),
+                    )
+                    .await;
                 }
                 Msg::ForwardBatch {
                     cache,
@@ -204,6 +254,7 @@ pub(super) async fn inbound_loop(
                     hops,
                     recs,
                 } => {
+                    let mut split = (recs, Vec::new());
                     if let Some(shard) = burst_shard(&mut shard_cache, &shards, &cache) {
                         reforward_stale_view(
                             &mut reforwarder,
@@ -214,11 +265,18 @@ pub(super) async fn inbound_loop(
                                 cache_name: &cache,
                                 sender_view_hash: view_hash,
                                 hops,
-                                records: &recs,
+                                records: &split.0,
                             },
                         );
+                        if let Some(view) = shard.ownership_view() {
+                            let (kept, held): (Vec<_>, Vec<_>) = split
+                                .0
+                                .into_iter()
+                                .partition(|rec| writer_kept(&view, from, view_hash, rec));
+                            split = (held, kept);
+                        }
                     }
-                    queue_run(&shards, &mut shard_cache, &mut pending, cache, true, recs).await;
+                    queue_run(&shards, &mut shard_cache, &mut pending, cache, true, split).await;
                 }
                 Msg::Invalidate { cache, key, ver } => {
                     if let Some(run) = pending.take() {
