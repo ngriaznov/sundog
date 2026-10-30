@@ -16,6 +16,16 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **The mDNS daemon stops with its cluster.** A cluster or observer built
+  with the default mDNS discovery started an `mdns-sd` daemon thread that
+  nothing stopped: `Cluster::shutdown`, `Cluster::crash`, `Observer::shutdown`
+  and a failed build left the thread, its sockets and its DNS cache running,
+  and a cluster's announcement on the network. A process that built and shut
+  down clusters gained a daemon per cycle, and the daemons cached each
+  other's announcements, so its memory grew faster than the number of
+  cycles. Dropping an `Mdns` now stops its daemon, and the seed stream a
+  cluster or observer reads holds its discovery source, so the daemon stops
+  when the gossip loop ends.
 - **A `Distributed` node no longer deletes a part a view gives back to it
   during the hand-off.** The rebalance tick read the ownership view once, ran
   its hand-off rounds and released against that view. A newer view that

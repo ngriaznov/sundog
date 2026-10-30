@@ -45,7 +45,7 @@ use tokio::time::{self, MissedTickBehavior};
 use crate::cluster::{local_hostname, resolve_discovery};
 use crate::config::ClusterConfig;
 use crate::discovery::statics::Static;
-use crate::discovery::{Discovery, DiscoveryKind};
+use crate::discovery::{Discovery, DiscoveryKind, candidates_holding};
 use crate::error::JoinError;
 use crate::membership::{
     CacheModes, Peer, collect_initial_seeds, is_departing, now_incarnation_ms, parse_cache_modes,
@@ -252,8 +252,11 @@ impl ObserverBuilder {
             config,
         } = self;
         let node_name = NodeName::new(&format!("observer.{}", local_hostname()), NodeId::random());
-        let discovery = resolve_discovery(discovery, &name, &node_name);
-        let mut seeds = discovery.candidates();
+        // The seed stream holds the source, so a source that runs a
+        // mechanism of its own, as the mDNS daemon does, stops when the
+        // observer's loop ends.
+        let mut seeds =
+            candidates_holding(Arc::new(resolve_discovery(discovery, &name, &node_name)));
         let seed_nodes = collect_initial_seeds(&mut seeds).await;
         // The empty key list is the seam: without a `node_id` key no member's
         // `parse_peer` accepts this entry, so it is never a peer. No

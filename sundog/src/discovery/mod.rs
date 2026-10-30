@@ -7,9 +7,10 @@ pub mod statics;
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use futures::future::BoxFuture;
-use futures::stream::BoxStream;
+use futures::stream::{self, BoxStream, StreamExt as _};
 
 /// A source of candidate cluster peers. Object-safe by construction
 /// (`BoxStream`/`BoxFuture` returns rather than `impl Stream`/`impl
@@ -76,6 +77,26 @@ impl Discovery for DiscoveryKind {
     }
 }
 
+/// `source`'s [`Discovery::candidates`], holding `source` for as long as the
+/// stream lives. A source whose mechanism runs only while it exists, as an
+/// [`mdns::Mdns`] daemon does, then runs exactly as long as the gossip loop
+/// that reads its candidates, and stops when that loop drops the stream. A
+/// custom source whose candidates end, against [`Discovery`]'s contract,
+/// leaves a stream that answers `None` from then on, however often the
+/// initial seed collection and the gossip loop poll it.
+pub(crate) fn candidates_holding(source: Arc<DiscoveryKind>) -> BoxStream<'static, SocketAddr> {
+    let candidates = source.candidates();
+    stream::unfold(
+        (candidates, source),
+        |(mut candidates, source)| async move {
+            let addr = candidates.next().await?;
+            Some((addr, (candidates, source)))
+        },
+    )
+    .fuse()
+    .boxed()
+}
+
 impl From<mdns::Mdns> for DiscoveryKind {
     fn from(discovery: mdns::Mdns) -> Self {
         Self::Mdns(discovery)
@@ -102,7 +123,87 @@ impl From<Box<dyn Discovery>> for DiscoveryKind {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
+
+    /// A source that never yields and records when it drops.
+    struct Dropped(Arc<AtomicBool>);
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl Discovery for Dropped {
+        fn candidates(&self) -> BoxStream<'static, SocketAddr> {
+            stream::pending().boxed()
+        }
+
+        fn announce(&self, _gossip_addr: SocketAddr) -> BoxFuture<'_, io::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[test]
+    fn candidates_holding_keeps_its_source_until_the_stream_drops() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let boxed: Box<dyn Discovery> = Box::new(Dropped(Arc::clone(&dropped)));
+        let source = Arc::new(DiscoveryKind::from(boxed));
+
+        let candidates = candidates_holding(Arc::clone(&source));
+        drop(source);
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "the stream holds the source"
+        );
+        drop(candidates);
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "and releases it when the stream drops"
+        );
+    }
+
+    /// A source whose candidates end, which the [`Discovery`] contract
+    /// forbids and a custom source can still do.
+    struct Ending(Vec<SocketAddr>);
+
+    impl Discovery for Ending {
+        fn candidates(&self) -> BoxStream<'static, SocketAddr> {
+            stream::iter(self.0.clone()).boxed()
+        }
+
+        fn announce(&self, _gossip_addr: SocketAddr) -> BoxFuture<'_, io::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn candidates_holding_answers_none_for_good_once_its_source_ends() {
+        let addr: SocketAddr = "127.0.0.1:4000".parse().expect("valid addr");
+        let boxed: Box<dyn Discovery> = Box::new(Ending(vec![addr]));
+        let mut candidates = candidates_holding(Arc::new(DiscoveryKind::from(boxed)));
+        assert_eq!(candidates.next().await, Some(addr));
+        assert_eq!(candidates.next().await, None);
+        assert_eq!(
+            candidates.next().await,
+            None,
+            "a stream polled again after it ended answers None, as the gossip loop polls it \
+             after the initial seed collection saw the end"
+        );
+    }
+
+    #[tokio::test]
+    async fn candidates_holding_yields_the_source_candidates() {
+        let seeds: Vec<SocketAddr> = vec![
+            "127.0.0.1:4000".parse().expect("valid addr"),
+            "127.0.0.1:4001".parse().expect("valid addr"),
+        ];
+        let source = Arc::new(DiscoveryKind::from(statics::Static::new(seeds.clone())));
+        let first: Vec<SocketAddr> = candidates_holding(source).take(seeds.len()).collect().await;
+        assert_eq!(first, seeds);
+    }
 
     #[tokio::test]
     async fn every_built_in_source_is_usable_as_a_trait_object() {

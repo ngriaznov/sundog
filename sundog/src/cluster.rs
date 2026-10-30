@@ -42,7 +42,7 @@ use crate::cache::CacheBuilder;
 use crate::config::ClusterConfig;
 use crate::discovery::mdns::Mdns;
 use crate::discovery::statics::Static;
-use crate::discovery::{Discovery, DiscoveryKind};
+use crate::discovery::{Discovery, DiscoveryKind, candidates_holding};
 use crate::error::JoinError;
 use crate::membership::{CacheModes, Membership, Peer};
 use crate::net::{BoundListener, Greeting, InboundMsg, Mesh, RequestHandler};
@@ -1101,7 +1101,10 @@ impl ClusterBuilder {
         let node = node_id.unwrap_or_else(NodeId::random);
         let hostname = local_hostname();
         let node_name = NodeName::new(&hostname, node);
-        let discovery = resolve_discovery(discovery, &name, &node_name);
+        // The seed stream holds the source, so a source that runs a
+        // mechanism of its own, as the mDNS daemon does, stops when the
+        // membership loop ends.
+        let discovery = Arc::new(resolve_discovery(discovery, &name, &node_name));
         let has_seeds = discovery.has_seeds();
 
         let data_listener = BoundListener::bind(config.data_bind_addr).await?;
@@ -1117,7 +1120,7 @@ impl ClusterBuilder {
             &hostname,
             advertise_data_addr,
             &config,
-            discovery.candidates(),
+            candidates_holding(Arc::clone(&discovery)),
             Some(Box::new(move |live| observed.observe(live))),
         )
         .await?;

@@ -5,7 +5,8 @@ use super::*;
 use crate::cache::Cache;
 use crate::cluster::Cluster;
 use crate::cluster::test_support::{
-    EndingDiscovery, loopback_config, registered_shard, wait_for_peer_count, wait_until,
+    DropFlagDiscovery, EndingDiscovery, loopback_config, registered_shard, wait_for_flag,
+    wait_for_peer_count, wait_until,
 };
 use crate::store::encode_key;
 
@@ -61,6 +62,30 @@ async fn observe(name: &str, seed: &Cluster) -> Observer {
         .build()
         .await
         .expect("the observer builds")
+}
+
+/// An observer holds its discovery source while it runs and releases it
+/// when it shuts down, so an mDNS daemon behind it stops with it.
+#[tokio::test]
+async fn an_observer_holds_its_discovery_source_until_it_shuts_down() {
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observer = Observer::builder("observe-it-discovery-lifetime")
+        .discovery(DropFlagDiscovery(Arc::clone(&dropped)))
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("the observer builds");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "a running observer holds its discovery source"
+    );
+    observer.shutdown().await;
+    wait_for_flag(
+        &dropped,
+        "the observer releases its discovery source on shutdown",
+    )
+    .await;
 }
 
 /// One live-peers receiver per member, marked seen. chitchat fires a

@@ -142,6 +142,34 @@ impl Discovery for EndingDiscovery {
     }
 }
 
+/// A discovery that never yields a candidate and sets its flag when it
+/// drops, so a test can tell how long a cluster or observer holds it.
+pub(crate) struct DropFlagDiscovery(pub(crate) Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for DropFlagDiscovery {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Discovery for DropFlagDiscovery {
+    fn candidates(&self) -> BoxStream<'static, SocketAddr> {
+        futures::stream::pending().boxed()
+    }
+
+    fn announce(&self, _gossip_addr: SocketAddr) -> BoxFuture<'_, std::io::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// Waits up to five seconds for `flag` to be set.
+pub(crate) async fn wait_for_flag(flag: &std::sync::atomic::AtomicBool, what: &str) {
+    wait_until(Duration::from_secs(5), what, async || {
+        flag.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};

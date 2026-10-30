@@ -13,7 +13,9 @@ service with two extra ports open and a way for nodes to find each other.
 
 Seeds only bootstrap. A node that reaches one member learns the rest of
 the cluster through gossip. Discovery keeps running after startup, so a
-cluster whose every node restarted at once finds itself again.
+cluster whose every node restarted at once finds itself again. `Mdns` runs
+its own daemon thread, which stops when the cluster or observer stops, or
+when its build fails.
 
 ## Ports
 

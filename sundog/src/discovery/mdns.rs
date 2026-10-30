@@ -22,6 +22,11 @@ const CLUSTER_TXT_KEY: &str = "cluster";
 /// The multicast sockets open lazily on the daemon thread, so an
 /// environment without multicast surfaces no error anywhere here; the
 /// candidate stream never yields anything instead. This type never panics.
+///
+/// The daemon thread runs until this value drops: dropping it stops the
+/// daemon, which ends every candidate stream it browses and withdraws its
+/// announcement. A cluster or an observer holds its `Mdns` for as long as
+/// its gossip loop reads the candidates, so the daemon stops with that loop.
 pub struct Mdns {
     cluster_name: SmolStr,
     instance_name: String,
@@ -42,6 +47,16 @@ impl Mdns {
             cluster_name: cluster_name.into(),
             instance_name: instance_name.into(),
             daemon,
+        }
+    }
+}
+
+impl Drop for Mdns {
+    fn drop(&mut self) {
+        if let Some(daemon) = self.daemon.take()
+            && let Err(error) = daemon.shutdown()
+        {
+            tracing::debug!(%error, "mDNS daemon was already stopped");
         }
     }
 }
@@ -137,6 +152,33 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// `daemon`'s status, `None` while a stopping daemon does not answer.
+    fn status(daemon: &ServiceDaemon) -> Option<mdns_sd::DaemonStatus> {
+        daemon
+            .status()
+            .ok()?
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .ok()
+    }
+
+    #[test]
+    fn dropping_an_mdns_stops_its_daemon() {
+        let mdns = Mdns::new("test-cluster", "test-node");
+        let daemon = mdns.daemon.clone().expect("the daemon starts");
+        let _browsing = mdns.candidates();
+        assert_eq!(status(&daemon), Some(mdns_sd::DaemonStatus::Running));
+
+        drop(mdns);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while status(&daemon) != Some(mdns_sd::DaemonStatus::Shutdown) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the daemon stops once its Mdns drops"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
 
     #[test]
     fn build_service_info_embeds_cluster_txt_and_gossip_port() {

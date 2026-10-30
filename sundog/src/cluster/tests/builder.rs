@@ -1,7 +1,7 @@
 //! Tests for the cluster builder: validation, discovery and identity overrides, and the data port.
 
 use super::*;
-use crate::cluster::test_support::EndingDiscovery;
+use crate::cluster::test_support::{DropFlagDiscovery, EndingDiscovery, wait_for_flag};
 use crate::wire::Msg;
 use std::net::Ipv4Addr;
 
@@ -129,6 +129,37 @@ async fn builder_discovery_override_forms_a_working_cluster() {
     assert_eq!(cache.get(&1).await, Some("a".to_string()));
 
     cluster.shutdown().await;
+}
+
+/// The discovery source lives as long as the cluster runs, so an mDNS
+/// daemon behind it keeps announcing, and goes when the cluster shuts down
+/// or crashes, so the daemon stops with it.
+#[tokio::test]
+async fn a_cluster_holds_its_discovery_source_until_it_stops() {
+    for crash in [false, true] {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cluster = Cluster::builder("cluster-it-discovery-lifetime")
+            .discovery(DropFlagDiscovery(Arc::clone(&dropped)))
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("the cluster builds");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "a running cluster holds its discovery source"
+        );
+        if crash {
+            cluster.crash().await;
+        } else {
+            cluster.shutdown().await;
+        }
+        wait_for_flag(
+            &dropped,
+            "the cluster releases its discovery source when it stops",
+        )
+        .await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
