@@ -391,6 +391,22 @@ against the three a co-owner gets. A group that ends with parts still
 diverging, whether its share ran out, its three completed rounds were spent or
 the co-owner left the live set, is logged at `warn` with the cause.
 
+An owner that stays in the live set but stops reading its connection holds a
+fan-out batch until its outbox has taken nothing for `fan_out_stall_timeout`,
+10 seconds by default; an owner that reads slowly is waited on for as long as
+it keeps taking frames. Its writer takes the outbox at most 1 MiB at a time,
+so an owner reading less than 1 MiB per `fan_out_stall_timeout` counts as
+stalled. Past the timeout, sundog drops the frames left for that owner and
+marks it for anti-entropy, which carries it every write this node stores. Two
+kinds of write have no copy but the frame and are lost instead: a forwarded
+write that no owner took, and a write whose entry left this node before it
+fanned out, by a sweep, a release or an unreadable spill, whose invalidation
+an owner missed. That owner keeps the value the write replaced, and
+anti-entropy brings it back to the other owners.
+`sundog_fan_out_lost_writes_total{cache}` counts both. Set
+`fan_out_stall_timeout` to `Duration::MAX` to wait instead for as long as the
+owner stays live, with the fan-out backlog growing meanwhile.
+
 ### Reads while ownership moves
 
 While `Distributed` nodes join, leave or crash, `fetch` answers one of

@@ -231,18 +231,36 @@ pub(crate) async fn seed_crdt_compaction_metrics(cluster: &Cluster, metrics_addr
 
     // `crdt_compact_task` ticks at most every 30s (its own cadence floor,
     // see the comment in `node_config`). Give the next real tick after the
-    // incarnation mismatch above becomes visible ample room to land.
-    common::eventually(Duration::from_secs(120), || async {
-        scrape_metrics(metrics_addr).await.is_some_and(|body| {
-            scraped_metric_value(
-                &body,
-                "sundog_crdt_retired_writers_total",
-                &[("cache", name)],
-            )
-            .is_some_and(|count| count >= 1.0)
-        })
-    })
-    .await;
+    // incarnation mismatch above becomes visible ample room to land. The
+    // first scrape that sees a retirement sees that tick's alone: the next
+    // is 30s away, and counts the same writer again while its record is
+    // skipped, so the exact count is pinned here, not at the final scrape.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let first_count = loop {
+        let count = scrape_metrics(metrics_addr)
+            .await
+            .and_then(|body| {
+                scraped_metric_value(
+                    &body,
+                    "sundog_crdt_retired_writers_total",
+                    &[("cache", name)],
+                )
+            })
+            .filter(|&count| count >= 1.0);
+        if count.is_some() {
+            break count;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the dead writer retires within two minutes"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(
+        first_count,
+        Some(1.0),
+        "the first sweep that finds the dead writer counts exactly it"
+    );
 
     assert_eq!(
         cluster_counters.get(&1).await.map(|c| c.value()),
@@ -467,4 +485,97 @@ pub(crate) async fn seed_distributed_metrics(cluster: &Cluster, peer: &Cluster) 
         ),
         "outcome=error"
     );
+}
+
+/// The `Distributed` cache [`seed_fan_out_stall_metrics`] stalls.
+pub(crate) const FAN_OUT_STALL_PIN: &str = "fan-out-stall-pin";
+
+/// Drives `sundog_fan_out_stalls_total` and
+/// `sundog_fan_out_lost_writes_total{cache}`: three scenario-local nodes open
+/// [`FAN_OUT_STALL_PIN`], the two owners of one key crash, and the writer,
+/// whose failure detector never drops them and whose outboxes hold one frame,
+/// writes the key until a write it forwards reaches neither owner. Shuts the
+/// writer down before it returns, which the stalled owners do not hold up.
+pub(crate) async fn seed_fan_out_stall_metrics(metrics_addr: SocketAddr) {
+    let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+    let mode = Mode::Distributed {
+        owners: NonZeroU8::new(2).expect("nonzero"),
+    };
+    let writer = Cluster::builder("it-fan-out-stall")
+        .seeds(std::iter::empty())
+        .config(node_config(loopback).with(|c| {
+            c.outbox_capacity = 1;
+            c.fan_out_stall_timeout = Duration::from_millis(300);
+            c.phi_threshold = 1_000.0;
+        }))
+        .build()
+        .await
+        .expect("the writer builds");
+    let mut owners = Vec::new();
+    for _ in 0..2 {
+        owners.push(
+            Cluster::builder("it-fan-out-stall")
+                .seeds([writer.local_gossip_addr()])
+                .config(node_config(loopback))
+                .build()
+                .await
+                .expect("an owner builds"),
+        );
+    }
+    common::wait_for_peer_count(&writer, 2, Duration::from_secs(15)).await;
+    let writer_cache = writer
+        .cache::<u32, String>(FAN_OUT_STALL_PIN)
+        .mode(mode)
+        .open()
+        .await
+        .expect("the writer opens the cache");
+    let mut owner_caches = Vec::new();
+    for owner in &owners {
+        owner_caches.push(
+            owner
+                .cache::<u32, String>(FAN_OUT_STALL_PIN)
+                .mode(mode)
+                .open()
+                .await
+                .expect("an owner opens the cache"),
+        );
+    }
+    let owner_ids: Vec<NodeId> = owners.iter().map(Cluster::node_id).collect();
+    let key = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(key) = (0..10_000u32).find(|key| {
+                let mut of = writer_cache.owners_of(key);
+                of.sort_unstable();
+                let mut wanted = owner_ids.clone();
+                wanted.sort_unstable();
+                of == wanted
+            }) {
+                return key;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the writer's view names the two owners within the bound");
+    for owner in owners {
+        owner.crash().await;
+    }
+    drop(owner_caches);
+
+    common::eventually(Duration::from_secs(30), || async {
+        let _ = writer_cache.insert(key, "stalled".to_string()).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        scrape_metrics(metrics_addr).await.is_some_and(|body| {
+            scraped_metric_value(
+                &body,
+                "sundog_fan_out_lost_writes_total",
+                &[("cache", FAN_OUT_STALL_PIN)],
+            )
+            .is_some_and(|lost| lost >= 1.0)
+        })
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(60), writer.shutdown())
+        .await
+        .expect("the writer shuts down while its owners take nothing");
 }

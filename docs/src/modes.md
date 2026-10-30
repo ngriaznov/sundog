@@ -88,7 +88,10 @@ A write for a part this node does not own goes to that part's owners. The
 forwarded batch carries the writer's ownership view, and an owner whose view
 differs passes it on once more, so a write routed under a view that has since
 changed still reaches every current owner. A forwarded write is held by no
-replica until an owner applies it, so anti-entropy cannot repair it. A
+replica until an owner applies it, so anti-entropy cannot repair it. One whose
+owners all stay live but take nothing for `fan_out_stall_timeout`, 10 seconds
+by default, is dropped and counted in `sundog_fan_out_lost_writes_total{cache}`
+(see [guarantees](guarantees.md#per-mode)). A
 forwarded delete counts its retention from its stamp at the owner, so one that
 waits in the send queue for more than `tombstone_ttl` is ignored there (see
 [guarantees](guarantees.md#deletes)). An owner

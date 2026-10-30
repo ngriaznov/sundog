@@ -353,6 +353,19 @@ pub struct ClusterConfig {
     /// [`fan_out_backlog_capacity`](Self::fan_out_backlog_capacity) before
     /// proceeding regardless. Default: 30s.
     pub fan_out_wait_timeout: Duration,
+    /// How long a `Mode::Distributed` fan-out batch waits on an owner whose
+    /// outbox takes nothing. A batch sends to every owner at once, and waits
+    /// on each for as long as its outbox keeps taking frames, which its
+    /// writer takes at most 1 MiB at a time as the owner reads; an owner that
+    /// takes none for this long while gossip still has it live has the rest
+    /// of its frames dropped and is marked dirty for anti-entropy, counted
+    /// once per stall in `sundog_fan_out_stalls_total`, and later batches
+    /// send it what fits without waiting until one fits whole. A forwarded
+    /// write that no owner took, and a departed write's invalidation an owner
+    /// missed, are lost, counted in `sundog_fan_out_lost_writes_total{cache}`.
+    /// `Duration::MAX` waits for as long as the owner stays live. Must be
+    /// nonzero: `ClusterBuilder::build` rejects zero. Default: 10s.
+    pub fan_out_stall_timeout: Duration,
     /// Per-peer wire-byte budget for a warm reopen's reconciliation loop
     /// (`Cache::reconcile_warm_buckets`). A peer's still-diverging buckets
     /// fall through to the cold-pull path once its rounds push and pull
@@ -490,6 +503,7 @@ impl Default for ClusterConfig {
             rebalance_ack_window: Duration::from_secs(60),
             fan_out_backlog_capacity: 262_144,
             fan_out_wait_timeout: Duration::from_secs(30),
+            fan_out_stall_timeout: Duration::from_secs(10),
             reconcile_byte_budget: 32 * 1024 * 1024,
         }
     }
@@ -772,6 +786,14 @@ mod tests {
         assert_eq!(
             ClusterConfig::default().fan_out_wait_timeout,
             Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn default_fan_out_stall_timeout_is_ten_seconds() {
+        assert_eq!(
+            ClusterConfig::default().fan_out_stall_timeout,
+            Duration::from_secs(10)
         );
     }
 

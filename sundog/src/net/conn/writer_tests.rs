@@ -149,7 +149,9 @@ mod scripted {
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
-    use super::super::writer::{LinkEnd, WriterState, coalesce_replicate, drive_connection};
+    use super::super::writer::{
+        LinkEnd, WRITER_BURST_BYTES, WriterState, coalesce_replicate, drain_burst, drive_connection,
+    };
     use super::*;
     use crate::net::OutFrame;
     use crate::net::outbox::DropOldestQueue;
@@ -262,6 +264,74 @@ mod scripted {
                 .await
                 .expect("receiver alive");
         }
+    }
+
+    /// A `ForwardBatch` frame for key `n` whose value is `bytes` long.
+    fn big_forward(n: u8, bytes: usize) -> OutFrame {
+        let rec = crate::wire::WireRecord {
+            value: Some(Bytes::from(vec![n; bytes])),
+            ..record(n)
+        };
+        out_frame(crate::net::batch_forward(&SmolStr::new("users"), 7, 0, vec![rec]).remove(0))
+    }
+
+    #[tokio::test]
+    async fn drain_burst_takes_frames_up_to_the_byte_limit_and_always_the_first() {
+        let (tx, mut rx) = mpsc::channel(32);
+        for n in 0..10 {
+            tx.send(big_forward(n, WRITER_BURST_BYTES / 4))
+                .await
+                .expect("receiver alive");
+        }
+        let first = rx.recv().await.expect("a frame");
+        let burst = drain_burst(first, &mut rx);
+        assert_eq!(
+            burst.len(),
+            4,
+            "four quarter-limit frames reach the limit, each a little over a quarter"
+        );
+        assert_eq!(rx.len(), 6, "the rest stay in the outbox");
+
+        tx.send(big_forward(10, WRITER_BURST_BYTES * 2))
+            .await
+            .expect("receiver alive");
+        let mut rest = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            rest.push(frame);
+        }
+        let oversized = rest.pop().expect("the oversized frame");
+        let burst = drain_burst(oversized, &mut rx);
+        assert_eq!(burst.len(), 1, "a frame past the limit goes alone");
+    }
+
+    /// The writer takes one burst of at most `WRITER_BURST_BYTES` from the
+    /// outbox and leaves the rest there while the burst's write is under
+    /// way, so the outbox's slots open as the peer reads.
+    #[tokio::test(start_paused = true)]
+    async fn drive_connection_takes_at_most_a_burst_of_bytes_from_the_outbox() {
+        let mut rig = Rig::new();
+        let mut link = ScriptedLink {
+            stall_flush: true,
+            ..ScriptedLink::default()
+        };
+        for n in 0..8 {
+            rig.replicate_tx
+                .send(big_forward(n, WRITER_BURST_BYTES / 2))
+                .await
+                .expect("receiver alive");
+        }
+
+        assert_eq!(
+            rig.drive_for_a_second(&mut link).await,
+            None,
+            "the stalled flush holds the burst"
+        );
+        assert_eq!(
+            rig.state.held.len(),
+            2,
+            "two half-limit frames reach the limit"
+        );
+        assert_eq!(rig.replicate_rx.len(), 6, "the rest stay in the outbox");
     }
 
     #[tokio::test(start_paused = true)]

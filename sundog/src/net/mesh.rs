@@ -11,9 +11,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    BoundListener, DEFAULT_CHANNEL_CAPACITY, FAN_OUT_SEND_DEADLINE, Greeting, InboundMsg, Mesh,
-    MeshInner, MsgClass, OUTBOX_FLUSH_DEADLINE, OUTBOX_FLUSH_TAIL, OutFrame, PeerHandle,
-    RequestHandler, build_tls_ctx, conn, fan_out_keep_waiting, mono_ms,
+    BoundListener, DEFAULT_CHANNEL_CAPACITY, Greeting, InboundMsg, Mesh, MeshInner, MsgClass,
+    NoRoom, OUTBOX_FLUSH_DEADLINE, OUTBOX_FLUSH_TAIL, OutFrame, PeerHandle, RequestHandler,
+    RoomWait, SendBudget, SendEnd, build_tls_ctx, conn, fan_out_no_room, fan_out_room_wait,
+    idle_deadline, mono_ms, stall_latch,
 };
 use crate::config::ClusterConfig;
 use crate::error::JoinError;
@@ -207,6 +208,7 @@ impl Mesh {
             invalidate,
             replicate_tx,
             dirty,
+            stalled: Arc::new(AtomicBool::new(false)),
             pull_limits: Mutex::new(HashMap::new()),
             pull_warned: Mutex::new(HashSet::new()),
             last_replicate_enqueued: Arc::new(AtomicU64::new(0)),
@@ -354,73 +356,130 @@ impl Mesh {
         enqueued_all
     }
 
-    /// [`Mesh::send_frames`] for records the sender keeps no copy of: a
-    /// `Mode::Distributed` fan-out, where a forwarded write's only copy is
-    /// the frame itself, so a frame for a peer still live in the peer table
-    /// is never dropped. Waits for outbox space in
-    /// [`FAN_OUT_SEND_DEADLINE`] slices, logging and counting each timed-out
-    /// one in `sundog_fan_out_wait_seconds_total{peer}`. Once `peer` leaves
-    /// the table or its outbox closes, remaining frames are dropped,
-    /// counted in `sundog_backlog_dropped_total`, and the peer marked
-    /// dirty. An unknown `peer` is a silent no-op.
+    /// [`Mesh::send_frames_within`] with no budget: waits for as long as
+    /// `peer` stays in the peer table, for a send whose frames have no
+    /// other copy and no bound of their own, as the inbound loop's
+    /// re-forward lanes do.
     ///
     /// # Panics
     ///
     /// Panics if the peer-table lock is poisoned.
     pub(crate) async fn send_frames_awaiting(&self, peer: NodeId, frames: Vec<OutFrame>) {
-        let (tx, dirty, enqueued_stamp) = {
+        self.send_frames_within(peer, frames, SendBudget::Unbounded)
+            .await;
+    }
+
+    /// [`Mesh::send_frames`] for records the sender keeps no copy of, a
+    /// `Mode::Distributed` fan-out's, which waits for outbox space instead
+    /// of dropping the newest: in [`FAN_OUT_SEND_DEADLINE`] slices, the
+    /// seconds of each one that finds no room counted in
+    /// `sundog_fan_out_wait_seconds_total{peer}`, while `peer` stays in the
+    /// peer table and its outbox takes a frame within `budget`'s idle time
+    /// ([`idle_deadline`], renewed by every frame placed). Once `peer`
+    /// leaves the table, its outbox closes or takes nothing for that long,
+    /// the frames not yet placed are dropped, counted in
+    /// `sundog_backlog_dropped_total{peer}`, and the peer marked dirty. A
+    /// bounded send whose peer took nothing latches the peer stalled
+    /// ([`stall_latch`]), counted once in `sundog_fan_out_stalls_total`:
+    /// every bounded send to it then takes free slots only, without waiting,
+    /// until one places all its frames, which clears the latch and marks the
+    /// peer dirty again. Returns how many of `frames`, from the front, went
+    /// in; an unknown `peer` takes none.
+    ///
+    /// [`FAN_OUT_SEND_DEADLINE`]: super::FAN_OUT_SEND_DEADLINE
+    ///
+    /// # Panics
+    ///
+    /// Panics if the peer-table lock is poisoned.
+    pub(crate) async fn send_frames_within(
+        &self,
+        peer: NodeId,
+        frames: Vec<OutFrame>,
+        budget: SendBudget,
+    ) -> usize {
+        if frames.is_empty() {
+            return 0;
+        }
+        let (tx, dirty, enqueued_stamp, stalled) = {
             let table = self
                 .inner
                 .peers
                 .read()
                 .expect("invariant: peers lock is never poisoned");
             let Some(handle) = table.get(&peer) else {
-                return;
+                return 0;
             };
             (
                 handle.replicate_tx.clone(),
                 Arc::clone(&handle.dirty),
                 Arc::clone(&handle.last_replicate_enqueued),
+                Arc::clone(&handle.stalled),
             )
         };
+        let mut deadline = idle_deadline(budget, tokio::time::Instant::now());
+        let bounded = deadline.is_some();
+        let latched = || stalled.load(Ordering::Relaxed);
         let mut queue: VecDeque<OutFrame> = frames.into();
+        let mut placed = 0usize;
         let mut dropped = 0u64;
+        let mut end = SendEnd::Placed;
         while let Some(frame) = queue.pop_front() {
-            let slice_deadline = tokio::time::Instant::now() + FAN_OUT_SEND_DEADLINE;
-            match tokio::time::timeout_at(slice_deadline, tx.reserve()).await {
-                Ok(Ok(permit)) => permit.send(frame),
-                Ok(Err(_)) => {
-                    // The channel closed: this peer's writer already ended.
-                    dropped += 1 + u64::try_from(queue.len()).unwrap_or(u64::MAX);
-                    queue.clear();
+            let started = tokio::time::Instant::now();
+            let wait = fan_out_room_wait(deadline, latched(), started);
+            let rest = 1 + u64::try_from(queue.len()).unwrap_or(u64::MAX);
+            let outcome = match reserve_room(&tx, wait).await {
+                Room::Slot(permit) => {
+                    permit.send(frame);
+                    placed += 1;
+                    deadline = idle_deadline(budget, tokio::time::Instant::now());
+                    continue;
                 }
-                Err(_) => {
-                    if fan_out_keep_waiting(self.peer_is_live(peer)) {
+                // This peer's writer already ended.
+                Room::Closed => NoRoom::Departed,
+                Room::Full => {
+                    let now = tokio::time::Instant::now();
+                    let outcome =
+                        fan_out_no_room(self.peer_is_live(peer), latched(), wait, deadline, now);
+                    let waited = now.saturating_duration_since(started).as_secs();
+                    if waited > 0 {
                         metrics::counter!(
                             "sundog_fan_out_wait_seconds_total",
                             "peer" => peer.to_string()
                         )
-                        .increment(FAN_OUT_SEND_DEADLINE.as_secs());
+                        .increment(waited);
+                    }
+                    if outcome == NoRoom::WaitAgain {
                         tracing::debug!(
                             %peer,
                             "outbox still full past one fan-out wait slice; peer is still \
                              live, waiting again"
                         );
                         queue.push_front(frame);
-                    } else {
-                        dropped += 1 + u64::try_from(queue.len()).unwrap_or(u64::MAX);
-                        queue.clear();
+                        continue;
                     }
+                    outcome
                 }
-            }
+            };
+            dropped += rest;
+            queue.clear();
+            end = if outcome == NoRoom::Stalled {
+                SendEnd::Stalled
+            } else {
+                SendEnd::Departed
+            };
         }
         enqueued_stamp.store(mono_ms() + 1, Ordering::Relaxed);
         if dropped > 0 {
             dirty.store(true, Ordering::Relaxed);
             metrics::counter!("sundog_backlog_dropped_total", "peer" => peer.to_string())
                 .increment(dropped);
-            tracing::warn!(%peer, dropped, "outbox stayed full past the fan-out deadline; frames dropped");
         }
+        if bounded {
+            settle_stall_latch(peer, end, dropped, &stalled, &dirty);
+        } else if dropped > 0 {
+            tracing::warn!(%peer, dropped, "a departed peer's fan-out frames dropped");
+        }
+        placed
     }
 
     /// Whether `peer` is still in the peer table:
@@ -619,5 +678,70 @@ impl Mesh {
         // Yield once so cancelled tasks observe the token before this handle
         // drops.
         tokio::task::yield_now().await;
+    }
+}
+
+/// What [`reserve_room`] found in a peer's replicate outbox.
+enum Room<'a> {
+    /// A slot, held for the frame.
+    Slot(mpsc::Permit<'a, OutFrame>),
+    /// The outbox closed: the peer's writer ended.
+    Closed,
+    /// No slot within the wait.
+    Full,
+}
+
+/// Takes a slot in `tx` as `wait` says: a free one only, or the first to
+/// open before the wait's end.
+async fn reserve_room(tx: &mpsc::Sender<OutFrame>, wait: RoomWait) -> Room<'_> {
+    match wait {
+        RoomWait::TryOnly => match tx.try_reserve() {
+            Ok(permit) => Room::Slot(permit),
+            Err(mpsc::error::TrySendError::Closed(())) => Room::Closed,
+            Err(mpsc::error::TrySendError::Full(())) => Room::Full,
+        },
+        RoomWait::Until(end) => match tokio::time::timeout_at(end, tx.reserve()).await {
+            Ok(Ok(permit)) => Room::Slot(permit),
+            Ok(Err(_)) => Room::Closed,
+            Err(_) => Room::Full,
+        },
+    }
+}
+
+/// Moves `peer`'s stall latch (`stalled`) as a bounded send that ended at
+/// `end`, having dropped `dropped` frames, sets it ([`stall_latch`]):
+/// counts a newly set latch in `sundog_fan_out_stalls_total` with a
+/// warning, and marks the peer `dirty` again when the latch clears.
+fn settle_stall_latch(
+    peer: NodeId,
+    end: SendEnd,
+    dropped: u64,
+    stalled: &AtomicBool,
+    dirty: &AtomicBool,
+) {
+    match stall_latch(end) {
+        Some(true) => {
+            if stalled.swap(true, Ordering::Relaxed) {
+                tracing::debug!(%peer, dropped, "fan-out frames dropped for a stalled peer");
+            } else {
+                metrics::counter!("sundog_fan_out_stalls_total").increment(1);
+                tracing::warn!(
+                    %peer,
+                    dropped,
+                    "a peer live in gossip took no fan-out frame for fan_out_stall_timeout; \
+                     dropped the rest and marked it dirty, and sends to it no longer wait until \
+                     its outbox takes a whole batch"
+                );
+            }
+        }
+        Some(false) => {
+            if stalled.swap(false, Ordering::Relaxed) {
+                dirty.store(true, Ordering::Relaxed);
+                tracing::info!(%peer, "a stalled peer's outbox takes fan-out frames again");
+            }
+        }
+        None => {
+            tracing::warn!(%peer, dropped, "a departed peer's fan-out frames dropped");
+        }
     }
 }

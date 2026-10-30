@@ -181,4 +181,7 @@ is one random read, so local NVMe serves the tier best.
 
 Set a container's memory limit above the resident set the tables above
 predict, plus the fan-out backlog: each cache queues up to
-`fan_out_backlog_capacity` keys, 262,144 by default, while peers are slow.
+`fan_out_backlog_capacity` keys, 262,144 by default, while peers are slow,
+and past it while writes wait out `fan_out_wait_timeout`. A `Distributed`
+owner that stops reading holds the backlog until it has taken nothing for
+`fan_out_stall_timeout`.

@@ -8,6 +8,7 @@ mod expiry_tombstone;
 mod explain_probes;
 mod explain_reads;
 mod fan_out_departed;
+mod fan_out_stall;
 mod forwarding;
 mod forwarding_skew;
 mod lifecycle;

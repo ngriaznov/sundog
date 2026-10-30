@@ -120,6 +120,23 @@ async fn build_rejects_a_zero_fan_out_backlog_capacity() {
     );
 }
 
+#[tokio::test]
+async fn build_rejects_a_zero_fan_out_stall_timeout() {
+    let mut config = loopback_config();
+    config.fan_out_stall_timeout = Duration::ZERO;
+
+    let err = Cluster::builder("cluster-it-fan-out-stall-timeout-guard")
+        .seeds(std::iter::empty())
+        .config(config)
+        .build()
+        .await
+        .expect_err("a zero fan_out_stall_timeout must be rejected at build() time");
+    assert!(
+        matches!(err, JoinError::InvalidConfig(ref msg) if msg.contains("fan_out_stall_timeout")),
+        "{err:?}"
+    );
+}
+
 /// `validate_config` does not reject a `rebalance_ack_window` past its
 /// own max: unlike `max_frame`, its bound moves with `ae_interval`, and
 /// many tests shrink `ae_interval` alone without re-tuning it to match.

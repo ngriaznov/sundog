@@ -6,14 +6,15 @@
 //! The queue holds keys and the version each was written at. The drain reads
 //! the written view back: a write still stored travels as a record, a lapsed
 //! one with its past deadline, and a write whose entry is gone travels as an
-//! invalidation of the version written, so a peer never keeps serving the
-//! value the write replaced.
+//! invalidation of the version written, so a peer that receives it stops
+//! serving the value the write replaced.
 
 use std::collections::HashSet;
 use std::hash::Hash;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::future::join_all;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use smol_str::SmolStr;
@@ -21,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{Cluster, group_in_order};
 use crate::hlc::Hlc;
-use crate::net::{Mesh, MsgClass, OutFrame, batch_forward, batch_replicate};
+use crate::net::{Mesh, MsgClass, OutFrame, SendBudget, batch_forward, batch_replicate};
 use crate::node::NodeId;
 use crate::ownership::OwnershipView;
 use crate::store::{
@@ -76,7 +77,7 @@ pub(super) struct OwnerGroup {
 
 /// Groups `records` by the exact target-peer set each replicates to: its
 /// part's live owners under `view`, self excluded. Pure and mesh-free, so
-/// [`fan_out_by_owner_set`] and its unit tests build on it directly.
+/// [`fan_out_to_owners`] and its unit tests build on it directly.
 /// Records whose parts share an owner set land in the same group, so
 /// replicating them costs one round trip per group, not one per record.
 pub(super) fn group_by_owner_set(
@@ -212,68 +213,149 @@ pub(super) fn encode_frames_for(mesh: &Mesh, peers: &[NodeId], msgs: Vec<Msg>) -
     frames
 }
 
+/// One frame of a `Mode::Distributed` batch and the owners it goes to.
+#[derive(Debug, Clone)]
+struct OwnerFrame {
+    frame: OutFrame,
+    /// The owners it goes to, this node excluded.
+    targets: Vec<NodeId>,
+    /// A departed write's invalidation, lost when any target misses it: a
+    /// target that keeps the older value hands it back through
+    /// anti-entropy. Otherwise a batch of records, lost when no target takes
+    /// it and this node does not store them.
+    invalidation: bool,
+}
+
 /// Groups `records` by the exact target-peer set each replicates to: its
-/// bucket's live owners under `view`, self excluded. Then sends each
-/// group as `ForwardBatch` frames stamped with `view`'s hash through the
-/// mesh's existing per-peer outboxes ([`Mesh::send_frames_awaiting`],
-/// waiting for space rather than dropping on overflow, since a forwarded
-/// write's only copy is the frame -- indefinitely, in
-/// [`crate::net::FAN_OUT_SEND_DEADLINE`] slices, so long as the target peer
-/// stays live).
-/// The single function both an owner's normal fan-out and a non-owner's
-/// forwarded writes route through: "group by owner set instead of
-/// broadcast" has one implementation, not two.
-async fn fan_out_by_owner_set(
+/// part's live owners under `view`, self excluded, as `ForwardBatch` frames
+/// stamped with `view`'s hash, and follows them with an invalidation per
+/// `departed` write for that write's other owners. Each owner then gets one
+/// send of its frames in that order ([`frames_by_owner`],
+/// [`Mesh::send_frames_within`]), every owner at once under `budget`: a
+/// send waits for outbox space rather than dropping on overflow, since a
+/// forwarded write's only copy is the frame, and ends once the owner's
+/// outbox takes nothing for the budget's idle time. Its frames left then
+/// are dropped and the owner marked dirty, which anti-entropy repairs for a
+/// record this node stores; a forwarded write no owner took, and a departed
+/// write's invalidation an owner missed, are lost, counted in
+/// `sundog_fan_out_lost_writes_total{cache}` ([`lost_writes`]). The single
+/// function both an owner's normal fan-out and a non-owner's forwarded
+/// writes route through: "group by owner set instead of broadcast" has one
+/// implementation, not two.
+async fn fan_out_to_owners(
     mesh: &Mesh,
     cache_name: &SmolStr,
     view: &OwnershipView,
     self_node: NodeId,
     records: Vec<WireRecord>,
+    departed: Vec<DepartedSend>,
+    budget: SendBudget,
 ) {
+    let mut frames: Vec<OwnerFrame> = Vec::new();
     for OwnerGroup { owners, records } in group_by_owner_set(view, self_node, records) {
         if owners.is_empty() {
             continue;
         }
-        let frames = encode_frames_for(
-            mesh,
-            &owners,
-            batch_forward(cache_name, view.view_hash(), 0, records),
-        );
-        for peer in owners {
-            mesh.send_frames_awaiting(peer, frames.clone()).await;
+        let msgs = batch_forward(cache_name, view.view_hash(), 0, records);
+        for frame in encode_frames_for(mesh, &owners, msgs) {
+            frames.push(OwnerFrame {
+                frame,
+                targets: owners.clone(),
+                invalidation: false,
+            });
         }
+    }
+    for DepartedSend { targets, records } in departed {
+        for frame in encode_frames_for(mesh, &targets, invalidations(cache_name, records)) {
+            frames.push(OwnerFrame {
+                frame,
+                targets: targets.clone(),
+                invalidation: true,
+            });
+        }
+    }
+    let by_owner = frames_by_owner(&frames);
+    let placed = join_all(by_owner.iter().map(|(peer, ids)| {
+        let owner_frames = ids.iter().map(|&i| frames[i].frame.clone()).collect();
+        mesh.send_frames_within(*peer, owner_frames, budget)
+    }))
+    .await;
+    let mut delivered = vec![0usize; frames.len()];
+    for ((_, ids), placed) in by_owner.iter().zip(placed) {
+        for &i in ids.iter().take(placed) {
+            delivered[i] += 1;
+        }
+    }
+    let lost = lost_writes(&frames, &delivered, |rec| {
+        view.owns(PartId::of_key(rec.key.as_ref()))
+    });
+    if lost > 0 {
+        metrics::counter!("sundog_fan_out_lost_writes_total", "cache" => cache_name.to_string())
+            .increment(lost);
+        tracing::warn!(
+            cache = %cache_name,
+            lost,
+            "writes whose only record was a fan-out frame missed an owner; they are lost"
+        );
     }
 }
 
-/// How a departed write's invalidation is sent to a peer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DepartedClass {
-    /// [`MsgClass::Invalidate`]: an overflowing outbox drops the oldest
-    /// frame. For `Invalidation` and `Replicated`, where a lost invalidation
-    /// is the same loss any invalidation has.
-    Drop,
-    /// [`Mesh::send_frames_awaiting`]: waits for outbox space, so a
-    /// co-owner of a part never keeps the older value that anti-entropy
-    /// would push back onto this node.
-    Awaiting,
+/// Each owner `frames` targets, with the indices of its frames in order.
+/// Pure; unit tested directly.
+fn frames_by_owner(frames: &[OwnerFrame]) -> Vec<(NodeId, Vec<usize>)> {
+    let mut by_owner: std::collections::BTreeMap<NodeId, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (i, frame) in frames.iter().enumerate() {
+        for &owner in &frame.targets {
+            by_owner.entry(owner).or_default().push(i);
+        }
+    }
+    by_owner.into_iter().collect()
 }
 
-/// The peers that receive one set of departed writes, and how.
+/// How many writes `frames` lost, given how many of its targets took each
+/// frame (`delivered`): the records of a record frame no target took that
+/// this node does not store (`!stored`), whose only copy was the frame,
+/// and the write of an invalidation frame some target missed. A record this
+/// node stores is not lost: the owners it missed are marked dirty and
+/// anti-entropy carries it. Pure; unit tested directly.
+fn lost_writes(
+    frames: &[OwnerFrame],
+    delivered: &[usize],
+    stored: impl Fn(&WireRecord) -> bool,
+) -> u64 {
+    frames
+        .iter()
+        .zip(delivered)
+        .map(|(frame, &took)| match &frame.frame.msg {
+            Msg::Invalidate { .. } if frame.invalidation && took < frame.targets.len() => 1,
+            Msg::ForwardBatch { recs, .. } if !frame.invalidation && took == 0 => {
+                recs.iter().filter(|rec| !stored(rec)).count()
+            }
+            _ => 0,
+        })
+        .map(|n| u64::try_from(n).unwrap_or(u64::MAX))
+        .sum()
+}
+
+/// The peers that hear of one set of departed writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DepartedSend {
     targets: Vec<NodeId>,
-    class: DepartedClass,
     records: Vec<WireRecord>,
 }
 
 /// Who hears of each departed write in `mode`: every peer in `peers` for
-/// `Invalidation` and `Replicated`, sent drop-oldest; the other owners of a
-/// write's part under `view` for `Distributed`, sent awaiting, with a part
-/// this node solely owns left out. `Local` sends nothing, and `Distributed`
-/// without a view has no owners to name. A `merges` resolver sends nothing in
-/// any mode: a peer's merged copy is the best one left, and a bare
-/// invalidation cannot say which contributions the writer's gone copy
-/// lacked. Pure; unit tested directly.
+/// `Invalidation` and `Replicated`, which [`send_departed`] sends
+/// drop-oldest, where a lost invalidation is the same loss any invalidation
+/// has; the other owners of a write's part under `view` for `Distributed`,
+/// which [`fan_out_to_owners`] sends after the batch's records and waits
+/// for, so a co-owner does not keep the older value that anti-entropy would
+/// push back onto this node; a part this node solely owns is left out.
+/// `Local` sends nothing, and `Distributed` without a view has no owners to
+/// name. A `merges` resolver sends nothing in any mode: a peer's merged copy
+/// is the best one left, and a bare invalidation cannot say which
+/// contributions the writer's gone copy lacked. Pure; unit tested directly.
 fn plan_departed_sends(
     mode: Mode,
     peers: &[NodeId],
@@ -293,7 +375,6 @@ fn plan_departed_sends(
             }
             vec![DepartedSend {
                 targets: peers.to_vec(),
-                class: DepartedClass::Drop,
                 records: departed,
             }]
         }
@@ -303,7 +384,6 @@ fn plan_departed_sends(
                 .filter(|group| !group.owners.is_empty())
                 .map(|OwnerGroup { owners, records }| DepartedSend {
                     targets: owners,
-                    class: DepartedClass::Awaiting,
                     records,
                 })
                 .collect()
@@ -311,24 +391,13 @@ fn plan_departed_sends(
     }
 }
 
-/// Sends each of `plan`'s departed writes as [`Msg::Invalidate`].
-async fn send_departed(mesh: &Mesh, cache_name: &SmolStr, plan: Vec<DepartedSend>) {
-    for DepartedSend {
-        targets,
-        class,
-        records,
-    } in plan
-    {
+/// Sends each of `plan`'s departed writes as [`Msg::Invalidate`] through
+/// the drop-oldest invalidate outboxes ([`MsgClass::Invalidate`]).
+fn send_departed(mesh: &Mesh, cache_name: &SmolStr, plan: Vec<DepartedSend>) {
+    for DepartedSend { targets, records } in plan {
         let frames = encode_frames_for(mesh, &targets, invalidations(cache_name, records));
         for peer in targets {
-            match class {
-                DepartedClass::Drop => {
-                    mesh.send_frames(peer, MsgClass::Invalidate, frames.iter().cloned());
-                }
-                DepartedClass::Awaiting => {
-                    mesh.send_frames_awaiting(peer, frames.clone()).await;
-                }
-            }
+            mesh.send_frames(peer, MsgClass::Invalidate, frames.iter().cloned());
         }
     }
 }
@@ -438,14 +507,6 @@ pub(crate) async fn fan_out_batch<K, V>(
         if !mine.is_empty() {
             shard.apply_forwarded_batch(mine).await;
         }
-        fan_out_by_owner_set(
-            cluster.mesh(),
-            cache_name,
-            &view,
-            cluster.node_id(),
-            records,
-        )
-        .await;
         let plan = plan_departed_sends(
             mode,
             &[],
@@ -454,7 +515,16 @@ pub(crate) async fn fan_out_batch<K, V>(
             shard.merges(),
             departed,
         );
-        send_departed(cluster.mesh(), cache_name, plan).await;
+        fan_out_to_owners(
+            cluster.mesh(),
+            cache_name,
+            &view,
+            cluster.node_id(),
+            records,
+            plan,
+            SendBudget::Idle(cluster.config().fan_out_stall_timeout),
+        )
+        .await;
         return;
     }
 
@@ -495,10 +565,10 @@ pub(crate) async fn fan_out_batch<K, V>(
         shard.merges(),
         departed,
     );
-    send_departed(cluster.mesh(), cache_name, plan).await;
+    send_departed(cluster.mesh(), cache_name, plan);
 }
 
-// The grouping logic is pure and mesh-free; this is `fan_out_by_owner_set`'s
+// The grouping logic is pure and mesh-free; this is `fan_out_to_owners`'s
 // own test.
 #[cfg(test)]
 mod tests {
@@ -537,7 +607,7 @@ mod tests {
 
     /// `group_by_owner_set`'s grouping is a pure function of an
     /// `OwnershipView` and a record list, with no `Mesh` or live cluster
-    /// involved: this is `fan_out_by_owner_set`'s own test, and the
+    /// involved: this is `fan_out_to_owners`'s own test, and the
     /// pinned guarantee that an owner's write fans out only to the
     /// bucket's other owners, never to every live peer.
     #[test]
@@ -876,7 +946,6 @@ mod tests {
                 ),
                 vec![DepartedSend {
                     targets: nodes(&[2, 3]),
-                    class: DepartedClass::Drop,
                     records: departed.clone(),
                 }],
                 "{mode:?}"
@@ -938,11 +1007,6 @@ mod tests {
         for (send, group) in plan.iter().zip(&expected) {
             assert_eq!(send.targets, group.owners);
             assert_eq!(send.records, group.records);
-            assert_eq!(
-                send.class,
-                DepartedClass::Awaiting,
-                "a co-owner must not keep the older value anti-entropy would push back"
-            );
             assert!(!send.targets.contains(&self_node));
         }
         let sent: usize = plan.iter().map(|send| send.records.len()).sum();
@@ -1344,12 +1408,14 @@ mod tests {
                 std::num::NonZeroU8::new(2).expect("nonzero"),
             );
 
-            fan_out_by_owner_set(
+            fan_out_to_owners(
                 &mesh,
                 &SmolStr::new("c"),
                 &view,
                 self_node,
                 vec![too_large_value(1)],
+                Vec::new(),
+                SendBudget::Idle(Duration::from_secs(10)),
             )
             .await;
 
@@ -1402,25 +1468,380 @@ mod tests {
 
         #[tokio::test]
         async fn a_departed_send_marks_its_targets_when_an_invalidation_does_not_encode() {
-            for class in [DepartedClass::Drop, DepartedClass::Awaiting] {
+            for awaiting in [false, true] {
                 let recorder = metrics_util::debugging::DebuggingRecorder::new();
                 let snapshotter = recorder.snapshotter();
                 let _guard = metrics::set_default_local_recorder(&recorder);
                 let mesh = mesh_with_peers().await;
+                let plan = vec![DepartedSend {
+                    targets: vec![NodeId::from(PEER)],
+                    records: vec![too_large_key(1)],
+                }];
 
-                send_departed(
-                    &mesh,
-                    &SmolStr::new("c"),
-                    vec![DepartedSend {
-                        targets: vec![NodeId::from(PEER)],
-                        class,
-                        records: vec![too_large_key(1)],
-                    }],
-                )
-                .await;
+                if awaiting {
+                    let self_node = NodeId::from(SELF);
+                    let view = OwnershipView::compute(
+                        self_node,
+                        vec![self_node, NodeId::from(PEER)],
+                        std::num::NonZeroU8::new(2).expect("nonzero"),
+                    );
+                    fan_out_to_owners(
+                        &mesh,
+                        &SmolStr::new("c"),
+                        &view,
+                        self_node,
+                        Vec::new(),
+                        plan,
+                        SendBudget::Idle(Duration::from_secs(10)),
+                    )
+                    .await;
+                } else {
+                    send_departed(&mesh, &SmolStr::new("c"), plan);
+                }
 
                 assert_peer_marked_and_counted(&mesh, &snapshotter, PEER, 1);
             }
+        }
+    }
+
+    /// An [`OwnerFrame`] for `msg`, sent to `targets`.
+    fn owner_frame(msg: Msg, targets: &[u64], invalidation: bool) -> OwnerFrame {
+        OwnerFrame {
+            frame: OutFrame::new(msg).expect("encodes"),
+            targets: targets.iter().copied().map(NodeId::from).collect(),
+            invalidation,
+        }
+    }
+
+    /// A one-record `ForwardBatch` for `key`.
+    fn forward_of(key: u32) -> Msg {
+        batch_forward(&SmolStr::new("c"), 7, 0, vec![wire_record_for_u32(key)]).remove(0)
+    }
+
+    /// An invalidation of `key`.
+    fn invalidation_of(key: u32) -> Msg {
+        invalidations(&SmolStr::new("c"), vec![wire_record_for_u32(key)]).remove(0)
+    }
+
+    #[test]
+    fn frames_by_owner_lists_each_owner_s_frames_in_batch_order() {
+        let frames = [
+            owner_frame(forward_of(1), &[2, 3], false),
+            owner_frame(forward_of(2), &[3], false),
+            owner_frame(invalidation_of(3), &[2], true),
+            owner_frame(invalidation_of(4), &[3, 4], true),
+        ];
+        assert_eq!(
+            frames_by_owner(&frames),
+            vec![
+                (NodeId::from(2), vec![0, 2]),
+                (NodeId::from(3), vec![0, 1, 3]),
+                (NodeId::from(4), vec![3]),
+            ],
+            "an owner's records come before its invalidations, in the order they were built"
+        );
+        assert_eq!(frames_by_owner(&[]), Vec::new());
+    }
+
+    #[test]
+    fn lost_writes_counts_unstored_records_no_owner_took_and_invalidations_an_owner_missed() {
+        let stored_even = |rec: &WireRecord| {
+            let key: u32 = postcard::from_bytes(&rec.key).expect("a u32 key");
+            key.is_multiple_of(2)
+        };
+        let frames = [
+            owner_frame(forward_of(1), &[2, 3], false),
+            owner_frame(forward_of(2), &[2, 3], false),
+            owner_frame(invalidation_of(3), &[2, 3], true),
+        ];
+        // (how many targets took each frame, writes lost)
+        let table: [([usize; 3], u64); 6] = [
+            ([2, 2, 2], 0),
+            ([1, 1, 2], 0),
+            ([0, 2, 2], 1),
+            ([0, 0, 2], 1),
+            ([2, 2, 1], 1),
+            ([0, 0, 0], 2),
+        ];
+        for (delivered, lost) in table {
+            assert_eq!(
+                lost_writes(&frames, &delivered, stored_even),
+                lost,
+                "delivered {delivered:?}"
+            );
+        }
+        assert_eq!(
+            lost_writes(&frames[..2], &[0, 0], |_| false),
+            2,
+            "a non-owner stores none of what it forwards"
+        );
+    }
+
+    /// Owners that stay live in the peer table but take no frame, under
+    /// `fan_out_stall_timeout`. Real loopback meshes, which the `sim`
+    /// transport cannot serve.
+    #[cfg(not(feature = "sim"))]
+    mod stalls {
+        use super::*;
+        use crate::config::ClusterConfig;
+        use crate::net::test_support::{BucketPullHandler, peer_at, spawn_mesh};
+        use crate::net::{InboundMsg, Mesh};
+        use tokio::sync::mpsc;
+
+        const SELF: u64 = 1;
+        // The highest id, so an owner-at-a-time send would reach it last.
+        const HEALTHY: u64 = 4;
+        const STALLED: u64 = 2;
+        const ALSO_STALLED: u64 = 3;
+
+        /// Each counter's total over its series. A snapshot reads the
+        /// counters out, so a test takes one.
+        fn counter_totals(
+            snapshotter: &metrics_util::debugging::Snapshotter,
+        ) -> std::collections::HashMap<String, u64> {
+            let mut totals = std::collections::HashMap::new();
+            for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+                if let metrics_util::debugging::DebugValue::Counter(n) = value {
+                    *totals.entry(key.key().name().to_string()).or_default() += n;
+                }
+            }
+            totals
+        }
+
+        /// A record whose part `view` hands exactly `owners`.
+        fn owned_by(view: &OwnershipView, owners: &[u64]) -> WireRecord {
+            let mut wanted: Vec<NodeId> = owners.iter().copied().map(NodeId::from).collect();
+            wanted.sort_unstable();
+            (0u32..100_000)
+                .map(wire_record_for_u32)
+                .find(|rec| {
+                    let mut got = view.owners_of(PartId::of_key(&rec.key)).to_vec();
+                    got.sort_unstable();
+                    got == wanted
+                })
+                .expect("every owner pair holds some part")
+        }
+
+        /// The four-node view every test here decides under: two owners per
+        /// part.
+        fn four_node_view() -> OwnershipView {
+            OwnershipView::compute(
+                NodeId::from(SELF),
+                (SELF..=HEALTHY).map(NodeId::from).collect(),
+                std::num::NonZeroU8::new(2).expect("nonzero"),
+            )
+        }
+
+        /// A one-slot-outbox mesh on node 1 whose peer 4 reads and whose
+        /// peers 2 and 3 never take a frame, their one slot already taken;
+        /// with peer 4's mesh and its inbound queue.
+        async fn mesh_with_two_stalled_owners() -> (Mesh, Mesh, mpsc::Receiver<InboundMsg>) {
+            let handler = || Arc::new(BucketPullHandler::default());
+            let (healthy, healthy_inbound) = spawn_mesh(NodeId::from(HEALTHY), handler()).await;
+            let config = ClusterConfig {
+                outbox_capacity: 1,
+                ..ClusterConfig::default()
+            };
+            let addr = "127.0.0.1:0".parse().expect("valid loopback addr");
+            let (mesh, _inbound) = Mesh::spawn(addr, NodeId::from(SELF), 1, &config, handler())
+                .await
+                .expect("bind loopback");
+            let unreachable = "127.0.0.1:1".parse().expect("valid addr");
+            mesh.update_peers(vec![
+                peer_at(NodeId::from(HEALTHY), healthy.local_addr()),
+                peer_at(NodeId::from(STALLED), unreachable),
+                peer_at(NodeId::from(ALSO_STALLED), unreachable),
+            ]);
+            for peer in [STALLED, ALSO_STALLED, HEALTHY] {
+                mesh.send(
+                    NodeId::from(peer),
+                    MsgClass::Replicate,
+                    Msg::Replicate {
+                        cache: SmolStr::new("c"),
+                        rec: wire_record_for_u32(0),
+                    },
+                );
+            }
+            // The healthy owner's link is up before any test times a send.
+            let mut healthy_inbound = healthy_inbound;
+            next_matching(&mut healthy_inbound, |msg| {
+                matches!(msg, Msg::Replicate { .. })
+            })
+            .await;
+            (mesh, healthy, healthy_inbound)
+        }
+
+        /// The first message from `inbound` that `wanted` accepts, within
+        /// five seconds.
+        async fn next_matching(
+            inbound: &mut mpsc::Receiver<InboundMsg>,
+            wanted: impl Fn(&Msg) -> bool,
+        ) -> Msg {
+            loop {
+                let msg = tokio::time::timeout(Duration::from_secs(5), inbound.recv())
+                    .await
+                    .expect("the healthy owner hears within five seconds")
+                    .expect("the healthy owner's inbound stays open")
+                    .msg;
+                if wanted(&msg) {
+                    return msg;
+                }
+            }
+        }
+
+        /// Pins the fan-out bound end to end at the owner layer: the healthy
+        /// owner's frames go out while the stalled owners hold theirs, the
+        /// batch ends at its stall timeout, and only the forwarded write
+        /// that reached no owner and that this node does not store is lost.
+        #[tokio::test]
+        async fn a_stalled_owner_holds_neither_a_healthy_owner_nor_the_batch_past_its_timeout() {
+            let recorder = metrics_util::debugging::DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let (mesh, healthy, mut healthy_inbound) = mesh_with_two_stalled_owners().await;
+            let view = four_node_view();
+            // Forwarded to both stalled owners: lost.
+            let lost = owned_by(&view, &[STALLED, ALSO_STALLED]);
+            // Stored here, so their stalled co-owners are repaired later.
+            let stored = owned_by(&view, &[SELF, STALLED]);
+            let also_stored = owned_by(&view, &[SELF, ALSO_STALLED]);
+            // Forwarded, and one of its owners takes it.
+            let reached = owned_by(&view, &[HEALTHY, STALLED]);
+            let stall_timeout = Duration::from_secs(1);
+
+            let cache = SmolStr::new("c");
+            let started = tokio::time::Instant::now();
+            let reached_key = reached.key.clone();
+            let (sent, healthy_got_it) = tokio::join!(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    fan_out_to_owners(
+                        &mesh,
+                        &cache,
+                        &view,
+                        NodeId::from(SELF),
+                        vec![lost, stored, also_stored, reached],
+                        Vec::new(),
+                        SendBudget::Idle(stall_timeout),
+                    ),
+                ),
+                async {
+                    next_matching(&mut healthy_inbound, |msg| {
+                        matches!(msg, Msg::ForwardBatch { recs, .. }
+                            if recs.iter().any(|rec| rec.key == reached_key))
+                    })
+                    .await;
+                    started.elapsed()
+                },
+            );
+            let took = started.elapsed();
+            sent.expect("the batch ends at its stall timeout, not never");
+            assert!(
+                healthy_got_it < stall_timeout,
+                "the healthy owner's frame goes out while the stalled owners wait: \
+                 {healthy_got_it:?}"
+            );
+            assert!(
+                took >= stall_timeout && took < stall_timeout + Duration::from_secs(3),
+                "the batch ends at its stall timeout: {took:?}"
+            );
+            let totals = counter_totals(&snapshotter);
+            assert_eq!(
+                totals.get("sundog_fan_out_lost_writes_total"),
+                Some(&1),
+                "only the write forwarded to two stalled owners is lost, not the two stored here"
+            );
+            assert_eq!(
+                totals.get("sundog_fan_out_stalls_total"),
+                Some(&2),
+                "each stalled owner latches once"
+            );
+            let mut dirty = mesh.take_dirty_peers();
+            dirty.sort();
+            assert_eq!(
+                dirty,
+                vec![NodeId::from(STALLED), NodeId::from(ALSO_STALLED)],
+                "each stalled owner is marked for anti-entropy; the healthy one is not"
+            );
+            healthy.shutdown().await;
+        }
+
+        /// A batch's records and its departed writes' invalidations go to
+        /// each owner in one send, every owner at once, so two owners that
+        /// take nothing hold the batch for one stall timeout, not one each.
+        /// An invalidation an owner missed is a lost write: that owner keeps
+        /// the older value, and anti-entropy hands it back.
+        #[tokio::test]
+        async fn records_and_departed_writes_wait_on_every_stalled_owner_at_once() {
+            let recorder = metrics_util::debugging::DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let (mesh, healthy, mut healthy_inbound) = mesh_with_two_stalled_owners().await;
+            let view = four_node_view();
+            let stored = owned_by(&view, &[SELF, STALLED]);
+            let shared = owned_by(&view, &[SELF, HEALTHY]);
+            let departed = vec![
+                DepartedSend {
+                    targets: vec![NodeId::from(ALSO_STALLED), NodeId::from(HEALTHY)],
+                    records: vec![wire_record_for_u32(5)],
+                },
+                DepartedSend {
+                    targets: vec![NodeId::from(STALLED)],
+                    records: vec![wire_record_for_u32(6)],
+                },
+            ];
+            // Two stalled owners in sequence would take twice this.
+            let stall_timeout = Duration::from_secs(2);
+
+            let started = tokio::time::Instant::now();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                fan_out_to_owners(
+                    &mesh,
+                    &SmolStr::new("c"),
+                    &view,
+                    NodeId::from(SELF),
+                    vec![stored, shared.clone()],
+                    departed,
+                    SendBudget::Idle(stall_timeout),
+                ),
+            )
+            .await
+            .expect("the batch ends at its stall timeout, not never");
+            let took = started.elapsed();
+            assert!(
+                took >= stall_timeout && took < stall_timeout * 3 / 2,
+                "both stalled owners are waited on at once: {took:?}"
+            );
+            let first = next_matching(&mut healthy_inbound, |msg| {
+                matches!(msg, Msg::ForwardBatch { .. } | Msg::Invalidate { .. })
+            })
+            .await;
+            assert!(
+                matches!(&first, Msg::ForwardBatch { recs, .. } if recs[0].key == shared.key),
+                "an owner gets the batch's records before its invalidations: {first:?}"
+            );
+            let invalidated = next_matching(&mut healthy_inbound, |msg| {
+                matches!(msg, Msg::Invalidate { .. })
+            })
+            .await;
+            assert!(
+                matches!(invalidated, Msg::Invalidate { key, .. } if key == wire_record_for_u32(5).key),
+                "the healthy co-owner gets its invalidation"
+            );
+            let totals = counter_totals(&snapshotter);
+            assert_eq!(
+                totals.get("sundog_fan_out_lost_writes_total"),
+                Some(&2),
+                "both departed writes missed a stalled co-owner; the stored record is not lost"
+            );
+            let mut dirty = mesh.take_dirty_peers();
+            dirty.sort();
+            assert_eq!(
+                dirty,
+                vec![NodeId::from(STALLED), NodeId::from(ALSO_STALLED)]
+            );
+            healthy.shutdown().await;
         }
     }
 }

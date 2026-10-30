@@ -71,6 +71,7 @@ addresses once it forms, under `cluster formed`.
 | `sundog_bytes_sent_total` | data-plane bytes sent |
 | `sundog_accept_dropped_total{reason}` | data-plane connections this node closed before they sent a hello: `hello_timeout` (no complete hello within 10 seconds of the connection's handler first running, TLS handshake included) or `over_cap` (512 connections from addresses that are not a peer's already waited for their hello) |
 | `sundog_fan_out_wait_seconds_total{peer}` | whole seconds writers spent waiting for a live peer's full outbox |
+| `sundog_fan_out_stalls_total` | live peers whose outbox took no fan-out frame for `fan_out_stall_timeout`: the rest of their frames were dropped, and fan-out sends to each took only free slots until one batch fit whole |
 | `sundog_backlog_dropped_total{peer}` | frames dropped before reaching the peer's connection: an outbox that stayed full, the oldest invalidation displaced by a newer one, a message that failed to encode, a re-forward lane that already held 64 MiB for a live peer, or the peer leaving the mesh. Each drop marks the peer for the next anti-entropy round, which repairs a record the dropping node owns but not one it only passed on. A broken connection drops a frame only if the writer cannot send it again: the writer resends the burst whose send failed and the frames it wrote in the last second, up to 1 MiB |
 
 ### Distributed caches
@@ -84,6 +85,7 @@ addresses once it forms, under `cluster formed`.
 | `sundog_fetch_total{cache, outcome}` | `fetch` calls by outcome: `local`, `remote`, `miss` or `error` |
 | `sundog_fetch_duration_seconds{cache, outcome}` | histogram of every `fetch` that asked an owner, under its outcome: `remote`, `miss`, `error`, or `local` after a view change |
 | `sundog_forwarded_writes_total{cache}` | writes sent on to a part's owners, or passed on because they arrived under another node's view |
+| `sundog_fan_out_lost_writes_total{cache}` | writes whose only copy was a fan-out frame that missed: a forwarded write no owner's outbox took, and a departed write's invalidation an owner missed, because the owners stalled past `fan_out_stall_timeout` or left the mesh |
 | `sundog_stale_view_total{cache}` | anti-entropy rounds a peer declined over a different ownership view |
 | `sundog_unowned_inbound_dropped_total{cache}` | inbound records dropped for a part this node does not own |
 
@@ -179,13 +181,28 @@ pull that times out is retried every `ae_interval` until it lands.
 
 `sundog_fan_out_backlog` climbs and `sundog_fan_out_wait_seconds_total`
 grows for one peer: that peer reads its outbox slower than this node
-writes. sundog applies backpressure instead of dropping frames for a live
-peer, so writers wait. Find the slow peer by its label and check its CPU
-and network. `sundog_fan_out_wait_timeouts_total` counts writes that
-waited the whole `fan_out_wait_timeout` and went ahead anyway. A peer that
-stops reading delays only the writes and re-forwards aimed at it: a node
-keeps applying what every other peer sends, and a re-forward waits in a lane
-for that peer alone.
+writes. A `Distributed` fan-out waits for a live owner's outbox instead of
+dropping its frames, so writers wait. Find the slow peer by its label and
+check its CPU and network. `sundog_fan_out_wait_timeouts_total` counts
+writes that waited the whole `fan_out_wait_timeout` and went ahead anyway.
+
+A fan-out batch sends to all of its owners at once, each owner's records
+before the invalidations of its departed writes, and waits on an owner for as
+long as its outbox keeps taking frames; the owner's writer takes the outbox at
+most 1 MiB at a time, as fast as the owner reads. One that stays live but
+takes nothing for `fan_out_stall_timeout`, 10 seconds by default, has the
+frames left for it dropped and counted in `sundog_backlog_dropped_total`, is
+marked for the next anti-entropy round, and `sundog_fan_out_stalls_total`
+counts the stall, with a warning naming the peer. Until one batch fits its
+outbox whole, later batches send it what fits without waiting, so the other
+owners and the backlog keep moving; the batch that fits marks it for
+anti-entropy again. A write this node owns reaches the stalled owner through
+anti-entropy. A forwarded write that no owner took, and a departed write's
+invalidation an owner missed, are lost, counted in
+`sundog_fan_out_lost_writes_total{cache}` and logged at `warn` (see
+[guarantees](guarantees.md#per-mode)). A peer that stops reading delays only
+the writes and re-forwards aimed at it: a node keeps applying what every other
+peer sends, and a re-forward waits in a lane for that peer alone.
 
 ### Repairs climb steadily
 

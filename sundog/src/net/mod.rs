@@ -148,10 +148,125 @@ const DEFAULT_CHANNEL_CAPACITY: usize = 8_192;
 const OUTBOX_FLUSH_DEADLINE: Duration = Duration::from_millis(500);
 const OUTBOX_FLUSH_TAIL: Duration = Duration::from_millis(20);
 
-/// How long [`Mesh::send_frames_awaiting`] waits for outbox space before
-/// rechecking peer liveness. Bounds the recheck interval, not the total
-/// time a live peer's send may take.
+/// How long [`Mesh::send_frames_within`] waits for outbox space before
+/// rechecking the peer: the slice of a wait, not its total, which the
+/// send's [`SendBudget`] bounds.
 pub(crate) const FAN_OUT_SEND_DEADLINE: Duration = Duration::from_secs(2);
+
+/// How long a send through [`Mesh::send_frames_within`] waits for one
+/// peer's outbox to take its frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SendBudget {
+    /// For as long as the peer stays in the peer table.
+    Unbounded,
+    /// While the peer's outbox takes a frame at least this often, and not
+    /// at all toward a peer latched stalled.
+    Idle(Duration),
+}
+
+/// When a send under `budget` stops waiting if no frame goes in after
+/// `now`: `None` waits for as long as the peer stays in the table, as an
+/// unbounded budget does, and an idle one past the clock's range, as
+/// `Duration::MAX` is. Pure; unit tested directly.
+pub(crate) fn idle_deadline(
+    budget: SendBudget,
+    now: tokio::time::Instant,
+) -> Option<tokio::time::Instant> {
+    match budget {
+        SendBudget::Unbounded => None,
+        SendBudget::Idle(idle) => now.checked_add(idle),
+    }
+}
+
+/// How the next frame of a [`Mesh::send_frames_within`] waits for an
+/// outbox slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoomWait {
+    /// Takes a free slot or none, without waiting.
+    TryOnly,
+    /// Waits for a slot until this instant.
+    Until(tokio::time::Instant),
+}
+
+/// How the next frame waits at `now`, given the send's [`idle_deadline`]:
+/// one [`FAN_OUT_SEND_DEADLINE`] slice, cut short at the deadline, or no
+/// wait at all once the deadline passed or the peer is latched stalled. A
+/// send with no deadline ignores the latch. Pure; unit tested directly.
+pub(crate) fn fan_out_room_wait(
+    deadline: Option<tokio::time::Instant>,
+    stalled: bool,
+    now: tokio::time::Instant,
+) -> RoomWait {
+    let slice_end = now + FAN_OUT_SEND_DEADLINE;
+    match deadline {
+        None => RoomWait::Until(slice_end),
+        Some(end) if stalled || now >= end => RoomWait::TryOnly,
+        Some(end) => RoomWait::Until(slice_end.min(end)),
+    }
+}
+
+/// What a [`Mesh::send_frames_within`] does with a frame that found no
+/// outbox slot within `wait`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoRoom {
+    /// Waits another slice for the same frame.
+    WaitAgain,
+    /// The peer left the table: drops what is left.
+    Departed,
+    /// The outbox took nothing until the deadline, or the peer is latched
+    /// stalled: drops what is left and latches the peer stalled.
+    Stalled,
+}
+
+/// What follows a frame finding no slot within `wait` at `now`: a send with
+/// no deadline waits again while `peer_live`; one with a deadline waits
+/// again only until it and while no other send latched the peer
+/// (`stalled`), so a second cache's wait ends within a slice of the first
+/// cache's trip. Pure; unit tested directly.
+pub(crate) fn fan_out_no_room(
+    peer_live: bool,
+    stalled: bool,
+    wait: RoomWait,
+    deadline: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> NoRoom {
+    if !peer_live {
+        return NoRoom::Departed;
+    }
+    let Some(end) = deadline else {
+        return NoRoom::WaitAgain;
+    };
+    if stalled || now >= end || wait == RoomWait::TryOnly {
+        NoRoom::Stalled
+    } else {
+        NoRoom::WaitAgain
+    }
+}
+
+/// How a bounded [`Mesh::send_frames_within`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SendEnd {
+    /// Every frame went in.
+    Placed,
+    /// The budget ran out, or the peer was latched stalled, before every
+    /// frame went in.
+    Stalled,
+    /// The peer left the table, or its outbox closed, before every frame
+    /// went in.
+    Departed,
+}
+
+/// What a bounded send that ended at `end` sets the peer's stall latch to:
+/// set once it dropped frames for a stall, cleared once it placed every
+/// frame, and left alone when the peer departed, since its handle leaves the
+/// table with it. Pure; unit tested directly.
+pub(crate) const fn stall_latch(end: SendEnd) -> Option<bool> {
+    match end {
+        SendEnd::Placed => Some(false),
+        SendEnd::Stalled => Some(true),
+        SendEnd::Departed => None,
+    }
+}
 
 /// Milliseconds since the first call in this process, a monotonic stamp
 /// for "how recently" bookkeeping that never needs wall-clock meaning.
@@ -172,6 +287,11 @@ struct PeerHandle {
     /// outbox dropped a message for it, or its writer redialed after a
     /// connection that carried frames broke ([`Mesh::take_dirty_peers`]).
     dirty: Arc<AtomicBool>,
+    /// Set once the peer's replicate outbox took nothing for a fan-out
+    /// send's idle budget ([`Mesh::send_frames_within`]): every cache's
+    /// bounded send to it then takes free slots only, without waiting, until
+    /// one places all its frames.
+    stalled: Arc<AtomicBool>,
     /// The most keys or hashes the next anti-entropy pull from this peer
     /// asks for, per cache, once a pull to it has timed out
     /// ([`Mesh::pull_limit`]). A cache absent from the map has not shrunk.
@@ -296,13 +416,6 @@ const MAX_AE_DEFERRALS: u32 = 3;
 /// never more than [`MAX_AE_DEFERRALS`] times running.
 fn defer_ae_digest(queued: usize, deferred_so_far: u32) -> bool {
     queued > 0 && deferred_so_far < MAX_AE_DEFERRALS
-}
-
-/// Whether [`Mesh::send_frames_awaiting`] should wait again after a
-/// timed-out [`FAN_OUT_SEND_DEADLINE`] slice: yes while `peer_live`, so a
-/// live peer's frame is never dropped.
-const fn fan_out_keep_waiting(peer_live: bool) -> bool {
-    peer_live
 }
 
 /// Whether a peer's outboxes still hold a frame its writer has not taken:

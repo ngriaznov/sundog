@@ -12,6 +12,13 @@ All notable changes to this project are documented in this file. Format follows
   the kernel then probes every third of that, three times, where the
   platform lets a socket set the interval and count. `build` accepts 1 to
   32,767 seconds. `None` turns it off.
+- **`ClusterConfig::fan_out_stall_timeout`.** How long a `Distributed` fan-out
+  batch waits on an owner that stays live but whose outbox takes nothing, 10
+  seconds by default. `sundog_fan_out_stalls_total` counts each owner that
+  runs it out, and `sundog_fan_out_lost_writes_total{cache}` the writes lost
+  with it: forwarded writes no owner took, and departed writes'
+  invalidations an owner missed. `Duration::MAX` waits for as long as the
+  owner stays live.
 
 ### Changed
 
@@ -24,6 +31,24 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **A stalled `Distributed` owner no longer holds the fan-out backlog.** A
+  batch sent to one owner at a time and waited for each owner's outbox for as
+  long as gossip had the owner live, so an owner that stopped reading while
+  its gossip stayed up, a hung process or a full receive path, held every
+  later write's fan-out on that cache: the other owners heard nothing, and the
+  backlog grew with every write until the owner left the live set. Writers
+  then waited out `fan_out_wait_timeout` on every write. A batch now sends to
+  all of its owners at once and waits on each for as long as its outbox keeps
+  taking frames, which an owner's writer takes 1 MiB at a time, not a whole
+  outbox at once; once one has taken nothing for
+  `ClusterConfig::fan_out_stall_timeout`, the frames left for it are dropped,
+  it is marked for anti-entropy, and later batches send it what fits without
+  waiting until one fits whole.
+- **`Cluster::shutdown` no longer hangs on a stalled `Distributed` owner.**
+  Shutdown waits for every cache's fan-out task to send what it holds, and
+  gossip stops updating the peer table once shutdown starts, so a fan-out
+  waiting on an owner that took nothing never ended and the node never
+  exited. The fan-out's wait now ends at `fan_out_stall_timeout`.
 - **A data-plane link whose peer vanished is released.** A node held each
   connection a peer had dialed to it until the peer closed it, and never
   wrote on a broadcast link, so a peer whose host lost power, whose VM was

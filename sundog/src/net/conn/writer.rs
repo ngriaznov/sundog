@@ -36,6 +36,28 @@ pub(crate) const REPLICATE_BATCH_BUDGET: usize = 256 * 1024;
 /// records doesn't grow one batch frame without bound.
 pub(crate) const REPLICATE_BATCH_COUNT: usize = 4096;
 
+/// The most encoded bytes one replicate burst takes from the outbox
+/// ([`drain_burst`]). Outbox slots then open as the peer reads, a burst at a
+/// time, rather than once per whole outbox, so a fan-out send waiting on a
+/// slow peer sees it keep taking frames, and the writer holds at most this
+/// much of the outbox while a write is under way.
+pub(super) const WRITER_BURST_BYTES: usize = 1024 * 1024;
+
+/// `first` and the frames after it in `rx`, up to [`WRITER_BURST_BYTES`] of
+/// encoded bytes counted from `first`: the frame that reaches the limit is
+/// the last one taken, and the rest stay in the outbox for the next burst.
+pub(super) fn drain_burst(first: OutFrame, rx: &mut mpsc::Receiver<OutFrame>) -> Vec<OutFrame> {
+    let mut bytes = first.frame.len();
+    let mut drained = vec![first];
+    while bytes < WRITER_BURST_BYTES
+        && let Ok(item) = rx.try_recv()
+    {
+        bytes += item.frame.len();
+        drained.push(item);
+    }
+    drained
+}
+
 /// A run of consecutive same-cache `Msg::Replicate`/`Msg::ReplicateBatch`
 /// [`OutFrame`]s considered for merging, tracked with cumulative frame byte
 /// size for [`REPLICATE_BATCH_BUDGET`] and record count for
@@ -441,7 +463,8 @@ where
 }
 
 /// Drives one connection: sends the held frames first, then drains the two
-/// outboxes in bursts until the link ends.
+/// outboxes in bursts until the link ends, a replicate burst at most
+/// [`WRITER_BURST_BYTES`] ([`drain_burst`]).
 ///
 /// The link is read only to notice the peer closing: an acceptor never
 /// writes on a broadcast link, so EOF, an error or any frame ends the
@@ -498,10 +521,7 @@ where
             }
             received = replicate_rx.recv() => {
                 let Some(first) = received else { return LinkEnd::PeerGone };
-                let mut drained = vec![first];
-                while let Ok(item) = replicate_rx.try_recv() {
-                    drained.push(item);
-                }
+                let drained = drain_burst(first, replicate_rx);
                 let (burst, unencoded) = coalesce_replicate_counted(drained);
                 state.note_dropped(unencoded);
                 if burst.is_empty() {

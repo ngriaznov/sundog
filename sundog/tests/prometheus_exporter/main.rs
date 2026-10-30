@@ -27,8 +27,8 @@ use crate::pins::{
     tombstone_pin_metrics,
 };
 use crate::seeds::{
-    seed_crdt_compaction_metrics, seed_distributed_metrics, seed_part_mismatch,
-    seed_pull_timeout_metric, seed_sketch_mismatch,
+    FAN_OUT_STALL_PIN, seed_crdt_compaction_metrics, seed_distributed_metrics,
+    seed_fan_out_stall_metrics, seed_part_mismatch, seed_pull_timeout_metric, seed_sketch_mismatch,
 };
 #[cfg(feature = "spill")]
 use crate::spill::{
@@ -36,7 +36,8 @@ use crate::spill::{
     spill_writes_and_promotes_pin_metrics,
 };
 use crate::support::{
-    node_config, raw_request, reserve_tcp_addr, scrape_metrics, scrape_status, scraped_metric_value,
+    node_config, raw_request, reserve_tcp_addr, scrape_metrics, scrape_status,
+    scraped_metric_value, scraped_unlabelled_value,
 };
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -116,6 +117,9 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     seed_crdt_compaction_metrics(&cluster, metrics_addr).await;
     // Also independent: donor and victim are both shut down before it returns.
     seed_pull_timeout_metric(cluster.local_gossip_addr(), metrics_addr).await;
+    // Also independent: its three nodes are crashed or shut down before it
+    // returns.
+    seed_fan_out_stall_metrics(metrics_addr).await;
     // Runs last: it shuts down two of its own scenario-local nodes once it
     // is done with them, and `peer` isn't touched by anything after it.
     seed_distributed_metrics(&cluster, &peer).await;
@@ -538,20 +542,22 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         "expected exactly one rebalance pull timeout on the 'delayed' cache; got body:\n{body}"
     );
 
-    // `seed_crdt_compaction_metrics` retires exactly one dead writer, ever
-    // (stage-one retirement never calls `retire` on it again once moved),
-    // so this pins exactly. `sundog_crdt_compactions_total` only gets a
-    // lower bound: that same writer's retired slot may or may not have
+    // `seed_crdt_compaction_metrics` pins the exact count at the first
+    // sweep that finds its one dead writer. Every later sweep that still
+    // finds the writer's slot eligible counts it again, and how many of the
+    // 30s sweeps land before this scrape depends on how long the scenarios
+    // after it run, so this is a lower bound. `sundog_crdt_compactions_total`
+    // gets one too: that same writer's retired slot may or may not have
     // already aged into a second, real stage-two fold by the time this
     // scrape lands (see `seed_crdt_compaction_metrics`'s own doc).
-    assert_eq!(
+    assert!(
         scraped_metric_value(
             &body,
             "sundog_crdt_retired_writers_total",
             &[("cache", "counters")]
-        ),
-        Some(1.0),
-        "expected exactly one retired writer on the 'counters' cache; got body:\n{body}"
+        )
+        .is_some_and(|count| count >= 1.0),
+        "expected the 'counters' cache's dead writer retired; got body:\n{body}"
     );
     assert!(
         scraped_metric_value(
@@ -866,15 +872,36 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         }
     }
 
-    // sundog_fan_out_wait_seconds_total{peer}: only bumps when a
-    // per-peer outbox stays full past a whole deadline slice; every real
-    // peer here drains loopback traffic far faster than that, so this
-    // series is correctly never registered. `net/tests/fan_out.rs`
-    // pin the actual increment against an outbox held full by construction.
+    // sundog_fan_out_wait_seconds_total{peer}: only bumps for a wait on a
+    // full outbox of a second or more; every real peer here drains loopback
+    // traffic far faster than that, and the stall scenario's waits end at
+    // its 300 ms timeout, so this series is correctly never registered.
+    // `net/tests/fan_out.rs` pins the actual increment against an outbox held
+    // full by construction.
     assert!(
         !body.contains("sundog_fan_out_wait_seconds_total"),
-        "no peer in this scenario ever stalls its outbox for a whole deadline slice; got \
+        "no peer in this scenario keeps its outbox full for a second; got \
          body:\n{body}"
+    );
+    // sundog_fan_out_stalls_total / sundog_fan_out_lost_writes_total{cache}:
+    // pinned by `seed_fan_out_stall_metrics`, whose writer forwards to two
+    // owners that take nothing until a write is lost. How many forwards
+    // drop before the first scrape sees one depends on when the crashed
+    // owners' writers stop draining, so both are lower bounds.
+    assert!(
+        scraped_unlabelled_value(&body, "sundog_fan_out_stalls_total")
+            .is_some_and(|stalls| stalls >= 1.0),
+        "a peer that took nothing for fan_out_stall_timeout latches as stalled; got \
+         body:\n{body}"
+    );
+    assert!(
+        scraped_metric_value(
+            &body,
+            "sundog_fan_out_lost_writes_total",
+            &[("cache", FAN_OUT_STALL_PIN)]
+        )
+        .is_some_and(|lost| lost >= 1.0),
+        "a forward that reached neither owner is a lost write; got body:\n{body}"
     );
 
     // `users` warmed during `seed_sketch_mismatch`: `is_ready()` and

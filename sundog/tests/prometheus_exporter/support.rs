@@ -88,6 +88,17 @@ pub(crate) fn scraped_metric_value(
     })
 }
 
+/// The value of the unlabelled series `metric` in a scraped `body`.
+pub(crate) fn scraped_unlabelled_value(body: &str, metric: &str) -> Option<f64> {
+    body.lines().find_map(|line| {
+        line.strip_prefix(metric)?
+            .strip_prefix(' ')?
+            .trim()
+            .parse::<f64>()
+            .ok()
+    })
+}
+
 /// Every bucket of the [`SKETCH_FILL`]-key fill holds about 20 entries, so
 /// with this threshold a mismatch there reconciles through an IBLT sketch.
 /// Comfortably under [`PART_MIN_BUCKET`], so this cache's buckets never take
