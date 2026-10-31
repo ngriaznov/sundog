@@ -290,6 +290,15 @@ mod scripted {
             "four quarter-limit frames reach the limit, each a little over a quarter"
         );
         assert_eq!(rx.len(), 6, "the rest stay in the outbox");
+        assert_eq!(tx.taken(), 4, "the burst counts as taken once drained");
+        let queued: usize = (4..10u8)
+            .map(|n| big_forward(n, WRITER_BURST_BYTES / 4).resident_bytes())
+            .sum();
+        assert_eq!(
+            tx.bytes_held(),
+            queued,
+            "the drained frames give their bytes back"
+        );
 
         tx.send(big_forward(10, WRITER_BURST_BYTES * 2))
             .await

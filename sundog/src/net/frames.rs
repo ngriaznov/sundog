@@ -20,12 +20,19 @@ use crate::wire::{self, Msg, WireRecord};
 pub(crate) struct OutFrame {
     pub(crate) msg: Msg,
     pub(crate) frame: Bytes,
+    /// [`OutFrame::resident_bytes`], counted once when the frame is built.
+    resident: usize,
 }
 
 impl OutFrame {
     pub(crate) fn new(msg: Msg) -> Result<Self, CodecError> {
         let frame = wire::encode(&msg)?;
-        Ok(Self { msg, frame })
+        let resident = resident_bytes(&msg, frame.len());
+        Ok(Self {
+            msg,
+            frame,
+            resident,
+        })
     }
 
     /// The memory a queued copy of this frame holds: its encoded bytes, its
@@ -35,23 +42,27 @@ impl OutFrame {
     /// first ([`WireRecord::detached`]), so its bytes are its own and the
     /// figure bounds what the frame keeps alive. For a run of small records
     /// the decoded message outweighs the encoded bytes several times over.
-    /// Pure; unit tested directly.
-    pub(crate) fn resident_bytes(&self) -> usize {
-        let record = |rec: &WireRecord| {
-            std::mem::size_of::<WireRecord>()
-                + rec.key.len()
-                + rec.value.as_ref().map_or(0, Bytes::len)
-        };
-        let decoded = match &self.msg {
-            Msg::Replicate { rec, .. } => record(rec),
-            Msg::ReplicateBatch { recs, .. } | Msg::ForwardBatch { recs, .. } => {
-                recs.iter().map(record).sum()
-            }
-            Msg::Invalidate { key, .. } => key.len(),
-            _ => 0,
-        };
-        std::mem::size_of::<Msg>() + self.frame.len() + decoded
+    /// Counted once, when the frame is built, since every send weighs it.
+    pub(crate) const fn resident_bytes(&self) -> usize {
+        self.resident
     }
+}
+
+/// [`OutFrame::resident_bytes`] of `msg` encoded in `encoded` bytes. Pure;
+/// unit tested through [`OutFrame::resident_bytes`].
+fn resident_bytes(msg: &Msg, encoded: usize) -> usize {
+    let record = |rec: &WireRecord| {
+        std::mem::size_of::<WireRecord>() + rec.key.len() + rec.value.as_ref().map_or(0, Bytes::len)
+    };
+    let decoded = match msg {
+        Msg::Replicate { rec, .. } => record(rec),
+        Msg::ReplicateBatch { recs, .. } | Msg::ForwardBatch { recs, .. } => {
+            recs.iter().map(record).sum()
+        }
+        Msg::Invalidate { key, .. } => key.len(),
+        _ => 0,
+    };
+    std::mem::size_of::<Msg>() + encoded + decoded
 }
 
 /// Process-wide wire-frame counters, incremented at [`super::conn::send_msg`], the

@@ -45,15 +45,18 @@ pub(super) const WRITER_BURST_BYTES: usize = 1024 * 1024;
 /// `first` and the frames after it in `rx`, up to [`WRITER_BURST_BYTES`] of
 /// encoded bytes counted from `first`: the frame that reaches the limit is
 /// the last one taken, and the rest stay in the outbox for the next burst.
+/// The frames taken after `first` give their bytes back to the outbox
+/// together, once.
 pub(super) fn drain_burst(first: OutFrame, rx: &mut OutboxRx) -> Vec<OutFrame> {
     let mut bytes = first.frame.len();
     let mut drained = vec![first];
     while bytes < WRITER_BURST_BYTES
-        && let Ok(item) = rx.try_recv()
+        && let Some(item) = rx.take_more()
     {
         bytes += item.frame.len();
         drained.push(item);
     }
+    rx.settle();
     drained
 }
 

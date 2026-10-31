@@ -36,8 +36,9 @@ where
 {
     /// Counts `ignored` tombstones one inbound batch dropped as lapsed in
     /// `sundog_tombstones_ignored_total{cache}`. When the batch came by
-    /// forward (`forwarded`), the writer kept no copy, so the delete is lost:
-    /// it is also logged at `warn`, rate limited.
+    /// forward (`forwarded`), the delete is lost, since every node ignores a
+    /// lapsed tombstone alike and a non-owner writer kept no copy: it is also
+    /// logged at `warn`, rate limited.
     pub(super) fn note_ignored_tombstones(&self, ignored: u64, forwarded: bool) {
         if ignored == 0 {
             return;
@@ -67,8 +68,8 @@ where
             tracing::warn!(
                 cache = %self.name,
                 ignored,
-                "ignored forwarded deletes that arrived past tombstone_ttl from their stamp: the \
-                 writer kept no copy, so those deletes are lost. A forward waits for outbox \
+                "ignored forwarded deletes that arrived past tombstone_ttl from their stamp: every \
+                 node ignores them alike, so those deletes are lost. A forward waits for outbox \
                  space while its owner is live; a writer clock more than tombstone_ttl behind \
                  this node's does the same. sundog_tombstones_ignored_total counts every one"
             );

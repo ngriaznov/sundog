@@ -626,6 +626,47 @@ async fn closing_hands_the_held_records_to_the_fan_out() {
     assert_eq!(s.get(&key).await, None);
 }
 
+/// A run of forwards applies in one call: a held record the stamp refuses is
+/// held, a kept one it refuses is dropped, as its writer kept it, and records
+/// within the bound apply either way.
+#[tokio::test]
+async fn a_forward_run_holds_its_held_records_and_drops_its_kept_ones() {
+    let clock = TestClock::at(START_MS);
+    let (s, view, _tx, _residency) = skew_shard::<String>(&clock);
+    let keys: Vec<u32> = (0..100_000u32)
+        .filter(|key| view.owns(PartId::of_key(&key_bytes(key))))
+        .take(4)
+        .collect();
+    // A held record this node does not own goes first: the guard drops it,
+    // and the held records the run keeps are one fewer.
+    let unowned = find_key_by_ownership(&view, false);
+    ShardOps::apply_forward_run(
+        &s,
+        vec![
+            forward(unowned, "elsewhere", 10_000),
+            forward(keys[0], "held", 10_000),
+            forward(keys[1], "now", 0),
+        ],
+        vec![
+            forward(keys[2], "kept", 10_000),
+            forward(keys[3], "also now", 0),
+        ],
+    )
+    .await;
+    assert_eq!(s.skew_held().0, 1, "only the held record waits");
+    assert_eq!(s.get(&keys[1]).await.as_deref(), Some("now"));
+    assert_eq!(s.get(&keys[3]).await.as_deref(), Some("also now"));
+
+    clock.set(START_MS + 9_000);
+    s.release_due_skewed().await;
+    assert_eq!(s.get(&keys[0]).await.as_deref(), Some("held"));
+    assert_eq!(
+        s.get(&keys[2]).await,
+        None,
+        "dropped, for anti-entropy to bring from its writer"
+    );
+}
+
 /// A held record is detached from the frame it came in: the hold, and the
 /// forward a close hands it to, keep the record's own bytes, so the hold's
 /// byte cap bounds the memory it keeps alive.

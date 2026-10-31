@@ -60,13 +60,14 @@ where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    /// The body of [`ShardOps::apply_remote_batch`] and
-    /// [`ShardOps::apply_forwarded_batch`]. `hold_skewed` says the records
-    /// came in a forward whose writer may have kept no copy: one the stamp
-    /// refuses goes to the skew hold instead of being dropped (see
-    /// [`Shard::hold_skewed`]). Every other refusal drops the record, because
-    /// its sender or its writer still holds it.
-    pub(super) async fn apply_inbound(&self, recs: Vec<WireRecord>, hold_skewed: bool) {
+    /// The body of [`ShardOps::apply_remote_batch`],
+    /// [`ShardOps::apply_forwarded_batch`] and [`ShardOps::apply_forward_run`].
+    /// `forwarded` says `recs` came in `ForwardBatch` messages. The first
+    /// `held` of them came in a forward whose writer may have kept no copy:
+    /// one the stamp refuses goes to the skew hold instead of being dropped
+    /// (see [`Shard::hold_skewed`]). Every other refusal drops the record,
+    /// because its sender or its writer still holds it.
+    pub(super) async fn apply_inbound(&self, recs: Vec<WireRecord>, forwarded: bool, held: usize) {
         #[cfg(feature = "spill")]
         if self.inbound_held() {
             tracing::trace!(
@@ -87,22 +88,27 @@ where
         // the record is forwarded on to the bucket's current owners,
         // never applied here and never dropped. A record for a bucket
         // this node never held is dropped and counted.
-        let recs = self.guard_inbound(recs);
+        let (recs, held) = self.guard_inbound(recs, held);
         // An `Invalidation` cache takes a tombstone record as the
         // invalidation it stands for: the copy goes, and a load in
         // flight for the key stores nothing.
         let scope = inbound_scope(self.mode);
-        let (recs, removals) = match scope {
-            engine::ApplyScope::HeldOnly => recs.into_iter().partition(|rec| !rec.is_tombstone()),
-            engine::ApplyScope::Any => (recs, Vec::new()),
+        let (recs, removals, held) = match scope {
+            // A shard that folds into held keys only has no ownership view,
+            // so it holds nothing for skew.
+            engine::ApplyScope::HeldOnly => {
+                let (recs, removals) = recs.into_iter().partition(|rec| !rec.is_tombstone());
+                (recs, removals, 0)
+            }
+            engine::ApplyScope::Any => (recs, Vec::new(), held),
         };
         for rec in removals {
             self.invalidate_key(rec.key.as_ref(), rec.ver, true);
         }
         let mut decoded: Vec<RemoteEntry<K, V>> = Vec::with_capacity(recs.len());
-        for rec in recs {
+        for (i, rec) in recs.into_iter().enumerate() {
             if !self.observe_remote(rec.ver) {
-                if hold_skewed {
+                if i < held {
                     self.hold_skewed(&rec);
                 }
                 continue;
@@ -182,7 +188,7 @@ where
             }
             deficit
         };
-        self.note_ignored_tombstones(written.ignored_tombstones(), hold_skewed);
+        self.note_ignored_tombstones(written.ignored_tombstones(), forwarded);
         self.retry_reservation_deficit(0, deficit, wait_left, &mut written)
             .await;
     }
@@ -273,12 +279,22 @@ where
     /// The inbound-apply guard, applied to a batch before decoding: keeps
     /// the records this node's current view owns, forwards the ones for a
     /// bucket mid disown-grace on to its current owners, and drops the rest.
-    fn guard_inbound(&self, recs: Vec<WireRecord>) -> Vec<WireRecord> {
+    /// Answers the kept records in order with how many of them came from
+    /// the first `held` of `recs`.
+    fn guard_inbound(&self, recs: Vec<WireRecord>, held: usize) -> (Vec<WireRecord>, usize) {
         match self.ownership.as_ref().map(OwnershipTracker::current) {
             Some(view) => {
-                let (owned, unowned): (Vec<_>, Vec<_>) = recs
-                    .into_iter()
-                    .partition(|rec| view.owns(PartId::of_key(rec.key.as_ref())));
+                let mut owned = Vec::with_capacity(recs.len());
+                let mut unowned = Vec::new();
+                let mut held_owned = 0;
+                for (i, rec) in recs.into_iter().enumerate() {
+                    if view.owns(PartId::of_key(rec.key.as_ref())) {
+                        held_owned += usize::from(i < held);
+                        owned.push(rec);
+                    } else {
+                        unowned.push(rec);
+                    }
+                }
                 let (redirected, dropped): (Vec<_>, Vec<_>) =
                     unowned.into_iter().partition(|rec| {
                         self.residency
@@ -299,9 +315,9 @@ where
                          not own"
                     );
                 }
-                owned
+                (owned, held_owned)
             }
-            None => recs,
+            None => (recs, held),
         }
     }
 
@@ -661,11 +677,22 @@ where
     }
 
     fn apply_remote_batch(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, ()> {
-        Box::pin(self.apply_inbound(recs, false))
+        Box::pin(self.apply_inbound(recs, false, 0))
     }
 
     fn apply_forwarded_batch(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, ()> {
-        Box::pin(self.apply_inbound(recs, true))
+        let held = recs.len();
+        Box::pin(self.apply_inbound(recs, true, held))
+    }
+
+    fn apply_forward_run(
+        &self,
+        mut held: Vec<WireRecord>,
+        kept: Vec<WireRecord>,
+    ) -> BoxFuture<'_, ()> {
+        let count = held.len();
+        held.extend(kept);
+        Box::pin(self.apply_inbound(held, true, count))
     }
 
     fn invalidate(&self, key: Bytes, ver: Hlc) -> BoxFuture<'_, ()> {

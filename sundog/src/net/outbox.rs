@@ -15,7 +15,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{Notify, Semaphore, SemaphorePermit, TryAcquireError, mpsc};
 
 use super::OutFrame;
 
@@ -150,23 +150,29 @@ impl<T: Weighed> DropOldestQueue<T> {
 pub(super) fn replicate_outbox(frames: usize, bytes: usize) -> (OutboxTx, OutboxRx) {
     let (tx, rx) = mpsc::channel(frames);
     let budget = bytes.clamp(1, Semaphore::MAX_PERMITS);
+    let bytes = Arc::new(Semaphore::new(budget));
     let taken = Arc::new(AtomicU64::new(0));
     (
         OutboxTx {
             tx,
-            bytes: Arc::new(Semaphore::new(budget)),
+            bytes: Arc::clone(&bytes),
             budget,
             taken: Arc::clone(&taken),
         },
-        OutboxRx { rx, taken },
+        OutboxRx {
+            rx,
+            bytes,
+            taken,
+            unsettled: (0, 0),
+        },
     )
 }
 
 /// A queued frame and the bytes it holds of its outbox's budget, given back
-/// when the writer takes the frame.
+/// once the writer takes the frame ([`OutboxRx::settle`]).
 struct Queued {
     frame: OutFrame,
-    _bytes: OwnedSemaphorePermit,
+    weight: usize,
 }
 
 /// The sending half of a [`replicate_outbox`].
@@ -183,16 +189,16 @@ pub(super) struct OutboxTx {
 /// until [`OutboxPermit::send`] queues the frame or the permit drops.
 pub(super) struct OutboxPermit<'a> {
     slot: mpsc::Permit<'a, Queued>,
-    bytes: OwnedSemaphorePermit,
+    bytes: SemaphorePermit<'a>,
 }
 
 impl OutboxPermit<'_> {
-    /// Queues `frame` in the slot and bytes this permit holds.
+    /// Queues `frame` in the slot and bytes this permit holds, which the
+    /// queued frame keeps until the writer settles it.
     pub(super) fn send(self, frame: OutFrame) {
-        self.slot.send(Queued {
-            frame,
-            _bytes: self.bytes,
-        });
+        let weight = self.bytes.num_permits();
+        self.bytes.forget();
+        self.slot.send(Queued { frame, weight });
     }
 }
 
@@ -215,9 +221,13 @@ impl OutboxTx {
     /// Takes a slot and `len` bytes, a frame's [`OutFrame::resident_bytes`],
     /// if both are free now.
     pub(super) fn try_reserve(&self, len: usize) -> Result<OutboxPermit<'_>, OutboxFull> {
-        let bytes = Arc::clone(&self.bytes)
-            .try_acquire_many_owned(self.weight(len))
-            .map_err(|_| OutboxFull::Full)?;
+        let bytes = self
+            .bytes
+            .try_acquire_many(self.weight(len))
+            .map_err(|err| match err {
+                TryAcquireError::NoPermits => OutboxFull::Full,
+                TryAcquireError::Closed => OutboxFull::Closed,
+            })?;
         match self.tx.try_reserve() {
             Ok(slot) => Ok(OutboxPermit { slot, bytes }),
             Err(mpsc::error::TrySendError::Full(())) => Err(OutboxFull::Full),
@@ -226,12 +236,19 @@ impl OutboxTx {
     }
 
     /// Waits for `len` bytes and then a slot. A dropped future holds
-    /// neither.
+    /// neither. Bytes free now are taken without waiting in line, which only
+    /// happens when no earlier frame waits for them.
     pub(super) async fn reserve(&self, len: usize) -> Result<OutboxPermit<'_>, OutboxFull> {
-        let bytes = Arc::clone(&self.bytes)
-            .acquire_many_owned(self.weight(len))
-            .await
-            .map_err(|_| OutboxFull::Closed)?;
+        let weight = self.weight(len);
+        let bytes = match self.bytes.try_acquire_many(weight) {
+            Ok(bytes) => bytes,
+            Err(TryAcquireError::Closed) => return Err(OutboxFull::Closed),
+            Err(TryAcquireError::NoPermits) => self
+                .bytes
+                .acquire_many(weight)
+                .await
+                .map_err(|_| OutboxFull::Closed)?,
+        };
         let slot = self.tx.reserve().await.map_err(|_| OutboxFull::Closed)?;
         Ok(OutboxPermit { slot, bytes })
     }
@@ -279,28 +296,55 @@ impl OutboxTx {
 }
 
 /// The receiving half of a [`replicate_outbox`]: taking a frame gives its
-/// bytes back. Dropping it drops the frames still queued, and their bytes
-/// with them.
+/// bytes back and counts it taken, at once or, for the frames of a burst
+/// ([`OutboxRx::take_more`]), once per burst ([`OutboxRx::settle`]).
+/// Dropping it drops the frames still queued and closes the outbox.
 pub(super) struct OutboxRx {
     rx: mpsc::Receiver<Queued>,
+    bytes: Arc<Semaphore>,
     taken: Arc<AtomicU64>,
+    /// The bytes and frames taken since the last [`OutboxRx::settle`].
+    unsettled: (usize, u64),
 }
 
 impl OutboxRx {
-    /// Waits for the next frame; `None` once every sender is gone.
+    /// Waits for the next frame and settles it; `None` once every sender is
+    /// gone.
     pub(super) async fn recv(&mut self) -> Option<OutFrame> {
         let queued = self.rx.recv().await?;
-        Some(self.take(queued))
+        let frame = self.take(queued);
+        self.settle();
+        Some(frame)
     }
 
-    /// The next frame, if one is queued.
+    /// The next frame, if one is queued, settled.
+    #[cfg(test)]
     pub(super) fn try_recv(&mut self) -> Result<OutFrame, mpsc::error::TryRecvError> {
-        self.rx.try_recv().map(|queued| self.take(queued))
+        let frame = self.rx.try_recv().map(|queued| self.take(queued))?;
+        self.settle();
+        Ok(frame)
     }
 
-    /// Counts `queued` taken and gives its bytes back.
-    fn take(&self, queued: Queued) -> OutFrame {
-        self.taken.fetch_add(1, Ordering::Relaxed);
+    /// The next frame, if one is queued, left for [`OutboxRx::settle`]: a
+    /// writer draining a burst settles its frames once, not one by one.
+    pub(super) fn take_more(&mut self) -> Option<OutFrame> {
+        self.rx.try_recv().ok().map(|queued| self.take(queued))
+    }
+
+    /// Gives back the bytes of the frames taken since the last settle and
+    /// counts them taken.
+    pub(super) fn settle(&mut self) {
+        let (bytes, frames) = std::mem::take(&mut self.unsettled);
+        if frames > 0 {
+            self.bytes.add_permits(bytes);
+            self.taken.fetch_add(frames, Ordering::Relaxed);
+        }
+    }
+
+    /// Takes `queued`, its bytes and its count left for the next settle.
+    fn take(&mut self, queued: Queued) -> OutFrame {
+        self.unsettled.0 += queued.weight;
+        self.unsettled.1 += 1;
         queued.frame
     }
 
@@ -308,6 +352,14 @@ impl OutboxRx {
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.rx.len()
+    }
+}
+
+impl Drop for OutboxRx {
+    /// Closes the byte budget, so a sender waiting for bytes learns the
+    /// writer is gone.
+    fn drop(&mut self) {
+        self.bytes.close();
     }
 }
 
@@ -414,18 +466,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_the_receiver_gives_the_bytes_back_and_closes_the_outbox() {
+    async fn dropping_the_receiver_closes_the_outbox_to_a_sender_waiting_for_bytes() {
         let len = frame_of(1_000).resident_bytes();
         let (tx, rx) = replicate_outbox(100, len);
         tx.try_send(frame_of(1_000)).expect("fits");
-        drop(rx);
-        assert_eq!(
-            tx.bytes_held(),
-            0,
-            "the dropped frames give their bytes back"
+        let waiting = tx.reserve(len);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut waiting)
+                .await
+                .is_err(),
+            "no bytes are free"
         );
+        drop(rx);
+        let woken = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("the waiting sender wakes once the receiver drops");
+        assert!(matches!(woken, Err(OutboxFull::Closed)));
         assert!(matches!(tx.reserve(len).await, Err(OutboxFull::Closed)));
         assert!(matches!(tx.try_reserve(len), Err(OutboxFull::Closed)));
+    }
+
+    /// The frames of a burst give their bytes back and count as taken once,
+    /// when the writer settles them, and not before.
+    #[test]
+    fn a_burst_settles_its_frames_bytes_and_count_at_once() {
+        let len = frame_of(1_000).resident_bytes();
+        let (tx, mut rx) = replicate_outbox(100, len * 3);
+        for _ in 0..3 {
+            tx.try_send(frame_of(1_000)).expect("fits");
+        }
+        assert!(rx.take_more().is_some());
+        assert!(rx.take_more().is_some());
+        assert_eq!(tx.bytes_held(), len * 3, "nothing settled yet");
+        assert_eq!(tx.taken(), 0);
+        rx.settle();
+        assert_eq!(tx.bytes_held(), len, "the burst's bytes come back at once");
+        assert_eq!(tx.taken(), 2);
+        rx.settle();
+        assert_eq!(tx.taken(), 2, "a settle with nothing taken changes nothing");
+        assert!(rx.take_more().is_some());
+        assert!(rx.take_more().is_none(), "the outbox is empty");
     }
 
     /// A test entry weighs its value in bytes.

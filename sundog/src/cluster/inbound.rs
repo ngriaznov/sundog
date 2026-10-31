@@ -35,8 +35,8 @@ struct PendingRun {
     forwarded: bool,
     recs: Vec<WireRecord>,
     /// The records of a forward run whose writer kept a copy (see
-    /// [`writer_kept`]), which the shard applies through
-    /// [`ShardOps::apply_remote_batch`]. Empty for a replicate run.
+    /// [`writer_kept`]), which the shard applies as
+    /// [`ShardOps::apply_remote_batch`] does. Empty for a replicate run.
     kept: Vec<WireRecord>,
 }
 
@@ -54,9 +54,9 @@ pub(super) fn same_run(
     })
 }
 
-/// Applies one accumulated run under one `apply_remote_batch` call, or, for
-/// a run of forwards, its kept records under one `apply_remote_batch` call
-/// and the rest under one `apply_forwarded_batch` call. `shard_cache`
+/// Applies one accumulated run under one `apply_remote_batch` call, or one
+/// `apply_forward_run` call for a run of forwards, its kept and held records
+/// together. `shard_cache`
 /// memoizes the lookup per drained batch, so a cache name costs at most one
 /// lock acquisition.
 async fn apply_pending_run(
@@ -74,15 +74,10 @@ async fn apply_pending_run(
         .entry(cache.clone())
         .or_insert_with(|| lookup_shard(shards, &cache));
     if let Some(shard) = shard {
-        if !forwarded {
+        if forwarded {
+            shard.apply_forward_run(recs, kept).await;
+        } else {
             shard.apply_remote_batch(recs).await;
-            return;
-        }
-        if !kept.is_empty() {
-            shard.apply_remote_batch(kept).await;
-        }
-        if !recs.is_empty() {
-            shard.apply_forwarded_batch(recs).await;
         }
     } else {
         tracing::trace!(%cache, "replicate batch for unknown cache; dropped");
@@ -183,10 +178,9 @@ fn burst_shard<'a>(
 /// shard, dropping a message for an unregistered cache with a trace event.
 /// Drains a bounded batch per wake with `recv_many`, so a run of same-cache
 /// messages coalesces into one `apply_remote_batch` call, and a run of
-/// `ForwardBatch` messages into one `apply_forwarded_batch` call, which holds a
-/// record the shard refuses for clock skew instead of dropping it, plus one
-/// `apply_remote_batch` call for the records whose writer kept a copy (see
-/// [`writer_kept`]). A `ForwardBatch`
+/// `ForwardBatch` messages into one `apply_forward_run` call, which holds a
+/// record the shard refuses for clock skew instead of dropping it, unless
+/// its writer kept a copy (see [`writer_kept`]). A `ForwardBatch`
 /// under a stale view hash is handed to the [`Reforwarder`], which sends it
 /// on to its records' current owners from a lane per peer, then applied like
 /// any other: the loop waits on no socket, so a peer that stops reading

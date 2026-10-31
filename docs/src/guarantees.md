@@ -236,7 +236,8 @@ collected, and those raise the counter without losing a delete.
   queue for as long as the owner is slow to read, and `remove` has returned by
   then. A forward that reaches the owner more than `tombstone_ttl` after its
   stamp is ignored there. It also logs a warning, at most once a minute, since
-  the delete is lost.
+  the delete is lost, as does an owner's own delete that reaches a co-owner
+  that late.
 
 The tombstone an expired entry leaves in `Replicated` and `Distributed` under
 a non-merging resolver follows the same rules, counted from the entry's expiry

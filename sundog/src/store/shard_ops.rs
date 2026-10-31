@@ -105,6 +105,22 @@ pub trait ShardOps: Send + Sync {
         self.apply_remote_batch(recs)
     }
 
+    /// A run of `ForwardBatch` records in one call: `held`, whose writer may
+    /// have kept no copy, applied as [`ShardOps::apply_forwarded_batch`]
+    /// applies them, and `kept`, whose writer kept them, as
+    /// [`ShardOps::apply_remote_batch`] does, a refusal dropping the record.
+    /// Default: those two calls.
+    fn apply_forward_run(&self, held: Vec<WireRecord>, kept: Vec<WireRecord>) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            if !kept.is_empty() {
+                self.apply_remote_batch(kept).await;
+            }
+            if !held.is_empty() {
+                self.apply_forwarded_batch(held).await;
+            }
+        })
+    }
+
     /// Drops the local copy of `key` iff `ver` is newer than the locally stored
     /// version. Not routed through [`ConflictResolver`]: an invalidation
     /// carries no value, so `Hlc` order is the only signal.

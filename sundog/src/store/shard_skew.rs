@@ -171,7 +171,8 @@ where
             owned
         };
         if !owned.is_empty() {
-            self.apply_inbound(owned, true).await;
+            let held = owned.len();
+            self.apply_inbound(owned, true, held).await;
         }
     }
 

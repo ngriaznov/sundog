@@ -307,9 +307,10 @@ pub(super) mod logged {
         assert_eq!(ignored_since_last_read(&snapshotter), 1);
         assert!(warnings.taken().is_empty(), "rate limited");
 
-        // After the spacing it warns again. The clock steps a gc period at a
-        // time with a collection at each, as the gc task would: a node that
-        // collects that often is not paused.
+        // After the spacing it warns again, for a forward its writer kept
+        // too. The clock steps a gc period at a time with a collection at
+        // each, as the gc task would: a node that collects that often is not
+        // paused.
         let mut at = START_MS;
         while at < START_MS + IGNORED_FORWARD_WARN_SPACING_MS {
             at += 15_000;
@@ -317,7 +318,7 @@ pub(super) mod logged {
             ShardOps::gc_tombstones(&s, false).await;
         }
         assert_eq!(at, START_MS + IGNORED_FORWARD_WARN_SPACING_MS);
-        ShardOps::apply_forwarded_batch(&s, vec![delete_record(2, lapsed)]).await;
+        ShardOps::apply_forward_run(&s, Vec::new(), vec![delete_record(2, lapsed)]).await;
         assert_eq!(ignored_since_last_read(&snapshotter), 1);
         assert_eq!(warnings.taken().len(), 1);
     }

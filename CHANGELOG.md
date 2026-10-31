@@ -16,6 +16,11 @@ All notable changes to this project are documented in this file. Format follows
   replicate outbox and, apart from it, its invalidate queue, queued frames
   counted encoded and decoded, 64 MiB by default, alongside
   `outbox_capacity`'s bound in frames.
+- **`ShardOps::apply_forward_run`.** Applies a run of `ForwardBatch` records
+  in one call: those whose writer may have kept no copy as
+  `apply_forwarded_batch` applies them, a record refused for clock skew
+  held, and those whose writer kept them as `apply_remote_batch` does. The
+  default makes those two calls.
 - **`ClusterConfig::fan_out_stall_timeout`.** How long a `Distributed` fan-out
   batch waits on an owner that stays live but whose outbox takes nothing, 10
   seconds by default. `sundog_fan_out_stalls_total` counts each owner that
