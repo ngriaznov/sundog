@@ -7,8 +7,16 @@ use super::*;
 /// the key and still reads it.
 #[tokio::test]
 async fn both_owners_leaving_gracefully_hand_the_key_to_the_remaining_node() {
-    let ((a, cache_a), (b, cache_b), (c, _cache_c), unowned_key) =
-        three_node_distributed("cache-it-graceful-hand-off", "prices").await;
+    // The default failure detector backs up each departure: a node whose
+    // runtime stalls through its departure notice still leaves the others'
+    // views once it goes quiet.
+    let ((a, cache_a), (b, cache_b), (c, _cache_c), unowned_key) = three_node_distributed_on(
+        "cache-it-graceful-hand-off",
+        "prices",
+        loopback_config(),
+        loopback_config(),
+    )
+    .await;
     cache_b
         .insert(unowned_key, "value".to_string())
         .await

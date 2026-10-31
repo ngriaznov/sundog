@@ -681,8 +681,13 @@ async fn fetch_returns_fetch_unavailable_when_every_owner_is_down() {
         phi_threshold: 1_000.0,
         ..loopback_config()
     };
-    let ((a, cache_a), (b, cache_b), (c, _cache_c), unowned_key) =
-        three_node_distributed_with_a("cache-it-fetch-unavailable", "prices", a_config).await;
+    let ((a, cache_a), (b, cache_b), (c, _cache_c), unowned_key) = three_node_distributed_on(
+        "cache-it-fetch-unavailable",
+        "prices",
+        a_config,
+        steady_config(),
+    )
+    .await;
     cache_b
         .insert(unowned_key, "value".to_string())
         .await

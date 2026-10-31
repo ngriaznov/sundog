@@ -156,14 +156,28 @@ async fn a_distributed_owner_tells_the_co_owner_of_a_zero_ttl_rearm() {
 /// A write the owner's fan-out finds gone reaches the other owner through the
 /// awaiting path: `b` wrote the key, its entry left before the drain, and
 /// `c` still holds the older value. The drain is driven by hand so the entry
-/// is gone when it reads the written view.
+/// is gone when it reads the written view. Anti-entropy is effectively off:
+/// until `c` takes the invalidation, `b` holds nothing for the key and `c`
+/// the older value, which a round between the two would carry back onto
+/// `b`. Rounds run by hand once `c` has dropped it.
 #[tokio::test]
 async fn a_distributed_owner_invalidates_the_co_owner_of_a_departed_write() {
+    use crate::cluster::anti_entropy::{RoundOutcome, run_round_against};
     use crate::cluster::fan_out::fan_out_batch;
+    use crate::cluster::test_support::registered_shard;
     use crate::store::{FanOutItem, ShardOps};
 
-    let ((a, _cache_a), (b, cache_b), (c, cache_c), key) =
-        three_node_distributed("cache-it-fan-out-distributed-departed", "prices").await;
+    let config = steady_config().with(|c| {
+        c.ae_interval = Duration::from_secs(3600);
+        c.tombstone_ttl = c.bucket_release_window();
+    });
+    let ((a, _cache_a), (b, cache_b), (c, cache_c), key) = three_node_distributed_on(
+        "cache-it-fan-out-distributed-departed",
+        "prices",
+        config.clone(),
+        config,
+    )
+    .await;
     cache_b.insert(key, "old".into()).await.expect("insert");
     wait_until(
         Duration::from_secs(10),
@@ -177,11 +191,16 @@ async fn a_distributed_owner_invalidates_the_co_owner_of_a_departed_write() {
         wall_ms: stored[0].ver.wall_ms + 5,
         ..stored[0].ver
     };
-    // The write the drain is about to send is gone from `b`: a release or a
-    // sweep would leave the same, and no record of it remains to ship.
+    // The write the drain is about to send is gone from `b`: a release, an
+    // idle drop or an unreadable spill would leave the same, and no record of
+    // it remains to ship.
     ShardOps::invalidate(&*cache_b.shard, key_bytes, written).await;
     assert_eq!(cache_b.get(&key).await, None, "b's entry is gone");
     assert_eq!(cache_c.get(&key).await.as_deref(), Some("old"));
+    assert!(
+        cache_b.owners_of(&key).contains(&c.node_id()),
+        "b's view names c an owner of the key"
+    );
 
     fan_out_batch(
         &cache_b.shard,
@@ -198,12 +217,23 @@ async fn a_distributed_owner_invalidates_the_co_owner_of_a_departed_write() {
         async || cache_c.get(&key).await.is_none(),
     )
     .await;
-    let deadline = tokio::time::Instant::now() + SETTLE;
-    while tokio::time::Instant::now() < deadline {
-        assert_eq!(cache_b.get(&key).await, None, "b read the old value again");
-        assert_eq!(cache_c.get(&key).await, None, "c read the old value again");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    // Neither owner kept the older value, so a round each way between the
+    // two carries nothing back.
+    let name = SmolStr::new("prices");
+    for (from, to) in [(&b, &c), (&c, &b)] {
+        let shard = registered_shard(from, &name);
+        wait_until(
+            CONVERGE,
+            "a round between the owners reconciles",
+            async || {
+                run_round_against(from.mesh(), &shard, &name, to.node_id()).await
+                    == RoundOutcome::Reconciled
+            },
+        )
+        .await;
     }
+    assert_eq!(cache_b.get(&key).await, None, "b read the old value again");
+    assert_eq!(cache_c.get(&key).await, None, "c read the old value again");
 
     c.shutdown().await;
     b.shutdown().await;

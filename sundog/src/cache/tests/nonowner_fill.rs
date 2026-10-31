@@ -38,9 +38,9 @@ async fn three_nodes_loading_on_the_first(
         .await
         .expect("a opens");
     let seed = a.local_gossip_addr();
-    let (b, _cache_b) = join_distributed(seed, name, name, 1).await;
+    let (b, _cache_b) = join_distributed(seed, name, name, 1, loopback_config()).await;
     wait_for_peer_count(&a, 1).await;
-    let (c, _cache_c) = join_distributed(seed, name, name, 2).await;
+    let (c, _cache_c) = join_distributed(seed, name, name, 2, loopback_config()).await;
     wait_for_peer_count(&a, 2).await;
     let key = tokio::time::timeout(Duration::from_secs(15), async {
         loop {

@@ -21,7 +21,7 @@ async fn owners_that_take_nothing(
         ..loopback_config()
     };
     let ((a, cache_a), (b, _cache_b), (c, _cache_c), key) =
-        three_node_distributed_with_a(name, "prices", a_config).await;
+        three_node_distributed_on(name, "prices", a_config, steady_config()).await;
     let owners = [b.node_id(), c.node_id()];
     tokio::join!(b.crash(), c.crash());
     // An outbox that refuses a frame, and still refuses one after its

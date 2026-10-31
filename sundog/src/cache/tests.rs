@@ -67,6 +67,14 @@ fn loopback_config() -> ClusterConfig {
     }
 }
 
+/// [`loopback_config`] whose failure detector never marks down a peer too
+/// busy to gossip. A test's nodes share its runtime, so on a busy runner
+/// one goes seconds without gossiping, and a peer marked down and back
+/// moves the ownership views mid-test.
+fn steady_config() -> ClusterConfig {
+    loopback_config().with(|c| c.phi_threshold = 1_000.0)
+}
+
 async fn wait_for_peer_count(cluster: &Cluster, expected: usize) {
     wait_until(
         Duration::from_secs(15),
@@ -95,17 +103,18 @@ fn test_record(key: u32, value: &str, node: NodeId) -> WireRecord {
 /// Joins a fresh node onto `cluster_name`'s chitchat cluster (three
 /// nodes total once this and the seed and a later joiner are all up, so
 /// `owners = 2` leaves each bucket owned by exactly two of the three,
-/// and every node fails to own a real share of buckets) and opens
-/// `cache_name` as `Mode::distributed()`, two owners, on it.
+/// and every node fails to own a real share of buckets) under `config`
+/// and opens `cache_name` as `Mode::distributed()`, two owners, on it.
 async fn join_distributed(
     seed_addr: SocketAddr,
     cluster_name: &'static str,
     cache_name: &'static str,
     peer_count: usize,
+    config: ClusterConfig,
 ) -> (Cluster, Cache<u32, String>) {
     let cluster = Cluster::builder(cluster_name)
         .seeds([seed_addr])
-        .config(loopback_config())
+        .config(config)
         .build()
         .await
         .expect("node builds");
@@ -125,7 +134,9 @@ async fn join_distributed(
 
 /// A three-node `Mode::Distributed { owners: 2 }` cluster, all open on
 /// `cache_name`, plus a key whose bucket the first node does not own
-/// (its live owners are exactly the second and third nodes).
+/// (its live owners are exactly the second and third nodes). Returns once
+/// every node's ownership view ranks all three, so each names the same
+/// owners for every key. Every node runs on [`steady_config`].
 async fn three_node_distributed(
     cluster_name: &'static str,
     cache_name: &'static str,
@@ -135,14 +146,16 @@ async fn three_node_distributed(
     (Cluster, Cache<u32, String>),
     u32,
 ) {
-    three_node_distributed_with_a(cluster_name, cache_name, loopback_config()).await
+    three_node_distributed_on(cluster_name, cache_name, steady_config(), steady_config()).await
 }
 
-/// [`three_node_distributed`] with the first node built on `a_config`.
-async fn three_node_distributed_with_a(
+/// [`three_node_distributed`] with the first node built on `a_config` and
+/// the other two on `peer_config`.
+async fn three_node_distributed_on(
     cluster_name: &'static str,
     cache_name: &'static str,
     a_config: ClusterConfig,
+    peer_config: ClusterConfig,
 ) -> (
     (Cluster, Cache<u32, String>),
     (Cluster, Cache<u32, String>),
@@ -165,9 +178,10 @@ async fn three_node_distributed_with_a(
         .expect("a opens alone, owning everything");
     let seed = a.local_gossip_addr();
 
-    let (b, cache_b) = join_distributed(seed, cluster_name, cache_name, 1).await;
+    let (b, cache_b) =
+        join_distributed(seed, cluster_name, cache_name, 1, peer_config.clone()).await;
     wait_for_peer_count(&a, 1).await;
-    let (c, cache_c) = join_distributed(seed, cluster_name, cache_name, 2).await;
+    let (c, cache_c) = join_distributed(seed, cluster_name, cache_name, 2, peer_config).await;
     wait_for_peer_count(&a, 2).await;
     wait_for_peer_count(&b, 2).await;
 
@@ -190,6 +204,21 @@ async fn three_node_distributed_with_a(
     })
     .await
     .expect("a's ownership view converges to include b and c within the bound");
+    // Each node rebuilds its view in its own task from the cache-mode
+    // adverts it has seen, so `a`'s view says nothing of the others'.
+    wait_until(
+        CONVERGE,
+        "every node's ownership view ranks every node",
+        async || {
+            [&cache_a, &cache_b, &cache_c].iter().all(|cache| {
+                cache
+                    .shard
+                    .ownership_view()
+                    .is_some_and(|view| view.eligible().len() == 3)
+            })
+        },
+    )
+    .await;
 
     ((a, cache_a), (b, cache_b), (c, cache_c), unowned_key)
 }
