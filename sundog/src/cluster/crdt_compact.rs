@@ -773,13 +773,20 @@ mod tests {
         absence.observe(&HashMap::new());
         tokio::time::sleep(retire_after + Duration::from_millis(20)).await;
 
+        // A receipt lifetime of a minute: a tick that runs past three
+        // bounds after the observation, as a busy runner's can, would
+        // otherwise forget the writer's node as gone too long and find the
+        // writer for the first time.
         let (retired, compacted) = crdt_compact_tick(
             shard.as_ref(),
             &name,
             &cluster,
             &absence,
             &UnseenWriters::default(),
-            three_bounds(retire_after),
+            CompactionBounds {
+                receipt_ttl_ms: 60_000,
+                ..three_bounds(retire_after)
+            },
         )
         .await;
         assert_eq!(retired, vec![dead_writer]);
@@ -932,14 +939,19 @@ mod tests {
 
         // Stage one: with no other known members the cache is vacuously
         // quiet, so the dead writer's live slot moves into its own retired
-        // entry the moment it's found dead.
+        // entry the moment it's found dead. A receipt lifetime of a minute
+        // keeps a tick a busy runner delays past three bounds from
+        // forgetting the writer's node as gone too long.
         let (retired, compacted) = crdt_compact_tick(
             shard.as_ref(),
             &name,
             &cluster,
             &absence,
             &UnseenWriters::default(),
-            three_bounds(retire_after),
+            CompactionBounds {
+                receipt_ttl_ms: 60_000,
+                ..three_bounds(retire_after)
+            },
         )
         .await;
         assert_eq!(retired, vec![dead_writer]);
