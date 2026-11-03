@@ -530,6 +530,101 @@ impl Default for ClusterConfig {
 mod tests {
     use super::*;
 
+    /// [`ClusterConfig`] fields documented outside `docs/src/tuning.md`, with
+    /// where.
+    const DOCUMENTED_ELSEWHERE: &[(&str, &str)] = &[("tls", "deployment.md, Mutual TLS")];
+
+    /// The fields `{:#?}` prints for `config`: the lines indented by exactly
+    /// four spaces.
+    fn debug_field_names(config: &ClusterConfig) -> Vec<String> {
+        format!("{config:#?}")
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("    ")?;
+                let (name, _) = rest.split_once(':')?;
+                name.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                    .then(|| name.to_owned())
+            })
+            .collect()
+    }
+
+    /// The backticked first cells of `tuning`'s `| Field | Default | Change
+    /// it when |` tables.
+    fn tuning_rows(tuning: &str) -> Vec<String> {
+        let mut rows = Vec::new();
+        let mut in_table = false;
+        for line in tuning.lines() {
+            if line.starts_with("| Field | Default | Change it when |") {
+                in_table = true;
+                continue;
+            }
+            if !line.starts_with('|') {
+                in_table = false;
+                continue;
+            }
+            let cell = line.split('|').nth(1).unwrap_or_default().trim();
+            if let Some(name) = cell.strip_prefix('`').and_then(|c| c.strip_suffix('`'))
+                && in_table
+            {
+                rows.push(name.to_owned());
+            }
+        }
+        rows
+    }
+
+    /// `docs/src/tuning.md` has one row for every [`ClusterConfig`] field and
+    /// none for a field that does not exist, so a field added, renamed or
+    /// removed fails here until the page follows.
+    #[test]
+    fn tuning_md_lists_every_cluster_config_field_once() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/src/tuning.md");
+        let tuning = std::fs::read_to_string(&path).expect("docs/src/tuning.md reads");
+        let fields = debug_field_names(&ClusterConfig::default());
+        let rows = tuning_rows(&tuning);
+        let elsewhere = |field: &str| DOCUMENTED_ELSEWHERE.iter().any(|(name, _)| *name == field);
+        let missing: Vec<&String> = fields
+            .iter()
+            .filter(|field| !rows.contains(field) && !elsewhere(field))
+            .collect();
+        let repeated: std::collections::BTreeSet<&String> = rows
+            .iter()
+            .filter(|row| rows.iter().filter(|other| other == row).count() > 1)
+            .collect();
+        let stray: Vec<&String> = rows.iter().filter(|row| !fields.contains(row)).collect();
+        assert!(
+            missing.is_empty() && repeated.is_empty() && stray.is_empty(),
+            "docs/src/tuning.md and ClusterConfig disagree: fields with no row {missing:?}, \
+             rows given more than once {repeated:?}, rows for no field {stray:?}"
+        );
+    }
+
+    #[test]
+    fn the_tuning_check_reads_fields_and_table_rows() {
+        let fields = debug_field_names(&ClusterConfig::default());
+        for field in ["ae_interval", "gossip_bind_addr", "reconcile_byte_budget"] {
+            assert!(
+                fields.iter().any(|name| name == field),
+                "{field} in {fields:?}"
+            );
+        }
+        assert!(
+            !fields.iter().any(|name| name.contains(' ')),
+            "no nested line reads as a field: {fields:?}"
+        );
+        let tuning = "\
+| Field | Default | Change it when |
+|---|---|---|
+| `a` | 1 | x |
+| `b` | 2 | y |
+
+| Name | Default | Change it when |
+|---|---|---|
+| `c` | 3 | z |
+";
+        assert_eq!(tuning_rows(tuning), ["a", "b"]);
+    }
+
     #[test]
     fn defaults_satisfy_the_tombstone_ttl_rule() {
         assert!(ClusterConfig::default().tombstone_ttl_is_safe());

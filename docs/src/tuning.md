@@ -31,7 +31,9 @@ Cache-level settings, `mode`, `max_capacity`, `max_resident_bytes`, `ttl`,
 | `phi_threshold` | 6.0 | peers flap between live and dead under jitter; raise it to detect failures later and more surely |
 | `phi_initial_interval` | 500 ms | the first heartbeats arrive slower than this |
 | `phi_max_interval` | 5 s | never, unless heartbeats legitimately pause longer |
+| `phi_sampling_window_size` | 1,000 heartbeats | heartbeat intervals shift and the detector should follow the shift sooner, from fewer samples, or smooth over more of them |
 | `dead_node_grace_period` | 10 min | a departed node's id should be forgotten sooner or later |
+| `kv_tombstone_grace_period` | 15 min | deleted gossip keys, such as a closed cache's advertisement, should leave the gossiped state sooner or later; a peer that missed a deletion older than this pulls that node's whole state again. These are chitchat's key tombstones, not a cache's |
 
 ## Replication and repair
 
@@ -40,6 +42,7 @@ Cache-level settings, `mode`, `max_capacity`, `max_resident_bytes`, `ttl`,
 | `ae_interval` | 30 s | repairs after message loss must land faster; each round costs one digest exchange per open cache |
 | `max_clock_skew` | 1 min | node clocks drift further apart than this in normal running; `None` accepts any stamp, and one fast clock then wins every conflict, pulls every other clock forward and leaves a tombstone stamped ahead of a slow clock alive for the stamp's whole lead; a `Distributed` owner holds a forward stamped past it until its own clock catches up |
 | `state_transfer_budget` | 20 s | a joining node's snapshot takes longer to pull; `open` waits this long before opening with a partial copy that anti-entropy completes; a `Distributed` cache on a fixed seed list also waits up to 5 s of it for a first peer before it computes ownership; a graceful `Cluster::shutdown` of a `Distributed` node spends up to this long reconciling with its live co-owners, each getting an equal share, before it leaves |
+| `reconcile_byte_budget` | 32 MiB | a warm reopen's reconciliation with each peer should move more or fewer bytes before that peer's still-diverging buckets fall back to a cold pull |
 | `fan_out_backlog_capacity` | 262,144 keys | write bursts outrun the network for longer than the backlog absorbs |
 | `fan_out_wait_timeout` | 30 s | a writer waiting for backlog room should give up sooner and write over capacity |
 | `fan_out_stall_timeout` | 10 s | a `Distributed` owner that stays live in gossip but whose outbox takes nothing should hold up a fan-out batch for a shorter or longer time before its frames are dropped and anti-entropy is left to repair it; a forwarded write no owner took by then is lost, as is a departed write's invalidation it missed. An owner that keeps taking frames is waited on, down to 1 MiB read per timeout, the most its writer takes from the outbox at a time. `Duration::MAX` waits for as long as the owner stays live |
