@@ -14,7 +14,12 @@ use crate::node::NodeId;
 pub enum CodecError {
     /// The frame exceeded [`crate::wire::MAX_FRAME`].
     #[error("frame of {size} bytes exceeds the {limit}-byte cap")]
-    FrameTooLarge { size: usize, limit: usize },
+    FrameTooLarge {
+        /// The frame size in bytes.
+        size: usize,
+        /// The cap in bytes.
+        limit: usize,
+    },
     /// postcard failed to serialize or deserialize a value.
     #[error("postcard codec error")]
     Postcard(#[from] postcard::Error),
@@ -103,6 +108,7 @@ pub enum CacheError {
     /// membership view and logs whatever this check missed.
     #[error("cache {cache:?} mode mismatch: local {local:?}, cluster has {remote:?}")]
     ModeMismatch {
+        /// The cache's name.
         cache: SmolStr,
         /// The mode requested locally.
         local: crate::store::Mode,
@@ -116,23 +122,34 @@ pub enum CacheError {
     #[error(
         "cache {cache:?} combines Mode::Replicated with a finite max_capacity or tti, which anti-entropy would silently defeat"
     )]
-    ReplicatedWithLocalEviction { cache: SmolStr },
+    ReplicatedWithLocalEviction {
+        /// The cache's name.
+        cache: SmolStr,
+    },
     /// The named cache is already open in this process. The registry is
     /// type-erased, so a second `open()` is always rejected, even when the
     /// key/value types match.
     #[error("cache {cache:?} is already open in this process")]
-    AlreadyOpen { cache: SmolStr },
+    AlreadyOpen {
+        /// The cache's name.
+        cache: SmolStr,
+    },
     /// A read-through loader returned an error.
     #[error("read-through loader failed")]
     Loader(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
     /// `load` or `load_many` ran on a cache with no registered loader.
     #[error("cache {cache:?} has no loader")]
-    NoLoader { cache: SmolStr },
+    NoLoader {
+        /// The cache's name.
+        cache: SmolStr,
+    },
     /// The builder's loading options do not fit together, such as a batch
     /// window with no loader.
     #[error("cache {cache:?} has an invalid load config: {reason}")]
     InvalidLoadConfig {
+        /// The cache's name.
         cache: SmolStr,
+        /// Why the load config is rejected.
         reason: &'static str,
     },
     /// Encoding or decoding a key or value for the wire failed.
@@ -141,7 +158,9 @@ pub enum CacheError {
     /// State transfer for a newly opened cache failed.
     #[error("state transfer from donor {donor} failed")]
     StateTransfer {
+        /// The node the transfer pulled from.
         donor: NodeId,
+        /// The underlying failure.
         #[source]
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
@@ -151,6 +170,7 @@ pub enum CacheError {
     #[cfg(feature = "spill")]
     #[error("cache {cache:?} has an invalid spill config: {reason}")]
     InvalidSpillConfig {
+        /// The cache's name.
         cache: SmolStr,
         /// Why the config is rejected.
         reason: &'static str,
@@ -160,7 +180,9 @@ pub enum CacheError {
     #[cfg(feature = "spill")]
     #[error("cache {cache:?} could not open its spill directory")]
     SpillUnavailable {
+        /// The cache's name.
         cache: SmolStr,
+        /// The underlying I/O failure.
         #[source]
         source: io::Error,
     },
@@ -169,7 +191,9 @@ pub enum CacheError {
     /// leaves.
     #[error("cache {cache:?} distributed mode needs at least 2 owners, got {owners}")]
     TooFewOwners {
+        /// The cache's name.
         cache: SmolStr,
+        /// The requested owner count.
         owners: std::num::NonZeroU8,
     },
     /// The cache was opened as [`crate::store::Mode::Distributed`] under a
@@ -182,8 +206,11 @@ pub enum CacheError {
         "cache {cache:?} distributed mode needs tombstone_ttl ({tombstone_ttl:?}) to cover the bucket release window of {window:?} (ae_interval x (2 x distributed_disown_grace_rounds + 2))"
     )]
     TombstoneTtlInsideReleaseWindow {
+        /// The cache's name.
         cache: SmolStr,
+        /// The configured tombstone TTL.
         tombstone_ttl: Duration,
+        /// The bucket release window the TTL must cover.
         window: Duration,
     },
     /// A `Cache::fetch` on a [`crate::store::Mode::Distributed`] cache found
@@ -191,7 +218,10 @@ pub enum CacheError {
     /// [`crate::config::ClusterConfig::fetch_timeout`], across every
     /// candidate. Distinct from a genuine miss, which returns `Ok(None)`.
     #[error("cache {cache:?} found no reachable owner for the requested key")]
-    FetchUnavailable { cache: SmolStr },
+    FetchUnavailable {
+        /// The cache's name.
+        cache: SmolStr,
+    },
     /// The cache is closing, or its cluster is shutting down, and the write
     /// is for a `Mode::Distributed` bucket this node does not own: it has
     /// no local copy to land in, so it is refused rather than accepted
@@ -199,7 +229,10 @@ pub enum CacheError {
     /// A write this node applies itself still succeeds, as a detached
     /// local write.
     #[error("cache {cache:?} is closing; the forwarded write was refused")]
-    Closed { cache: SmolStr },
+    Closed {
+        /// The cache's name.
+        cache: SmolStr,
+    },
     /// [`crate::cache::CacheBuilder::merge_coalesce_window`] is set to a
     /// nonzero window on a cache whose [`crate::store::ConflictResolver`]
     /// does not merge ([`crate::store::ConflictResolver::merges`] is
@@ -207,7 +240,10 @@ pub enum CacheError {
     /// into one record only preserves every fold if the resolver can fold
     /// two values, not only pick a side.
     #[error("cache {cache:?} set a merge coalesce window but its resolver does not merge")]
-    MergeWindowRequiresMergingResolver { cache: SmolStr },
+    MergeWindowRequiresMergingResolver {
+        /// The cache's name.
+        cache: SmolStr,
+    },
 }
 
 /// A loader on another node failed while loading for this one. A

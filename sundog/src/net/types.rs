@@ -35,6 +35,7 @@ pub enum MsgClass {
 pub struct InboundMsg {
     /// The peer that sent `msg`.
     pub from: NodeId,
+    /// The decoded message.
     pub msg: Msg,
 }
 
@@ -78,14 +79,20 @@ impl AeMismatch {
 pub enum AePartReply {
     /// The part's full `(key, version)` listing.
     Listing {
+        /// The bucket the part belongs to.
         bucket: u16,
+        /// The part within `bucket`, `0..PART_COUNT`.
         part: u8,
+        /// The part's `(key, version)` pairs.
         entries: Vec<KeyVersion>,
     },
     /// An IBLT sketch over the part.
     Sketch {
+        /// The bucket the part belongs to.
         bucket: u16,
+        /// The part within `bucket`, `0..PART_COUNT`.
         part: u8,
+        /// The IBLT cells over the part.
         cells: Vec<Cell>,
     },
 }

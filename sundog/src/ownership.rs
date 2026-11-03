@@ -768,6 +768,8 @@ impl Default for ResidencySet {
 }
 
 impl ResidencySet {
+    /// An empty set: no part releasing, cold, unverified or stale, and no
+    /// settled view.
     #[must_use]
     pub fn new() -> Self {
         Self {

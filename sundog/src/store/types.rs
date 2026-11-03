@@ -156,11 +156,30 @@ pub enum Origin {
 #[derive(Debug, Clone)]
 pub enum Event<K, V> {
     /// A key is inserted where none existed before.
-    Created { key: K, value: V, origin: Origin },
+    Created {
+        /// The inserted key.
+        key: K,
+        /// The inserted value.
+        value: V,
+        /// Who caused the insert.
+        origin: Origin,
+    },
     /// An existing key's value changes.
-    Updated { key: K, value: V, origin: Origin },
+    Updated {
+        /// The updated key.
+        key: K,
+        /// The new value.
+        value: V,
+        /// Who caused the update.
+        origin: Origin,
+    },
     /// A key is removed; a tombstone is applied.
-    Removed { key: K, origin: Origin },
+    Removed {
+        /// The removed key.
+        key: K,
+        /// Who caused the removal.
+        origin: Origin,
+    },
 }
 
 /// A second-level anti-entropy part: a bucket and one of its
