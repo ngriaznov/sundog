@@ -1,6 +1,6 @@
 //! Tests for the decoded-sketch diff, the part-mismatch scan and the bucket and part settlement rules.
 
-use crate::cluster::sketch::Elem;
+use crate::sketch::Elem;
 
 use super::*;
 

@@ -212,7 +212,7 @@ fn listing_or_sketch_answers_a_small_bucket_of_long_keys_with_a_sketch() {
     else {
         panic!("a listing past half a frame goes out as a sketch");
     };
-    let mut expected = crate::cluster::sketch::Iblt::new(6);
+    let mut expected = crate::sketch::Iblt::new(6);
     for kv in &long {
         expected.insert(xxhash_rust::xxh3::xxh3_64(&kv.key), kv.version);
     }

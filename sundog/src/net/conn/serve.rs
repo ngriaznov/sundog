@@ -10,8 +10,9 @@ use tokio_util::sync::CancellationToken;
 use super::framing::{
     PeerFramed, key_versions_to_wire, recv_msg, send_batch_or_cancelled, send_or_cancelled,
 };
-use crate::net::{AeServeOutcome, LoadServe, MeshInner, RequestHandler};
+use crate::net::{AeServeOutcome, MeshInner, RequestHandler};
 use crate::node::NodeId;
+use crate::store::LoadServe;
 use crate::store::{BucketDigest, BucketEntries, BucketPart, BucketPartDigests, KeyVersion};
 use crate::wire::{self, AE_ENTRY_MAX_WIRE_LEN, MAX_FRAME, Msg, WireRecord};
 
@@ -688,7 +689,7 @@ pub(super) fn listing_or_sketch(
     sketch_cells: usize,
 ) -> ListingOrSketch {
     if entries.len() > min_bucket || !listing_fits(&entries, AE_LISTING_BUDGET) {
-        let mut iblt = crate::cluster::sketch::Iblt::new(sketch_cells);
+        let mut iblt = crate::sketch::Iblt::new(sketch_cells);
         for kv in &entries {
             iblt.insert(xxhash_rust::xxh3::xxh3_64(&kv.key), kv.version);
         }

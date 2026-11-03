@@ -18,7 +18,6 @@ pub(crate) mod fan_out;
 mod handler;
 mod inbound;
 pub(crate) mod rebalance;
-pub(crate) mod sketch;
 pub(crate) mod state_transfer;
 #[cfg(all(test, not(feature = "sim")))]
 pub(crate) mod test_support;

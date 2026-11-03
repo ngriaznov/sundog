@@ -179,30 +179,15 @@ pub(crate) enum FetchServe {
     Unavailable,
 }
 
-/// A [`RequestHandler`]'s answer to a [`crate::wire::Msg::Load`].
-pub(crate) enum LoadServe {
-    /// The record stored for each requested key the responder or its
-    /// source holds, and each value it loaded without storing.
-    Loaded {
-        found: Vec<WireRecord>,
-        uncached: Vec<(Bytes, Bytes)>,
-    },
-    /// The responder's loader failed, with the error's message.
-    Failed(String),
-    /// The responder cannot load for the requester: no loader, the cache
-    /// not open, or a requested key's part not warm here.
-    Unavailable,
-}
-
 /// What a [`Mesh::load`] request came back with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LoadOutcome {
-    /// See [`LoadServe::Loaded`].
+    /// See [`crate::store::LoadServe::Loaded`].
     Loaded {
         found: Vec<WireRecord>,
         uncached: Vec<(Bytes, Bytes)>,
     },
-    /// See [`LoadServe::Failed`].
+    /// See [`crate::store::LoadServe::Failed`].
     Failed(String),
     /// The responder declined; the requester loads elsewhere.
     Declined,

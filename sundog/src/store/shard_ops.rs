@@ -133,12 +133,11 @@ pub trait ShardOps: Send + Sync {
     /// loader.
     #[allow(
         private_interfaces,
-        reason = "LoadServe is crate-private like the rest of the load path; \
-                  see crate::net::RequestHandler::fetch"
+        reason = "LoadServe is crate-private like the rest of the load path"
     )]
-    fn serve_load(&self, keys: Vec<Bytes>) -> BoxFuture<'_, crate::net::LoadServe> {
+    fn serve_load(&self, keys: Vec<Bytes>) -> BoxFuture<'_, crate::store::LoadServe> {
         let _ = keys;
-        Box::pin(async { crate::net::LoadServe::Unavailable })
+        Box::pin(async { crate::store::LoadServe::Unavailable })
     }
 
     /// Takes a peer's [`crate::wire::Msg::RefreshHint`]: the peer read

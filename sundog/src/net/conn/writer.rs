@@ -1,8 +1,5 @@
 //! Dial, the persistent per-peer writer and the replicate coalescer.
 
-#[cfg(doc)]
-use crate::wire::MAX_FRAME;
-
 use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
@@ -24,16 +21,7 @@ use crate::net::outbox::DropOldestQueue;
 use crate::net::tcp::TcpStream;
 use crate::net::{Greeting, OutFrame, OutboxRx, TlsCtx};
 use crate::node::NodeId;
-use crate::wire::{self, Msg};
-
-/// Byte budget for one coalesced [`Msg::ReplicateBatch`] frame, well under
-/// [`MAX_FRAME`]. Shared with the fan-out layer (`cluster::fan_out_batch`),
-/// which pre-batches drained write bursts by the same rules.
-pub(crate) const REPLICATE_BATCH_BUDGET: usize = 256 * 1024;
-
-/// Count cap alongside [`REPLICATE_BATCH_BUDGET`], so a long run of tiny
-/// records doesn't grow one batch frame without bound.
-pub(crate) const REPLICATE_BATCH_COUNT: usize = 4096;
+use crate::wire::{self, Msg, REPLICATE_BATCH_BUDGET, REPLICATE_BATCH_COUNT};
 
 /// The most encoded bytes one replicate burst takes from the outbox
 /// ([`drain_burst`]). Outbox slots then open as the peer reads, a burst at a

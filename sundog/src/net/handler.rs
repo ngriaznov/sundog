@@ -9,7 +9,8 @@ use futures::stream::BoxStream;
 use smol_str::SmolStr;
 use xxhash_rust::xxh3::xxh3_64;
 
-use super::{AeServeOutcome, FetchServe, LoadServe, StServe};
+use super::{AeServeOutcome, FetchServe, StServe};
+use crate::store::LoadServe;
 use crate::store::{BucketDigest, BucketLen, BucketPart, BucketPartDigests, KeyVersion};
 use crate::wire::WireRecord;
 

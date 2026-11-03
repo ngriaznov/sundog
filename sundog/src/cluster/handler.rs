@@ -10,8 +10,9 @@ use smol_str::SmolStr;
 
 use super::{ShardRegistry, ShardRegistryExt, Warmth};
 use crate::explain::ServeVerdict;
-use crate::net::{AeServeOutcome, FetchServe, LoadServe, RequestHandler, StServe};
+use crate::net::{AeServeOutcome, FetchServe, RequestHandler, StServe};
 use crate::ownership::{Granularity, parts_of_wire_id};
+use crate::store::LoadServe;
 use crate::store::{
     BucketDigest, BucketLen, BucketPart, BucketPartDigests, KeyVersion, PartId, PartMask, ShardOps,
     chunk_records_for_snapshot,

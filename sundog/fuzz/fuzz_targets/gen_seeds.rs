@@ -65,7 +65,7 @@ fn main() {
         Msg::AeSketch {
             cache: "users".into(),
             bucket: 512,
-            // `Cell`'s fields are private to `cluster::sketch`, so a seed
+            // `Cell`'s fields are private to `sketch`, so a seed
             // can only reach `Cell::default`, a valid empty-cell encoding.
             cells: vec![Cell::default(); 6],
         },

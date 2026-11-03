@@ -20,7 +20,7 @@ use xxhash_rust::xxh3::xxh3_64;
 
 /// `SUNDOG_BENCH_KEYS` default for `sketch_path_convergence`: the size of
 /// the single dense anti-entropy bucket this scenario builds. Comfortably
-/// under `cluster::sketch`'s rated 100-element symmetric difference once a
+/// under `sketch`'s rated 100-element symmetric difference once a
 /// quarter of it is invalidated (50 elements: see
 /// [`SKETCH_PATH_INVALIDATE_FRACTION`]), so the default run's sketch
 /// mismatch decodes rather than falling back; `SUNDOG_BENCH_KEYS` raises
@@ -39,7 +39,7 @@ const SKETCH_PATH_MIN_BUCKET: usize = 4;
 /// The fraction of the dense bucket [`sundog::Cache::invalidate_local`]
 /// drops on `cache_b` to seed this scenario's mismatch: a quarter, so the
 /// default `keys=200` run seeds a 50-element one-sided difference, half of
-/// `cluster::sketch`'s rated 100-element capacity.
+/// `sketch`'s rated 100-element capacity.
 const SKETCH_PATH_INVALIDATE_FRACTION: usize = 4;
 
 /// The anti-entropy bucket a `u32` key hashes into, mirroring

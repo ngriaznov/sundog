@@ -39,4 +39,3 @@ pub(super) use reply::{
     state_stream,
 };
 pub(super) use writer::{PeerTarget, dial_with_hello_and, run_peer_writer};
-pub(crate) use writer::{REPLICATE_BATCH_BUDGET, REPLICATE_BATCH_COUNT};

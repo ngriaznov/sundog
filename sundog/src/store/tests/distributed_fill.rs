@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize};
 use tokio::sync::Notify;
 
 use super::*;
-use crate::net::LoadServe;
+use crate::store::LoadServe;
 use crate::store::Loader;
 use crate::store::fan_out::{FillRoute, ReadThroughRoute, fill_route, read_through_route};
 use crate::store::refresh::RefreshRequest;

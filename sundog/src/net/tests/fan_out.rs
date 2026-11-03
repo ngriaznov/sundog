@@ -1,6 +1,7 @@
 //! Replicate batching and fan-out send tests.
 
 use super::*;
+use crate::wire::{REPLICATE_BATCH_BUDGET, REPLICATE_BATCH_COUNT};
 
 #[test]
 fn batch_replicate_splits_by_count_and_budget_and_keeps_a_singleton_plain() {

@@ -26,8 +26,23 @@ use super::engine::{self, Inflight, JoinOutcome};
 use super::{PartId, Shard, ShardOps, SharedLoaderFailure, encode_key};
 use crate::error::CacheError;
 use crate::hlc::Hlc;
-use crate::net::LoadServe;
 use crate::wire::WireRecord;
+
+/// A shard's answer to a [`crate::wire::Msg::Load`], what
+/// [`ShardOps::serve_load`] returns.
+pub(crate) enum LoadServe {
+    /// The record stored for each requested key the responder or its
+    /// source holds, and each value it loaded without storing.
+    Loaded {
+        found: Vec<WireRecord>,
+        uncached: Vec<(Bytes, Bytes)>,
+    },
+    /// The responder's loader failed, with the error's message.
+    Failed(String),
+    /// The responder cannot load for the requester: no loader, the cache
+    /// not open, or a requested key's part not warm here.
+    Unavailable,
+}
 
 /// The error a [`Loader`] reports, type-erased.
 pub type LoadError = Box<dyn std::error::Error + Send + Sync + 'static>;

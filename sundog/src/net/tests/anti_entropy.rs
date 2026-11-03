@@ -379,7 +379,7 @@ fn long_key_entries(count: u64, key_len: usize) -> Vec<(Bytes, Hlc)> {
 
 /// The sketch a responder with the default cell count builds over `entries`.
 fn sketch_of(entries: &[(Bytes, Hlc)]) -> Vec<wire::Cell> {
-    let mut iblt = crate::cluster::sketch::Iblt::new(ClusterConfig::default().ae_sketch_cells);
+    let mut iblt = crate::sketch::Iblt::new(ClusterConfig::default().ae_sketch_cells);
     for (key, version) in entries {
         iblt.insert(xxh3_64(key), *version);
     }

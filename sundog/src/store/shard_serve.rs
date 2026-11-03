@@ -700,7 +700,7 @@ where
     }
 
     #[allow(private_interfaces, reason = "see ShardOps::serve_load")]
-    fn serve_load(&self, keys: Vec<Bytes>) -> BoxFuture<'_, crate::net::LoadServe> {
+    fn serve_load(&self, keys: Vec<Bytes>) -> BoxFuture<'_, crate::store::LoadServe> {
         Box::pin(self.serve_load_encoded(keys))
     }
 

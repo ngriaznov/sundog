@@ -208,10 +208,10 @@ fn part_msg_strategy() -> impl Strategy<Value = Msg> {
 }
 
 /// Real `Cell`s built through `Iblt`'s `pub(crate)` API, since `Cell`'s
-/// fields are private outside `cluster::sketch`.
+/// fields are private outside `sketch`.
 fn cells_strategy() -> impl Strategy<Value = Vec<Cell>> {
     proptest::collection::vec((any::<u64>(), hlc_strategy()), 0..8).prop_map(|elems| {
-        let mut iblt = crate::cluster::sketch::Iblt::new(6);
+        let mut iblt = crate::sketch::Iblt::new(6);
         for (key_hash, ver) in elems {
             iblt.insert(key_hash, ver);
         }

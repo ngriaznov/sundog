@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 use smol_str::SmolStr;
 
-use super::{REPLICATE_BATCH_BUDGET, REPLICATE_BATCH_COUNT};
 use crate::error::CodecError;
 use crate::wire::{self, Msg, WireRecord};
+use crate::wire::{REPLICATE_BATCH_BUDGET, REPLICATE_BATCH_COUNT};
 
 /// A queued outbound message paired with its already-encoded wire frame,
 /// cheaply cloned into each peer's outbox so the writer never re-encodes

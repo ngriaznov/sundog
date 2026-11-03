@@ -35,12 +35,22 @@ use crate::error::CodecError;
 use crate::hlc::Hlc;
 use crate::node::NodeId;
 
-/// One cell of the anti-entropy IBLT sketch, defined in `cluster::sketch`.
-pub use crate::cluster::sketch::Cell;
+/// One cell of the anti-entropy IBLT sketch, defined in `sketch`.
+pub use crate::sketch::Cell;
 
 /// Hard cap on any single wire frame: 4 MiB. Oversized values are rejected
 /// at the API boundary (`CacheError::ValueTooLarge`) instead.
 pub const MAX_FRAME: usize = 4 * 1024 * 1024;
+
+/// Byte budget for one coalesced [`Msg::ReplicateBatch`] frame, well under
+/// [`MAX_FRAME`]. The connection writer coalesces by it, and the fan-out
+/// layer (`cluster::fan_out_batch`) pre-batches drained write bursts by the
+/// same rules.
+pub(crate) const REPLICATE_BATCH_BUDGET: usize = 256 * 1024;
+
+/// Count cap alongside [`REPLICATE_BATCH_BUDGET`], so a long run of tiny
+/// records doesn't grow one batch frame without bound.
+pub(crate) const REPLICATE_BATCH_COUNT: usize = 4096;
 
 /// The wire protocol this build speaks, carried in every [`Msg::Hello`] and
 /// gossiped with membership. A node answers a peer only with what that
@@ -1240,7 +1250,7 @@ mod tests {
     /// `Cell`'s fields are private; this builds one through `Iblt`'s
     /// `pub(crate)` API instead of a struct literal.
     fn sample_cells() -> Vec<Cell> {
-        let mut iblt = crate::cluster::sketch::Iblt::new(6);
+        let mut iblt = crate::sketch::Iblt::new(6);
         iblt.insert(1, sample_hlc());
         iblt.into_cells()
     }
@@ -1804,7 +1814,7 @@ mod tests {
         // Every cell XOR-accumulates well-spread elements, so each field
         // encodes as a varint of a random full-width integer.
         let spread = |i: u64| i.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let mut iblt = crate::cluster::sketch::Iblt::new(240);
+        let mut iblt = crate::sketch::Iblt::new(240);
         for i in 0..2_000u64 {
             iblt.insert(
                 spread(i),

@@ -10,7 +10,7 @@ use crate::wire::WireRecord;
 use bytes::Bytes;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-// --- Sketch-based anti-entropy (`cluster::sketch`) ---
+// --- Sketch-based anti-entropy (`sketch`) ---
 
 /// Among `0..n`, every key in a bucket holding more than `min_count` of
 /// them. Deterministic given a fixed key range.

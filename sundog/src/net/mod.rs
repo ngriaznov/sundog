@@ -32,7 +32,6 @@ mod conn;
 
 #[cfg(all(test, not(feature = "sim")))]
 pub(crate) use conn::HELLO_TIMEOUT;
-pub(crate) use conn::{REPLICATE_BATCH_BUDGET, REPLICATE_BATCH_COUNT};
 mod frames;
 mod handler;
 mod mesh;
@@ -58,7 +57,7 @@ pub use handler::RequestHandler;
 pub use types::{AeMismatch, AePartReply, InboundMsg, MsgClass};
 pub(crate) use types::{
     AeRoundOutcome, AeServeOutcome, BucketPull, BucketStreamItem, FetchOutcome, FetchServe,
-    LoadOutcome, LoadServe, StServe,
+    LoadOutcome, StServe,
 };
 
 #[cfg(doc)]

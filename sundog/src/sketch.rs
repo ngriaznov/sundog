@@ -1,6 +1,7 @@
 //! A partitioned invertible Bloom lookup table (IBLT) over one anti-entropy
-//! bucket's `(key_hash, version)` elements. [`super::anti_entropy`] uses it
-//! to reconcile a large bucket without shipping the bucket's entry list.
+//! bucket's `(key_hash, version)` elements. [`crate::cluster::anti_entropy`]
+//! uses it to reconcile a large bucket without shipping the bucket's entry
+//! list.
 //!
 //! Each side inserts its bucket into an [`Iblt`] of the same shape. One side
 //! sends its sketch; the other [`Iblt::subtract`]s the two and
@@ -84,7 +85,7 @@ fn cell_index(partition: usize, mixed: u64, partition_len: usize) -> usize {
 /// verifies a "pure" cell holds exactly one element. `Default` is the empty
 /// cell, what every cell in a freshly built `Iblt` starts as.
 ///
-/// Reachable outside `cluster::sketch` only because
+/// Reachable outside `sketch` only because
 /// [`crate::wire::Msg::AeSketch`] carries a `Vec<Cell>` on the wire,
 /// re-exported as [`crate::wire::Cell`]; every field stays private here.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,7 +134,7 @@ impl Cell {
 /// the key's actual bytes. A pulled-only element is always pulled by hash
 /// ([`crate::wire::Msg::AePullHashes`]), never by key.
 ///
-/// Reachable outside `cluster::sketch` only because `crate::diff_decoded`
+/// Reachable outside `sketch` only because `crate::diff_decoded`
 /// (a `feature = "sim"`-gated re-export `tests/sim/` drives directly)
 /// carries [`Decoded`], which carries this; every field stays crate-visible
 /// in spirit even though `pub` is what the re-export requires.
@@ -147,7 +148,7 @@ pub struct Elem {
 /// but not the other. `only_left` is what the caller had and the other
 /// didn't; `only_right` is the reverse.
 ///
-/// Reachable outside `cluster::sketch` only because [`Iblt::peel`] returns
+/// Reachable outside `sketch` only because [`Iblt::peel`] returns
 /// it and `crate::diff_decoded` takes it, both re-exported (the latter
 /// under its `crate::` path) for `tests/sim/` under `feature = "sim"`;
 /// see this module's docs.
@@ -161,7 +162,7 @@ pub struct Decoded {
 /// for peeling to resolve every cell back to zero. Never a wrong result,
 /// only no result; the caller's `AeEntries` fallback is exact regardless.
 ///
-/// Reachable outside `cluster::sketch` only because [`Iblt::peel`]'s
+/// Reachable outside `sketch` only because [`Iblt::peel`]'s
 /// `Result` names it; see [`Decoded`]'s doc for why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Undecodable;
@@ -169,7 +170,7 @@ pub struct Undecodable;
 /// A partitioned IBLT over `(key_hash, version)` elements; see this
 /// module's docs for the overall scheme.
 ///
-/// Reachable outside `cluster::sketch` only because
+/// Reachable outside `sketch` only because
 /// [`crate::wire::Msg::AeSketch`]'s peer needs the same construction on the
 /// initiator's side; `tests/sim/` re-exports it as `crate::Iblt` under
 /// `feature = "sim"` to build and peel its own comparison sketch, the same

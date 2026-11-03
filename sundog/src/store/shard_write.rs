@@ -18,7 +18,7 @@ use super::{
 };
 use crate::error::{CacheError, CodecError};
 use crate::hlc::Hlc;
-use crate::net::REPLICATE_BATCH_COUNT;
+use crate::wire::REPLICATE_BATCH_COUNT;
 use crate::wire::{self, WireRecord};
 
 #[cfg(doc)]

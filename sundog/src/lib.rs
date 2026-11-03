@@ -75,11 +75,15 @@ pub mod net;
 pub mod node;
 pub mod observe;
 pub(crate) mod ownership;
+pub(crate) mod sketch;
 pub mod store;
 #[cfg(feature = "prometheus")]
 pub mod telemetry;
 pub(crate) mod verdict;
 pub mod wire;
+
+#[cfg(test)]
+mod layers;
 
 pub use cache::{Cache, CacheBuilder};
 pub use cluster::{CacheHealth, Cluster, ClusterBuilder, Health};
@@ -101,7 +105,7 @@ pub use store::{
 #[cfg(feature = "prometheus")]
 pub use telemetry::{BuildError, PrometheusHandle, prometheus_handle};
 
-/// `cluster::sketch` and `cluster::anti_entropy` are `pub(crate)`; nothing
+/// `sketch` and `cluster::anti_entropy` are `pub(crate)`; nothing
 /// outside `cluster.rs`'s own composition normally names an IBLT, its
 /// diffing, or a raw anti-entropy round directly. `tests/sim/` drives
 /// `net::Mesh` and `store::ShardOps` directly rather than through a whole
@@ -115,7 +119,7 @@ pub use telemetry::{BuildError, PrometheusHandle, prometheus_handle};
 pub use cluster::anti_entropy::{RoundOutcome, diff_decoded, mismatched_parts, run_round_against};
 #[cfg(feature = "sim")]
 #[doc(hidden)]
-pub use cluster::sketch::{Decoded, Elem, Iblt, Undecodable};
+pub use sketch::{Decoded, Elem, Iblt, Undecodable};
 
 /// `ownership` is `pub(crate)`; nothing outside the crate's own composition
 /// normally builds or reads a `Mode::Distributed` cache's ownership view
