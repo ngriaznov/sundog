@@ -15,6 +15,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::Shard;
+use super::shard_serve::Inbound;
 
 /// The least time between two warnings about forwarded tombstones ignored as
 /// lapsed.
@@ -36,10 +37,10 @@ where
 {
     /// Counts `ignored` tombstones one inbound batch dropped as lapsed in
     /// `sundog_tombstones_ignored_total{cache}`. When the batch came by
-    /// forward (`forwarded`), the delete is lost, since every node ignores a
-    /// lapsed tombstone alike and a non-owner writer kept no copy: it is also
-    /// logged at `warn`, rate limited.
-    pub(super) fn note_ignored_tombstones(&self, ignored: u64, forwarded: bool) {
+    /// forward ([`Inbound::Forwarded`]), the delete is lost, since every node
+    /// ignores a lapsed tombstone alike and a non-owner writer kept no copy:
+    /// it is also logged at `warn`, rate limited.
+    pub(super) fn note_ignored_tombstones(&self, ignored: u64, inbound: Inbound) {
         if ignored == 0 {
             return;
         }
@@ -48,7 +49,7 @@ where
             "cache" => self.name.to_string()
         )
         .increment(ignored);
-        if !forwarded {
+        if inbound == Inbound::Replicated {
             return;
         }
         let now = self.now_ms();

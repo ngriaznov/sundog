@@ -8,6 +8,7 @@ use std::sync::atomic::AtomicU64;
 use super::distributed_fill::{crowded_view, key_moved_away};
 use super::merging::SumResolver;
 use super::*;
+use crate::store::shard_serve::Inbound;
 use crate::store::skew_hold::SKEW_HOLD_MAX_RECORDS;
 
 const START_MS: u64 = 1_000_000;
@@ -107,6 +108,13 @@ fn owned_key(view: &OwnershipView) -> u32 {
 
 /// A forward the owner's clock refuses is parked, applies when the clock
 /// comes within the bound, and the clock then absorbs its stamp.
+#[test]
+fn only_a_forwarded_batch_has_records_for_the_skew_hold() {
+    assert_eq!(Inbound::Replicated.held(), 0);
+    assert_eq!(Inbound::Forwarded { held: 0 }.held(), 0);
+    assert_eq!(Inbound::Forwarded { held: 3 }.held(), 3);
+}
+
 #[tokio::test]
 async fn a_forwarded_record_past_the_bound_is_held_then_applied_within_it() {
     let clock = TestClock::at(START_MS);

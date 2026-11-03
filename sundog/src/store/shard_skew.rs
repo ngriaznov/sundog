@@ -21,6 +21,7 @@ use std::time::Duration;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use super::shard_serve::Inbound;
 use super::skew_hold::{
     HoldOutcome, SkewHold, beyond_horizon, skew_due_ms, skew_hold_horizon_ms, skew_hold_wait,
 };
@@ -172,7 +173,7 @@ where
         };
         if !owned.is_empty() {
             let held = owned.len();
-            self.apply_inbound(owned, true, held).await;
+            self.apply_inbound(owned, Inbound::Forwarded { held }).await;
         }
     }
 

@@ -50,6 +50,32 @@ pub(super) const fn inbound_scope(mode: Mode) -> engine::ApplyScope {
     }
 }
 
+/// How an inbound batch reached a shard, which decides what becomes of a
+/// record its clock refuses and whether a lapsed delete among the records is
+/// lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Inbound {
+    /// Replicate, anti-entropy or transfer records. A record the stamp
+    /// refuses is dropped, since its sender still holds it.
+    Replicated,
+    /// `ForwardBatch` records. The first `held` came from a writer that may
+    /// have kept no copy, and one of those the stamp refuses goes to the skew
+    /// hold ([`Shard::hold_skewed`]). A lapsed delete among any of them is
+    /// lost, since every node ignores it alike.
+    Forwarded { held: usize },
+}
+
+impl Inbound {
+    /// How many of the batch's first records the skew hold takes when the
+    /// stamp refuses them.
+    pub(super) const fn held(self) -> usize {
+        match self {
+            Self::Replicated => 0,
+            Self::Forwarded { held } => held,
+        }
+    }
+}
+
 #[allow(
     clippy::unused_async,
     clippy::unused_async_trait_impl,
@@ -61,13 +87,12 @@ where
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
     /// The body of [`ShardOps::apply_remote_batch`],
-    /// [`ShardOps::apply_forwarded_batch`] and [`ShardOps::apply_forward_run`].
-    /// `forwarded` says `recs` came in `ForwardBatch` messages. The first
-    /// `held` of them came in a forward whose writer may have kept no copy:
-    /// one the stamp refuses goes to the skew hold instead of being dropped
-    /// (see [`Shard::hold_skewed`]). Every other refusal drops the record,
-    /// because its sender or its writer still holds it.
-    pub(super) async fn apply_inbound(&self, recs: Vec<WireRecord>, forwarded: bool, held: usize) {
+    /// [`ShardOps::apply_forwarded_batch`] and [`ShardOps::apply_forward_run`]:
+    /// applies `recs`, which arrived as `inbound` says. A held record the
+    /// stamp refuses ([`Inbound::Forwarded`]) goes to the skew hold; every
+    /// other refusal drops the record, because its sender or its writer still
+    /// holds it.
+    pub(super) async fn apply_inbound(&self, recs: Vec<WireRecord>, inbound: Inbound) {
         #[cfg(feature = "spill")]
         if self.inbound_held() {
             tracing::trace!(
@@ -88,7 +113,7 @@ where
         // the record is forwarded on to the bucket's current owners,
         // never applied here and never dropped. A record for a bucket
         // this node never held is dropped and counted.
-        let (recs, held) = self.guard_inbound(recs, held);
+        let (recs, held) = self.guard_inbound(recs, inbound.held());
         // An `Invalidation` cache takes a tombstone record as the
         // invalidation it stands for: the copy goes, and a load in
         // flight for the key stores nothing.
@@ -188,7 +213,7 @@ where
             }
             deficit
         };
-        self.note_ignored_tombstones(written.ignored_tombstones(), forwarded);
+        self.note_ignored_tombstones(written.ignored_tombstones(), inbound);
         self.retry_reservation_deficit(0, deficit, wait_left, &mut written)
             .await;
     }
@@ -677,12 +702,12 @@ where
     }
 
     fn apply_remote_batch(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, ()> {
-        Box::pin(self.apply_inbound(recs, false, 0))
+        Box::pin(self.apply_inbound(recs, Inbound::Replicated))
     }
 
     fn apply_forwarded_batch(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, ()> {
         let held = recs.len();
-        Box::pin(self.apply_inbound(recs, true, held))
+        Box::pin(self.apply_inbound(recs, Inbound::Forwarded { held }))
     }
 
     fn apply_forward_run(
@@ -692,7 +717,7 @@ where
     ) -> BoxFuture<'_, ()> {
         let count = held.len();
         held.extend(kept);
-        Box::pin(self.apply_inbound(held, true, count))
+        Box::pin(self.apply_inbound(held, Inbound::Forwarded { held: count }))
     }
 
     fn invalidate(&self, key: Bytes, ver: Hlc) -> BoxFuture<'_, ()> {
