@@ -230,7 +230,8 @@ impl ObserverBuilder {
 
     /// Gossip settings: `gossip_bind_addr`, `advertise_ip`, `gossip_interval`,
     /// the failure-detector fields and both grace periods. Other fields are
-    /// unused. Pass the cluster's own gossip settings so the observer marks a
+    /// unused, and `SUNDOG_GOSSIP_PORT` is not read: port `0` picks a free
+    /// port. Pass the cluster's own gossip settings so the observer marks a
     /// member [`MemberStatus::Down`] when the members do.
     pub fn config(mut self, config: ClusterConfig) -> Self {
         self.config = config;

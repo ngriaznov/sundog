@@ -61,7 +61,8 @@ sundog-distributed-demo -- --nodes 5` (a `Distributed` cache).
 ## Features
 
 - **Zeroconf clustering.** The cluster is a name. Nodes find each other over
-  mDNS on a LAN, static seeds in Docker or a VPC, and DNS SRV on Kubernetes.
+  mDNS on a LAN, static seeds in Docker or a VPC, and a headless Service on
+  Kubernetes, set up from the environment alone.
 - **Four modes, per cache**, [below](#modes). A `get` never waits on the network.
 - **Read-through loading.** `get_or_load` runs one loader call for concurrent
   misses on a key. A [registered batch loader][loading] gathers misses into

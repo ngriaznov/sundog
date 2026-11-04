@@ -8,7 +8,7 @@ service with two extra ports open and a way for nodes to find each other.
 | Mechanism | Default | What it does | Use it on |
 |---|---|---|---|
 | `Mdns` | yes | registers `_sundog._udp.local.` and browses for peers continuously | a LAN or anywhere multicast works |
-| `Static` | when `.seeds(..)` is called, or `SUNDOG_SEEDS=host:port,host:port` is set and nothing else is configured | dials a fixed seed list, re-resolving hostnames every 30 seconds | VPCs, Docker networks, tests |
+| `Static` | when `.seeds(..)` is called, or `SUNDOG_SEEDS=host:port,host:port` is set and nothing else is configured | dials a fixed seed list, re-resolving hostnames every 30 seconds | VPCs, Docker networks, Kubernetes through a headless Service's name, tests |
 | `DnsSrv` | no, `.discovery(DnsSrv::new(..))` | polls SRV records for a name every 30 seconds, falling back to A and AAAA records | Kubernetes, private DNS zones |
 
 Seeds only bootstrap. A node that reaches one member learns the rest of
@@ -27,6 +27,13 @@ nodes, fix both:
 ```rust
 {{#include ../cookbook/src/deploy.rs:fixed_ports}}
 ```
+
+Or fix them from the environment, with no code: `SUNDOG_GOSSIP_PORT` and
+`SUNDOG_DATA_PORT` give a `Cluster` the gossip and data-plane ports its
+config leaves at 0. A port the config sets stays, with a warning when the
+variable names another, and `build` fails on a value that is not a port
+number. An `Observer` does not read them and binds the port its config
+names.
 
 Seeds and DNS records name the gossip port only. Peers learn each other's
 data-plane port through gossip.
@@ -81,6 +88,7 @@ metadata:
   name: myservice-gossip
 spec:
   clusterIP: None
+  publishNotReadyAddresses: true
   selector:
     app: myservice
   ports:
@@ -89,8 +97,39 @@ spec:
       protocol: UDP
 ```
 
-Point `DnsSrv` at it, with the gossip port as the fallback so plain A
-records suffice, and declare both fixed ports as container ports:
+`publishNotReadyAddresses` lists a pod in the Service's DNS before its
+readiness check passes, so pods that start together find each other while
+their caches warm instead of each warming alone. The Service carries gossip
+only, so a pod it lists early takes no client traffic.
+
+The pod spec then sets everything sundog needs, and the service calls
+`Cluster::builder("prod").build()` with no configuration:
+
+```yaml
+containers:
+  - name: myservice
+    env:
+      - name: SUNDOG_SEEDS
+        value: myservice-gossip.my-ns.svc.cluster.local:7946
+      - name: SUNDOG_GOSSIP_PORT
+        value: "7946"
+      - name: SUNDOG_DATA_PORT
+        value: "7947"
+    ports:
+      - name: gossip
+        containerPort: 7946
+        protocol: UDP
+      - name: data
+        containerPort: 7947
+        protocol: TCP
+```
+
+`SUNDOG_SEEDS` names the headless Service, whose name resolves to every pod
+it lists. The node re-resolves it every 30 seconds, so a pod that starts
+later is found too. A network policy between the pods allows both ports.
+
+Alternatively, in code, `DnsSrv` polls the Service's SRV records, with the
+gossip port as the fallback so plain A records suffice:
 
 ```rust
 {{#include ../cookbook/src/deploy.rs:kubernetes}}

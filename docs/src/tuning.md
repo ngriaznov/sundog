@@ -15,8 +15,8 @@ Cache-level settings, `mode`, `max_capacity`, `max_resident_bytes`, `ttl`,
 
 | Field | Default | Change it when |
 |---|---|---|
-| `gossip_bind_addr` | `0.0.0.0:0` | a firewall needs a fixed gossip (UDP) port |
-| `data_bind_addr` | `0.0.0.0:0` | a firewall needs a fixed data-plane (TCP) port |
+| `gossip_bind_addr` | `0.0.0.0:0` | a firewall needs a fixed gossip (UDP) port; `SUNDOG_GOSSIP_PORT` fixes it without code |
+| `data_bind_addr` | `0.0.0.0:0` | a firewall needs a fixed data-plane (TCP) port; `SUNDOG_DATA_PORT` fixes it without code |
 | `advertise_ip` | probed | peers must dial an address other than the node's own interface |
 | `max_frame` | 4 MiB | never raise it past `wire::MAX_FRAME`; lower it to cap single messages and the merged values a cache stores, and set the same on every node |
 | `outbox_capacity` | 8,192 frames | a peer's link is slow and bursts need more room per peer |

@@ -1,6 +1,7 @@
 //! Cluster-wide tunables: the values and their defaults, consumed by the
 //! `Cluster` builder.
 
+use crate::error::JoinError;
 use crate::store::CompactionBounds;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -217,11 +218,14 @@ pub struct ClusterConfig {
     /// a smaller cap refuses a merged value a node under a larger one
     /// builds.
     pub max_frame: usize,
-    /// Bind address for the gossip (membership) UDP socket. Port `0` picks the
-    /// zeroconf default.
+    /// Bind address for the gossip (membership) UDP socket. Port `0` picks a
+    /// free port at startup; a [`Cluster`](crate::Cluster) takes the port
+    /// `SUNDOG_GOSSIP_PORT` names instead when that variable is set. An
+    /// [`Observer`](crate::observe::Observer) does not read the variable.
     pub gossip_bind_addr: SocketAddr,
-    /// Bind address for the data-plane TCP listener. Port `0` picks the
-    /// zeroconf default.
+    /// Bind address for the data-plane TCP listener. Port `0` picks a free
+    /// port at startup; a [`Cluster`](crate::Cluster) takes the port
+    /// `SUNDOG_DATA_PORT` names instead when that variable is set.
     pub data_bind_addr: SocketAddr,
     /// Cadence of chitchat's own SWIM gossip rounds, distinct from
     /// [`ae_interval`](Self::ae_interval). Chosen for sub-5s failure
@@ -474,7 +478,58 @@ impl ClusterConfig {
         f(&mut self);
         self
     }
+
+    /// This config with the port [`GOSSIP_PORT_ENV`] and [`DATA_PORT_ENV`]
+    /// each name, as `env` reads them, on the bind address that leaves its
+    /// port at 0. A variable unset or blank leaves its address alone, and so
+    /// does a port the config sets, with a warning when the variable names
+    /// another. Pure over `env`; unit tested directly.
+    ///
+    /// # Errors
+    ///
+    /// [`JoinError::InvalidConfig`] when a variable holds anything but a port
+    /// number.
+    pub(crate) fn with_env_ports(
+        mut self,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, JoinError> {
+        for (variable, addr) in [
+            (GOSSIP_PORT_ENV, &mut self.gossip_bind_addr),
+            (DATA_PORT_ENV, &mut self.data_bind_addr),
+        ] {
+            let Some(raw) = env(variable) else {
+                continue;
+            };
+            let raw = raw.trim();
+            if raw.is_empty() {
+                continue;
+            }
+            let port = raw.parse::<u16>().map_err(|_| {
+                JoinError::InvalidConfig(format!(
+                    "{variable} must be a port number from 0 to 65535, got {raw:?}"
+                ))
+            })?;
+            if addr.port() == 0 {
+                addr.set_port(port);
+            } else if addr.port() != port {
+                tracing::warn!(
+                    variable,
+                    configured = addr.port(),
+                    named = port,
+                    "the config sets this port, so the variable is ignored"
+                );
+            }
+        }
+        Ok(self)
+    }
 }
+
+/// The variable that names the gossip port for a
+/// [`ClusterConfig::gossip_bind_addr`] left at port 0.
+pub(crate) const GOSSIP_PORT_ENV: &str = "SUNDOG_GOSSIP_PORT";
+/// The variable that names the data-plane port for a
+/// [`ClusterConfig::data_bind_addr`] left at port 0.
+pub(crate) const DATA_PORT_ENV: &str = "SUNDOG_DATA_PORT";
 
 /// The shortest [`ClusterConfig::mesh_keepalive`] `ClusterBuilder::build`
 /// accepts.
@@ -623,6 +678,111 @@ mod tests {
 | `c` | 3 | z |
 ";
         assert_eq!(tuning_rows(tuning), ["a", "b"]);
+    }
+
+    /// An environment that holds `vars` and nothing else.
+    fn env_of(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let vars: Vec<(String, String)> = vars
+            .iter()
+            .map(|&(name, value)| (name.to_owned(), value.to_owned()))
+            .collect();
+        move |name| {
+            vars.iter()
+                .find(|(var, _)| var == name)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    #[test]
+    fn env_ports_fill_the_ports_the_config_leaves_at_zero() {
+        let config = ClusterConfig::default()
+            .with_env_ports(env_of(&[
+                (GOSSIP_PORT_ENV, "7946"),
+                (DATA_PORT_ENV, " 7947 "),
+            ]))
+            .expect("both are ports");
+        assert_eq!(
+            config.gossip_bind_addr,
+            SocketAddr::from(([0, 0, 0, 0], 7946))
+        );
+        assert_eq!(
+            config.data_bind_addr,
+            SocketAddr::from(([0, 0, 0, 0], 7947))
+        );
+
+        let loopback = ClusterConfig::default().with(|c| {
+            c.gossip_bind_addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        });
+        let config = loopback
+            .with_env_ports(env_of(&[(GOSSIP_PORT_ENV, "7946")]))
+            .expect("a port");
+        assert_eq!(
+            config.gossip_bind_addr,
+            SocketAddr::from(([127, 0, 0, 1], 7946)),
+            "the variable sets the port and keeps the configured IP"
+        );
+        assert_eq!(
+            config.data_bind_addr.port(),
+            0,
+            "an unset variable changes nothing"
+        );
+
+        let config = ClusterConfig::default()
+            .with_env_ports(env_of(&[(GOSSIP_PORT_ENV, "65535"), (DATA_PORT_ENV, "0")]))
+            .expect("the top port and 0");
+        assert_eq!(config.gossip_bind_addr.port(), 65535);
+        assert_eq!(
+            config.data_bind_addr.port(),
+            0,
+            "0 keeps the free-port default"
+        );
+    }
+
+    #[test]
+    fn env_ports_leave_a_configured_port_and_skip_a_blank_variable() {
+        let pinned = ClusterConfig::default().with(|c| {
+            c.gossip_bind_addr = SocketAddr::from(([0, 0, 0, 0], 9000));
+            c.data_bind_addr = SocketAddr::from(([0, 0, 0, 0], 7947));
+        });
+        let config = pinned
+            .with_env_ports(env_of(&[
+                (GOSSIP_PORT_ENV, "7946"),
+                (DATA_PORT_ENV, "7947"),
+            ]))
+            .expect("two ports");
+        assert_eq!(
+            config.gossip_bind_addr.port(),
+            9000,
+            "the config's port wins"
+        );
+        assert_eq!(config.data_bind_addr.port(), 7947, "an equal port stays");
+        let config = ClusterConfig::default()
+            .with_env_ports(env_of(&[(GOSSIP_PORT_ENV, "  ")]))
+            .expect("a blank");
+        assert_eq!(
+            config.gossip_bind_addr.port(),
+            0,
+            "a blank variable is unset"
+        );
+    }
+
+    #[test]
+    fn env_ports_refuse_a_value_that_is_no_port() {
+        for (variable, raw) in [
+            (GOSSIP_PORT_ENV, "gossip"),
+            (DATA_PORT_ENV, "65536"),
+            (DATA_PORT_ENV, "-1"),
+            (GOSSIP_PORT_ENV, "7946,7947"),
+            (DATA_PORT_ENV, "79\u{fffd}47"),
+        ] {
+            let error = ClusterConfig::default()
+                .with_env_ports(env_of(&[(variable, raw)]))
+                .expect_err(raw);
+            assert!(
+                matches!(&error, JoinError::InvalidConfig(message) if message.contains(variable)),
+                "{raw}: {error}"
+            );
+        }
     }
 
     #[test]

@@ -7,6 +7,13 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Added
 
+- **`SUNDOG_GOSSIP_PORT` and `SUNDOG_DATA_PORT`.** A `Cluster` binds the
+  gossip and data-plane ports these name where its config leaves the port at
+  0, the default, so a Kubernetes deployment sets up sundog from the pod spec
+  alone: the headless Service in `SUNDOG_SEEDS` and both ports from the
+  environment. A port the config sets stays, with a warning when the
+  variable names another, and `build` fails on a value that is not a port
+  number. `deployment.md` gives the recipe.
 - **`ClusterConfig::mesh_keepalive`.** TCP keepalive on every data-plane
   connection a node dials or accepts, at 30 seconds of silence by default:
   the kernel then probes every third of that, three times, where the

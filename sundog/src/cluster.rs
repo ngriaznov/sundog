@@ -1060,8 +1060,9 @@ impl ClusterBuilder {
     /// # Errors
     ///
     /// Returns [`JoinError`] if the sockets cannot bind, the membership
-    /// backend fails to start, or [`Self::node_id`] receives a
-    /// merge-derived id.
+    /// backend fails to start, [`Self::node_id`] receives a merge-derived id,
+    /// or `SUNDOG_GOSSIP_PORT` or `SUNDOG_DATA_PORT` holds something other
+    /// than a port number.
     pub async fn build(self) -> Result<Cluster, JoinError> {
         let started_at = Instant::now();
         let Self {
@@ -1077,7 +1078,7 @@ impl ClusterBuilder {
 
         #[cfg(feature = "tls")]
         let config = with_explicit_tls(config, tls);
-        validate_config(&config)?;
+        let config = checked_config(config)?;
         if let Some(id) = node_id.filter(|id| id.is_merge_derived()) {
             // Mirrors `NodeId::MERGE_BIT`: a real id always has this bit
             // clear, so any id at or past it is reserved for merge versions.
@@ -1215,6 +1216,18 @@ fn with_explicit_tls(
         config.tls = explicit;
     }
     config
+}
+
+/// `config` with the ports the environment names
+/// ([`ClusterConfig::with_env_ports`]), checked by [`validate_config`]. A
+/// value that is not UTF-8 reaches the parse with its bad bytes replaced, so
+/// it fails as any other value that is not a port number does.
+fn checked_config(config: ClusterConfig) -> Result<ClusterConfig, JoinError> {
+    let config = config.with_env_ports(|variable| {
+        std::env::var_os(variable).map(|raw| raw.to_string_lossy().into_owned())
+    })?;
+    validate_config(&config)?;
+    Ok(config)
 }
 
 /// Validates the `ClusterConfig` invariants `build()` cannot recover from:
