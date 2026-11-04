@@ -21,8 +21,13 @@ when its build fails.
 
 A node binds two ports: gossip over UDP and the data plane over TCP. Both
 default to port 0, a free port chosen at startup, which suits a LAN with
-mDNS. Anywhere a firewall, security group or network policy sits between
-nodes, fix both:
+mDNS: each node announces the gossip port it bound. Seeds and DNS records
+name a gossip port instead, so every node they name must bind that port.
+With the default ports nothing listens at the address a seed names, the
+nodes never reach each other, and each runs as a cluster of one, with no
+error. Fix the gossip port on every node a seed list or DNS record names,
+and both ports wherever a firewall, security group or network policy sits
+between nodes:
 
 ```rust
 {{#include ../cookbook/src/deploy.rs:fixed_ports}}
@@ -35,8 +40,8 @@ variable names another, and `build` fails on a value that is not a port
 number. An `Observer` does not read them and binds the port its config
 names.
 
-Seeds and DNS records name the gossip port only. Peers learn each other's
-data-plane port through gossip.
+Peers learn each other's data-plane port through gossip, so a free one
+works wherever nodes reach each other on any port.
 
 ## The advertised address
 
@@ -53,9 +58,12 @@ peers do not route to. The override covers both ports.
 ## Docker
 
 mDNS does not cross Docker's default bridge network, and most Wi-Fi networks
-block it too with access-point isolation. Give each container
-its seeds through `SUNDOG_SEEDS` or `.seeds(..)`, and with published ports
-set `advertise_ip` to the address other containers dial.
+block it too with access-point isolation. Give each container its seeds
+through `SUNDOG_SEEDS` or `.seeds(..)`. A container the seeds name fixes its
+gossip port at the number they name, through `SUNDOG_GOSSIP_PORT` or the
+config. With published ports, fix both ports, publish each at the number the
+container binds, since a node advertises the ports it binds, and set
+`advertise_ip` to the address other containers dial.
 
 ## A cloud VPC
 

@@ -133,8 +133,11 @@ addresses once it forms, under `cluster formed`.
 1. Check that every node uses the same cluster name.
 2. On Docker, in a VPC or in Kubernetes, mDNS finds nobody. Configure
    seeds or `DnsSrv`, per [Deployment](deployment.md).
-3. Check that both ports are fixed and open between nodes: gossip over
-   UDP, the data plane over TCP.
+3. Check that each node the seeds or DNS records name binds the gossip
+   port they name, fixed in its config or by `SUNDOG_GOSSIP_PORT`. With the
+   default free port nothing listens there, and when no named node does,
+   every node runs alone. Check that both ports are open between nodes:
+   gossip over UDP, the data plane over TCP.
 4. Check the advertised address in the `cluster formed` log line. A NAT or
    port mapping needs `advertise_ip`.
 5. A TLS node and a plaintext node never connect. Give every node the same
