@@ -950,6 +950,16 @@ fn top_level_modules(src: &Path) -> BTreeSet<String> {
     outline_mods(&lib_code(src)).into_iter().collect()
 }
 
+/// `path` relative to `src`, its components joined by `/` on every platform.
+fn relative_name(src: &Path, path: &Path) -> String {
+    path.strip_prefix(src)
+        .expect("a file under src/")
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn src_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
 }
@@ -961,7 +971,7 @@ fn lower_modules_name_only_the_modules_beneath_them() {
     let mut violations = Vec::new();
     for &(module, allowed) in LAYERS {
         for file in module_files(&src, module) {
-            let relative = file.path.strip_prefix(&src).expect("a file under src/");
+            let relative = relative_name(&src, &file.path);
             for (line, name) in root_names(&file.code, file.depth) {
                 if name == module || allowed.contains(&name.as_str()) {
                     continue;
@@ -975,10 +985,7 @@ fn lower_modules_name_only_the_modules_beneath_them() {
                 } else {
                     "a crate-root re-export; name it by its module"
                 };
-                violations.push(format!(
-                    "{}:{line} names crate::{name}, {what}",
-                    relative.display()
-                ));
+                violations.push(format!("{relative}:{line} names crate::{name}, {what}"));
             }
         }
     }
@@ -1023,10 +1030,7 @@ fn the_walk_follows_declarations_and_skips_test_modules() {
     let src = src_dir();
     let files: Vec<(String, usize)> = module_files(&src, "store")
         .into_iter()
-        .map(|file| {
-            let relative = file.path.strip_prefix(&src).expect("a file under src/");
-            (relative.display().to_string(), file.depth)
-        })
+        .map(|file| (relative_name(&src, &file.path), file.depth))
         .collect();
     let has = |path: &str| files.iter().find(|(file, _)| file == path).map(|f| f.1);
     assert_eq!(has("store/mod.rs"), Some(1));
@@ -1713,4 +1717,11 @@ fn after() -> crate::net::Mesh { todo!() }
         expected.map(|(line, name)| (line, name.to_owned())),
     );
     assert!(!requires_test("all(test, unix))"));
+}
+
+#[test]
+fn relative_name_joins_components_with_a_slash() {
+    let src = Path::new("crate").join("src");
+    let file = src.join("store").join("engine").join("mod.rs");
+    assert_eq!(relative_name(&src, &file), "store/engine/mod.rs");
 }
