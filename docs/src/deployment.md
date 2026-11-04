@@ -170,6 +170,29 @@ instead of downgrading. Gossip itself stays
 plaintext UDP and carries membership only: node ids, addresses and cache
 modes, never keys or values.
 
+## Over a WireGuard network
+
+A WireGuard network encrypts and authenticates every packet between its
+hosts, gossip and the data plane alike, with no change to sundog: kernel
+WireGuard between hosts, a Tailscale network, or a Kubernetes network
+plugin's WireGuard mode, such as Cilium's or Calico's, which encrypts pod
+traffic between Kubernetes nodes. It is the alternative to the `tls`
+feature where gossip must not cross the network in the clear, since `tls`
+covers the data plane only.
+
+WireGuard authenticates hosts, not sundog nodes: any process on a host in
+the network reaches both ports. Add the `tls` feature where each node must
+prove itself to its peers.
+
+Between hosts, peers must dial each other's tunnel address. The default
+bind address advertises the address on the route to the internet, which on
+most hosts is outside the tunnel, so bind both ports to the host's
+WireGuard address or set `advertise_ip` to it, and name tunnel addresses or
+their DNS names in the seeds. WireGuard carries no multicast, so mDNS finds
+nothing across it: seed through `SUNDOG_SEEDS` or `.seeds(..)`. A network
+plugin's WireGuard mode keeps pod IPs, so the Kubernetes setup above needs
+no change.
+
 ## The data-plane port
 
 Open the data-plane port between the service's instances and nowhere else.
