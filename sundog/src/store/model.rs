@@ -244,10 +244,12 @@ impl Model {
     }
 
     /// The pause gap, restated here rather than imported so the model stays
-    /// an independent oracle: twice the gc period, a quarter of the
-    /// retention with a one-second floor.
+    /// an independent oracle: the gc period, a quarter of the retention with
+    /// a one-second floor, plus a quarter of the period with a one-second
+    /// floor.
     fn pause_gap_ms(&self) -> u64 {
-        2 * (self.tombstone_ttl_ms / 4).max(1_000)
+        let period = (self.tombstone_ttl_ms / 4).max(1_000);
+        period + (period / 4).max(1_000)
     }
 
     /// Whether the clock at `now` shows more than the pause gap since the
@@ -965,7 +967,7 @@ mod tests {
 
     #[test]
     fn a_pause_longer_than_the_gap_defers_collection_for_a_ttl() {
-        // A retention of 8 s: a 2 s gc period and a 4 s gap.
+        // A retention of 8 s: a 2 s gc period and a 3 s gap.
         let mut model = Model::new(NodeId::from(1), 8_000, 80_000);
         model.gc(false);
         model.remove(1, ver(START_CLOCK_MS - 7_999), None, true);
@@ -984,9 +986,11 @@ mod tests {
 
         // Ticks one gap apart through the hold keep it; the one at its end
         // collects.
-        model.advance_clock(4_000);
-        model.gc(false);
-        assert!(held(&model, 1).is_some(), "inside the hold");
+        for _ in 0..2 {
+            model.advance_clock(3_000);
+            model.gc(false);
+            assert!(held(&model, 1).is_some(), "inside the hold");
+        }
         model.advance_clock(hold_ends - 1 - model.now_ms());
         model.gc(false);
         assert!(held(&model, 1).is_some(), "a millisecond before it ends");

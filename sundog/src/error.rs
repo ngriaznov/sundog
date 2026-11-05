@@ -213,6 +213,19 @@ pub enum CacheError {
         /// The bucket release window the TTL must cover.
         window: Duration,
     },
+    /// The cache was opened as [`crate::store::Mode::Distributed`] under a
+    /// zero `ClusterConfig::state_transfer_budget`. A part it owns with a
+    /// co-owner reads as cold until a pull lands, and a zero budget runs no
+    /// pull, so the part would stay cold for as long as the co-owner lives
+    /// and the node would never answer for it. A `Replicated` cache takes
+    /// zero and opens warm with what it holds.
+    #[error(
+        "cache {cache:?} distributed mode needs a nonzero state_transfer_budget to pull the parts it owns with a co-owner"
+    )]
+    ZeroStateTransferBudget {
+        /// The cache's name.
+        cache: SmolStr,
+    },
     /// A `Cache::fetch` on a [`crate::store::Mode::Distributed`] cache found
     /// no reachable owner of the key's bucket within
     /// [`crate::config::ClusterConfig::fetch_timeout`], across every
@@ -281,6 +294,16 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("prices"));
         assert!(text.contains('1'));
+    }
+
+    #[test]
+    fn zero_state_transfer_budget_message_names_the_cache_and_the_setting() {
+        let err = CacheError::ZeroStateTransferBudget {
+            cache: SmolStr::new("prices"),
+        };
+        let text = err.to_string();
+        assert!(text.contains("prices"), "{text}");
+        assert!(text.contains("state_transfer_budget"), "{text}");
     }
 
     #[test]

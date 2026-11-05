@@ -1,15 +1,16 @@
-//! The pause guard: a node whose wall clock shows a gap longer than twice the
-//! gc period since its last collection defers for `tombstone_ttl`, judging
-//! arrivals against the cap deadline and keeping its tombstones to it.
+//! The pause guard: a node whose wall clock shows a gap longer than a gc
+//! period and a quarter since its last collection defers for
+//! `tombstone_ttl`, judging arrivals against the cap deadline and keeping its
+//! tombstones to it.
 //!
-//! With a 60 s retention the gc period is 15 s and the gap 30 s.
+//! With a 60 s retention the gc period is 15 s and the gap 18.75 s.
 
 use super::super::expiry::{gc_period_ms, paused_since};
 use super::tombstone_arrival::{apply_records, entry, put_of};
 use super::*;
 
 const TTL: u64 = 60_000;
-const GAP: u64 = 30_000;
+const GAP: u64 = 18_750;
 
 /// An engine with the pause guard on, its first collection at `first_gc_ms`.
 fn guarded(first_gc_ms: u64) -> Engine<u32, String> {
@@ -202,7 +203,13 @@ fn arrivals_stay_judged_against_the_cap_until_the_first_collection_after_the_hol
     let engine = guarded(50_000);
     let t1 = 50_000 + GAP + 1;
     assert!(engine.gc_tombstones(false, t1, TTL).is_some());
-    for tick in [t1 + 1_000, t1 + 31_000, t1 + TTL - 1] {
+    for tick in [
+        t1 + 1_000,
+        t1 + 16_000,
+        t1 + 31_000,
+        t1 + 46_000,
+        t1 + TTL - 1,
+    ] {
         assert_eq!(engine.gc_tombstones(false, tick, TTL), None, "tick {tick}");
         assert!(engine.gc_deferring(), "told not to defer, held by the hold");
     }

@@ -489,12 +489,7 @@ fn retry_parts_covers_only_cold_parts_the_view_owns_with_a_co_owner() {
     let parts: Vec<PartId> = PartId::all().take(6).collect();
     let cold: HashSet<PartId> = parts[..4].iter().copied().collect();
 
-    let retry = retry_parts(
-        &unfinished_of(&parts),
-        &view,
-        Duration::from_secs(20),
-        |part| cold.contains(&part),
-    );
+    let retry = retry_parts(&unfinished_of(&parts), &view, |part| cold.contains(&part));
 
     assert_eq!(
         retry,
@@ -513,12 +508,7 @@ fn retry_parts_leaves_a_part_owned_alone_to_sole_owned() {
     );
 
     assert_eq!(
-        retry_parts(
-            &unfinished_of(&parts),
-            &alone,
-            Duration::from_secs(20),
-            |_| true
-        ),
+        retry_parts(&unfinished_of(&parts), &alone, |_| true),
         Vec::<PartId>::new()
     );
 }
@@ -536,26 +526,15 @@ fn retry_parts_leaves_a_part_the_view_no_longer_owns_to_the_next_view_change() {
         .collect();
     let all: Vec<PartId> = unowned.iter().chain(&owned).copied().collect();
 
-    assert_eq!(
-        retry_parts(&unfinished_of(&all), &view, Duration::from_secs(20), |_| {
-            true
-        }),
-        owned
-    );
+    assert_eq!(retry_parts(&unfinished_of(&all), &view, |_| true), owned);
 }
 
 #[test]
-fn retry_parts_is_empty_for_nothing_unfinished_and_for_a_zero_budget() {
+fn retry_parts_is_empty_for_nothing_unfinished() {
     let view = co_owned_view();
     assert_eq!(
-        retry_parts(&PartSet::new(), &view, Duration::from_secs(20), |_| true),
+        retry_parts(&PartSet::new(), &view, |_| true),
         Vec::<PartId>::new()
-    );
-    let parts: Vec<PartId> = PartId::all().take(3).collect();
-    assert_eq!(
-        retry_parts(&unfinished_of(&parts), &view, Duration::ZERO, |_| true),
-        Vec::<PartId>::new(),
-        "a zero budget runs no pull, so there is nothing to retry"
     );
 }
 
@@ -565,12 +544,7 @@ fn retry_parts_lists_parts_in_ascending_order() {
     let mut parts: Vec<PartId> = PartId::all().step_by(131).take(20).collect();
     parts.reverse();
 
-    let retry = retry_parts(
-        &unfinished_of(&parts),
-        &view,
-        Duration::from_secs(20),
-        |_| true,
-    );
+    let retry = retry_parts(&unfinished_of(&parts), &view, |_| true);
 
     let mut sorted = parts.clone();
     sorted.sort_unstable();

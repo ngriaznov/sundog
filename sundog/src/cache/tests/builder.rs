@@ -315,6 +315,41 @@ async fn distributed_cache_rejects_a_tombstone_ttl_inside_the_release_window() {
     cluster.shutdown().await;
 }
 
+/// A zero `state_transfer_budget` runs no pull, so a `Distributed` cache
+/// refuses it at open; a `Replicated` cache takes it and opens warm with what
+/// it holds.
+#[tokio::test]
+async fn distributed_cache_rejects_a_zero_state_transfer_budget() {
+    let name = "distributed-zero-budget-guard";
+    let cluster = Cluster::builder(name)
+        .seeds(std::iter::empty())
+        .config(loopback_config().with(|c| c.state_transfer_budget = Duration::ZERO))
+        .build()
+        .await
+        .expect("the cluster builds; the rule binds distributed caches only");
+
+    let err = cluster
+        .cache::<u32, String>(name)
+        .mode(Mode::distributed())
+        .open()
+        .await
+        .expect_err("a distributed cache under a zero budget is rejected");
+    assert!(
+        matches!(&err, CacheError::ZeroStateTransferBudget { cache } if cache == name),
+        "{err:?}"
+    );
+
+    let replicated = cluster
+        .cache::<u32, String>(name)
+        .mode(Mode::Replicated)
+        .open()
+        .await
+        .expect("a replicated cache takes a zero budget");
+    assert!(cluster.is_warm(&SmolStr::new(name)), "and opens warm");
+    replicated.close().await;
+    cluster.shutdown().await;
+}
+
 #[tokio::test]
 async fn distributed_cache_rejects_owners_below_two() {
     let cluster = Cluster::builder("cache-it-distributed-owners-below-two")

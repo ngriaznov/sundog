@@ -103,55 +103,36 @@ async fn build_rejects_a_mesh_keepalive_no_kernel_accepts_and_takes_the_bounds()
     }
 }
 
+/// Every setting `build()` needs nonzero fails it at zero, with an
+/// `InvalidConfig` that names the setting.
 #[tokio::test]
-async fn build_rejects_a_zero_fan_out_backlog_capacity() {
-    let mut config = loopback_config();
-    config.fan_out_backlog_capacity = 0;
-
-    let err = Cluster::builder("cluster-it-fan-out-backlog-capacity-guard")
-        .seeds(std::iter::empty())
-        .config(config)
-        .build()
-        .await
-        .expect_err("a zero fan_out_backlog_capacity must be rejected at build() time");
-    assert!(
-        matches!(err, JoinError::InvalidConfig(ref msg) if msg.contains("fan_out_backlog_capacity")),
-        "{err:?}"
-    );
-}
-
-#[tokio::test]
-async fn build_rejects_a_zero_outbox_bytes() {
-    let mut config = loopback_config();
-    config.outbox_bytes = 0;
-
-    let err = Cluster::builder("cluster-it-outbox-bytes-guard")
-        .seeds(std::iter::empty())
-        .config(config)
-        .build()
-        .await
-        .expect_err("a zero outbox_bytes must be rejected at build() time");
-    assert!(
-        matches!(err, JoinError::InvalidConfig(ref msg) if msg.contains("outbox_bytes")),
-        "{err:?}"
-    );
-}
-
-#[tokio::test]
-async fn build_rejects_a_zero_fan_out_stall_timeout() {
-    let mut config = loopback_config();
-    config.fan_out_stall_timeout = Duration::ZERO;
-
-    let err = Cluster::builder("cluster-it-fan-out-stall-timeout-guard")
-        .seeds(std::iter::empty())
-        .config(config)
-        .build()
-        .await
-        .expect_err("a zero fan_out_stall_timeout must be rejected at build() time");
-    assert!(
-        matches!(err, JoinError::InvalidConfig(ref msg) if msg.contains("fan_out_stall_timeout")),
-        "{err:?}"
-    );
+async fn build_rejects_each_setting_that_must_be_nonzero_at_zero() {
+    type Zeroing = (&'static str, fn(&mut ClusterConfig));
+    let zeroed: [Zeroing; 5] = [
+        ("crdt_compact_batch", |c| c.crdt_compact_batch = 0),
+        ("outbox_capacity", |c| c.outbox_capacity = 0),
+        ("outbox_bytes", |c| c.outbox_bytes = 0),
+        ("fan_out_backlog_capacity", |c| {
+            c.fan_out_backlog_capacity = 0;
+        }),
+        ("fan_out_stall_timeout", |c| {
+            c.fan_out_stall_timeout = Duration::ZERO;
+        }),
+    ];
+    for (setting, zero) in zeroed {
+        let mut config = loopback_config();
+        zero(&mut config);
+        let err = Cluster::builder("cluster-it-nonzero-guard")
+            .seeds(std::iter::empty())
+            .config(config)
+            .build()
+            .await
+            .expect_err(setting);
+        assert!(
+            matches!(&err, JoinError::InvalidConfig(msg) if msg.contains(setting)),
+            "{setting}: {err:?}"
+        );
+    }
 }
 
 /// `validate_config` does not reject a `rebalance_ack_window` past its

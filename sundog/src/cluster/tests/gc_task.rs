@@ -309,7 +309,7 @@ async fn the_gc_task_period_is_the_shared_gc_period_and_inside_the_pause_gap() {
         }
         assert!(
             period_ms < crate::store::pause_gap_ms(ttl_ms),
-            "{ttl:?}: a healthy tick leaves a whole period of jitter"
+            "{ttl:?}: a healthy tick, one period after the last, is no pause"
         );
     }
 }
@@ -405,6 +405,98 @@ async fn the_gc_task_arms_the_pause_guard_when_the_wall_clock_jumps_under_it() {
     tokio::time::sleep(Duration::from_secs(12)).await;
     ShardOps::apply_remote(&*shard, lapsed_delete(4)).await;
     assert_eq!(shard.get(&4).await.as_deref(), Some("old"), "ignored again");
+
+    cancel.cancel();
+    task.await.expect("the gc task ends once cancelled");
+}
+
+/// A forward step of the wall clock shorter than one gc period, but past the
+/// quarter period of jitter room, reads as a pause at the task's next tick:
+/// the tombstones would otherwise reach their deadlines early by the step. A
+/// delete lapsed past its ttl is ignored before the step and applied after it.
+#[tokio::test(start_paused = true)]
+async fn the_gc_task_holds_after_a_forward_step_shorter_than_a_period() {
+    const START_MS: u64 = 1_700_000_000_500;
+    const TTL_MS: u64 = 8_000;
+    let origin = tokio::time::Instant::now();
+    let stepped_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let step = Arc::clone(&stepped_ms);
+    let clock: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(move || {
+        let elapsed_ms = (origin.elapsed().as_micros() + 500) / 1_000;
+        START_MS
+            + u64::try_from(elapsed_ms).expect("a test runs for far less than 2^64 ms")
+            + step.load(std::sync::atomic::Ordering::SeqCst)
+    });
+    let shard = Arc::new(
+        Shard::<u32, String>::new(
+            SmolStr::new("forward-step"),
+            Mode::Replicated,
+            NodeId::from(1),
+            10_000,
+            None,
+            None,
+        )
+        .with_tombstone_ttl(Duration::from_millis(TTL_MS))
+        .with_clock(Arc::clone(&clock)),
+    );
+    let key_bytes = |key: u32| Bytes::from(postcard::to_stdvec(&key).expect("a u32 encodes"));
+    let old = |key: u32| WireRecord {
+        key: key_bytes(key),
+        value: Some(Bytes::from(
+            postcard::to_stdvec(&"old".to_string()).expect("a string encodes"),
+        )),
+        ver: Hlc {
+            wall_ms: 1_000,
+            logical: 0,
+            node: NodeId::from(3),
+        },
+        expires_at_ms: None,
+    };
+    let lapsed_delete = |key: u32| WireRecord {
+        key: key_bytes(key),
+        value: None,
+        ver: Hlc {
+            wall_ms: clock() - 2 * TTL_MS,
+            logical: 0,
+            node: NodeId::from(2),
+        },
+        expires_at_ms: None,
+    };
+    let period_ms = crate::store::gc_period_ms(TTL_MS);
+    let room_ms = crate::store::pause_gap_ms(TTL_MS) - period_ms;
+    assert!(
+        room_ms < period_ms,
+        "a step between the two is the case here"
+    );
+    let task_clock = Arc::clone(&clock);
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn(tombstone_gc_task(
+        Arc::clone(&shard) as Arc<dyn ShardOps>,
+        Mode::Replicated,
+        Duration::from_millis(TTL_MS),
+        Duration::from_hours(24),
+        absence::AbsenceTracker::default(),
+        move || task_clock(),
+        cancel.clone(),
+    ));
+
+    // Past the task's start deferral, ticking on time: no hold is in force.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    for key in [1, 2] {
+        ShardOps::apply_remote(&*shard, old(key)).await;
+    }
+    ShardOps::apply_remote(&*shard, lapsed_delete(1)).await;
+    assert_eq!(shard.get(&1).await.as_deref(), Some("old"), "ignored");
+
+    // The wall clock steps forward halfway between the room and a whole
+    // period; the next tick sees the gap and holds.
+    stepped_ms.fetch_add(
+        u64::midpoint(room_ms, period_ms),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    tokio::time::sleep(Duration::from_millis(period_ms + 100)).await;
+    ShardOps::apply_remote(&*shard, lapsed_delete(2)).await;
+    assert_eq!(shard.get(&2).await, None, "applied inside the hold");
 
     cancel.cancel();
     task.await.expect("the gc task ends once cancelled");

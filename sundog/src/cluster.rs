@@ -1232,7 +1232,8 @@ fn checked_config(config: ClusterConfig) -> Result<ClusterConfig, JoinError> {
 
 /// Validates the `ClusterConfig` invariants `build()` cannot recover from:
 /// `max_frame` against the wire codec's hard cap and the sketch frame size
-/// it implies. `rebalance_chunk_bytes` and `rebalance_ack_window` are not
+/// it implies, `mesh_keepalive`'s range, and the batch, capacity, byte and
+/// timeout settings that must be nonzero. `rebalance_chunk_bytes` and `rebalance_ack_window` are not
 /// checked here: both have a bound of their own
 /// ([`ClusterConfig::rebalance_chunk_bytes_value`],
 /// [`ClusterConfig::rebalance_ack_window_max`]) applied as a clamp at the
@@ -1261,6 +1262,16 @@ fn validate_config(config: &ClusterConfig) -> Result<(), JoinError> {
         return Err(JoinError::InvalidConfig(format!(
             "ClusterConfig::mesh_keepalive ({idle:?}) must be between 1 s and 32767 s"
         )));
+    }
+    if config.crdt_compact_batch == 0 {
+        return Err(JoinError::InvalidConfig(
+            "ClusterConfig::crdt_compact_batch must be nonzero".to_string(),
+        ));
+    }
+    if config.outbox_capacity == 0 {
+        return Err(JoinError::InvalidConfig(
+            "ClusterConfig::outbox_capacity must be nonzero".to_string(),
+        ));
     }
     if config.fan_out_backlog_capacity == 0 {
         return Err(JoinError::InvalidConfig(
@@ -1523,8 +1534,9 @@ fn until_next_grid_tick(now_ms: u64, period: Duration) -> Duration {
 /// has to reach it. `uptime` counts from when the gc task started. `Local` and
 /// `Invalidation` never defer. The shard adds one more reason of its own,
 /// which this task does not decide: a pause, a gap between its collections of
-/// more than twice the period [`tombstone_gc_task`] ticks on, which it
-/// measures on the wall clock and holds for `settle` after the gap. Pure; unit
+/// more than a period and a quarter of the one [`tombstone_gc_task`] ticks
+/// on, which it measures on the wall clock and holds for `settle` after the
+/// gap. Pure; unit
 /// tested directly.
 fn gc_defers(mode: Mode, absent_defers: bool, uptime: Duration, settle: Duration) -> bool {
     mode.defers_tombstone_gc() && (absent_defers || uptime < settle)
@@ -1552,7 +1564,9 @@ fn gc_defers(mode: Mode, absent_defers: bool, uptime: Duration, settle: Duration
 /// itself starts deferring when it is built, so the records that arrive
 /// before the first tick, state transfer among them, meet the same rule. The
 /// shard also defers on its own for `tombstone_ttl` after a pause, a wall-clock
-/// gap of more than twice this period between two ticks, and judges arrivals
+/// gap of more than a period and a quarter between two ticks, at least a
+/// period and a second, from a node that did not run or a clock that stepped
+/// forward, and judges arrivals
 /// against that gap before the task wakes; the task only has to tick on
 /// [`gc_period_ms`], which the gap is measured against. The tombstone of an
 /// expired entry has its cap at its ttl deadline, so no deferral keeps it.

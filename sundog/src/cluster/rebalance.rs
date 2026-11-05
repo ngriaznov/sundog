@@ -422,8 +422,8 @@ impl PullRequest<'_> {
     /// Pulls `parts` from any current owner, grouped by donor set so two
     /// parts sharing an owner-set-minus-self go in one `StBuckets` round
     /// trip, bounded to `concurrency` simultaneous donor streams. Answers
-    /// [`Outcome::Completed`]/[`Outcome::Skipped`]/[`Outcome::NoPeers`] for
-    /// an empty part set, a zero budget, or no live co-owner anywhere;
+    /// [`Outcome::Completed`]/[`Outcome::NoPeers`] for an empty part set or
+    /// no live co-owner anywhere;
     /// otherwise races `budget`, answering [`Outcome::TimedOut`] or
     /// [`Outcome::Superseded`] if it runs out or the view moves on first.
     pub(crate) async fn run(self) -> Outcome {
@@ -440,10 +440,6 @@ impl PullRequest<'_> {
         } = self;
         if parts.is_empty() {
             return Outcome::Completed;
-        }
-        if budget.is_zero() {
-            tracing::debug!(cache = %cache, "rebalance transfer budget is zero; leaving gained parts to anti-entropy");
-            return Outcome::Skipped;
         }
 
         // Opened before the view is read, so any view published after the
@@ -541,19 +537,15 @@ fn count_pull_timeout(cache: &SmolStr) {
 
 /// The parts of `unfinished` a retry pulls: those `view` owns with a
 /// co-owner to pull from and that are still cold, in ascending part order.
-/// None for a zero `budget`, which runs no pull at all. A part owned alone is
-/// left to [`sole_owned`], which serves it once its absent co-owners have
-/// been gone for `budget`; a part `view` does not own is left to the next
-/// view change, which plans it afresh. Pure; unit tested directly.
+/// A part owned alone is left to [`sole_owned`], which serves it once its
+/// absent co-owners have been gone for `state_transfer_budget`; a part
+/// `view` does not own is left to the next view change, which plans it
+/// afresh. Pure; unit tested directly.
 pub(crate) fn retry_parts(
     unfinished: &PartSet,
     view: &OwnershipView,
-    budget: Duration,
     is_cold: impl Fn(PartId) -> bool,
 ) -> Vec<PartId> {
-    if budget.is_zero() {
-        return Vec::new();
-    }
     let mut parts: Vec<PartId> = unfinished
         .iter()
         .filter(|&part| view.owns(part) && view.owners_of(part).len() > 1 && is_cold(part))
@@ -1366,7 +1358,7 @@ pub(crate) async fn rebalance_task(
                 // holds a release behind it: parts a pull planned and did not
                 // land are pulled again, preempted by a cancel or a view
                 // change.
-                let retry = retry_parts(&unfinished, &ownership.current(), budget, |part| {
+                let retry = retry_parts(&unfinished, &ownership.current(), |part| {
                     residency.is_cold(part)
                 });
                 if !retry.is_empty() {

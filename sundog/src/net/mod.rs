@@ -135,11 +135,6 @@ fn build_tls_ctx(_config: &ClusterConfig) -> TlsCtx {
     TlsCtx
 }
 
-/// Capacity of the inbound-message channel and of each per-peer, per-class
-/// outbox absent a caller override, mirroring
-/// [`ClusterConfig::outbox_capacity`]'s default.
-const DEFAULT_CHANNEL_CAPACITY: usize = 8_192;
-
 /// How long [`Mesh::shutdown`] waits for queued frames, replicate and
 /// invalidate, to reach their writers before cancelling them, and the moment
 /// it then leaves for the writers' last frames to go out.
@@ -688,7 +683,7 @@ impl MeshInner {
             node: NodeId::from(1),
             incarnation: 1,
             cluster: wire::UNNAMED_CLUSTER,
-            outbox_capacity: DEFAULT_CHANNEL_CAPACITY,
+            outbox_capacity: ClusterConfig::default().outbox_capacity,
             outbox_bytes: ClusterConfig::default().outbox_bytes,
             peers: RwLock::new(HashMap::new()),
             accept_cancel,

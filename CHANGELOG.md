@@ -3,6 +3,42 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+
+- **`build` rejects a zero `crdt_compact_batch` or `outbox_capacity`.** A
+  zero batch built and turned the CRDT compaction sweep off without a word:
+  each call examined nothing, so dead writers never retired or folded. A zero
+  outbox capacity was replaced by the default of 8,192 frames. `build` now
+  fails on either with `JoinError::InvalidConfig`.
+- **A `Distributed` cache rejects a zero `state_transfer_budget`.** A part a
+  `Distributed` node owns with a co-owner reads as cold until a pull lands,
+  and zero ran no pull, so every such part stayed cold for as long as the
+  co-owner lived: local misses went to the other owners, the node never
+  answered for the part, and a cluster whose nodes all ran zero answered
+  `FetchUnavailable`. `open` now fails with the new
+  `CacheError::ZeroStateTransferBudget`. A `Replicated` cache still takes
+  zero and opens warm with what it holds.
+- **The pause guard's gap is a gc period plus a jitter room.** The gap
+  between two tombstone collections that counts as a pause was two periods,
+  half of `tombstone_ttl`; it is now one period plus a quarter of the period
+  and at least a second: 3 minutes 7.5 seconds at the default
+  `tombstone_ttl` of 10 minutes, and unchanged at 2 seconds below a
+  `tombstone_ttl` of 4 seconds. The gc task collects on the period's
+  wall-clock grid, so a healthy gap never passes one period by more than
+  scheduler jitter.
+
+### Fixed
+
+- **A wall clock that steps forward by less than a gc period is held.** A
+  step of up to a whole period between two collections, a quarter of
+  `tombstone_ttl`, left the gap under the pause threshold, and the node
+  reached every tombstone deadline early by the step, so a replica that had
+  missed a delete could hand its older value back. A step past the jitter
+  room now counts as a pause and defers collection for another
+  `tombstone_ttl`.
+
 ## [0.6.10] – 2026-11-05
 
 ### Added

@@ -331,6 +331,10 @@ where
     /// Returns [`CacheError::AlreadyOpen`] if a cache named `name` is
     /// already open in this process; [`CacheError::TooFewOwners`] if
     /// `mode` is [`Mode::Distributed`] with an `owners` count under 2;
+    /// [`CacheError::TombstoneTtlInsideReleaseWindow`] or
+    /// [`CacheError::ZeroStateTransferBudget`] if `mode` is
+    /// [`Mode::Distributed`] under a `tombstone_ttl` shorter than the bucket
+    /// release window or a zero `state_transfer_budget`;
     /// [`CacheError::ReplicatedWithLocalEviction`] if `mode` is
     /// [`Mode::Replicated`] or [`Mode::Distributed`] with `tti` set, or
     /// `max_capacity` set with no `spill` tier configured (`tti` is

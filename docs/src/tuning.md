@@ -41,7 +41,7 @@ Cache-level settings, `mode`, `max_capacity`, `max_resident_bytes`, `ttl`,
 |---|---|---|
 | `ae_interval` | 30 s | repairs after message loss must land faster; each round costs one digest exchange per open cache |
 | `max_clock_skew` | 1 min | node clocks drift further apart than this in normal running; `None` accepts any stamp, and one fast clock then wins every conflict, pulls every other clock forward and leaves a tombstone stamped ahead of a slow clock alive for the stamp's whole lead; a `Distributed` owner holds a forward stamped past it until its own clock catches up |
-| `state_transfer_budget` | 20 s | a joining node's snapshot takes longer to pull; `open` waits this long before opening with a partial copy that anti-entropy completes; a `Distributed` cache on a fixed seed list also waits up to 5 s of it for a first peer before it computes ownership; a graceful `Cluster::shutdown` of a `Distributed` node spends up to this long reconciling with its live co-owners, each getting an equal share, before it leaves |
+| `state_transfer_budget` | 20 s | a joining node's snapshot takes longer to pull; `open` waits this long before opening with a partial copy that anti-entropy completes; a `Distributed` cache on a fixed seed list also waits up to 5 s of it for a first peer before it computes ownership; a graceful `Cluster::shutdown` of a `Distributed` node spends up to this long reconciling with its live co-owners, each getting an equal share, before it leaves; zero opens a `Replicated` cache warm with what it holds at once, and a `Distributed` cache refuses it |
 | `reconcile_byte_budget` | 32 MiB | a warm reopen's reconciliation with each peer should move more or fewer bytes before that peer's still-diverging buckets fall back to a cold pull |
 | `fan_out_backlog_capacity` | 262,144 keys | write bursts outrun the network for longer than the backlog absorbs |
 | `fan_out_wait_timeout` | 30 s | a writer waiting for backlog room should give up sooner and write over capacity |
@@ -54,7 +54,7 @@ Cache-level settings, `mode`, `max_capacity`, `max_resident_bytes`, `ttl`,
 
 | Field | Default | Change it when |
 |---|---|---|
-| `tombstone_ttl` | 10 min | tombstones cost too much memory, deletes and, in the replicated modes without a merging resolver, expired entries alike, or a lagging peer needs longer to see a delete; a delete has to reach every replica within it of the delete's stamp, so keep it at least 3 × `ae_interval` and well above the clock error between nodes and the longest data-plane stall you tolerate; a quarter of it is the collection period and twice that the pause gap, half of it from 4 s up |
+| `tombstone_ttl` | 10 min | tombstones cost too much memory, deletes and, in the replicated modes without a merging resolver, expired entries alike, or a lagging peer needs longer to see a delete; a delete has to reach every replica within it of the delete's stamp, so keep it at least 3 × `ae_interval` and well above the clock error between nodes and the longest data-plane stall you tolerate; a quarter of it is the collection period, and that period plus a quarter of it, at least plus a second, the pause gap |
 | `tombstone_max_ttl` | 24 h | entries have no TTL and a member can be absent longer than this; a node that defers keeps its deletes to it and judges an arriving one against it, while the tombstone of an expired entry keeps only `tombstone_ttl`; lower it if a day of deletes does not fit in memory |
 
 ## Distributed caches

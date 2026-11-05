@@ -127,7 +127,7 @@ async fn products_by_id(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::solo_cluster;
+    use crate::test_support::{solo_cluster, solo_distributed_cluster};
 
     async fn seeded_db() -> SqlitePool {
         let db = SqlitePool::connect("sqlite::memory:")
@@ -203,7 +203,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_registered_loader_fills_misses_in_one_call_and_skips_absent_rows() {
-        let cluster = solo_cluster("cookbook-read-through-loader").await;
+        let cluster = solo_distributed_cluster("cookbook-read-through-loader").await;
         let db = seeded_db().await;
         sqlx::query("INSERT INTO products (id, name, price_cents) VALUES (2, 'mug', 900)")
             .execute(&db)

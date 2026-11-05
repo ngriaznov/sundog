@@ -270,10 +270,12 @@ pub trait ShardOps: Send + Sync {
     /// `tombstone_max_ttl` is left in place instead; the tombstone of an
     /// expired entry has its cap at its ttl deadline, so no deferral keeps it.
     /// On a `Replicated` or
-    /// `Distributed` shard a call more than twice the gc period (a quarter of
-    /// `tombstone_ttl`, at least a second) after the previous one defers too,
-    /// as does every later call for `tombstone_ttl`: the shard did not run,
-    /// and may hold values whose deletes it never saw. A tombstone that
+    /// `Distributed` shard a call more than a gc period (a quarter of
+    /// `tombstone_ttl`, at least a second) and a quarter, at least a second,
+    /// after the previous one on the wall clock defers too, as does every
+    /// later call for `tombstone_ttl`: the shard did not run, and may hold
+    /// values whose deletes it never saw, or its clock stepped forward, and
+    /// would reach its tombstones' deadlines early. A tombstone that
     /// arrives from a peer already past the retention this shard applies is
     /// dropped on arrival, whatever the key holds.
     fn gc_tombstones(&self, defer: bool) -> BoxFuture<'_, ()>;

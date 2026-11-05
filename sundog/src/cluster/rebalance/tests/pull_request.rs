@@ -454,34 +454,3 @@ async fn rebalance_task_stops_mid_pull_when_cancelled() {
     donor.shutdown().await;
     cluster.shutdown().await;
 }
-
-#[tokio::test]
-async fn pull_buckets_skips_with_a_zero_budget() {
-    let cluster = solo_cluster("rebalance-unit-test-zero-budget").await;
-    let name = SmolStr::new("prices");
-    let k = NonZeroU8::new(2).expect("nonzero");
-    let (tracker, _tx) = OwnershipTracker::seed(
-        cluster.node_id(),
-        &cluster.peers(),
-        &cluster.advertised_cache_modes(),
-        &name,
-        k,
-    );
-
-    let outcome = PullRequest {
-        cluster: &cluster,
-        shard: &empty_shard(),
-        ownership: &tracker,
-        residency: &Arc::new(ResidencySet::new()),
-        cache: &name,
-        parts: vec![PartId::from_raw(0)],
-        budget: Duration::ZERO,
-        concurrency: 4,
-        trust_sole_owner: true,
-    }
-    .run()
-    .await;
-    assert_eq!(outcome, Outcome::Skipped);
-
-    cluster.shutdown().await;
-}

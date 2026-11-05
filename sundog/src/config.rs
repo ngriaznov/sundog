@@ -69,11 +69,13 @@ pub struct ClusterConfig {
     /// also defers collection for the first `tombstone_ttl` after it opens,
     /// whoever is absent, since a node that just opened can hold a copy a
     /// peer's tombstone has to delete, and for another `tombstone_ttl` after
-    /// a pause: a wall-clock gap of more than twice the collection period,
-    /// a quarter of this retention and at least a second, between two of its
-    /// tombstone collections. A stopped or suspended process leaves such a
-    /// gap, and misses the deletes its peers make meanwhile. The gap is half
-    /// of this retention from 4 seconds up.
+    /// a pause: a wall-clock gap between two of its tombstone collections of
+    /// more than one collection period, a quarter of this retention and at
+    /// least a second, plus a jitter room of a quarter of the period and at
+    /// least a second. A stopped or suspended process leaves such a gap, and
+    /// misses the deletes its peers make meanwhile; a wall clock stepped
+    /// forward by more than the jitter room leaves one too. The gap is
+    /// 3 minutes 7.5 seconds at the default of 10 minutes.
     ///
     /// Every tombstone counts this retention from an instant all replicas
     /// agree on, capped at the receiving node's clock: the delete's version
@@ -166,7 +168,8 @@ pub struct ClusterConfig {
     /// How many resident CRDT records one `compact_pass` call examines
     /// before yielding to the executor. A tick keeps calling until the
     /// whole keyspace has been examined, so this bounds the stall per call,
-    /// not the work per tick.
+    /// not the work per tick. Must be nonzero: `ClusterBuilder::build`
+    /// rejects zero. Default: 4,096.
     pub crdt_compact_batch: usize,
     /// How often the CRDT compaction sweep runs. `None`, the default, is a
     /// quarter of [`crdt_retire_after`](Self::crdt_retire_after) floored at
@@ -176,7 +179,10 @@ pub struct ClusterConfig {
     /// ([`crdt_compaction_bounds`](Self::crdt_compaction_bounds)) the
     /// sweep period feeds.
     pub crdt_sweep_interval: Option<Duration>,
-    /// Bounded capacity of each per-peer outbox (`mpsc`) on the data plane.
+    /// Bounded capacity of each per-peer outbox (`mpsc`) on the data plane,
+    /// in frames, and of the channel that carries inbound frames to the
+    /// cluster. Must be nonzero: `ClusterBuilder::build` rejects zero.
+    /// Default: 8,192.
     pub outbox_capacity: usize,
     /// How much memory each of a peer's two outboxes holds, its replicate
     /// outbox and its invalidate queue, alongside
@@ -273,7 +279,10 @@ pub struct ClusterConfig {
     /// with [`Mode::Distributed`] caches also runs on it: the node
     /// reconciles its parts with each live co-owner first, every co-owner of
     /// every cache gets an equal share of the time left, and a round that
-    /// fails is retried within the share.
+    /// fails is retried within the share. A [`Mode::Distributed`] cache
+    /// needs a nonzero budget: a part it owns with a co-owner reads as cold
+    /// until a pull lands, so `open()` rejects zero with
+    /// [`CacheError::ZeroStateTransferBudget`](crate::CacheError::ZeroStateTransferBudget).
     ///
     /// [`Mode::Replicated`]: crate::Mode::Replicated
     /// [`Mode::Distributed`]: crate::Mode::Distributed

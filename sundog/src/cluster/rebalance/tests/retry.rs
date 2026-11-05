@@ -380,25 +380,6 @@ async fn rebalance_task_stops_mid_retry_when_cancelled() {
     rig.cluster.shutdown().await;
 }
 
-/// A zero budget runs no pull at all, so nothing times out and the retry
-/// never starts.
-#[tokio::test]
-async fn a_zero_budget_runs_no_retry() {
-    let recorder = metrics_util::debugging::DebuggingRecorder::new();
-    let timeouts = Timeouts::new(&recorder);
-    let _guard = metrics::set_default_local_recorder(&recorder);
-    let before = timeouts.count();
-    let rig = Rig::start(
-        "rebalance-unit-test-retry-zero",
-        Duration::ZERO,
-        Duration::from_secs(3600),
-    )
-    .await;
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    assert_eq!(timeouts.count(), before, "no pull ran");
-    rig.finish().await;
-}
-
 /// A part whose disown grace has run out is released on the tick that finds
 /// it due, before a retry begins, so a pull that keeps timing out never
 /// holds a release behind the retry's budget.

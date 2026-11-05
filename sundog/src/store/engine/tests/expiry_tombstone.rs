@@ -980,29 +980,30 @@ fn gc_period_is_a_quarter_of_the_ttl_with_a_floor_of_a_second() {
 }
 
 #[test]
-fn pause_gap_is_twice_the_gc_period_and_half_the_ttl_from_four_seconds_up() {
-    for ttl_ms in [0, 1_000, 2_000, 3_000, 4_000, 8_000, 600_000, u64::MAX] {
-        assert_eq!(
-            pause_gap_ms(ttl_ms),
-            gc_period_ms(ttl_ms).saturating_mul(2),
-            "ttl {ttl_ms}"
+fn pause_gap_is_a_period_and_a_quarter_with_a_second_of_room_at_least() {
+    for (ttl_ms, gap_ms) in [
+        (0, 2_000),
+        (2_000, 2_000),
+        (4_000, 2_000),
+        (8_000, 3_000),
+        (16_000, 5_000),
+        (60_000, 18_750),
+        (600_000, 187_500),
+        (u64::MAX, u64::MAX / 4 + u64::MAX / 16),
+    ] {
+        assert_eq!(pause_gap_ms(ttl_ms), gap_ms, "ttl {ttl_ms}");
+        assert!(
+            pause_gap_ms(ttl_ms) > gc_period_ms(ttl_ms),
+            "a healthy tick, one period after the last, is no pause: ttl {ttl_ms}"
         );
     }
-    assert_eq!(
-        pause_gap_ms(2_000),
-        2_000,
-        "the floor: a gap as long as the ttl"
-    );
-    assert_eq!(pause_gap_ms(4_000), 2_000, "half the ttl from here up");
-    assert_eq!(pause_gap_ms(600_000), 300_000);
-    assert_eq!(pause_gap_ms(u64::MAX), u64::MAX / 4 * 2);
 }
 
 #[test]
 fn paused_since_is_strictly_over_the_gap_and_never_before_a_collection() {
     let ttl_ms = 60_000;
     let gap = pause_gap_ms(ttl_ms);
-    assert_eq!(gap, 30_000);
+    assert_eq!(gap, 18_750);
     assert!(
         !paused_since(0, u64::MAX, ttl_ms),
         "0 means no collection yet"
@@ -1022,7 +1023,7 @@ fn paused_since_is_strictly_over_the_gap_and_never_before_a_collection() {
     assert!(!paused_since(u64::MAX, u64::MAX, ttl_ms));
     assert!(
         !paused_since(1, 1 + gap, u64::MAX),
-        "a gap of u64::MAX / 2 saturates without wrapping"
+        "a gap of over u64::MAX / 4 saturates without wrapping"
     );
 }
 

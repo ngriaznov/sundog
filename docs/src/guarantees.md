@@ -199,17 +199,25 @@ A pause defers collection too. A process that was stopped, a virtual machine
 that was suspended and a starved gc task all miss the deletes their peers
 make, and gossip does not reliably flag them: the monotonic clock the failure
 detector reads does not advance across a suspend. A `Replicated` or
-`Distributed` node compares the wall clock at each tombstone collection with
-the one before. A gap of more than twice the collection period, a quarter of
-`tombstone_ttl` and at least a second, counts as a pause. The node then
+`Distributed` node collects tombstones on a fixed wall-clock schedule, every
+quarter of `tombstone_ttl` and at least every second, and compares the wall
+clock at each collection with the one before. A gap of more than one period
+plus a jitter room of a quarter of the period and at least a second counts as
+a pause: 3 minutes 7.5 seconds at the default `tombstone_ttl` of 10 minutes,
+and 2 seconds below a `tombstone_ttl` of 4 seconds. A wall clock stepped
+forward by more than the jitter room leaves the same gap and counts the same
+way, so the node's tombstones do not reach their deadlines early by the
+step. The node then
 defers for another `tombstone_ttl` and logs one warning with the gap; a second
 pause inside the hold extends it. The check also runs when a record arrives,
 so the first delete after a resume is judged against `tombstone_max_ttl`
-before the gc task wakes. The gap is half of `tombstone_ttl` for a
-`tombstone_ttl` of 4 seconds or more; the one-second floor of the period makes
-it 2 seconds below that. A pause shorter than the gap is not detected: the
+before the gc task wakes. A pause shorter than the gap is not detected: the
 deletes made meanwhile have the rest of `tombstone_ttl` from their stamp to
-reach the node. A false positive, such as a clock stepped forward, only
+reach the node. A forward step inside the jitter room shortens the node's
+retention by at most the room. No hold outlasts a tombstone's
+`tombstone_max_ttl`, so a clock stepped further ahead than that collects every
+tombstone at once, one of the clocks off by `tombstone_ttl` or more that fall
+outside the contract below. A false positive, such as a starved gc task, only
 lengthens the deferral.
 
 Three cases fall outside the contract, because no deferral covers them. In each

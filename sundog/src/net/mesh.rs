@@ -11,11 +11,11 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    BoundListener, DEFAULT_CHANNEL_CAPACITY, Greeting, InboundMsg, Mesh, MeshInner, MsgClass,
-    NoRoom, OUTBOX_FLUSH_DEADLINE, OUTBOX_FLUSH_TAIL, OutFrame, OutboxFull, OutboxPermit, OutboxTx,
-    PeerHandle, RequestHandler, RoomWait, SendBudget, SendEnd, build_tls_ctx, conn,
-    fan_out_no_room, fan_out_room_wait, idle_deadline, latch_mark, mono_ms, replicate_outbox,
-    stall_latch, taken_since_latch, waits_out_latch,
+    BoundListener, Greeting, InboundMsg, Mesh, MeshInner, MsgClass, NoRoom, OUTBOX_FLUSH_DEADLINE,
+    OUTBOX_FLUSH_TAIL, OutFrame, OutboxFull, OutboxPermit, OutboxTx, PeerHandle, RequestHandler,
+    RoomWait, SendBudget, SendEnd, build_tls_ctx, conn, fan_out_no_room, fan_out_room_wait,
+    idle_deadline, latch_mark, mono_ms, replicate_outbox, stall_latch, taken_since_latch,
+    waits_out_latch,
 };
 use crate::config::ClusterConfig;
 use crate::error::JoinError;
@@ -37,6 +37,11 @@ impl Mesh {
     /// # Errors
     ///
     /// Returns [`JoinError::Bind`] if `bind_addr` cannot be bound.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config.outbox_capacity` is 0, which
+    /// [`ClusterBuilder::build`](crate::ClusterBuilder::build) rejects.
     pub async fn spawn(
         bind_addr: SocketAddr,
         node: NodeId,
@@ -80,11 +85,7 @@ impl Mesh {
         #[cfg(not(all(feature = "tls", not(feature = "sim"))))]
         let tls = build_tls_ctx(config);
 
-        let outbox_capacity = if config.outbox_capacity == 0 {
-            DEFAULT_CHANNEL_CAPACITY
-        } else {
-            config.outbox_capacity
-        };
+        let outbox_capacity = config.outbox_capacity;
         let (inbound_tx, inbound_rx) = mpsc::channel(outbox_capacity);
         let inner = Arc::new(MeshInner {
             node: greeting.node,

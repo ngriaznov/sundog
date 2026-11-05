@@ -59,9 +59,10 @@ where
     Ok(())
 }
 
-/// Rejects a `Mode::Distributed` cache opened with `owners` under 2 or
-/// under a `tombstone_ttl` shorter than
-/// [`ClusterConfig::bucket_release_window`], and rejects a `Replicated` or
+/// Rejects a `Mode::Distributed` cache opened with `owners` under 2, under a
+/// `tombstone_ttl` shorter than [`ClusterConfig::bucket_release_window`], or
+/// under a zero `state_transfer_budget`, which would pull none of its parts
+/// with a co-owner and leave them cold, and rejects a `Replicated` or
 /// `Distributed` cache combined with `local_eviction`: any `tti`, or a
 /// finite `max_capacity` with no spill tier configured. Anti-entropy would
 /// silently re-pull an evicted entry back for either mode, since every owner
@@ -85,6 +86,11 @@ pub(super) fn validate_mode(
                 cache: name.clone(),
                 tombstone_ttl: config.tombstone_ttl,
                 window,
+            });
+        }
+        if config.state_transfer_budget.is_zero() {
+            return Err(CacheError::ZeroStateTransferBudget {
+                cache: name.clone(),
             });
         }
     }

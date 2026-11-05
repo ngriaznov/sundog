@@ -213,7 +213,7 @@ mod tests {
     use tower::ServiceExt as _;
 
     use super::*;
-    use crate::test_support::solo_cluster;
+    use crate::test_support::{solo_cluster, solo_distributed_cluster};
 
     #[tokio::test]
     async fn the_first_cache_writes_reads_and_removes() {
@@ -262,7 +262,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_distributed_write_is_fetchable() {
-        let cluster = solo_cluster("cookbook-distributed").await;
+        let cluster = solo_distributed_cluster("cookbook-distributed").await;
         assert_eq!(
             price_lookup(&cluster).await.expect("fetch answers"),
             Some(999)

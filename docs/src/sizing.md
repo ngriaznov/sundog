@@ -103,8 +103,10 @@ cap, so a delete lasts longer there than on a node that does not defer. The
 tombstone of an expired entry is collected `tombstone_ttl` after its expiry
 whether or not the node defers.
 
-A pause is a gap between a node's collections of more than twice the period
-(half of `tombstone_ttl` from 4 seconds up). The hold costs the deletes the
+A pause is a gap between a node's collections of more than a period plus a
+jitter room of a quarter of the period and at least a second (3 minutes 7.5
+seconds at the default `tombstone_ttl` of 10 minutes), from a node that did
+not run or a wall clock that stepped forward. The hold costs the deletes the
 node would have collected during the `tombstone_ttl` after the pause: budget
 for the removal rate times that retention on top of the usual count, outside
 `max_capacity` and visible in `sundog_tombstones{cache}`. A

@@ -61,9 +61,6 @@ fn view_for(mask: u8, granularity: Granularity) -> Arc<OwnershipView> {
     ))
 }
 
-/// The `state_transfer_budget` the model's retries run under.
-const RETRY_BUDGET: Duration = Duration::from_secs(1);
-
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
 
@@ -145,7 +142,7 @@ proptest! {
                     // The task retries only on a tick, and a published view
                     // it has not yet handled is handled first.
                     if Arc::ptr_eq(&pulled, &published) {
-                        let retry = retry_parts(&unfinished, &published, RETRY_BUDGET, |part| {
+                        let retry = retry_parts(&unfinished, &published, |part| {
                             residency.is_cold(part)
                         });
                         let landing: Vec<PartId> = retry
@@ -166,7 +163,7 @@ proptest! {
         // Liveness: retries alone complete what a timed-out pull left, with
         // no further view published.
         if Arc::ptr_eq(&pulled, &published) {
-            let retry = retry_parts(&unfinished, &published, RETRY_BUDGET, |part| {
+            let retry = retry_parts(&unfinished, &published, |part| {
                 residency.is_cold(part)
             });
             residency.mark_serving(&retry);

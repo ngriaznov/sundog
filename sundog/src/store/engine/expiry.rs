@@ -317,12 +317,15 @@ pub(crate) fn gc_period_ms(ttl_ms: u64) -> u64 {
 }
 
 /// How long a node may go without a tombstone collection before it counts as
-/// paused: two gc periods. A healthy task collects once per period, so the
-/// second period is the room for scheduler jitter. The gap is half the
-/// `tombstone_ttl` for a ttl of 4 s or more; below that the one-second floor
-/// of the period dominates. Pure; unit tested directly.
+/// paused: one gc period, plus a quarter of one and at least a second of room
+/// for scheduler jitter. The gc task collects on the period's wall-clock grid,
+/// so a healthy gap never passes one period by more than the jitter. The gap
+/// is a period and a quarter for a `tombstone_ttl` of 16 s or more, a period
+/// and a second below that, and 2 s below 4 s, where the period's own
+/// one-second floor dominates. Pure; unit tested directly.
 pub(crate) fn pause_gap_ms(ttl_ms: u64) -> u64 {
-    gc_period_ms(ttl_ms).saturating_mul(2)
+    let period = gc_period_ms(ttl_ms);
+    period.saturating_add((period / 4).max(1_000))
 }
 
 /// Whether the wall clock shows this node did not collect tombstones for
@@ -330,8 +333,10 @@ pub(crate) fn pause_gap_ms(ttl_ms: u64) -> u64 {
 /// last collection (`last_gc_ms`, `0` before the first). A process that was
 /// stopped, a VM that was suspended and a starved gc task all leave such a
 /// gap, and none of them can have received the deletes its peers made
-/// meanwhile. The comparison is strict and saturating, so a clock that stepped
-/// back never reads as a pause. Pure; unit tested directly.
+/// meanwhile. A wall clock that stepped forward leaves one too, and would
+/// otherwise reach every tombstone deadline early by the step. The
+/// comparison is strict and saturating, so a clock that stepped back never
+/// reads as a pause. Pure; unit tested directly.
 pub(crate) fn paused_since(last_gc_ms: u64, now_ms: u64, ttl_ms: u64) -> bool {
     last_gc_ms != 0 && now_ms.saturating_sub(last_gc_ms) > pause_gap_ms(ttl_ms)
 }

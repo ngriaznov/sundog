@@ -1,5 +1,5 @@
-//! The pause guard at the shard: a node whose collections are more than
-//! twice the gc period apart defers for `tombstone_ttl`, judging a delete
+//! The pause guard at the shard: a node whose collections are more than a
+//! gc period and a quarter apart defers for `tombstone_ttl`, judging a delete
 //! from a peer against the cap and keeping its tombstones to it. Every test
 //! reads a manual clock and calls `gc_tombstones` itself, so none depends on
 //! real time or on the gc task.
@@ -11,8 +11,8 @@ use super::*;
 
 const TTL: Duration = Duration::from_secs(60);
 const TTL_MS: u64 = 60_000;
-/// Twice the 15 s gc period of a 60 s retention.
-const GAP_MS: u64 = 30_000;
+/// The 15 s gc period of a 60 s retention and a quarter of it.
+const GAP_MS: u64 = 18_750;
 
 /// A shard on `clock` that has collected once, at the clock's reading.
 async fn collected(clock: &Arc<AtomicU64>, ttl: Duration) -> Shard<u32, String> {
@@ -105,11 +105,12 @@ async fn every_engine_rebuild_keeps_the_pause_guard() {
 }
 
 /// A delete lapsed past its `ttl` is ignored a gap after the last collection
-/// and applied a millisecond later, for every retention: the gap is twice the
-/// shard's own gc period, and the shard reads its retention at call time.
+/// and applied a millisecond later, for every retention: the gap is the
+/// shard's own gc period and a quarter, with at least a second of room, and
+/// the shard reads its retention at call time.
 #[tokio::test]
-async fn the_gap_is_twice_the_gc_period_of_the_shards_own_retention() {
-    for (ttl_secs, gap_ms) in [(60, 30_000), (8, 4_000), (2, 2_000), (1, 2_000)] {
+async fn the_gap_is_a_period_and_a_quarter_of_the_shards_own_retention() {
+    for (ttl_secs, gap_ms) in [(60, 18_750), (8, 3_000), (2, 2_000), (1, 2_000)] {
         let ttl = Duration::from_secs(ttl_secs);
         let ttl_ms = ttl_secs * 1_000;
         for (offset, lands) in [(gap_ms, false), (gap_ms + 1, true)] {
