@@ -3,7 +3,7 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.6.10] – 2026-11-05
 
 ### Added
 
@@ -13,7 +13,7 @@ All notable changes to this project are documented in this file. Format follows
   alone: the headless Service in `SUNDOG_SEEDS` and both ports from the
   environment. A port the config sets stays, with a warning when the
   variable names another, and `build` fails on a value that is not a port
-  number. `deployment.md` gives the recipe.
+  number. An `Observer` reads neither. `deployment.md` gives the recipe.
 - **`ClusterConfig::mesh_keepalive`.** TCP keepalive on every data-plane
   connection a node dials or accepts, at 30 seconds of silence by default:
   the kernel then probes every third of that, three times, where the
@@ -22,7 +22,7 @@ All notable changes to this project are documented in this file. Format follows
 - **`ClusterConfig::outbox_bytes`.** The bound in memory of each peer's
   replicate outbox and, apart from it, its invalidate queue, queued frames
   counted encoded and decoded, 64 MiB by default, alongside
-  `outbox_capacity`'s bound in frames.
+  `outbox_capacity`'s bound in frames. `build` rejects 0.
 - **`ShardOps::apply_forward_run`.** Applies a run of `ForwardBatch` records
   in one call: those whose writer may have kept no copy as
   `apply_forwarded_batch` applies them, a record refused for clock skew
@@ -34,7 +34,7 @@ All notable changes to this project are documented in this file. Format follows
   runs it out, and `sundog_fan_out_lost_writes_total{cache}` the writes lost
   with it: forwarded writes no owner took, and departed writes'
   invalidations an owner missed. `Duration::MAX` waits for as long as the
-  owner stays live.
+  owner stays live, and `build` rejects a zero timeout.
 
 ### Changed
 
@@ -57,6 +57,11 @@ All notable changes to this project are documented in this file. Format follows
   hold reached an owner whose view made the writer an owner, and the write
   was lost. An owner now drops a refused forward only when its writer sent it
   under the owner's own view and owns its part there, and holds every other.
+  A node that sends on a forwarded write of a part it owns applied it only
+  when no local write of the same key shared the drain, yet its co-owners
+  took it as a write the node kept, so under a merging resolver a co-owner
+  that refused its stamp lost the contribution. The node now applies every
+  forwarded write of a part it owns.
 - **A peer that stops reading holds a bounded share of memory.** A peer's
   replicate outbox was bounded only in frames, 8,192 by default, and a frame
   carries up to 256 KiB of records and keeps them decoded as well, so a peer
