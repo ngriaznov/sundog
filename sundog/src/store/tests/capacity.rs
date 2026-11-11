@@ -390,10 +390,10 @@ async fn a_zero_weigher_result_counts_as_one_and_the_cap_holds() {
     assert_eq!(s.entry_count().await, 20, "the cap holds");
 }
 
-/// An LWW shard presized far above its entry count gives the capacity back
-/// through its paced pass, and keeps the entry it holds.
+/// An LWW shard presized far above its entry count keeps the presize through
+/// its paced pass, and keeps the entry it holds.
 #[tokio::test]
-async fn shrink_pass_reclaims_an_oversized_capacity_hint_on_a_non_merging_shard() {
+async fn shrink_pass_keeps_a_capacity_hint_presize_on_a_non_merging_shard() {
     let s = Shard::<u32, String>::new(
         SmolStr::new("shrink"),
         Mode::Local,
@@ -411,7 +411,7 @@ async fn shrink_pass_reclaims_an_oversized_capacity_hint_on_a_non_merging_shard(
         shrunk += s.shrink_pass(BUCKET_COUNT / 4);
     }
 
-    assert_eq!(shrunk, BUCKET_COUNT);
-    assert!(s.stripe_capacities().iter().all(|&c| c < 100));
+    assert_eq!(shrunk, 0, "every stripe sits at its floor");
+    assert!(s.stripe_capacities().iter().all(|&c| c == 100));
     assert_eq!(s.get(&1).await.as_deref(), Some("v"));
 }

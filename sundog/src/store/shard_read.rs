@@ -340,7 +340,8 @@ where
 
     /// One paced capacity-reclaim pass over up to `max_stripes` stripes,
     /// resuming where the last call stopped; see `Engine::shrink_pass`.
-    /// Returns how many stripes it shrank. Driven by
+    /// A stripe shrinks to its live count or its `capacity_hint` presize,
+    /// whichever is larger. Returns how many stripes it shrank. Driven by
     /// `cache::tasks::shrink_task`.
     pub(crate) fn shrink_pass(&self, max_stripes: usize) -> usize {
         self.engine.shrink_pass(max_stripes)

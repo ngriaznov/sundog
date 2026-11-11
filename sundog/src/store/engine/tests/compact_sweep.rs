@@ -136,28 +136,53 @@ fn compact_locks_only_as_many_stripes_as_its_budget_needs() {
     );
 }
 
-/// One entry seeded into a stripe an inflated [`Engine::new`]
-/// `capacity_hint` presized far past what it ever held:
-/// [`Engine::compact`]'s visit to that stripe must call
-/// [`should_shrink_stripe`] and, finding `1 <= 100 / 8`, shrink the
-/// slab back down toward its one live entry instead of leaving it
-/// at its original oversized allocation.
+/// One entry seeded into a stripe an [`Engine::new`] `capacity_hint`
+/// presized: [`Engine::compact`]'s visit leaves the presize in place, even
+/// though `1 <= 100 / 8`, because [`stripe_shrink_target`] floors the
+/// shrink at the hint.
 #[test]
-fn compact_shrinks_an_overallocated_stripe_toward_its_len() {
+fn compact_keeps_a_hinted_stripes_presize() {
     let target = 7usize;
     let per_stripe_capacity = 100usize;
     let hint = per_stripe_capacity as u64 * BUCKET_COUNT as u64;
     let engine = Engine::<u32, PnCounter>::new(u64::MAX, None, None, Some(hint));
-    assert_eq!(
-        engine.stripe_capacities()[target],
-        per_stripe_capacity,
-        "the hint presizes every stripe, including this one, before any write"
-    );
+    assert_eq!(engine.stripe_capacities()[target], per_stripe_capacity);
 
     let resolver = PnCounterResolver;
     let key = key_for_stripe(target);
     seed_counter(&engine, resolver, key, writer(1));
+    compact_stripe(&engine, resolver, target);
 
+    assert_eq!(
+        engine.stripe_capacities()[target],
+        per_stripe_capacity,
+        "the stripe sits at its floor"
+    );
+}
+
+/// A stripe that grew to 800 slots and drained to one entry shrinks to the
+/// hinted 100 on [`Engine::compact`], and to its one entry without a hint.
+#[test]
+fn compact_shrinks_a_grown_stripe_to_the_hint_or_to_fit() {
+    let target = 7usize;
+    for (hint, expected) in [(Some(100u64 * BUCKET_COUNT as u64), 100usize), (None, 1)] {
+        let engine = Engine::<u32, PnCounter>::new(u64::MAX, None, None, hint);
+        engine.stripe_lock(target).write().live = Slab::with_capacity(800);
+        let resolver = PnCounterResolver;
+        seed_counter(&engine, resolver, key_for_stripe(target), writer(1));
+
+        compact_stripe(&engine, resolver, target);
+
+        assert_eq!(
+            engine.stripe_capacities()[target],
+            expected,
+            "hint {hint:?}"
+        );
+    }
+}
+
+/// One [`Engine::compact`] call that starts at stripe `target` and visits it.
+fn compact_stripe(engine: &Engine<u32, PnCounter>, resolver: PnCounterResolver, target: usize) {
     engine.debug_set_compact_cursor(target as u64);
     let retire_everyone = |_: WriterId| true;
     let _ = engine.compact(
@@ -167,18 +192,6 @@ fn compact_shrinks_an_overallocated_stripe_toward_its_len() {
         Quiescence::Churning,
         crate::store::CompactionBounds::three_bounds(0),
         1,
-    );
-
-    let shrunk = engine.stripe_capacities()[target];
-    assert!(
-        shrunk < per_stripe_capacity,
-        "one entry in a 100-capacity stripe sits well under the eighth-capacity \
-         threshold, so the visit shrinks it: got {shrunk}"
-    );
-    assert!(
-        shrunk <= 8,
-        "shrink_to_fit brings the arena back down toward its one live entry, not only \
-         partway: got {shrunk}"
     );
 }
 

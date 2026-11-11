@@ -40,13 +40,15 @@ pub(super) fn shrink_batch(cursor: usize, budget: usize) -> (usize, usize) {
 }
 
 impl<K, V> Stripe<K, V> {
-    /// Gives back the capacity a stripe holds far beyond its contents: the
-    /// arena and index, and the tombstone and long-ttl maps, each shrunk
-    /// once [`should_shrink_stripe`] finds it at or under an eighth full.
-    /// Callers hold the stripe's write lock.
-    pub(super) fn shrink_if_sparse(&mut self) {
-        if should_shrink_stripe(self.live.len(), self.live.capacity()) {
-            self.live.shrink_to_fit(hasher_for);
+    /// Gives back the capacity a stripe holds far beyond its contents. The
+    /// arena and index shrink to [`stripe_shrink_target`], never below the
+    /// engine's presize `floor`; the tombstone and long-ttl maps, which no
+    /// hint presizes, shrink to fit once [`should_shrink_stripe`] finds
+    /// each at or under an eighth full. Callers hold the stripe's write
+    /// lock.
+    pub(super) fn shrink_if_sparse(&mut self, floor: usize) {
+        if let Some(target) = stripe_shrink_target(self.live.len(), self.live.capacity(), floor) {
+            self.live.shrink_to(target, hasher_for);
         }
         if should_shrink_stripe(self.tombstones.len(), self.tombstones.capacity()) {
             self.tombstones.shrink_to_fit();
@@ -57,8 +59,8 @@ impl<K, V> Stripe<K, V> {
     }
 
     /// Whether [`Stripe::shrink_if_sparse`] would shrink anything.
-    fn is_sparse(&self) -> bool {
-        should_shrink_stripe(self.live.len(), self.live.capacity())
+    fn is_sparse(&self, floor: usize) -> bool {
+        stripe_shrink_target(self.live.len(), self.live.capacity(), floor).is_some()
             || should_shrink_stripe(self.tombstones.len(), self.tombstones.capacity())
             || should_shrink_stripe(self.long_ttl.len(), self.long_ttl.capacity())
     }
@@ -100,12 +102,25 @@ pub(crate) struct CompactScan<K> {
 /// `Vec`'s own amortized growth settles into, so a naturally growing
 /// stripe is never shrunk out from under itself; this fires for an
 /// oversized `capacity_hint` or a stripe drained by expiry, eviction,
-/// removal or ownership rebalancing. Every path that shrinks a stripe goes
-/// through it: [`Engine::sweep`], [`Engine::release_buckets`],
-/// [`Engine::release_parts`], [`Engine::compact`] and [`Engine::shrink_pass`].
+/// removal or ownership rebalancing. The tombstone and long-ttl maps,
+/// which no hint presizes, shrink on this rule alone; the arena and index
+/// go through [`stripe_shrink_target`], which adds the presize floor.
 /// Pure; unit tested directly.
 pub(super) fn should_shrink_stripe(len: usize, capacity: usize) -> bool {
     capacity > 0 && len <= capacity / 8
+}
+
+/// The capacity a stripe's arena and index shrink to, or `None` to leave
+/// them: `Some(max(len, floor))` once [`should_shrink_stripe`] holds and
+/// `capacity` is above the presize `floor`, so a hinted stripe keeps its
+/// preallocation and a stripe at its floor is not reallocated on every
+/// pass. With a `floor` of `0` the target is the live count. Every path
+/// that shrinks an arena goes through it: [`Engine::sweep`],
+/// [`Engine::release_buckets`], [`Engine::release_parts`],
+/// [`Engine::compact`] and [`Engine::shrink_pass`]. Pure; unit tested
+/// directly.
+pub(super) fn stripe_shrink_target(len: usize, capacity: usize, floor: usize) -> Option<usize> {
+    (capacity > floor && should_shrink_stripe(len, capacity)).then(|| len.max(floor))
 }
 
 /// One [`Engine::compact_replace_if_current`] call's write.
@@ -273,7 +288,7 @@ where
                 }
             }
             stripe.next_expiry_ms = new_next;
-            stripe.shrink_if_sparse();
+            stripe.shrink_if_sparse(self.stripe_floor);
             drop(guard);
             if removed_weight > 0 {
                 self.total_weight
@@ -296,10 +311,11 @@ where
     /// [`EntryState::Spilled`] entry is skipped until promoted back to
     /// `Resident`.
     ///
-    /// Once a visited stripe's scan finishes, [`should_shrink_stripe`]
-    /// decides whether its `live` slab is worth reclaiming (an oversized
-    /// `capacity_hint` or a stripe drained by rebalancing): if so, this
-    /// pass takes a separate write lock and calls [`Slab::shrink_to_fit`].
+    /// Once a visited stripe's scan finishes, [`stripe_shrink_target`]
+    /// decides whether its `live` slab is worth reclaiming (a stripe
+    /// drained by rebalancing, never below the `capacity_hint` presize): if
+    /// so, this pass takes a separate write lock and calls
+    /// [`Slab::shrink_to`].
     ///
     /// A compacted form that passes the engine's [`MergeCap`](super::MergeCap)
     /// and is larger than the record it replaces ([`merge_fits`](super::merge_fits))
@@ -375,12 +391,13 @@ where
                     });
                 }
             }
-            let shrink = should_shrink_stripe(stripe.live.len(), stripe.live.capacity());
+            let shrink =
+                stripe_shrink_target(stripe.live.len(), stripe.live.capacity(), self.stripe_floor);
             drop(stripe);
             // A separate write lock: reclaiming is rare enough that a
             // second lock here beats holding one for the whole scan.
-            if shrink {
-                self.stripes[idx].write().live.shrink_to_fit(hasher_for);
+            if let Some(target) = shrink {
+                self.stripes[idx].write().live.shrink_to(target, hasher_for);
             }
             if examined >= max_entries {
                 break;
@@ -476,23 +493,23 @@ where
 
     /// One paced pass of the capacity reclaim every cache runs, merging or
     /// not: walks up to `max_stripes` stripes from where the last call
-    /// stopped ([`shrink_batch`]), and shrinks each one [`should_shrink_stripe`]
-    /// finds sparse, under a write lock taken only for those. It reclaims
-    /// what the paths that empty a stripe leave behind, and an oversized
-    /// `capacity_hint`, which sees no removal at all. Returns how many
-    /// stripes it shrank.
+    /// stopped ([`shrink_batch`]), and shrinks each one
+    /// [`Stripe::shrink_if_sparse`] finds sparse, under a write lock taken
+    /// only for those. It reclaims what the paths that empty a stripe leave
+    /// behind, down to the `capacity_hint` presize and no further. Returns
+    /// how many stripes it shrank.
     pub(crate) fn shrink_pass(&self, max_stripes: usize) -> usize {
         let cursor = self.shrink_cursor.load(Ordering::Relaxed);
         let (count, next) = shrink_batch(cursor, max_stripes);
         let mut shrunk = 0;
         for i in 0..count {
             let idx = (cursor + i) % BUCKET_COUNT;
-            if !self.stripes[idx].read().is_sparse() {
+            if !self.stripes[idx].read().is_sparse(self.stripe_floor) {
                 continue;
             }
             let mut stripe = self.stripes[idx].write();
-            if stripe.is_sparse() {
-                stripe.shrink_if_sparse();
+            if stripe.is_sparse(self.stripe_floor) {
+                stripe.shrink_if_sparse(self.stripe_floor);
                 shrunk += 1;
             }
         }

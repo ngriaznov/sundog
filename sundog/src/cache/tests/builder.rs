@@ -155,22 +155,22 @@ async fn open_accepts_a_tti_above_the_cap() {
     cluster.shutdown().await;
 }
 
-/// Through `Cache`: the shrink task reclaims an oversized `capacity_hint` of
-/// a default (LWW) cache without a single removal.
+/// Through `Cache`: the shrink task leaves the `capacity_hint` presize of a
+/// default (LWW) cache in place across a full turn of the keyspace.
 #[tokio::test]
-async fn an_oversized_capacity_hint_is_reclaimed_by_the_background_shrink() {
+async fn the_background_shrink_keeps_a_capacity_hint_presize() {
     let (cluster, result) = open_local("cache-it-shrink", |b| {
         b.capacity_hint(100 * crate::store::BUCKET_COUNT as u64)
     })
     .await;
     let cache = result.expect("opens");
     cache.insert(1, "v".to_string()).await.expect("insert");
-    crate::cluster::test_support::wait_until(
-        Duration::from_secs(15),
-        "every stripe gives back its presize",
-        async || cache.stripe_capacities().iter().all(|&c| c < 100),
-    )
-    .await;
+    // One turn of the keyspace takes four 1 s ticks; wait for more than one.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        cache.stripe_capacities(),
+        vec![100; crate::store::BUCKET_COUNT]
+    );
     assert_eq!(cache.get(&1).await.as_deref(), Some("v"));
     cluster.shutdown().await;
 }

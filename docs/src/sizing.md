@@ -69,7 +69,9 @@ about a million entries presizes that many and the tables grow past it as usual.
 A background pass in every cache, merging or not, gives back the capacity of a
 stripe left at or under an eighth full, and so does an expiry sweep or a
 release of a part, so resident memory follows the live entry count after a
-peak. A hint far above the real count is reclaimed the same way.
+peak. The hint is a floor: a stripe shrinks to its live count or to its
+hinted preallocation, whichever is larger, so a cold cache keeps the
+capacity the hint reserved.
 
 ## Tombstones
 

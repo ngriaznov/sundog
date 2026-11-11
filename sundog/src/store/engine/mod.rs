@@ -691,6 +691,10 @@ pub(crate) struct Engine<K, V> {
     /// Where [`Engine::shrink_pass`]'s next call resumes, a stripe index
     /// kept in `0..BUCKET_COUNT` the way `compact_cursor` is.
     shrink_cursor: AtomicUsize,
+    /// The per-stripe preallocation `new` presized with ([`stripe_prealloc`]
+    /// of the `capacity_hint`; `0` without a hint). No shrink takes a
+    /// stripe's arena or index below it.
+    stripe_floor: usize,
     /// What the last [`Engine::gc_tombstones`] call was told about whether
     /// collection defers, or what [`Engine::starting_gc_deferred`] set before
     /// the first call. A tombstone that arrives already past the retention
@@ -722,7 +726,8 @@ where
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
     /// `capacity_hint`, when `Some`, presizes every stripe for
-    /// `ceil(hint / BUCKET_COUNT)` entries, so a cold fill never grows.
+    /// `ceil(hint / BUCKET_COUNT)` entries, so a cold fill never grows, and
+    /// keeps that presize as the floor every shrink respects.
     pub(crate) fn new(
         max_capacity: u64,
         tti: Option<Duration>,
@@ -767,6 +772,7 @@ where
             merge_cap_cache_len: AtomicUsize::new(0),
             compact_cursor: AtomicU64::new(0),
             shrink_cursor: AtomicUsize::new(0),
+            stripe_floor: per_stripe_capacity.unwrap_or(0),
             gc_deferring: AtomicBool::new(false),
             last_gc_ms: AtomicU64::new(0),
             pause_hold_until_ms: AtomicU64::new(0),

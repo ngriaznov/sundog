@@ -277,7 +277,7 @@ fn slab_with_capacity_presizes_entries_and_index_with_no_growth_up_to_hint() {
         slab.remove(hash_of(key), eq_for(key), hasher_for);
     }
     assert_eq!(slab.len(), 1);
-    slab.shrink_to_fit(hasher_for);
+    slab.shrink_to(0, hasher_for);
     assert!(slab.entries.capacity() < entries_cap_before);
     assert!(slab.find(hash_of(0), eq_for(0)).is_some());
 }
@@ -339,11 +339,11 @@ fn slab_random_permutation_insert_remove_matches_a_hashmap_mirror() {
     }
 
     // shrink_to_fit at the end must not disturb any surviving entry.
-    slab.shrink_to_fit(hasher_for);
+    slab.shrink_to(0, hasher_for);
     for (&k, &v) in &mirror {
         let found = slab
             .find(hash_of(k), eq_for(k))
-            .expect("shrink_to_fit must not drop or misplace a surviving entry");
+            .expect("shrink_to must not drop or misplace a surviving entry");
         assert_eq!(record_value(&found.record), [v]);
     }
 }
@@ -393,7 +393,7 @@ fn slab_with_same_stripe_keys_finds_removes_and_shrinks_consistently() {
     for &k in keys.iter().step_by(2) {
         assert!(slab.remove(hash_of(k), eq_for(k), hasher_for).is_some());
     }
-    slab.shrink_to_fit(hasher_for);
+    slab.shrink_to(0, hasher_for);
     for (i, &k) in keys.iter().enumerate() {
         assert_eq!(
             slab.find(hash_of(k), eq_for(k)).is_some(),

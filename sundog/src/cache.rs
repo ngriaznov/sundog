@@ -165,6 +165,9 @@ where
     /// weigher turns `max_capacity` into a weight budget, not an entry count.
     /// Each stripe presizes for at most 1024 entries, so a hint above 1 Mi
     /// entries presizes that much and the stripes grow past it as usual.
+    /// The presize is a floor: the background shrink, the expiry sweep and
+    /// the compaction pass shrink a sparse stripe to its live count or to
+    /// its presize, whichever is larger, and never below it.
     pub fn capacity_hint(mut self, entries: u64) -> Self {
         self.capacity_hint = Some(entries);
         self

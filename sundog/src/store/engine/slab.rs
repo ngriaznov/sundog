@@ -259,13 +259,14 @@ impl<K, V> Slab<K, V> {
         self.entries.drain(..)
     }
 
-    /// Shrinks the arena and index to fit, rehashing every entry's index
-    /// row. Called through [`Stripe::shrink_if_sparse`] and [`Engine::compact`].
-    pub(super) fn shrink_to_fit(&mut self, hasher: impl Fn(&Live<K, V>) -> u64) {
-        self.entries.shrink_to_fit();
+    /// Shrinks the arena and index to hold `min` entries, or the live count
+    /// when that is larger, rehashing every entry's index row. Called
+    /// through [`Stripe::shrink_if_sparse`] and [`Engine::compact`].
+    pub(super) fn shrink_to(&mut self, min: usize, hasher: impl Fn(&Live<K, V>) -> u64) {
+        self.entries.shrink_to(min);
         let entries = &self.entries;
         self.index
-            .shrink_to_fit(|&i| index_hash(hasher(&entries[i as usize])));
+            .shrink_to(min, |&i| index_hash(hasher(&entries[i as usize])));
     }
 }
 

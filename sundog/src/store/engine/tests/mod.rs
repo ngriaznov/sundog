@@ -15,7 +15,7 @@ use super::expiry::{
     LONG_TTL, MAX_INLINE_TTL_MS, MAX_STAMP_LEAD_MS, MAX_TTI_MS, NEVER_EXPIRES, decode_expiry,
     encode_expiry, idle_elapsed_ms, lapse_cause,
 };
-use super::housekeeping::{should_shrink_stripe, shrink_batch};
+use super::housekeeping::{should_shrink_stripe, shrink_batch, stripe_shrink_target};
 use super::inflight::{fill_replaces, fill_supersedes};
 use super::prefold::BatchEntry;
 #[cfg(feature = "spill")]

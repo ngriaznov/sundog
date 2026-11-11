@@ -202,12 +202,25 @@ fn capacity_of(engine: &Engine<u32, String>, bucket: usize) -> usize {
     engine.stripe_capacities()[bucket]
 }
 
-/// An engine presized for `per_stripe` entries in every stripe, holding the
-/// first key of [`same_bucket_pair`] in its bucket.
-fn presized_engine_with_one_entry(per_stripe: u64) -> (Engine<u32, String>, u32, usize) {
-    let engine =
-        Engine::<u32, String>::new(u64::MAX, None, None, Some(per_stripe * BUCKET_COUNT as u64));
+/// An engine presized for `per_stripe` entries in every stripe (none when
+/// `None`), holding the first key of [`same_bucket_pair`] in its bucket.
+/// `bloat`, when `Some`, first swaps that stripe's empty arena for one of
+/// that capacity, the state a stripe is left in after it grew far past
+/// its hint and drained.
+fn engine_with_one_entry(
+    per_stripe: Option<u64>,
+    bloat: Option<usize>,
+) -> (Engine<u32, String>, u32, usize) {
+    let engine = Engine::<u32, String>::new(
+        u64::MAX,
+        None,
+        None,
+        per_stripe.map(|n| n * BUCKET_COUNT as u64),
+    );
     let (key, _, bucket) = same_bucket_pair(100_000);
+    if let Some(capacity) = bloat {
+        engine.stripe_lock(bucket).write().live = Slab::with_capacity(capacity);
+    }
     let _ = put(&engine, key, key_bytes(key), "v".into(), hlc(1, 1), None, 0);
     (engine, key, bucket)
 }
@@ -224,38 +237,94 @@ fn shrink_batch_walks_the_budget_from_the_cursor_and_wraps() {
 }
 
 #[test]
-fn shrink_pass_reclaims_an_oversized_presize_without_touching_a_full_stripe() {
-    let (engine, _, bucket) = presized_engine_with_one_entry(64);
+fn stripe_shrink_target_floors_the_target_and_leaves_a_stripe_at_its_floor() {
+    assert_eq!(stripe_shrink_target(1, 64, 0), Some(1), "unhinted: to fit");
+    assert_eq!(stripe_shrink_target(0, 64, 0), Some(0), "drained: to zero");
+    assert_eq!(stripe_shrink_target(1, 64, 16), Some(16), "to the floor");
+    assert_eq!(stripe_shrink_target(8, 64, 16), Some(16), "len under floor");
+    assert_eq!(stripe_shrink_target(8, 256, 4), Some(8), "len over floor");
+    assert_eq!(stripe_shrink_target(16, 128, 4), Some(16), "at the eighth");
+    assert_eq!(stripe_shrink_target(0, 16, 16), None, "at the floor: no-op");
+    assert_eq!(stripe_shrink_target(0, 10, 16), None, "under the floor");
+    assert_eq!(stripe_shrink_target(0, 0, 0), None, "nothing allocated");
+    assert_eq!(stripe_shrink_target(20, 64, 16), None, "not sparse");
+}
+
+#[test]
+fn shrink_pass_keeps_a_hinted_presize_without_touching_a_full_stripe() {
+    let (engine, _, bucket) = engine_with_one_entry(Some(64), None);
     assert_eq!(capacity_of(&engine, bucket), 64);
 
-    let shrunk = engine.shrink_pass(BUCKET_COUNT);
-
-    assert_eq!(
-        shrunk, BUCKET_COUNT,
-        "every stripe is at most an eighth full"
-    );
-    assert!(capacity_of(&engine, bucket) < 64);
-    assert_eq!(engine.debug_totals().0, 1, "the entry stays");
     assert_eq!(
         engine.shrink_pass(BUCKET_COUNT),
         0,
-        "nothing is left to reclaim"
+        "every stripe sits at its floor"
     );
+
+    assert_eq!(engine.stripe_capacities(), vec![64; BUCKET_COUNT]);
+    assert_eq!(engine.debug_totals().0, 1, "the entry stays");
+}
+
+#[test]
+fn shrink_pass_shrinks_a_grown_then_drained_stripe_to_the_hint() {
+    let (engine, _, bucket) = engine_with_one_entry(Some(16), Some(512));
+    assert_eq!(capacity_of(&engine, bucket), 512);
+
+    assert_eq!(engine.shrink_pass(BUCKET_COUNT), 1, "only the grown stripe");
+
+    assert_eq!(capacity_of(&engine, bucket), 16, "to the hint, not to fit");
+    assert_eq!(engine.debug_totals().0, 1, "the entry stays");
+    assert_eq!(engine.shrink_pass(BUCKET_COUNT), 0, "at the floor: no-op");
+}
+
+#[test]
+fn shrink_pass_shrinks_an_unhinted_grown_stripe_to_fit() {
+    let (engine, _, bucket) = engine_with_one_entry(None, Some(512));
+
+    assert_eq!(engine.shrink_pass(BUCKET_COUNT), 1);
+
+    assert_eq!(capacity_of(&engine, bucket), 1, "to the one live entry");
+    assert_eq!(engine.shrink_pass(BUCKET_COUNT), 0);
 }
 
 #[test]
 fn shrink_pass_visits_only_its_budget_and_resumes_where_it_stopped() {
-    let engine = Engine::<u32, String>::new(u64::MAX, None, None, Some(64 * BUCKET_COUNT as u64));
+    let engine = Engine::<u32, String>::new(u64::MAX, None, None, None);
+    for i in 0..BUCKET_COUNT {
+        engine.stripe_lock(i).write().live = Slab::with_capacity(64);
+    }
 
     assert_eq!(engine.shrink_pass(10), 10);
     assert_eq!(engine.shrink_pass(BUCKET_COUNT), BUCKET_COUNT - 10);
     let caps = engine.stripe_capacities();
-    assert!(caps.iter().all(|&c| c < 64), "every stripe was reached");
+    assert!(caps.iter().all(|&c| c == 0), "every stripe was reached");
 }
 
 #[test]
-fn sweep_shrinks_a_stripe_it_emptied() {
-    let (engine, key, bucket) = presized_engine_with_one_entry(64);
+fn sweep_shrinks_a_drained_stripe_to_the_hint_or_to_nothing() {
+    for (hint, bloat, expected) in [(Some(16), 512, 16), (None, 512, 0)] {
+        let (engine, key, bucket) = engine_with_one_entry(hint, Some(bloat));
+        let _ = put(
+            &engine,
+            key,
+            key_bytes(key),
+            "v".into(),
+            hlc(2, 1),
+            Some(50),
+            0,
+        );
+
+        engine.sweep(100, None);
+
+        assert_eq!(engine.get(&key, 100), None);
+        assert_eq!(capacity_of(&engine, bucket), expected, "hint {hint:?}");
+        assert_eq!(engine.digests(), engine.recompute_digests_paired());
+    }
+}
+
+#[test]
+fn sweep_keeps_a_hinted_empty_stripes_presize() {
+    let (engine, key, bucket) = engine_with_one_entry(Some(64), None);
     let _ = put(
         &engine,
         key,
@@ -269,27 +338,46 @@ fn sweep_shrinks_a_stripe_it_emptied() {
     engine.sweep(100, None);
 
     assert_eq!(engine.get(&key, 100), None);
-    assert!(capacity_of(&engine, bucket) < 64, "the swept stripe shrank");
-    assert_eq!(engine.digests(), engine.recompute_digests_paired());
+    assert_eq!(capacity_of(&engine, bucket), 64, "the presize stays");
 }
 
 #[test]
-fn release_buckets_and_release_parts_shrink_the_stripes_they_empty() {
-    let (engine, key, bucket) = presized_engine_with_one_entry(64);
-    engine.release_buckets(&[u16::try_from(bucket).expect("bucket fits")]);
-    assert!(capacity_of(&engine, bucket) < 64, "release_buckets");
+fn release_buckets_and_release_parts_shrink_to_the_hint_or_to_nothing() {
+    for (hint, expected) in [(Some(16), 16), (None, 0)] {
+        let (engine, key, bucket) = engine_with_one_entry(hint, Some(512));
+        engine.release_buckets(&[u16::try_from(bucket).expect("bucket fits")]);
+        assert_eq!(capacity_of(&engine, bucket), expected, "release_buckets");
 
-    let (engine, key2, bucket2) = presized_engine_with_one_entry(64);
-    assert_eq!(key, key2);
+        let (engine, key2, bucket2) = engine_with_one_entry(hint, Some(512));
+        assert_eq!(key, key2);
+        let part = PartId::new(
+            u16::try_from(bucket2).expect("bucket fits"),
+            u8::try_from(part_index_from_hash(hash_key_bytes(
+                key_bytes(key2).as_ref(),
+            )))
+            .expect("part fits"),
+        );
+        assert_eq!(engine.release_parts(&[part]), 1);
+        assert_eq!(capacity_of(&engine, bucket2), expected, "release_parts");
+    }
+}
+
+#[test]
+fn release_buckets_and_release_parts_keep_a_hinted_presize() {
+    let (engine, _, bucket) = engine_with_one_entry(Some(64), None);
+    engine.release_buckets(&[u16::try_from(bucket).expect("bucket fits")]);
+    assert_eq!(capacity_of(&engine, bucket), 64, "release_buckets");
+
+    let (engine, key, bucket) = engine_with_one_entry(Some(64), None);
     let part = PartId::new(
-        u16::try_from(bucket2).expect("bucket fits"),
+        u16::try_from(bucket).expect("bucket fits"),
         u8::try_from(part_index_from_hash(hash_key_bytes(
-            key_bytes(key2).as_ref(),
+            key_bytes(key).as_ref(),
         )))
         .expect("part fits"),
     );
     assert_eq!(engine.release_parts(&[part]), 1);
-    assert!(capacity_of(&engine, bucket2) < 64, "release_parts");
+    assert_eq!(capacity_of(&engine, bucket), 64, "release_parts");
 }
 
 #[test]
@@ -311,7 +399,7 @@ fn shrink_if_sparse_reclaims_the_tombstone_and_long_ttl_maps() {
     stripe.long_ttl.clear();
     assert!(stripe.tombstones.capacity() >= 64 && stripe.long_ttl.capacity() >= 64);
 
-    stripe.shrink_if_sparse();
+    stripe.shrink_if_sparse(0);
 
     assert_eq!(stripe.tombstones.capacity(), 0);
     assert_eq!(stripe.long_ttl.capacity(), 0);

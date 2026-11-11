@@ -102,8 +102,10 @@ All notable changes to this project are documented in this file. Format follows
 - **A background pass shrinks sparse stripes of every cache.** A stripe at
   or under an eighth of its capacity is shrunk by the sweep, by a release and
   by a pass that visits 256 stripes a second, so memory follows the entry
-  count after a peak, and an unused `capacity_hint` is reclaimed within
-  seconds.
+  count after a peak. A stripe shrinks to its live count or to its
+  `capacity_hint` preallocation, whichever is larger, so an unused hint is
+  kept. This holds for caches with a merging resolver too, whose compaction
+  pass shrank a stripe below the hint.
 - **The scale gate bounds fetch errors.** `ops/scale-gate.json` sets
   `max_fetch_errors` to 0, and a failed fetch stays out of the latency
   histogram.

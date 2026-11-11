@@ -175,9 +175,9 @@ const SHRINK_STRIPES_PER_TICK: usize = 256;
 /// Drives [`Shard::shrink_pass`] for every cache, whatever its resolver:
 /// each tick walks the next [`SHRINK_STRIPES_PER_TICK`] stripes and gives
 /// back the capacity of one left far over-allocated, such as by a traffic
-/// peak, evictions, or a `capacity_hint` set well above the real count.
-/// Reclaim never changes an entry, so its timing is not load-bearing for
-/// correctness.
+/// peak or evictions, down to its live count or its `capacity_hint`
+/// presize, whichever is larger. Reclaim never changes an entry, so its
+/// timing is not load-bearing for correctness.
 async fn shrink_task<K, V>(shard: Arc<Shard<K, V>>, cancel: CancellationToken)
 where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
