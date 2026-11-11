@@ -74,6 +74,15 @@ addresses once it forms, under `cluster formed`.
 | `sundog_fan_out_stalls_total` | live peers whose outbox took no fan-out frame for `fan_out_stall_timeout`: the rest of their frames were dropped, and fan-out sends to each took only free room until the peer read a frame again |
 | `sundog_backlog_dropped_total{peer}` | frames dropped before reaching the peer's connection: an outbox that stayed full, in frames (`outbox_capacity`) or in bytes (`outbox_bytes`), the oldest invalidations displaced by a newer one, in frames or bytes alike, a message that failed to encode, a re-forward lane that already held 64 MiB, encoded and decoded, for a live peer, or the peer leaving the mesh. Each drop marks the peer for the next anti-entropy round, which repairs a record the dropping node owns but not one it only passed on. A broken connection drops a frame only if the writer cannot send it again: the writer resends the burst whose send failed and the frames it wrote in the last second, up to 1 MiB |
 
+The `peer` label is the peer's node id. A node that starts without a
+configured id draws a random one, so every restart adds a series to each
+`peer`-labelled counter on every other node, and the series of the id it
+left behind stays in the exposition for the life of the process that holds
+it. Give each node a persisted id with `ClusterBuilder::node_id`, stored
+with the node's own state and passed again on restart: the label then
+survives restarts and the series count stays at the number of nodes. Ids
+are per node; see [Two nodes share a node id](#two-nodes-share-a-node-id).
+
 ### Distributed caches
 
 | Metric | Meaning |

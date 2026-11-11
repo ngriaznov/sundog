@@ -1049,7 +1049,9 @@ impl ClusterBuilder {
     /// Uses `id` as this node's identity instead of a fresh
     /// [`NodeId::random`]. Persist it and pass the same value on restart:
     /// the node rejoins as the same member, so its prior incarnation is
-    /// not tracked absent for `tombstone_max_ttl` after every restart.
+    /// not tracked absent for `tombstone_max_ttl` after every restart, and
+    /// the `peer` label other nodes export for it stays the same, where a
+    /// random id adds a series to every `peer`-labelled counter per restart.
     /// Validated at [`build`](Self::build): a merge-derived id is rejected
     /// with [`JoinError::InvalidConfig`] rather than silently remapped.
     pub fn node_id(mut self, id: NodeId) -> Self {

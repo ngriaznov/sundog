@@ -235,6 +235,10 @@ All notable changes to this project are documented in this file. Format follows
 - **The docs state** the 1,024-event capacity of `Cache::events`, that a
   dropped `Cache` handle flushes nothing, and that a spill tier lifts only
   the `Replicated` capacity limit.
+- **The operations guide recommends a persisted node id.** The `peer`
+  label is the node id, so a node restarted under a random id leaves a
+  series behind on every `peer`-labelled counter; `ClusterBuilder::node_id`
+  keeps the label, and the series count, stable.
 
 ## [0.6.10] – 2026-11-05
 
