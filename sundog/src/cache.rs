@@ -1012,10 +1012,12 @@ where
     /// fold applies exactly once, when the window that opened at the first
     /// of those calls elapses: replication and every [`Event`] this key
     /// gets during the window see one record, not one per call.
-    /// [`Cache::close`], [`Cluster::shutdown`] and dropping this cache's last
-    /// handle flush whatever is still pending regardless of the window. A
-    /// graceful close or shutdown sends those folds to the peers as it
-    /// applies them; a crash loses them.
+    /// [`Cache::close`] and [`Cluster::shutdown`] flush whatever is still
+    /// pending regardless of the window. A graceful close or shutdown sends
+    /// those folds to the peers as it applies them; a crash loses them.
+    /// Dropping the last handle flushes nothing: the cache stays open until
+    /// `close` or `shutdown`, and a pending fold applies at its window
+    /// deadline.
     ///
     /// [`Cache::get`] never consults a pending fold: a value folded in but
     /// not yet flushed is invisible to a read for as long as it stays
