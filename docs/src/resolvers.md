@@ -72,7 +72,8 @@ merge to 1, not 2, so a retried write never counts twice. Decrements carry
 a separate cumulative total, `PnCounter::local_decrement(writer, total)`.
 
 Every task in one process shares one writer id, `Cache::writer_id`, so the
-tasks share one running total per key, an `AtomicU64` for example. The
+tasks share one running total per key, a `Mutex<HashMap<String, u64>>`
+for example. The
 total starts at zero in each run of the process: a restart writes under a
 new writer id, in a slot of its own.
 

@@ -1,8 +1,8 @@
 //! A replicated counter that never loses an increment: a `PnCounter` value
 //! under its merge resolver, written with `Cache::merge`.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use sundog::crdt::{PnCounter, PnCounterResolver};
 use sundog::{Cache, CacheError, Cluster, Mode};
@@ -12,9 +12,10 @@ use sundog::{Cache, CacheError, Cluster, Mode};
 #[derive(Clone)]
 pub struct PageViews {
     cache: Cache<String, PnCounter>,
-    /// This process's own running total for each page would live in a map;
-    /// one page keeps the example short.
-    local_total: Arc<AtomicU64>,
+    /// This process's running total for each page. A write carries the
+    /// writer's cumulative total for its own page, so every page keeps a
+    /// total of its own.
+    local_totals: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl PageViews {
@@ -32,7 +33,7 @@ impl PageViews {
             .await?;
         Ok(Self {
             cache,
-            local_total: Arc::new(AtomicU64::new(0)),
+            local_totals: Arc::default(),
         })
     }
 
@@ -44,7 +45,15 @@ impl PageViews {
     ///
     /// Returns an error if the value fails to encode.
     pub async fn record(&self, page: &str) -> Result<(), CacheError> {
-        let total = self.local_total.fetch_add(1, Ordering::SeqCst) + 1;
+        let total = {
+            let mut totals = self
+                .local_totals
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let total = totals.entry(page.to_string()).or_insert(0);
+            *total += 1;
+            *total
+        };
         let delta = PnCounter::local_delta(self.cache.writer_id(), total);
         self.cache.merge(page.to_string(), delta).await
     }
@@ -73,6 +82,19 @@ mod tests {
         }
         assert_eq!(views.views("/home").await, 5);
         assert_eq!(views.views("/about").await, 0);
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn each_page_counts_its_own_views() {
+        let cluster = solo_cluster("cookbook-counters-pages").await;
+        let views = PageViews::open(&cluster).await.expect("cache opens");
+        for _ in 0..5 {
+            views.record("/home").await.expect("record");
+        }
+        views.record("/about").await.expect("record");
+        assert_eq!(views.views("/home").await, 5);
+        assert_eq!(views.views("/about").await, 1);
         cluster.shutdown().await;
     }
 }
