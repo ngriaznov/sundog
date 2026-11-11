@@ -607,3 +607,15 @@ fn leave_deadline_adds_the_budget_and_caps_an_unbounded_one() {
     assert_eq!(leave_deadline(now, Duration::ZERO), now);
     assert_eq!(leave_deadline(now, Duration::MAX), now + FAR_FUTURE);
 }
+
+#[tokio::test]
+async fn build_accepts_a_discovery_with_a_zero_interval() {
+    let cluster = Cluster::builder("cluster-it-zero-discovery-interval")
+        .discovery(Static::new(std::iter::empty()).with_rediscover_interval(Duration::ZERO))
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("a zero interval is raised to the floor, not a panic");
+    cluster.shutdown().await;
+}
+

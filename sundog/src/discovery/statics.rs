@@ -13,6 +13,8 @@ use super::Discovery;
 
 pub(crate) const SUNDOG_SEEDS_ENV: &str = "SUNDOG_SEEDS";
 const DEFAULT_REDISCOVER_INTERVAL: Duration = Duration::from_secs(30);
+/// The shortest rediscover interval; a timer cannot tick every zero.
+pub(super) const MIN_INTERVAL: Duration = Duration::from_millis(1);
 
 /// A fixed seed list: explicit addresses merged with `SUNDOG_SEEDS`.
 /// Entries may be hostnames; each re-resolves through the OS resolver on
@@ -41,10 +43,11 @@ impl Static {
         Self::new(std::iter::empty())
     }
 
-    /// Overrides the default 30s rediscover interval.
+    /// Overrides the default 30s rediscover interval. An interval under 1ms
+    /// is raised to 1ms.
     #[must_use]
     pub fn with_rediscover_interval(mut self, interval: Duration) -> Self {
-        self.rediscover_interval = interval;
+        self.rediscover_interval = interval.max(MIN_INTERVAL);
         self
     }
 
@@ -213,5 +216,15 @@ mod tests {
         second_batch.insert(candidates.next().await.expect("second batch item"));
         second_batch.insert(candidates.next().await.expect("second batch item"));
         assert_eq!(second_batch, HashSet::from([a, b]));
+    }
+
+    #[tokio::test]
+    async fn a_zero_rediscover_interval_is_raised_to_the_floor() {
+        let addr: SocketAddr = "127.0.0.1:4000".parse().expect("valid addr");
+        let discovery = Static::new([addr]).with_rediscover_interval(Duration::ZERO);
+        assert_eq!(discovery.rediscover_interval, MIN_INTERVAL);
+        let _stream = discovery.candidates();
+        let kept = Static::new([addr]).with_rediscover_interval(Duration::from_secs(3));
+        assert_eq!(kept.rediscover_interval, Duration::from_secs(3));
     }
 }

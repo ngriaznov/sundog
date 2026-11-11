@@ -46,10 +46,11 @@ impl DnsSrv {
         }
     }
 
-    /// Overrides the default poll interval of 30s.
+    /// Overrides the default poll interval of 30s. An interval under 1ms is
+    /// raised to 1ms.
     #[must_use]
     pub fn with_interval(mut self, interval: Duration) -> Self {
-        self.interval = interval;
+        self.interval = interval.max(super::statics::MIN_INTERVAL);
         self
     }
 }
@@ -246,6 +247,20 @@ mod tests {
                 ))),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_zero_interval_is_raised_to_the_floor() {
+        let discovery = DnsSrv::new("svc.local.", 4000).with_interval(Duration::ZERO);
+        assert_eq!(discovery.interval, super::super::statics::MIN_INTERVAL);
+        let _stream = candidate_ticks(
+            FakeLookup::default(),
+            "svc.local.".to_owned(),
+            4000,
+            discovery.interval,
+        );
+        let kept = DnsSrv::new("svc.local.", 4000).with_interval(Duration::from_secs(7));
+        assert_eq!(kept.interval, Duration::from_secs(7));
     }
 
     #[tokio::test]

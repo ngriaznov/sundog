@@ -882,3 +882,20 @@ fn parts_owned_by_sums_to_part_space_times_min_owners_and_is_zero_off_the_eligib
         "min(owners, eligible) owners a part"
     );
 }
+
+#[tokio::test]
+async fn an_observer_builds_with_a_zero_rediscover_interval() {
+    let loopback = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
+    let observer = Observer::builder("observer-zero-interval")
+        .discovery(
+            Static::new(std::iter::empty()).with_rediscover_interval(std::time::Duration::ZERO),
+        )
+        .config(ClusterConfig {
+            gossip_bind_addr: loopback,
+            ..ClusterConfig::default()
+        })
+        .build()
+        .await
+        .expect("a zero interval is raised to the floor, not a panic");
+    observer.shutdown().await;
+}
