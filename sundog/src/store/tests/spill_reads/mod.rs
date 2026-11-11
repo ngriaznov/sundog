@@ -1,5 +1,6 @@
 //! Shard-layer spill read path tests that go through a real spill tier.
 
+mod claim_cancel;
 mod fan_out;
 mod pressure;
 mod unreadable;

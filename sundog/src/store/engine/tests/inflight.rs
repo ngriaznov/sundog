@@ -429,9 +429,10 @@ fn an_invalidation_before_the_load_starts_leaves_the_next_fill_alone() {
 fn fill_at(engine: &Engine<u32, String>, key: u32, ver: Hlc, now_ms: u64) -> FillOutcome {
     let kb = key_bytes(key);
     let hash = hash_key_bytes(kb.as_ref());
-    let JoinOutcome::Owner(inflight) = engine.miss_or_join(&kb, hash, now_ms) else {
-        panic!("the key has no load in flight");
-    };
+    // Registers the load over the entry, readable or not, as a refresh does.
+    let inflight = engine
+        .begin_refresh(&kb, hash)
+        .expect("the key has no load in flight");
     let encoded = Bytes::from(postcard::to_stdvec("b").expect("encode"));
     engine.complete_fresh_load(
         FreshLoad {

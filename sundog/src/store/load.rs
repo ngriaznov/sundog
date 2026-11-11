@@ -279,25 +279,82 @@ type Slot<V> = Result<Option<V>, Arc<dyn std::error::Error + Send + Sync>>;
 
 /// One key this node is loading: the in-flight entry other readers join,
 /// the stamp taken before the load, and the slot the batch fills.
-pub(super) struct Queued<K, V> {
+pub(super) struct Queued<K, V>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
     key: K,
     key_bytes: Bytes,
     hash: u64,
     ver: Hlc,
     inflight: Arc<Inflight<V>>,
     slot: Arc<OnceLock<Slot<V>>>,
+    /// Frees the in-flight entry unless the load completes, so a load that
+    /// is queued, or built into a chunk future that never runs, never leaves
+    /// its waiters behind.
+    guard: LoadGuard<K, V>,
+}
+
+/// Frees one in-flight load a call registered, as
+/// [`Engine::abandon_inflight`](engine::Engine::abandon_inflight) does, unless
+/// [`LoadGuard::complete`] runs first: every joined waiter wakes, reads again
+/// and takes the load over. Owns its engine, so it travels with the
+/// [`Queued`] load through the batch queue and into the chunk that runs it.
+struct LoadGuard<K, V>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    engine: Arc<engine::Engine<K, V>>,
+    key_bytes: Bytes,
+    hash: u64,
+    inflight: Arc<Inflight<V>>,
+    completed: bool,
+}
+
+impl<K, V> LoadGuard<K, V>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    /// Marks the load as ended, so dropping the guard releases nothing.
+    fn complete(mut self) {
+        self.completed = true;
+    }
+}
+
+impl<K, V> Drop for LoadGuard<K, V>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    fn drop(&mut self) {
+        if !self.completed {
+            self.engine
+                .abandon_inflight(&self.key_bytes, self.hash, &self.inflight);
+        }
+    }
 }
 
 /// The loads waiting for a batch window to close. Empty whenever the
 /// loader's window is zero.
-pub(super) struct LoadQueue<K, V> {
+pub(super) struct LoadQueue<K, V>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
     pending: StdMutex<Vec<Queued<K, V>>>,
     /// Notified once the queue holds [`Loader::max_keys`] keys, so the
     /// leader flushes before its window closes.
     full: Notify,
 }
 
-impl<K, V> LoadQueue<K, V> {
+impl<K, V> LoadQueue<K, V>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
     pub(super) fn new() -> Self {
         Self {
             pending: StdMutex::new(Vec::new()),
@@ -402,11 +459,8 @@ where
     fn drop(&mut self) {
         if self.armed {
             let queued = std::mem::take(&mut *self.shard.load_queue.lock());
-            for item in queued {
-                self.shard
-                    .engine
-                    .abandon_inflight(&item.key_bytes, item.hash, &item.inflight);
-            }
+            // Each queued load's guard frees its in-flight entry as it drops.
+            drop(queued);
         }
     }
 }
@@ -644,10 +698,10 @@ where
     /// Answers each of `todo` from the cache where it can, and otherwise
     /// joins the load in flight for it or starts one, stamped now. Returns
     /// the loads this call starts and every load the call waits on. Each
-    /// started load's guard stays armed until every key is claimed: a later
-    /// key's spilled read is a point where this future can be dropped, and
-    /// dropping it there frees the in-flight entries already started
-    /// instead of leaving their waiters on a load that never runs.
+    /// started load carries its [`LoadGuard`] from the moment it registers:
+    /// a later key's spilled read is a point where this future can be
+    /// dropped, and dropping it there frees the in-flight entries already
+    /// started instead of leaving their waiters on a load that never runs.
     #[cfg_attr(
         not(feature = "spill"),
         allow(
@@ -663,8 +717,6 @@ where
     ) -> (Vec<Queued<K, V>>, Vec<Wait<K, V>>) {
         let mut owned = Vec::new();
         let mut waits = Vec::with_capacity(todo.len());
-        #[cfg(feature = "spill")]
-        let mut armed = Vec::new();
         for (key, key_bytes, hash) in todo {
             let now = self.now_ms();
             if let Some(value) = self.read_resident(&key, key_bytes.as_ref(), hash, now) {
@@ -685,32 +737,35 @@ where
                     });
                 }
                 JoinOutcome::Owner(inflight) => {
+                    // Covers the entry from here on: through a later key's
+                    // spilled read, the batch queue and the chunk that runs
+                    // it, wherever this call or the batch leader drops or
+                    // panics.
+                    let guard = LoadGuard {
+                        engine: Arc::clone(&self.engine),
+                        key_bytes: key_bytes.clone(),
+                        hash,
+                        inflight: Arc::clone(&inflight),
+                        completed: false,
+                    };
                     #[cfg(feature = "spill")]
+                    if let Some((ver, value)) =
+                        self.get_spilled_by_bytes(key_bytes.as_ref(), hash).await
                     {
-                        let guard = self.engine.guard_inflight(
-                            key_bytes.clone(),
+                        self.hits.increment(1);
+                        // Joined waiters answer with the value, promoted
+                        // back to RAM or not, iff the key still holds it.
+                        self.engine.finish_spilled_read(
+                            &key_bytes,
                             hash,
-                            Arc::clone(&inflight),
+                            &inflight,
+                            ver,
+                            value.clone(),
+                            self.now_ms(),
                         );
-                        if let Some((ver, value)) =
-                            self.get_spilled_by_bytes(key_bytes.as_ref(), hash).await
-                        {
-                            self.hits.increment(1);
-                            // Joined waiters answer with the value, promoted
-                            // back to RAM or not, iff the key still holds it.
-                            self.engine.finish_spilled_read(
-                                &key_bytes,
-                                hash,
-                                &inflight,
-                                ver,
-                                value.clone(),
-                                self.now_ms(),
-                            );
-                            guard.complete();
-                            found.insert(key, value);
-                            continue;
-                        }
-                        armed.push(guard);
+                        guard.complete();
+                        found.insert(key, value);
+                        continue;
                     }
                     let slot = Arc::new(OnceLock::new());
                     let done = inflight.subscribe();
@@ -721,6 +776,7 @@ where
                         ver: self.stamp_local(),
                         inflight: Arc::clone(&inflight),
                         slot: Arc::clone(&slot),
+                        guard,
                     });
                     waits.push(Wait::Owned {
                         key,
@@ -730,10 +786,6 @@ where
                     });
                 }
             }
-        }
-        #[cfg(feature = "spill")]
-        for guard in armed {
-            guard.complete();
         }
         (owned, waits)
     }
@@ -800,25 +852,16 @@ where
     /// deadline its [`FillExpiry`] sets; one it returns to answer with ends
     /// uncached, a key it leaves out ends absent, and a failure fails every
     /// key. Each counts as a miss, a failed key included.
-    /// Dropping this future mid-call releases every load it holds.
+    /// Every load in `chunk` is released, by its guard, if this future
+    /// drops or panics before the load ends, or is never polled.
     async fn run_chunk(&self, source: &SourceFn<'_, K, V>, chunk: Vec<Queued<K, V>>) {
-        let guards: Vec<_> = chunk
-            .iter()
-            .map(|item| {
-                self.engine.guard_inflight(
-                    item.key_bytes.clone(),
-                    item.hash,
-                    Arc::clone(&item.inflight),
-                )
-            })
-            .collect();
         let keys = chunk.iter().map(|item| item.key.clone()).collect();
         match source(keys).await {
             Ok(Sourced {
                 mut store,
                 mut answer,
             }) => {
-                for (item, guard) in chunk.into_iter().zip(guards) {
+                for item in chunk {
                     if let Some(fill) = store.remove(&item.key) {
                         self.misses.increment(1);
                         match self.plan_fill(&item.key_bytes, item.ver, fill) {
@@ -859,12 +902,12 @@ where
                             .finish_absent(&item.key_bytes, item.hash, &item.inflight);
                         self.misses.increment(1);
                     }
-                    guard.complete();
+                    item.guard.complete();
                 }
             }
             Err(err) => {
                 let err: Arc<dyn std::error::Error + Send + Sync> = Arc::from(err);
-                for (item, guard) in chunk.into_iter().zip(guards) {
+                for item in chunk {
                     self.misses.increment(1);
                     let _ = item.slot.set(Err(Arc::clone(&err)));
                     self.engine.fail_inflight(
@@ -873,7 +916,7 @@ where
                         &item.inflight,
                         Arc::clone(&err),
                     );
-                    guard.complete();
+                    item.guard.complete();
                 }
             }
         }
@@ -882,8 +925,11 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::panic::AssertUnwindSafe;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+    use futures::FutureExt as _;
 
     use smol_str::SmolStr;
 
@@ -1187,6 +1233,105 @@ mod tests {
             calls_of(&calls),
             vec![vec![2]],
             "the released load runs once, under the waiter that took it over"
+        );
+    }
+
+    /// A batch loader that panics on its first call, before it returns a
+    /// future, and holds every key as `v{key}` after.
+    fn panicking_once_loader() -> Loader<u32, String> {
+        let first = Arc::new(AtomicBool::new(true));
+        Loader::batch(
+            move |keys: Vec<u32>| -> std::future::Ready<Result<HashMap<u32, String>, Down>> {
+                assert!(
+                    !first.swap(false, Ordering::SeqCst),
+                    "loader bug: unwrap while building the query"
+                );
+                std::future::ready(Ok(keys
+                    .into_iter()
+                    .map(|key| (key, format!("v{key}")))
+                    .collect()))
+            },
+        )
+    }
+
+    /// Loads `key` and fails the test instead of hanging when the load never
+    /// ends.
+    async fn load_within(s: &Shard<u32, String>, key: u32) -> Option<String> {
+        tokio::time::timeout(Duration::from_secs(5), s.load(&key))
+            .await
+            .unwrap_or_else(|_| panic!("the load of {key} hangs on a stale in-flight entry"))
+            .expect("load")
+    }
+
+    #[tokio::test]
+    async fn a_loader_that_panics_in_the_first_chunk_frees_the_keys_of_the_unpolled_chunks() {
+        let s = shard(Mode::Replicated)
+            .with_loader(panicking_once_loader().with_window(Duration::ZERO, 2));
+        let outcome = AssertUnwindSafe(s.load_many(1..=6)).catch_unwind().await;
+        assert!(outcome.is_err(), "the loader's panic reaches the caller");
+        for key in [1, 3, 5, 6] {
+            assert_eq!(load_within(&s, key).await, Some(format!("v{key}")));
+        }
+        assert_eq!(
+            s.load_many(1..=6).await.expect("load_many").len(),
+            6,
+            "every key loads again"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_loader_that_panics_under_a_leader_frees_the_loads_other_callers_queued() {
+        let s = Arc::new(
+            shard(Mode::Replicated)
+                .with_loader(panicking_once_loader().with_window(Duration::from_millis(20), 2)),
+        );
+        let leader = AssertUnwindSafe(s.load_many(1..=6)).catch_unwind();
+        let follower = s.load(&9);
+        let (leader, follower) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(leader, follower)
+        })
+        .await
+        .expect("the follower's queued load hangs on a stale in-flight entry");
+        assert!(leader.is_err(), "the leader's panic reaches the leader");
+        assert_eq!(
+            follower.expect("load"),
+            Some("v9".to_string()),
+            "the follower's load is released and runs again"
+        );
+        for key in [3, 5, 6] {
+            assert_eq!(load_within(&s, key).await, Some(format!("v{key}")));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_leader_frees_the_loads_other_callers_queued_behind_it() {
+        let calls = Calls::default();
+        let s = shard(Mode::Replicated)
+            .with_loader(recording_loader(&calls).with_window(Duration::from_millis(50), 100));
+        let mut leader = Box::pin(s.load_many([2, 4, 6]));
+        tokio::select! {
+            _ = &mut leader => panic!("the window has not closed"),
+            () = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+        let follower = s.load_many([4, 12]);
+        tokio::pin!(follower);
+        tokio::select! {
+            _ = &mut follower => panic!("the follower waits on the leader's batch"),
+            () = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+        drop(leader);
+        let found = tokio::time::timeout(Duration::from_secs(5), follower)
+            .await
+            .expect("the follower takes the released loads over")
+            .expect("load_many");
+        assert_eq!(
+            found,
+            HashMap::from([(4, "v4".to_string()), (12, "v12".to_string())])
+        );
+        assert_eq!(
+            calls_of(&calls).into_iter().flatten().count(),
+            2,
+            "the released loads run once, under the follower"
         );
     }
 

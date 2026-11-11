@@ -320,8 +320,21 @@ where
 
     /// Ends `inflight` with no outcome, as a dropped [`InflightGuard`]
     /// does: every joined waiter wakes, re-reads and takes the load over.
+    ///
+    /// Removes the map entry only while it is `inflight` itself, so ending a
+    /// load a second time never removes the entry of a later load of the
+    /// same key.
     pub(crate) fn abandon_inflight(&self, key_bytes: &Bytes, hash: u64, inflight: &Inflight<V>) {
-        self.finish_inflight(key_bytes, hash);
+        {
+            let mut stripe = self.stripes[stripe_index_from_hash(hash)].write();
+            if stripe
+                .inflight
+                .get(key_bytes.as_ref())
+                .is_some_and(|held| std::ptr::eq(Arc::as_ptr(held), inflight))
+            {
+                stripe.inflight.remove(key_bytes.as_ref());
+            }
+        }
         inflight.finish();
     }
 

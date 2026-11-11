@@ -1141,3 +1141,61 @@ async fn a_loaded_value_that_fails_to_encode_fails_the_cache_read_with_codec() {
     );
     cluster.shutdown().await;
 }
+
+/// A batch loader that panics on its first call, before it returns a future.
+fn panicking_once_loader()
+-> impl Fn(Vec<u32>) -> std::future::Ready<Result<HashMap<u32, String>, SourceDown>>
++ Send
++ Sync
++ 'static {
+    let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    move |keys| {
+        assert!(
+            !first.swap(false, std::sync::atomic::Ordering::SeqCst),
+            "loader bug: unwrap while building the query"
+        );
+        std::future::ready(Ok(keys
+            .into_iter()
+            .map(|key| (key, format!("v{key}")))
+            .collect()))
+    }
+}
+
+/// A loader panic in the first chunk of a split batch leaves every other key
+/// loadable, with and without a batching window.
+#[tokio::test]
+async fn a_loader_panic_in_the_first_chunk_frees_the_keys_of_the_unpolled_chunks() {
+    use futures::FutureExt as _;
+
+    for (name, window) in [
+        ("cache-it-load-panic", Duration::ZERO),
+        ("cache-it-load-panic-window", Duration::from_millis(20)),
+    ] {
+        let cluster = Cluster::builder(name)
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node builds");
+        let cache = cluster
+            .cache::<u32, String>("prices")
+            .mode(Mode::Local)
+            .batch_loader(panicking_once_loader())
+            .batch_window(window, 2)
+            .open()
+            .await
+            .expect("opens");
+        let outcome = std::panic::AssertUnwindSafe(cache.load_many(1..=6))
+            .catch_unwind()
+            .await;
+        assert!(outcome.is_err(), "{name}: the panic reaches the caller");
+        for key in [3, 5, 6] {
+            let loaded = tokio::time::timeout(Duration::from_secs(5), cache.load(&key))
+                .await
+                .unwrap_or_else(|_| panic!("{name}: the load of {key} hangs"))
+                .expect("load");
+            assert_eq!(loaded, Some(format!("v{key}")), "{name}");
+        }
+        cluster.shutdown().await;
+    }
+}
