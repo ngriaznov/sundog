@@ -58,6 +58,7 @@ jobs:
         env:
           RUST_LOG: warn
         run: |
+          set -o pipefail
           mkdir -p "$RUNNER_TEMP/spill"
           ./target/release/sundog-distributed-demo \
             --nodes 3 \
