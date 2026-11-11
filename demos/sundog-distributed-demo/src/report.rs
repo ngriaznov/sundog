@@ -111,6 +111,9 @@ pub(crate) struct Gate {
     /// Bound on `backlog_dropped_other_peers`; `None` skips the check.
     #[serde(default)]
     pub(crate) max_backlog_dropped_other_peers: Option<u64>,
+    /// Bound on `fetch_errors`; `None` skips the check.
+    #[serde(default)]
+    pub(crate) max_fetch_errors: Option<u64>,
     /// Minimum required `spill_reopen_warm`; `None` skips the check.
     #[serde(default)]
     pub(crate) min_spill_reopen_warm: Option<u64>,
@@ -182,6 +185,14 @@ pub(crate) fn check(report: &Report, gate: &Gate) -> Vec<String> {
         violations.push(format!(
             "backlog_dropped_other_peers {} exceeds max_backlog_dropped_other_peers {max_other}",
             report.backlog_dropped_other_peers
+        ));
+    }
+    if let Some(max_errors) = gate.max_fetch_errors
+        && report.fetch_errors > max_errors
+    {
+        violations.push(format!(
+            "fetch_errors {} exceeds max_fetch_errors {max_errors}",
+            report.fetch_errors
         ));
     }
     if gate.require_converged && !report.converged {
@@ -256,6 +267,7 @@ mod tests {
             require_full_sample: true,
             max_backlog_dropped: Some(0),
             max_backlog_dropped_other_peers: Some(0),
+            max_fetch_errors: Some(0),
             min_spill_reopen_warm: Some(1),
         }
     }
@@ -419,6 +431,49 @@ mod tests {
         let gate: Gate = serde_json::from_value(value)
             .expect("an older gate file with no max_backlog_dropped field still parses");
         assert_eq!(gate.max_backlog_dropped, None);
+    }
+
+    #[test]
+    fn check_flags_fetch_errors_above_the_bound() {
+        let gate = passing_gate();
+        let at_bound = Report {
+            fetch_errors: 0,
+            ..sample_report()
+        };
+        assert_eq!(check(&at_bound, &gate), Vec::<String>::new());
+        let above = Report {
+            fetch_errors: 3,
+            ..sample_report()
+        };
+        let violations = check(&above, &gate);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].contains("fetch_errors 3 exceeds max_fetch_errors 0"));
+    }
+
+    #[test]
+    fn check_skips_fetch_errors_when_the_gate_leaves_them_unset() {
+        let report = Report {
+            fetch_errors: 1_000,
+            ..sample_report()
+        };
+        let gate = Gate {
+            max_fetch_errors: None,
+            ..passing_gate()
+        };
+        assert_eq!(check(&report, &gate), Vec::<String>::new());
+    }
+
+    #[test]
+    fn gate_without_max_fetch_errors_defaults_to_none() {
+        let mut value =
+            serde_json::to_value(passing_gate()).expect("gate serializes to a JSON value");
+        value
+            .as_object_mut()
+            .expect("a Gate serializes as a JSON object")
+            .remove("max_fetch_errors");
+        let gate: Gate = serde_json::from_value(value)
+            .expect("a gate file with no max_fetch_errors field still parses");
+        assert_eq!(gate.max_fetch_errors, None);
     }
 
     #[test]

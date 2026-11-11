@@ -87,7 +87,7 @@ A weekly workflow runs the distributed demo at 4 million keys across three
 nodes over a spill tier, kills and restarts a node midway, and checks the
 result against thresholds in `ops/scale-gate.json`: steady and peak
 memory, dropped spill writes, pull timeouts, dropped replication backlog,
-fetch latency, warm reopens, convergence and a sampled value check.
+fetch errors, fetch latency, warm reopens, convergence and a sampled value check.
 
 ## Warnings are errors
 

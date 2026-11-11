@@ -147,6 +147,21 @@ impl LoadState {
         latencies.push_back(u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX));
     }
 
+    /// Counts one fetch's outcome. A fetch that succeeds, hit or miss, adds
+    /// its duration to the latency histogram; a fetch that fails does not, so
+    /// a fast failure never lowers the percentiles.
+    fn record_fetch<T, E>(&self, outcome: &Result<Option<T>, E>, elapsed: Duration) {
+        let counter = match outcome {
+            Ok(Some(_)) => &self.fetch_hits,
+            Ok(None) => &self.fetch_misses,
+            Err(_) => &self.fetch_errors,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        if outcome.is_ok() {
+            self.record_latency(elapsed);
+        }
+    }
+
     /// A snapshot of `(p50, p99)` fetch latency in microseconds.
     #[must_use]
     pub(crate) fn latency_percentiles(&self) -> (u64, u64) {
@@ -230,18 +245,7 @@ async fn run_fetch_tick(nodes: &[Arc<NodeSlot>], state: &LoadState) {
     let index = random_range(0..state.keys);
     let started = tokio::time::Instant::now();
     let outcome = cache.fetch(&key_for(index)).await;
-    state.record_latency(started.elapsed());
-    match outcome {
-        Ok(Some(_)) => {
-            state.fetch_hits.fetch_add(1, Ordering::Relaxed);
-        }
-        Ok(None) => {
-            state.fetch_misses.fetch_add(1, Ordering::Relaxed);
-        }
-        Err(_) => {
-            state.fetch_errors.fetch_add(1, Ordering::Relaxed);
-        }
-    }
+    state.record_fetch(&outcome, started.elapsed());
 }
 
 #[cfg(test)]
@@ -342,6 +346,19 @@ mod tests {
         let (p50, p99) = state.latency_percentiles();
         assert_eq!(p50, 30_000);
         assert_eq!(p99, 50_000);
+    }
+
+    #[test]
+    fn a_failed_fetch_counts_an_error_and_stays_out_of_the_latency_histogram() {
+        let state = LoadState::new(1);
+        state.record_fetch::<(), ()>(&Ok(Some(())), Duration::from_millis(30));
+        state.record_fetch::<(), ()>(&Ok(None), Duration::from_millis(50));
+        state.record_fetch::<(), ()>(&Err(()), Duration::from_micros(1));
+        assert_eq!(state.fetch_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(state.fetch_misses.load(Ordering::Relaxed), 1);
+        assert_eq!(state.fetch_errors.load(Ordering::Relaxed), 1);
+        let (p50, p99) = state.latency_percentiles();
+        assert_eq!((p50, p99), (50_000, 50_000));
     }
 
     #[test]
