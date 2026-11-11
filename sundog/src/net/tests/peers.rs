@@ -1203,3 +1203,160 @@ async fn update_peers_keeps_the_ips_of_the_peers_data_addresses_as_known_sources
     mesh.update_peers(Vec::new());
     assert!(!known("127.0.0.3"), "an empty table knows no source");
 }
+
+/// Queues two invalidations and three replicate frames for `peer`, which
+/// nobody listens for, so they wait in its outboxes.
+fn queue_five_frames_for(mesh: &Mesh, peer: NodeId) {
+    let invalidate = |n: u8| Msg::Invalidate {
+        cache: SmolStr::new("users"),
+        key: Bytes::from(vec![n]),
+        ver: sample_record(n).ver,
+    };
+    let replicate = |n: u8| Msg::Replicate {
+        cache: SmolStr::new("users"),
+        rec: sample_record(n),
+    };
+    mesh.send_many(peer, MsgClass::Invalidate, [invalidate(1), invalidate(2)]);
+    mesh.send_many(
+        peer,
+        MsgClass::Replicate,
+        [replicate(1), replicate(2), replicate(3)],
+    );
+}
+
+#[tokio::test]
+async fn frames_queued_for_a_removed_peer_are_counted_and_its_next_handle_starts_dirty() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let (mesh, _inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+    let dead_peer: SocketAddr = "127.0.0.1:1".parse().expect("valid unroutable addr");
+    mesh.update_peers(vec![peer_at(NodeId::from(2), dead_peer)]);
+    queue_five_frames_for(&mesh, NodeId::from(2));
+    assert_eq!(backlog_dropped(&snapshotter, NodeId::from(2)), 0);
+
+    mesh.update_peers(Vec::new());
+
+    assert_eq!(
+        backlog_dropped(&snapshotter, NodeId::from(2)),
+        5,
+        "every queued frame goes into the dropped count"
+    );
+    assert!(
+        mesh.take_dirty_peers().is_empty(),
+        "no handle is left to mark"
+    );
+    mesh.update_peers(vec![peer_at(NodeId::from(2), dead_peer)]);
+    assert_eq!(
+        mesh.take_dirty_peers(),
+        vec![NodeId::from(2)],
+        "the peer's next handle owes the round its lost frames would have saved"
+    );
+    assert!(
+        mesh.take_dirty_peers().is_empty(),
+        "the mark is taken once, as any dirty mark is"
+    );
+    assert!(
+        mesh.inner.departed_dirty.lock().expect("lock").is_empty(),
+        "the carried mark leaves the table with the new handle"
+    );
+}
+
+#[tokio::test]
+async fn a_changed_data_address_counts_the_queued_frames_and_the_new_handle_starts_dirty() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let (mesh, _inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+    let first: SocketAddr = "127.0.0.1:1".parse().expect("valid unroutable addr");
+    let second: SocketAddr = "127.0.0.1:2".parse().expect("valid unroutable addr");
+    mesh.update_peers(vec![peer_at(NodeId::from(2), first)]);
+    queue_five_frames_for(&mesh, NodeId::from(2));
+
+    mesh.update_peers(vec![peer_at(NodeId::from(2), second)]);
+
+    assert_eq!(backlog_dropped(&snapshotter, NodeId::from(2)), 5);
+    assert_eq!(
+        mesh.take_dirty_peers(),
+        vec![NodeId::from(2)],
+        "the handle for the new address starts dirty"
+    );
+}
+
+#[tokio::test]
+async fn a_peer_removed_with_nothing_queued_leaves_no_count_and_no_mark() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let (mesh, _inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+    let dead_peer: SocketAddr = "127.0.0.1:1".parse().expect("valid unroutable addr");
+    mesh.update_peers(vec![peer_at(NodeId::from(2), dead_peer)]);
+
+    mesh.update_peers(Vec::new());
+    mesh.update_peers(vec![peer_at(NodeId::from(2), dead_peer)]);
+
+    assert_eq!(backlog_dropped(&snapshotter, NodeId::from(2)), 0);
+    assert!(mesh.take_dirty_peers().is_empty());
+    assert!(mesh.inner.departed_dirty.lock().expect("lock").is_empty());
+}
+
+#[tokio::test]
+async fn a_peer_already_marked_dirty_keeps_its_mark_across_a_removal() {
+    let (mesh, _inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+    let dead_peer: SocketAddr = "127.0.0.1:1".parse().expect("valid unroutable addr");
+    mesh.update_peers(vec![peer_at(NodeId::from(2), dead_peer)]);
+    mesh.note_unsent(NodeId::from(2), 1);
+
+    mesh.update_peers(Vec::new());
+    mesh.update_peers(vec![peer_at(NodeId::from(2), dead_peer)]);
+
+    assert_eq!(mesh.take_dirty_peers(), vec![NodeId::from(2)]);
+}
+
+#[tokio::test]
+async fn a_departure_is_forgotten_once_it_outlives_the_window_and_the_map_stays_bounded() {
+    use crate::net::DEPARTED_DIRTY_WINDOW;
+    let (mesh, _inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+    let dead_peer: SocketAddr = "127.0.0.1:1".parse().expect("valid unroutable addr");
+    mesh.update_peers(vec![peer_at(NodeId::from(2), dead_peer)]);
+    queue_five_frames_for(&mesh, NodeId::from(2));
+    mesh.update_peers(Vec::new());
+    assert_eq!(mesh.inner.departed_dirty.lock().expect("lock").len(), 1);
+
+    mesh.inner
+        .forget_aged_departures(std::time::Instant::now() + DEPARTED_DIRTY_WINDOW / 2);
+    assert_eq!(
+        mesh.inner.departed_dirty.lock().expect("lock").len(),
+        1,
+        "inside the window the departure stays"
+    );
+    mesh.inner.forget_aged_departures(
+        std::time::Instant::now() + DEPARTED_DIRTY_WINDOW + Duration::from_secs(1),
+    );
+    assert!(
+        mesh.inner.departed_dirty.lock().expect("lock").is_empty(),
+        "past the window it is dropped"
+    );
+    mesh.update_peers(vec![peer_at(NodeId::from(2), dead_peer)]);
+    assert!(mesh.take_dirty_peers().is_empty());
+}
+
+#[test]
+fn a_removal_owes_a_repair_for_queued_frames_or_an_existing_mark() {
+    use crate::net::{DEPARTED_DIRTY_WINDOW, departure_dirties_handle, removal_owes_repair};
+    assert!(!removal_owes_repair(0, false));
+    assert!(removal_owes_repair(1, false));
+    assert!(removal_owes_repair(0, true));
+    assert!(removal_owes_repair(7, true));
+
+    let departed = std::time::Instant::now();
+    assert!(departure_dirties_handle(departed, departed));
+    assert!(departure_dirties_handle(
+        departed,
+        departed + DEPARTED_DIRTY_WINDOW
+    ));
+    assert!(!departure_dirties_handle(
+        departed,
+        departed + DEPARTED_DIRTY_WINDOW + Duration::from_millis(1)
+    ));
+}

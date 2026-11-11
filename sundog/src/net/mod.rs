@@ -386,6 +386,35 @@ struct MeshInner {
     ack_window: Duration,
     /// When the last age sweep of `acked_buckets` started.
     ack_swept_at: Mutex<Instant>,
+    /// The peers whose handle left the table owing a repair, each with the
+    /// instant it left ([`MeshInner::note_handle_removed`]): the next handle
+    /// of such a peer starts dirty ([`MeshInner::take_departed_dirty`]). A
+    /// row goes when that handle is made or when it outlives
+    /// [`DEPARTED_DIRTY_WINDOW`] ([`MeshInner::forget_aged_departures`]), so
+    /// the map holds at most the peers that left inside the window.
+    departed_dirty: Mutex<HashMap<NodeId, Instant>>,
+}
+
+/// How long a departed peer's owed repair is remembered: a peer whose handle
+/// comes back inside this window starts dirty, and one that stays away longer
+/// is a new peer that state transfer and its first anti-entropy round bring
+/// up to date.
+const DEPARTED_DIRTY_WINDOW: Duration = Duration::from_mins(10);
+
+/// Whether removing a peer's handle leaves the peer owing an anti-entropy
+/// round: `queued_frames` were discarded with it, or it was already marked
+/// (`was_dirty`) and the mark leaves with the handle. Pure; unit tested
+/// directly.
+const fn removal_owes_repair(queued_frames: usize, was_dirty: bool) -> bool {
+    queued_frames > 0 || was_dirty
+}
+
+/// Whether a handle made at `now` for a peer whose last handle left at
+/// `departed_at` starts dirty: the departure is inside
+/// [`DEPARTED_DIRTY_WINDOW`], by the rule [`ack_within_window`] applies to an
+/// ack. Pure; unit tested directly.
+fn departure_dirties_handle(departed_at: Instant, now: Instant) -> bool {
+    ack_within_window(departed_at, now, DEPARTED_DIRTY_WINDOW)
 }
 
 /// The shortest gap between two age sweeps of the acknowledgment table, so a
@@ -570,6 +599,48 @@ impl MeshInner {
         }
     }
 
+    /// Accounts for `handle`, which [`Mesh::update_peers`] removes from the
+    /// table for `peer`: the frames still queued in its outboxes go with it
+    /// and are added to `sundog_backlog_dropped_total{peer}`, and the peer's
+    /// next handle starts dirty ([`removal_owes_repair`]). Frames the writer
+    /// already took from the outboxes are its own to account for.
+    fn note_handle_removed(&self, peer: NodeId, handle: &PeerHandle, now: Instant) {
+        let queued = handle.invalidate.len() + handle.replicate_tx.queued();
+        if queued > 0 {
+            metrics::counter!("sundog_backlog_dropped_total", "peer" => peer.to_string())
+                .increment(u64::try_from(queued).unwrap_or(u64::MAX));
+        }
+        if removal_owes_repair(queued, handle.dirty.load(Ordering::Relaxed)) {
+            self.departed_dirty
+                .lock()
+                .expect("invariant: departed_dirty lock is never poisoned")
+                .insert(peer, now);
+        }
+    }
+
+    /// Whether the handle about to be made for `peer` at `now` starts dirty,
+    /// forgetting the departure it answers.
+    fn take_departed_dirty(&self, peer: NodeId, now: Instant) -> bool {
+        self.departed_dirty
+            .lock()
+            .expect("invariant: departed_dirty lock is never poisoned")
+            .remove(&peer)
+            .is_some_and(|departed_at| departure_dirties_handle(departed_at, now))
+    }
+
+    /// Drops the departures that [`departure_dirties_handle`] no longer
+    /// honors at `now`.
+    fn forget_aged_departures(&self, now: Instant) {
+        let mut departed = self
+            .departed_dirty
+            .lock()
+            .expect("invariant: departed_dirty lock is never poisoned");
+        departed.retain(|_, departed_at| departure_dirties_handle(*departed_at, now));
+        if departed.capacity() >= ACK_SHRINK_FLOOR && departed.len() <= departed.capacity() / 4 {
+            departed.shrink_to_fit();
+        }
+    }
+
     /// Drops every ack whose requester is not in `peers`, the peer table
     /// [`Mesh::update_peers`] just built. An ack is a hint that saves one
     /// confirming anti-entropy round, so a dropped row costs that round at
@@ -712,6 +783,7 @@ impl MeshInner {
             acked_buckets: RwLock::new(HashMap::new()),
             ack_window,
             ack_swept_at: Mutex::new(Instant::now()),
+            departed_dirty: Mutex::new(HashMap::new()),
         })
     }
 }

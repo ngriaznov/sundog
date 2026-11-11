@@ -101,6 +101,7 @@ impl Mesh {
             acked_buckets: RwLock::new(HashMap::new()),
             ack_window: config.rebalance_ack_window_value(),
             ack_swept_at: Mutex::new(Instant::now()),
+            departed_dirty: Mutex::new(HashMap::new()),
         });
         tokio::spawn(conn::accept_loop(
             listener,
@@ -128,7 +129,10 @@ impl Mesh {
     /// Refreshes the set of peers the mesh dials and fans traffic out to:
     /// spawns a writer for each newly seen peer, cancels it for any that
     /// departed or changed `data_addr`, and drops the bucket acks of every
-    /// requester that is no longer a peer. The IPs of the peers' data
+    /// requester that is no longer a peer. The frames queued for a peer whose
+    /// handle goes are counted in `sundog_backlog_dropped_total{peer}`, and
+    /// the peer's next handle, if it comes back inside ten minutes, starts
+    /// dirty. The IPs of the peers' data
     /// addresses are the sources the cap on connections waiting for their
     /// `Hello` never refuses. Called on every
     /// [`crate::membership::Membership::peers`] change.
@@ -159,13 +163,16 @@ impl Mesh {
             .peers
             .write()
             .expect("invariant: peers lock is never poisoned");
+        let now = Instant::now();
         table.retain(|node, handle| {
             let Some(&(data_addr, protocol)) = incoming.get(node) else {
                 handle.cancel.cancel();
+                self.inner.note_handle_removed(*node, handle, now);
                 return false;
             };
             if data_addr != handle.data_addr {
                 handle.cancel.cancel();
+                self.inner.note_handle_removed(*node, handle, now);
                 return false;
             }
             // The peer is unchanged; its gossiped protocol may still have
@@ -175,9 +182,11 @@ impl Mesh {
         });
         for peer in incoming_peers {
             table.entry(peer.node).or_insert_with(|| {
-                self.spawn_peer_handle(peer.node, peer.data_addr, peer.protocol)
+                let dirty = self.inner.take_departed_dirty(peer.node, now);
+                self.spawn_peer_handle(peer.node, peer.data_addr, peer.protocol, dirty)
             });
         }
+        self.inner.forget_aged_departures(now);
         self.inner
             .admission
             .set_known_sources(table.values().map(|handle| handle.data_addr.ip()));
@@ -188,7 +197,13 @@ impl Mesh {
         self.inner.forget_acks_of_departed(&incoming);
     }
 
-    fn spawn_peer_handle(&self, peer: NodeId, data_addr: SocketAddr, protocol: u16) -> PeerHandle {
+    fn spawn_peer_handle(
+        &self,
+        peer: NodeId,
+        data_addr: SocketAddr,
+        protocol: u16,
+        dirty: bool,
+    ) -> PeerHandle {
         let invalidate = Arc::new(DropOldestQueue::new(
             self.inner.outbox_capacity,
             self.inner.outbox_bytes,
@@ -196,7 +211,7 @@ impl Mesh {
         let (replicate_tx, replicate_rx) =
             replicate_outbox(self.inner.outbox_capacity, self.inner.outbox_bytes);
         let cancel = CancellationToken::new();
-        let dirty = Arc::new(AtomicBool::new(false));
+        let dirty = Arc::new(AtomicBool::new(dirty));
         tokio::spawn(conn::run_peer_writer(
             conn::PeerTarget {
                 peer,

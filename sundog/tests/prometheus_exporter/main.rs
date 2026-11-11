@@ -29,8 +29,9 @@ use crate::pins::{
     tombstone_ignored_pin_metrics, tombstone_pin_metrics,
 };
 use crate::seeds::{
-    FAN_OUT_STALL_PIN, seed_crdt_compaction_metrics, seed_distributed_metrics,
-    seed_fan_out_stall_metrics, seed_part_mismatch, seed_pull_timeout_metric, seed_sketch_mismatch,
+    FAN_OUT_STALL_PIN, seed_crdt_compaction_metrics, seed_departed_peer_backlog_metric,
+    seed_distributed_metrics, seed_fan_out_stall_metrics, seed_part_mismatch,
+    seed_pull_timeout_metric, seed_sketch_mismatch,
 };
 #[cfg(feature = "spill")]
 use crate::spill::{
@@ -159,6 +160,9 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     seed_fan_out_stall_metrics(metrics_addr).await;
     // Closes the caches it opens, so nothing after it sees them.
     closed_cache_gauge_pins(&cluster, metrics_addr).await;
+    // Also independent: its writer is shut down and its victim crashed before
+    // it returns.
+    let departed_peer = seed_departed_peer_backlog_metric(metrics_addr).await;
     // Runs last: it shuts down two of its own scenario-local nodes once it
     // is done with them, and `peer` isn't touched by anything after it.
     seed_distributed_metrics(&cluster, &peer, metrics_addr).await;
@@ -997,6 +1001,21 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         )
         .is_some_and(|lost| lost >= 1.0),
         "a forward that reached neither owner is a lost write; got body:\n{body}"
+    );
+
+    // sundog_backlog_dropped_total{peer}: pinned by
+    // `seed_departed_peer_backlog_metric`, whose victim leaves the writer's
+    // peer table with twenty writes still queued for it. How many frames
+    // coalesce before the writer's burst takes them is not fixed, so the pin
+    // is a lower bound of one frame.
+    assert!(
+        scraped_metric_value(
+            &body,
+            "sundog_backlog_dropped_total",
+            &[("peer", &departed_peer.to_string())]
+        )
+        .is_some_and(|dropped| dropped >= 1.0),
+        "the frames queued for a peer that left the table are counted; got body:\n{body}"
     );
 
     // `users` warmed during `seed_sketch_mismatch`: `is_ready()` and

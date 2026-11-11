@@ -600,3 +600,66 @@ pub(crate) async fn seed_fan_out_stall_metrics(metrics_addr: SocketAddr) {
         .await
         .expect("the writer shuts down while its owners take nothing");
 }
+
+/// The `Replicated` cache [`seed_departed_peer_backlog_metric`] writes.
+pub(crate) const DEPARTED_PEER_PIN: &str = "departed-peer-pin";
+
+/// Drives `sundog_backlog_dropped_total{peer}` through a peer that leaves the
+/// membership table with frames queued for it: a scenario-local writer and
+/// victim open [`DEPARTED_PEER_PIN`], the victim crashes, and the writer
+/// writes twenty keys, which wait in the victim's outbox because its writer
+/// cannot connect. The writer's failure detector then drops the victim, and
+/// the frames still queued are counted. Returns the victim's node id, the
+/// counter's `peer` label, once the counter is positive. Shuts the writer
+/// down before it returns.
+pub(crate) async fn seed_departed_peer_backlog_metric(metrics_addr: SocketAddr) -> NodeId {
+    let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+    let writer = Cluster::builder("it-departed-backlog")
+        .seeds(std::iter::empty())
+        .config(node_config(loopback))
+        .build()
+        .await
+        .expect("the writer builds");
+    let victim = Cluster::builder("it-departed-backlog")
+        .seeds([writer.local_gossip_addr()])
+        .config(node_config(loopback))
+        .build()
+        .await
+        .expect("the victim builds");
+    common::wait_for_peer_count(&writer, 1, Duration::from_secs(15)).await;
+    let writer_cache = writer
+        .cache::<u32, String>(DEPARTED_PEER_PIN)
+        .mode(Mode::Replicated)
+        .open()
+        .await
+        .expect("the writer opens the cache");
+    let victim_cache = victim
+        .cache::<u32, String>(DEPARTED_PEER_PIN)
+        .mode(Mode::Replicated)
+        .open()
+        .await
+        .expect("the victim opens the cache");
+    let victim_id = victim.node_id();
+    drop(victim_cache);
+    victim.crash().await;
+
+    for key in 0..20u32 {
+        writer_cache
+            .insert(key, format!("queued-{key}"))
+            .await
+            .expect("the writer accepts the write");
+    }
+    let label = victim_id.to_string();
+    common::eventually(Duration::from_secs(60), || async {
+        writer.peers().is_empty()
+            && scrape_metrics(metrics_addr).await.is_some_and(|body| {
+                scraped_metric_value(&body, "sundog_backlog_dropped_total", &[("peer", &label)])
+                    .is_some_and(|dropped| dropped >= 1.0)
+            })
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(60), writer.shutdown())
+        .await
+        .expect("the writer shuts down");
+    victim_id
+}

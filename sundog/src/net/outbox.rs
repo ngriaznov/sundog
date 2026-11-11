@@ -272,6 +272,11 @@ impl OutboxTx {
         self.taken.load(Ordering::Relaxed)
     }
 
+    /// Frames queued or reserved: the slots in use.
+    pub(super) fn queued(&self) -> usize {
+        self.tx.max_capacity() - self.tx.capacity()
+    }
+
     /// Free frame slots.
     pub(super) fn capacity(&self) -> usize {
         self.tx.capacity()
