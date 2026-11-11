@@ -21,6 +21,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: cargo yank
-        run: cargo yank sundog --version "${{ inputs.version }}"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "version must look like 1.2.3, got: $VERSION" >&2
+            exit 1
+          fi
+          cargo yank sundog --version "$VERSION"
