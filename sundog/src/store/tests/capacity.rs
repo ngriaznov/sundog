@@ -370,3 +370,22 @@ async fn insert_many_applies_entries_before_an_oversized_one_then_fails() {
         "insert_many is not a transaction: the key before the oversized one already applied"
     );
 }
+
+/// A weigher that returns `0` still weighs each entry at `1`, so the cap
+/// holds and the entries evict.
+#[tokio::test]
+async fn a_zero_weigher_result_counts_as_one_and_the_cap_holds() {
+    let s = Shard::<u32, String>::new(
+        SmolStr::new("zero-weight"),
+        Mode::Local,
+        NodeId::from(1u64),
+        20,
+        None,
+        None,
+    )
+    .with_weigher(|_k: &u32, _v: &String| 0);
+    for k in 0..300u32 {
+        s.insert(k, k.to_string()).await.expect("insert");
+    }
+    assert_eq!(s.entry_count().await, 20, "the cap holds");
+}

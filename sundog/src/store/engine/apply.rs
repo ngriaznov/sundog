@@ -599,7 +599,7 @@ where
         expires_at_ms,
         encoded,
     } = put;
-    let weight = ctx.weigher.map_or(1, |w| w(&key, &value));
+    let weight = super::weigh(ctx.weigher, &key, &value);
     let removed = if had_live {
         remove_live(stripe, hash, key_bytes.as_ref())
     } else {

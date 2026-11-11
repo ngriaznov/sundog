@@ -266,6 +266,15 @@ fn is_spill_candidate<K, V>(live: &Live<K, V>) -> bool {
     is_resident(live) && live.weight > 0
 }
 
+/// The weight an entry carries: the weigher's result floored at `1`, or `1`
+/// without a weigher. Weight `0` on a resident entry marks a spill hand-off
+/// in flight (see [`is_spill_candidate`]), so a stored weight is never `0`
+/// otherwise and every entry stays evictable. Every call site that weighs
+/// an entry goes through here. Pure; unit tested directly.
+fn weigh<K, V>(weigher: Option<&Weigher<K, V>>, key: &K, value: &V) -> u32 {
+    weigher.map_or(1, |w| w(key, value).max(1))
+}
+
 /// The keys the writes in progress just stored, by hash. The eviction a
 /// write triggers samples every other entry first and takes these only
 /// once nothing else is left to evict, so a write never makes room by

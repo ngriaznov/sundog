@@ -395,7 +395,7 @@ where
             if live.ver() != expected_ver || !is_resident(live) {
                 return false;
             }
-            let new_weight = self.weigher.as_ref().map_or(1, |w| w(key, &value));
+            let new_weight = super::weigh(self.weigher.as_ref(), key, &value);
             let old_weight = live.weight;
             let old_wall_ms = live.wall_ms;
             let old_expiry = live.expiry;

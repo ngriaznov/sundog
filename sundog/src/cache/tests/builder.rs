@@ -67,6 +67,31 @@ async fn a_value_heavier_than_max_capacity_leaves_the_older_entry() {
     cluster.shutdown().await;
 }
 
+/// Through `Cache`: a weigher that returns `0` weighs each entry at `1`, so
+/// the cap holds.
+#[tokio::test]
+async fn a_zero_weigher_result_counts_as_one_through_the_cache() {
+    let cluster = Cluster::builder("cache-it-zero-weigher")
+        .seeds(std::iter::empty())
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("node builds");
+    let cache = cluster
+        .cache::<u32, String>("zero")
+        .mode(Mode::Local)
+        .max_capacity(20)
+        .weigher(|_k: &u32, _v: &String| 0)
+        .open()
+        .await
+        .expect("opens");
+    for k in 0..300u32 {
+        cache.insert(k, k.to_string()).await.expect("insert");
+    }
+    assert_eq!(cache.entry_count().await, 20);
+    cluster.shutdown().await;
+}
+
 #[tokio::test]
 async fn merge_coalesce_window_rejects_a_non_merging_resolver() {
     let cluster = Cluster::builder("cache-it-merge-window-rejects-non-merging")

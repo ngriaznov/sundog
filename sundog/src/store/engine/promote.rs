@@ -98,7 +98,7 @@ where
             return false;
         }
         let key: K = decode_key(key_bytes);
-        let weight = self.weigher.as_ref().map_or(1, |w| w(&key, value));
+        let weight = super::weigh(self.weigher.as_ref(), &key, value);
         if !promotion_fits(weight, self.max_capacity) {
             return false;
         }

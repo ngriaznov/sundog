@@ -256,7 +256,7 @@ where
                 entry_fingerprint(key_bytes.as_ref(), ver),
                 Ordering::Relaxed,
             );
-            let weight = self.weigher.as_ref().map_or(1, |w| w(key, &value));
+            let weight = super::weigh(self.weigher.as_ref(), key, &value);
             // `remove_live` already cleared any stale `long_ttl` row above.
             let (expiry, long_ttl_value) = encode_expiry(ver.wall_ms, expires_at_ms);
             if let Some(deadline) = long_ttl_value {

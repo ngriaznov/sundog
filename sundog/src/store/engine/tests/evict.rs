@@ -991,3 +991,52 @@ fn handoff_progress_credits_the_weight_only_once_the_channel_took_the_job() {
     assert_eq!(handoff_progress(u32::MAX, true), u64::from(u32::MAX));
     assert_eq!(handoff_progress(u32::MAX, false), 0);
 }
+
+#[test]
+fn weigh_floors_the_weigher_result_at_one() {
+    let zero: Weigher<u32, String> = Box::new(|_k, _v| 0);
+    let heavy: Weigher<u32, String> = Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
+    assert_eq!(weigh(None, &1, &String::new()), 1, "no weigher: one unit");
+    assert_eq!(
+        weigh(Some(&zero), &1, &String::new()),
+        1,
+        "zero floors to one"
+    );
+    assert_eq!(
+        weigh(Some(&heavy), &1, &String::new()),
+        1,
+        "empty value floors to one"
+    );
+    assert_eq!(weigh(Some(&heavy), &1, &"abc".to_string()), 3);
+}
+
+#[test]
+fn zero_weigher_entries_count_against_the_cap_and_evict() {
+    let target_bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(0).as_ref()));
+    let keys: Vec<u32> = (0..u32::MAX)
+        .filter(|&k| stripe_index_from_hash(hash_key_bytes(key_bytes(k).as_ref())) == target_bucket)
+        .take(10)
+        .collect();
+    let weigher: Weigher<u32, String> = Box::new(|_k, _v| 0);
+    let engine = Engine::<u32, String>::new(5, None, Some(weigher), None);
+    for &k in &keys {
+        let _ = put(
+            &engine,
+            k,
+            key_bytes(k),
+            "v".into(),
+            hlc(u64::from(k) + 1, 1),
+            None,
+            0,
+        );
+    }
+    assert_eq!(
+        engine.debug_totals(),
+        (10, 10),
+        "each entry weighs one unit"
+    );
+
+    engine.enforce_capacity(target_bucket, &mut Written::default(), 500);
+
+    assert_eq!(engine.debug_totals(), (5, 5), "the cap holds");
+}

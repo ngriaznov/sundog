@@ -243,6 +243,10 @@ where
 
     /// Sets a custom per-entry weigher for size-bounded eviction:
     /// `max_capacity` becomes a weight budget rather than an entry count.
+    ///
+    /// Every entry weighs at least `1`: a weigher that returns `0` is
+    /// treated as returning `1`, so an entry always counts against
+    /// `max_capacity` and stays evictable.
     pub fn weigher<W>(mut self, weigher: W) -> Self
     where
         W: Fn(&K, &V) -> u32 + Send + Sync + 'static,

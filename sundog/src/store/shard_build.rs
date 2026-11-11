@@ -479,7 +479,8 @@ where
     }
 
     /// Installs a custom per-entry weigher for size-bounded eviction, in place
-    /// of the default of one weight unit per entry. Rebuilds
+    /// of the default of one weight unit per entry; a result of `0` counts as
+    /// `1`. Rebuilds
     /// `engine::Engine` from scratch, carrying forward any
     /// [`Shard::with_capacity_hint`] already set. Call this right after
     /// [`Shard::new`], before any reads or writes reach this shard; the two
