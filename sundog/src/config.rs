@@ -137,8 +137,11 @@ pub struct ClusterConfig {
     /// those limits is dropped and counted in
     /// `sundog_clock_skew_hold_dropped_total{cache, reason}`; a held record
     /// is never evicted to make room, so a merging resolver loses the
-    /// contribution that arrives at a full hold. A crash loses
-    /// the hold; a closing cache hands it to the other owners. While a record
+    /// contribution that arrives at a full hold. The hold is in memory: a
+    /// crash, a kill or any stop without `Cache::close` or
+    /// `Cluster::shutdown` loses it, and a close hands it to the other owners
+    /// of each part, which have nobody to hand it to when the closing node
+    /// is the only live owner. While a record
     /// is held the owner's clock has not absorbed its stamp, so a write made
     /// meanwhile stamps below it and loses to it once it applies.
     ///

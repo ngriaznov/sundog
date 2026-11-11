@@ -358,7 +358,19 @@ each a lost write unless its writer kept a copy for anti-entropy to offer
 again: the `full` reason is a hold at its 16,384 records or 32 MiB, and `horizon` a
 record that would wait longer than a day (or `tombstone_max_ttl`, if
 shorter), a stamp ahead by more than `max_clock_skew` plus that limit, which
-no clock skew explains. A node that logs that its clock is behind its own last
+no clock skew explains.
+
+The hold lives in memory, and a held forward is the only copy of the write.
+Before a planned stop of a `Distributed` owner, wait for
+`sundog_clock_skew_held` to read 0 on it, and stop it with `Cache::close` or
+`Cluster::shutdown`, which hand what it holds to the other owners of each
+part. A value above 0 when a node stops without either, by a crash, a kill or
+an out-of-memory stop, is a set of acknowledged writes that this node alone
+held and the node lost; each live owner of the part took its own copy of the
+forward, so a write is gone for good only when every live owner that held it
+stopped the same way. The gauge counts records, and a stop that follows a
+rise in `sundog_clock_skew_rejected_total` is the case to wait for. A node
+that logs that its clock is behind its own last
 write stamp had its system clock stepped back; its writes keep their order.
 
 ### Merges are refused at the frame limit

@@ -53,9 +53,19 @@ full hold is the one lost. A record whose wait would pass the shorter of
 `tombstone_max_ttl` and a day, a stamp ahead by more than `max_clock_skew`
 plus that limit, is a broken clock rather than skew, and is dropped and
 counted with reason `horizon`. Both count in
-`sundog_clock_skew_hold_dropped_total{cache, reason}`. The hold is in memory:
-a crash loses it, and a cache that closes hands its held records to the other
-owners of their parts, which hold them in turn. A forward its writer sent
+`sundog_clock_skew_hold_dropped_total{cache, reason}`. The hold is in memory
+and no spill snapshot or checkpoint carries it. `Cache::close` and
+`Cluster::shutdown` hand the held records to the other owners of their parts,
+which hold them in turn; the hand-off is a forward like any other, queued to
+each owner's outbox and not acknowledged. A crash, a kill, an out-of-memory
+stop or a process that ends without either call loses the hold, as does a
+close of the only live owner of a part, which has nobody to hand to. A
+dropped `Cache` handle leaves the cache open in its cluster, and the cluster's
+shutdown hands the hold off. The writer kept no copy of these forwards and
+nothing acknowledges them, so a held write is lost only when every live owner
+that holds it stops without a hand-off before its wait ends: each live owner
+of the part takes its own copy of the forward, and the others still hold
+theirs. A forward its writer sent
 under the receiver's own ownership view, for a part the writer owns in that
 view, is not held, because the writer kept its record and anti-entropy offers
 it again. Every other forward is held: one another node relays, such as a
