@@ -110,6 +110,7 @@ pub(super) async fn spawn_cache_tasks<K, V>(
             ),
         );
     }
+    cluster.spawn_tracked_in(tasks, shrink_task(Arc::clone(shard), cancel.clone()));
     cluster.spawn_tracked_in(
         tasks,
         crate::cluster::cache_entries_gauge_task(Arc::clone(shard), name.clone(), cancel.clone()),
@@ -160,6 +161,35 @@ where
                 shard.flush_due_pending_merges(now_ms());
             }
         }
+    }
+}
+
+/// How often [`shrink_task`] runs a pass.
+const SHRINK_TICK: Duration = Duration::from_secs(1);
+
+/// How many stripes one [`shrink_task`] pass walks: a full turn of the
+/// keyspace every few ticks, each stripe costing a read lock when it is
+/// not sparse.
+const SHRINK_STRIPES_PER_TICK: usize = 256;
+
+/// Drives [`Shard::shrink_pass`] for every cache, whatever its resolver:
+/// each tick walks the next [`SHRINK_STRIPES_PER_TICK`] stripes and gives
+/// back the capacity of one left far over-allocated, such as by a traffic
+/// peak, evictions, or a `capacity_hint` set well above the real count.
+/// Reclaim never changes an entry, so its timing is not load-bearing for
+/// correctness.
+async fn shrink_task<K, V>(shard: Arc<Shard<K, V>>, cancel: CancellationToken)
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    let mut ticker = tokio::time::interval(SHRINK_TICK);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        if cancel.run_until_cancelled(ticker.tick()).await.is_none() {
+            return;
+        }
+        shard.shrink_pass(SHRINK_STRIPES_PER_TICK);
     }
 }
 

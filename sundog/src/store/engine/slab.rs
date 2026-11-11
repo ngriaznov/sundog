@@ -260,7 +260,7 @@ impl<K, V> Slab<K, V> {
     }
 
     /// Shrinks the arena and index to fit, rehashing every entry's index
-    /// row. Called by [`Engine::compact`]'s paced shrink pass.
+    /// row. Called through [`Stripe::shrink_if_sparse`] and [`Engine::compact`].
     pub(super) fn shrink_to_fit(&mut self, hasher: impl Fn(&Live<K, V>) -> u64) {
         self.entries.shrink_to_fit();
         let entries = &self.entries;

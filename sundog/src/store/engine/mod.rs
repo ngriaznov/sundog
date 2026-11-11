@@ -667,6 +667,9 @@ pub(crate) struct Engine<K, V> {
     /// `evict_cursor` this is a rotation pointer, not a PRNG state, so a
     /// zero seed is fine.
     compact_cursor: AtomicU64,
+    /// Where [`Engine::shrink_pass`]'s next call resumes, a stripe index
+    /// kept in `0..BUCKET_COUNT` the way `compact_cursor` is.
+    shrink_cursor: AtomicUsize,
     /// What the last [`Engine::gc_tombstones`] call was told about whether
     /// collection defers, or what [`Engine::starting_gc_deferred`] set before
     /// the first call. A tombstone that arrives already past the retention
@@ -740,6 +743,7 @@ where
             merge_cap_limit: AtomicUsize::new(usize::MAX),
             merge_cap_cache_len: AtomicUsize::new(0),
             compact_cursor: AtomicU64::new(0),
+            shrink_cursor: AtomicUsize::new(0),
             gc_deferring: AtomicBool::new(false),
             last_gc_ms: AtomicU64::new(0),
             pause_hold_until_ms: AtomicU64::new(0),

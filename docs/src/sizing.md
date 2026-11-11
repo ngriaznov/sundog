@@ -66,6 +66,10 @@ SUNDOG_BENCH=1 cargo test --release -p sundog --test entry_diet_bench \
 node's own share, not the cluster total.
 Each of the 1024 stripes presizes for at most 1024 entries, so a hint above
 about a million entries presizes that many and the tables grow past it as usual.
+A background pass in every cache, merging or not, gives back the capacity of a
+stripe left at or under an eighth full, and so does an expiry sweep or a
+release of a part, so resident memory follows the live entry count after a
+peak. A hint far above the real count is reclaimed the same way.
 
 ## Tombstones
 

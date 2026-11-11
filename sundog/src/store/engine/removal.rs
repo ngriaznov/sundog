@@ -111,6 +111,7 @@ where
                 stripe.tombstones.clear();
                 stripe.long_ttl.clear();
                 stripe.next_expiry_ms = u64::MAX;
+                stripe.shrink_if_sparse();
                 // Zeroed under the guard: a removal folds its digest change
                 // in under the same guard, so none lands after this store.
                 for part in 0..PART_COUNT {
@@ -178,6 +179,7 @@ where
                 stripe.tombstones.retain(|key, _| !released(key));
                 let removed_tombstones = before - stripe.tombstones.len();
                 stripe.long_ttl.retain(|key, _| !released(key));
+                stripe.shrink_if_sparse();
                 // Zeroed under the guard, as in `release_buckets`.
                 for part in 0..PART_COUNT {
                     if mask & (1u64 << part) != 0 {

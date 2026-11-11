@@ -238,6 +238,14 @@ where
         self.engine.contains_key(key, self.now_ms())
     }
 
+    /// One paced capacity-reclaim pass over up to `max_stripes` stripes,
+    /// resuming where the last call stopped; see `Engine::shrink_pass`.
+    /// Returns how many stripes it shrank. Driven by
+    /// `cache::tasks::shrink_task`.
+    pub(crate) fn shrink_pass(&self, max_stripes: usize) -> usize {
+        self.engine.shrink_pass(max_stripes)
+    }
+
     /// The number of live entries this node currently holds. Runs the engine's
     /// sweep first, so completed TTL/TTI expiries are reflected rather than
     /// estimated. In a `Replicated` or `Distributed` shard whose resolver

@@ -155,6 +155,26 @@ async fn open_accepts_a_tti_above_the_cap() {
     cluster.shutdown().await;
 }
 
+/// Through `Cache`: the shrink task reclaims an oversized `capacity_hint` of
+/// a default (LWW) cache without a single removal.
+#[tokio::test]
+async fn an_oversized_capacity_hint_is_reclaimed_by_the_background_shrink() {
+    let (cluster, result) = open_local("cache-it-shrink", |b| {
+        b.capacity_hint(100 * crate::store::BUCKET_COUNT as u64)
+    })
+    .await;
+    let cache = result.expect("opens");
+    cache.insert(1, "v".to_string()).await.expect("insert");
+    crate::cluster::test_support::wait_until(
+        Duration::from_secs(15),
+        "every stripe gives back its presize",
+        async || cache.stripe_capacities().iter().all(|&c| c < 100),
+    )
+    .await;
+    assert_eq!(cache.get(&1).await.as_deref(), Some("v"));
+    cluster.shutdown().await;
+}
+
 #[tokio::test]
 async fn merge_coalesce_window_rejects_a_non_merging_resolver() {
     let cluster = Cluster::builder("cache-it-merge-window-rejects-non-merging")
