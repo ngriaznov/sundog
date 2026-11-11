@@ -452,6 +452,7 @@ where
     shard
         .engine
         .spilled_loc(kb.as_ref(), engine::hash_key_bytes(&kb), shard.now_ms())
+        .spilled()
         .expect("the key is spilled")
         .0
 }

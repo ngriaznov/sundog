@@ -67,6 +67,25 @@ pub(crate) fn admission_charge(record_len: u32, floor: u32) -> u32 {
     record_len.max(floor)
 }
 
+/// [`admission_charge`] clamped to `queue_total`, the whole budget in
+/// permits ([`whole_queue_permits`](super::SpillTier::whole_queue_permits)).
+/// A record that fits a region but is larger than the whole flush-queue
+/// budget is charged the whole budget, so it is admitted whenever the queue
+/// is empty rather than refused forever. Pure; unit tested directly.
+pub(crate) fn clamped_admission_charge(record_len: u32, floor: u32, queue_total: u32) -> u32 {
+    admission_charge(record_len, floor).min(queue_total)
+}
+
+/// The permit count of an admission semaphore over a `flush_queue_bytes`
+/// budget: one permit per byte, clamped to tokio's
+/// [`Semaphore::MAX_PERMITS`](tokio::sync::Semaphore::MAX_PERMITS) so
+/// building the semaphore never panics. Pure; unit tested directly.
+pub(crate) fn admit_permits_for(flush_queue_bytes: u64) -> usize {
+    usize::try_from(flush_queue_bytes)
+        .unwrap_or(usize::MAX)
+        .min(tokio::sync::Semaphore::MAX_PERMITS)
+}
+
 /// Whether `record_len` more bytes fit in a region of `region_bytes` bytes
 /// whose write cursor already sits at `write_cursor`. Checked arithmetic: a
 /// pathological `record_len` never wraps into a false "yes".

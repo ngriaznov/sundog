@@ -56,6 +56,8 @@ mod snapshot;
 mod test_support;
 
 pub use config::SpillConfig;
+pub(crate) use config::validate_cache_name;
+pub(crate) use open::ReopenGate;
 
 #[cfg(doc)]
 use crate::store::engine::OnRefusal;
@@ -73,7 +75,7 @@ pub(crate) use rules::flush_queue_slots;
 pub(crate) use rules::region_count_for;
 #[cfg(test)]
 pub(crate) use rules::spill_record_len;
-use rules::{admission_charge, slot_charge_floor};
+use rules::{clamped_admission_charge, slot_charge_floor};
 pub(crate) use rules::{keeps_refused_victim_resident, spilled_is_current};
 #[cfg(test)]
 pub(crate) use snapshot::write_stale_snapshot_for_test;
@@ -228,7 +230,8 @@ pub(crate) trait SpillSink: Send + Sync + 'static {
     /// Under the stripe write lock: leaves an already-present key
     /// untouched and returns `false` (never resurrects or clobbers);
     /// otherwise inserts at `Payload::Spilled(loc)`, folds its fingerprint
-    /// into the digest, and returns `true`.
+    /// into the digest, and returns `true`. `now_ms` starts the entry's idle
+    /// clock: the replayed entry counts as last accessed at the reopen.
     #[allow(clippy::too_many_arguments)]
     fn install_new(
         &self,
@@ -239,7 +242,23 @@ pub(crate) trait SpillSink: Send + Sync + 'static {
         expires_at_ms: Option<u64>,
         loc: SpillLoc,
         weight: u32,
+        now_ms: u64,
     ) -> bool;
+
+    /// Whether `key_bytes` decode as this sink's key type and encode back
+    /// to the same bytes. [`SpillTier::reopen`]'s replay drops a snapshot
+    /// entry that fails this before it installs anything, so an entry
+    /// written under another key type or encoding never reaches a key
+    /// listing. A sink with no key type to check accepts every key.
+    fn key_round_trips(&self, _key_bytes: &[u8]) -> bool {
+        true
+    }
+
+    /// The flusher resolved a batch, installing or abandoning each job in
+    /// it. A sink whose eviction left refused victims resident (see
+    /// [`SpillTier::keep_resident_when_refused`]) re-checks its capacity
+    /// here, since nothing else runs eviction on an idle node. Default: no-op.
+    fn batch_resolved(&self) {}
 
     /// `region` at `generation` is about to be reused. Under each stripe
     /// write lock, remove every listed entry whose payload is still
@@ -398,11 +417,15 @@ struct Inner {
 impl Inner {
     /// The admission bytes a queued job of `record_len` bytes costs, charged
     /// at admission and credited by [`flusher_loop`] once the job leaves
-    /// the channel: [`admission_charge`] over this tier's
-    /// [`slot_charge_floor`]. Computed on demand from the budget, so every
+    /// the channel: [`clamped_admission_charge`] over this tier's
+    /// [`slot_charge_floor`], never more than the whole budget. Computed on demand from the budget, so every
     /// charge and credit goes through one function.
     fn admit_charge(&self, record_len: u32) -> u32 {
-        admission_charge(record_len, slot_charge_floor(self.flush_queue_bytes))
+        clamped_admission_charge(
+            record_len,
+            slot_charge_floor(self.flush_queue_bytes),
+            u32::try_from(self.flush_queue_bytes).unwrap_or(u32::MAX),
+        )
     }
 
     /// Increments `sundog_spill_dropped_total{cache,reason}`. `reason` is
@@ -634,6 +657,13 @@ impl SpillTier {
     /// Live, un-reclaimed, bytes across all regions.
     pub(crate) fn bytes_used(&self) -> u64 {
         self.inner.bytes_used.load(Ordering::Acquire)
+    }
+
+    /// Publishes `sundog_spill_bytes_used{cache}` at the tier's current
+    /// byte count. A warm reopen calls it once the replay has set the
+    /// count, so the series exists before the first flush.
+    pub(crate) fn publish_bytes_used(&self) {
+        self.inner.publish_bytes_used();
     }
 
     /// The cache name this tier is [`SpillTier::open`]ed under. The

@@ -638,3 +638,60 @@ fn a_job_is_credited_back_at_the_amount_it_was_charged() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_record_larger_than_the_flush_queue_is_admitted_when_the_queue_is_empty() {
+    let dir = temp_dir("record-over-queue");
+    let cfg = SpillConfig::new(&dir, 1 << 20)
+        .region_bytes(4096)
+        .flush_queue_bytes(HEADER_LEN as u64 + 8);
+    let tier = SpillTier::open(&cfg, "cache-a").unwrap();
+    tier.pause_flusher();
+    let sink = Arc::new(RecordingSink::default());
+    tier.attach(Arc::downgrade(&(Arc::clone(&sink) as Arc<dyn SpillSink>)));
+    let value = vec![7u8; 1000];
+    assert_eq!(
+        tier.would_accept(None, 4, value.len()),
+        Admission::Accepted,
+        "a record that fits a region is admitted into an empty, smaller queue"
+    );
+    assert_eq!(tier.queued_bytes(), HEADER_LEN as u64 + 8);
+    assert_eq!(
+        tier.would_accept(None, 4, value.len()),
+        Admission::RefusedFinal,
+        "a second one waits for the first to leave the queue"
+    );
+    tier.release(tier.admit_charge(4, value.len()));
+    assert_eq!(tier.queued_bytes(), 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn open_rejects_a_zero_read_concurrency_without_hanging() {
+    let dir = temp_dir("zero-read-concurrency");
+    let cfg = SpillConfig::new(&dir, 1 << 20)
+        .region_bytes(4096)
+        .read_concurrency(0);
+    assert!(SpillTier::open(&cfg, "cache-a").is_err());
+    let cfg = cfg.read_concurrency(usize::MAX);
+    assert!(SpillTier::open(&cfg, "cache-a").is_err());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn open_rejects_a_cache_name_that_escapes_its_subdirectory() {
+    let dir = temp_dir("bad-cache-name");
+    let cfg = SpillConfig::new(&dir, 1 << 20)
+        .region_bytes(4096)
+        .warm_reopen(true);
+    for name in ["", "..", "../x", "a/b"] {
+        assert!(SpillTier::open(&cfg, name).is_err(), "{name:?}");
+    }
+    let sink = RecordingSink::default();
+    assert!(
+        SpillTier::reopen(&cfg, "../x", &sink, 0, ReopenGate::new(1), |_| true).is_err(),
+        "reopen validates the name too"
+    );
+    assert!(!dir.exists() || fs::read_dir(&dir).unwrap().next().is_none());
+    let _ = fs::remove_dir_all(&dir);
+}

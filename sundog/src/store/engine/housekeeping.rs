@@ -202,6 +202,8 @@ where
     /// Without it, and for an entry that went idle, the removal leaves no
     /// trace.
     pub(crate) fn sweep(&self, now_ms: u64, expiry_tombstones: Option<TombstoneRetention>) {
+        #[cfg(feature = "spill")]
+        self.retry_capacity(now_ms);
         for (idx, stripe_lock) in self.stripes.iter().enumerate() {
             let due = stripe_lock.read().next_expiry_ms <= now_ms;
             if !due && self.tti_ms.is_none() {

@@ -256,8 +256,10 @@ pub(crate) fn write_stale_snapshot_for_test(
 /// and parse cleanly (`"no_snapshot"` otherwise), name the current
 /// [`SNAPSHOT_FORMAT_VERSION`] (`"stale_snapshot"`), match
 /// `region_bytes`/`region_count` (`"config_mismatch"`), and have closed
-/// within `tombstone_ttl_ms` of `now_ms` (`"downtime_exceeded"`). `Ok`
-/// names the parsed snapshot; `Err` names the [`ReopenOutcome::reason`]
+/// within `tombstone_ttl_ms` of `now_ms` (`"downtime_exceeded"`) and not
+/// stamped more than `clock_slack_ms` ahead of `now_ms`
+/// (`"clock_behind_snapshot"`: a reopen clock that reads earlier than the
+/// close stamp hides the real downtime). `Ok` names the parsed snapshot; `Err` names the [`ReopenOutcome::reason`]
 /// to record.
 pub(super) fn snapshot_eligibility(
     dir: &Path,
@@ -265,6 +267,7 @@ pub(super) fn snapshot_eligibility(
     region_count: u32,
     now_ms: u64,
     tombstone_ttl_ms: u64,
+    clock_slack_ms: u64,
 ) -> Result<(SnapshotHeader, Vec<SnapshotEntry>), &'static str> {
     let bytes = fs::read(snapshot_path(dir)).map_err(|_| "no_snapshot")?;
     let (header, entries) = parse_snapshot(&bytes).ok_or("no_snapshot")?;
@@ -276,6 +279,9 @@ pub(super) fn snapshot_eligibility(
     }
     if header.closed_at_ms == 0 || now_ms.saturating_sub(header.closed_at_ms) > tombstone_ttl_ms {
         return Err("downtime_exceeded");
+    }
+    if header.closed_at_ms.saturating_sub(now_ms) > clock_slack_ms {
+        return Err("clock_behind_snapshot");
     }
     Ok((header, entries))
 }

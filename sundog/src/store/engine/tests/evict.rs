@@ -2,6 +2,8 @@
 
 use std::collections::HashSet;
 
+#[cfg(feature = "spill")]
+use super::super::evict::should_retry_capacity;
 use super::*;
 
 #[test]
@@ -1039,4 +1041,25 @@ fn zero_weigher_entries_count_against_the_cap_and_evict() {
     engine.enforce_capacity(target_bucket, &mut Written::default(), 500);
 
     assert_eq!(engine.debug_totals(), (5, 5), "the cap holds");
+}
+
+#[cfg(feature = "spill")]
+#[test]
+fn should_retry_capacity_only_for_a_keep_resident_node_over_its_cap_with_queue_room() {
+    // keep_resident, cap, total, pending, room
+    assert!(should_retry_capacity(true, 10, 11, 0, true), "over the cap");
+    assert!(
+        should_retry_capacity(true, 10, 6, 5, true),
+        "weight plus pending is over the cap"
+    );
+    assert!(!should_retry_capacity(true, 10, 10, 0, true), "at the cap");
+    assert!(
+        !should_retry_capacity(false, 10, 99, 0, true),
+        "delete mode"
+    );
+    assert!(!should_retry_capacity(true, 10, 99, 0, false), "no room");
+    assert!(
+        !should_retry_capacity(true, u64::MAX, u64::MAX, 5, true),
+        "unbounded cap"
+    );
 }

@@ -68,6 +68,7 @@ impl SpillSink for RejectingSink {
         _: Option<u64>,
         _: SpillLoc,
         _: u32,
+        _: u64,
     ) -> bool {
         false
     }

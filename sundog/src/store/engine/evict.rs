@@ -60,6 +60,28 @@ pub(super) fn defer_to_flusher(
     pending_spill_weight > 0 && (refused || total_weight <= limit)
 }
 
+/// Whether the flusher, having resolved a batch, should run eviction again:
+/// the tier keeps a refused victim resident (`keep_resident`, the
+/// `Replicated` and `Distributed` policy), a finite `max_capacity` is
+/// exceeded by `total_weight` plus the `pending_spill_weight` still in
+/// flight, and the flush queue has room (`queue_has_room`) for a hand-off a
+/// pass would try. Nothing else runs eviction on an idle node, so without
+/// this its refused victims stay resident until the next write. Pure; unit
+/// tested directly.
+#[cfg(feature = "spill")]
+pub(super) fn should_retry_capacity(
+    keep_resident: bool,
+    max_capacity: u64,
+    total_weight: u64,
+    pending_spill_weight: u64,
+    queue_has_room: bool,
+) -> bool {
+    keep_resident
+        && queue_has_room
+        && max_capacity != u64::MAX
+        && total_weight.saturating_add(pending_spill_weight) > max_capacity
+}
+
 /// The eviction progress a spill hand-off earns: the victim's `weight` once
 /// the flusher's channel took the job, `0` once the hand-off was abandoned
 /// and the weight restored. An abandoned hand-off freed nothing, so
@@ -198,6 +220,32 @@ where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
+    /// Runs one eviction pass when [`should_retry_capacity`] says a
+    /// keep-resident node is over its cap with room in the flush queue.
+    /// Called by the flusher thread after each resolved batch and by
+    /// [`Engine::sweep`], the periodic housekeeping, since a node whose
+    /// refused hand-offs never reached the flusher gets no batch to wake it.
+    #[cfg(feature = "spill")]
+    pub(super) fn retry_capacity(&self, now_ms: u64) {
+        let Some(tier) = self.spill() else {
+            return;
+        };
+        if !should_retry_capacity(
+            tier.keep_resident_when_refused(),
+            self.max_capacity,
+            self.total_weight.load(Ordering::Relaxed),
+            self.pending_spill_weight_or_zero(),
+            tier.has_queue_room(),
+        ) {
+            return;
+        }
+        self.enforce_capacity(
+            self.next_pseudo_random_bucket(),
+            &mut Written::default(),
+            now_ms,
+        );
+    }
+
     /// xorshift64: fast and allocation-free for choosing which stripe to look
     /// at next and where to start sampling. No correctness property depends
     /// on its output.

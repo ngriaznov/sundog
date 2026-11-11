@@ -842,6 +842,55 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
                 &body,
                 "sundog_spill_reopen_total",
                 &[
+                    ("cache", "spill-reopen-mode"),
+                    ("outcome", "cold_fallback"),
+                    ("reason", "mode")
+                ]
+            ),
+            Some(2.0),
+            "expected the first and second open of 'spill-reopen-mode' both to fall back on `mode`; \
+             got body:\n{body}"
+        );
+        // The warm reopen seeds both gauges from the replayed tier. This
+        // process shares the gauge between the first open's shard, which
+        // checkpointed two entries to disk and is still alive, and the
+        // reopened one, which replays those two: 2 + 2. The replayed bytes
+        // are published before any flush.
+        assert_eq!(
+            scraped_metric_value(
+                &body,
+                "sundog_spill_entries",
+                &[("cache", "spill-reopen-warm")]
+            ),
+            Some(4.0),
+            "expected sundog_spill_entries = 4 on 'spill-reopen-warm'; got body:\n{body}"
+        );
+        assert!(
+            scraped_metric_value(
+                &body,
+                "sundog_spill_bytes_used",
+                &[("cache", "spill-reopen-warm")]
+            )
+            .is_some_and(|bytes| bytes > 0.0),
+            "expected sundog_spill_bytes_used > 0 on 'spill-reopen-warm'; got body:\n{body}"
+        );
+        assert_eq!(
+            scraped_metric_value(
+                &body,
+                "sundog_spill_reopen_entries_total",
+                &[
+                    ("cache", "spill-reopen-warm"),
+                    ("stage", "dropped_key_mismatch")
+                ]
+            ),
+            Some(0.0),
+            "expected no key-mismatch drops on 'spill-reopen-warm'; got body:\n{body}"
+        );
+        assert_eq!(
+            scraped_metric_value(
+                &body,
+                "sundog_spill_reopen_total",
+                &[
                     ("cache", "spill-reopen-bad-region"),
                     ("outcome", "cold_fallback"),
                     ("reason", "bad_region")

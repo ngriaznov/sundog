@@ -11,6 +11,8 @@ use serde::de::DeserializeOwned;
 use super::engine::JoinOutcome;
 use super::fan_out::{FillRoute, ReadThroughRoute, fill_fans_out, fill_route, read_through_route};
 use super::load::{Fill, FillDeadline, FillPlan, fill_deadline};
+#[cfg(feature = "spill")]
+use super::shard_spill::SpilledMiss;
 use super::{
     EncodeFailure, Event, FanOutItem, Origin, PartId, Shard, SharedLoaderFailure, encode_key,
     engine, read_timing, shared_failure,
@@ -451,6 +453,8 @@ where
     {
         let key_bytes = encode_key(key)?;
         let hash = engine::hash_key_bytes(key_bytes.as_ref());
+        #[cfg(feature = "spill")]
+        let mut spill_races = 0u8;
         loop {
             if let Some(value) = self
                 .engine
@@ -492,20 +496,28 @@ where
                     // the key still holds it; a removal, expiry or newer
                     // write since the read leaves them to read again.
                     #[cfg(feature = "spill")]
-                    if let Some((ver, value)) =
-                        self.get_spilled_by_bytes(key_bytes.as_ref(), hash).await
-                    {
-                        self.hits.increment(1);
-                        self.engine.finish_spilled_read(
-                            &key_bytes,
-                            hash,
-                            &inflight,
-                            ver,
-                            value.clone(),
-                            self.now_ms(),
-                        );
-                        guard.complete();
-                        return Ok(value);
+                    match self.get_spilled_or_resident(key_bytes.as_ref(), hash).await {
+                        Ok((ver, value)) => {
+                            self.hits.increment(1);
+                            self.engine.finish_spilled_read(
+                                &key_bytes,
+                                hash,
+                                &inflight,
+                                ver,
+                                value.clone(),
+                                self.now_ms(),
+                            );
+                            guard.complete();
+                            return Ok(value);
+                        }
+                        // Promoted or overwritten since the miss above: the
+                        // fast path reads it, with no load.
+                        Err(SpilledMiss::Resident) if spill_races < 2 => {
+                            spill_races += 1;
+                            drop(guard);
+                            continue;
+                        }
+                        Err(_) => {}
                     }
                     // Stamped before the first step runs, so a write or
                     // removal that lands during the load is newer than the

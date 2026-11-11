@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use tokio::sync::Semaphore;
+
 use super::HEADER_LEN;
 #[cfg(doc)]
 use super::SpillTier;
@@ -42,6 +44,9 @@ pub struct SpillConfig {
     /// Directory the tier's region files live under. `SpillTier::open`
     /// creates and owns a per-cache subdirectory inside it. Two caches
     /// never share a directory even when given the same `dir`.
+    /// A cache name that is empty, `.`, `..`, absolute, or contains `/`, `\`
+    /// or a NUL byte is rejected at open, so the subdirectory is always one
+    /// component under `dir`.
     pub dir: PathBuf,
     /// Disk budget for this cache's spill tier, in bytes. Must be at least
     /// twice `region_bytes_value()`. See `SpillConfig::validate`, a
@@ -110,7 +115,9 @@ impl SpillConfig {
     /// record length and its share of the flush channel's 262,144 slots, the
     /// budget divided by 262,144 (256 bytes at the default 64 MiB), so many
     /// tiny values fill the budget before the channel, and a budget over
-    /// 12 MiB admits no more than 262,144 queued values. Own-and-return.
+    /// 12 MiB admits no more than 262,144 queued values. A record larger than
+    /// the whole budget is charged the whole budget, so it is admitted
+    /// whenever the queue is empty. Own-and-return.
     #[must_use]
     pub fn flush_queue_bytes(mut self, bytes: u64) -> Self {
         self.flush_queue_bytes = Some(bytes);
@@ -133,7 +140,12 @@ impl SpillConfig {
 
     /// Whether `SpillTier::open` may replay a clean close's snapshot
     /// instead of the wipe-and-recreate cold path. Default `false`. See
-    /// `SpillTier::reopen`'s docs for when it still falls back cold.
+    /// `SpillTier::reopen`'s docs for when it still falls back cold. A
+    /// `Mode::Invalidation` cache always opens cold, reason `mode`: it runs no
+    /// anti-entropy, so a replayed entry could be one a peer removed or
+    /// rewrote during the downtime. A snapshot stamped ahead of the clock at
+    /// reopen by more than `max_clock_skew` opens cold too, reason
+    /// `clock_behind_snapshot`.
     #[must_use]
     pub fn warm_reopen(mut self, enabled: bool) -> Self {
         self.warm_reopen = enabled;
@@ -180,7 +192,8 @@ impl SpillConfig {
     /// with the tier's 32-bit on-disk offsets, a `capacity_bytes` less than
     /// twice `region_bytes`, a `flush_queue_bytes` too small to ever hold
     /// even the smallest possible record (header plus a zero-length key and
-    /// value), a `flush_queue_bytes` bigger than `capacity_bytes` itself,
+    /// value), a zero `read_concurrency` or one above
+    /// `tokio::sync::Semaphore::MAX_PERMITS`, a `flush_queue_bytes` bigger than `capacity_bytes` itself,
     /// and a `spill_wait_timeout` at or above the sanity cap
     /// `MAX_SPILL_WAIT_TIMEOUT` (`Duration::ZERO` remains a valid opt-out).
     /// The `capacity_bytes` rule prevents a hazard where a
@@ -209,9 +222,42 @@ impl SpillConfig {
         if flush_queue_bytes > self.capacity_bytes {
             return Err("flush_queue_bytes must not exceed capacity_bytes");
         }
+        if self.read_concurrency == 0 {
+            return Err("read_concurrency must be greater than zero");
+        }
+        if self.read_concurrency > Semaphore::MAX_PERMITS {
+            return Err("read_concurrency must not exceed the semaphore permit limit");
+        }
         if self.spill_wait_timeout >= MAX_SPILL_WAIT_TIMEOUT {
             return Err("spill_wait_timeout must be under the sanity cap");
         }
         Ok(())
     }
+}
+
+/// Checks that `name` is usable as the one-component subdirectory a spill
+/// tier lives in under [`SpillConfig::dir`].
+///
+/// Rejects an empty name, one containing `/`, `\` or NUL, `.` and `..`, and
+/// an absolute path, any of which puts the tier outside its own
+/// subdirectory or in a directory another name also reaches. Every other
+/// name keeps its directory.
+///
+/// # Errors
+///
+/// Returns a static reason string naming the rule the name breaks.
+pub(crate) fn validate_cache_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("the cache name must not be empty");
+    }
+    if name.contains(['/', '\\', '\0']) {
+        return Err("the cache name must not contain a path separator or a NUL byte");
+    }
+    if name == "." || name == ".." {
+        return Err("the cache name must not be `.` or `..`");
+    }
+    if std::path::Path::new(name).is_absolute() {
+        return Err("the cache name must not be an absolute path");
+    }
+    Ok(())
 }

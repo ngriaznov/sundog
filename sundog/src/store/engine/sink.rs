@@ -81,10 +81,22 @@ where
     /// the real weight). `weight` mirrors `install`'s parameter for
     /// signature symmetry and is never folded into `total_weight`.
     ///
+    /// `now_ms` is the entry's last-access stamp, so its idle clock starts at
+    /// the reopen rather than at its write. A key that does not decode as `K`
+    /// and re-encode to the same bytes is refused (`false`): it was written
+    /// under another key type or encoding.
+    ///
     /// Never overwrites a key already present, live or tombstoned: `false`
     /// and a no-op either way, so this can never resurrect a deleted key or
     /// clobber a fresher write. Folds the fresh entry's fingerprint into
     /// the bucket's digest like every other insert path.
+    fn key_round_trips(&self, key_bytes: &[u8]) -> bool {
+        postcard::from_bytes::<K>(key_bytes)
+            .ok()
+            .and_then(|key| postcard::to_allocvec(&key).ok())
+            .is_some_and(|encoded| encoded == key_bytes)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn install_new(
         &self,
@@ -95,7 +107,11 @@ where
         expires_at_ms: Option<u64>,
         loc: SpillLoc,
         _weight: u32,
+        now_ms: u64,
     ) -> bool {
+        if !self.key_round_trips(key_bytes) {
+            return false;
+        }
         let part = part_index_from_hash(hash);
         let inserted = {
             let mut stripe = self.stripes[stripe_idx].write();
@@ -118,7 +134,7 @@ where
                         ver,
                         expiry,
                         0,
-                        ver.wall_ms,
+                        now_ms,
                         EntryState::Spilled(loc),
                     ),
                     hasher_for,
@@ -140,6 +156,10 @@ where
             self.note_spill_arrival();
         }
         inserted
+    }
+
+    fn batch_resolved(&self) {
+        self.retry_capacity(crate::store::now_ms());
     }
 
     /// Resolves a job the tier could not write: `weight` leaves

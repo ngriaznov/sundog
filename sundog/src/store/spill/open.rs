@@ -12,10 +12,11 @@ use tokio::sync::Semaphore;
 
 use crate::hlc::Hlc;
 
+use super::config::validate_cache_name;
 use super::record::{
     decode_record_with_key, pread_exact, region_file_name, remove_stale_region_files,
 };
-use super::rules::region_count_for;
+use super::rules::{admit_permits_for, region_count_for};
 #[cfg(doc)]
 use super::snapshot::SNAPSHOT_FORMAT_VERSION;
 use super::snapshot::{delete_snapshot, remove_stale_snapshot_files, snapshot_eligibility};
@@ -81,6 +82,7 @@ impl SpillTier {
         readonly_regions: &[u32],
     ) -> io::Result<Self> {
         cfg.validate()
+            .and_then(|()| validate_cache_name(cache_name))
             .map_err(|reason| io::Error::new(io::ErrorKind::InvalidInput, reason))?;
 
         let dir = cfg.dir.join(cache_name);
@@ -121,10 +123,9 @@ impl SpillTier {
         }
 
         let flush_queue_bytes = cfg.flush_queue_bytes_value();
-        // `validate` bounds this well under any real disk budget; the
-        // fallback keeps it total rather than panicking on an unvalidated
-        // config.
-        let admit_permits = usize::try_from(flush_queue_bytes).unwrap_or(usize::MAX);
+        // Clamped to tokio's permit limit, so `Semaphore::new` cannot panic
+        // on an unvalidated config.
+        let admit_permits = admit_permits_for(flush_queue_bytes);
         let inner = Arc::new(Inner {
             regions: regions.into_boxed_slice(),
             region_bytes: region_bytes_u32,
@@ -167,13 +168,18 @@ impl SpillTier {
     /// check first rules out a warm reopen:
     ///
     /// 1. `"disabled"`: [`SpillConfig::warm_reopen_value`] is `false`.
-    /// 2. `"no_snapshot"`: no trusted snapshot (missing, truncated, bad
+    /// 2. `"mode"`: the cache's mode never replays a snapshot
+    ///    ([`ReopenGate::mode_allows_warm`]).
+    /// 3. `"no_snapshot"`: no trusted snapshot (missing, truncated, bad
     ///    checksum).
-    /// 3. `"stale_snapshot"`: an older [`SNAPSHOT_FORMAT_VERSION`].
-    /// 4. `"config_mismatch"`: `region_bytes`/`region_count` don't match
+    /// 4. `"stale_snapshot"`: an older [`SNAPSHOT_FORMAT_VERSION`].
+    /// 5. `"config_mismatch"`: `region_bytes`/`region_count` don't match
     ///    `cfg`, meaning the tier was resized.
-    /// 5. `"downtime_exceeded"`: closed longer ago than `tombstone_ttl_ms`.
-    /// 6. `"bad_region"`: a region or entry fails to validate; one bad
+    /// 6. `"downtime_exceeded"`: closed longer ago than
+    ///    [`ReopenGate::tombstone_ttl_ms`].
+    /// 7. `"clock_behind_snapshot"`: closed later than `now_ms` plus
+    ///    [`ReopenGate::clock_slack_ms`], so the real downtime is unknown.
+    /// 8. `"bad_region"`: a region or entry fails to validate; one bad
     ///    entry falls the whole tier back cold.
     ///
     /// Past those checks, this replays only the snapshot. Each surviving
@@ -197,14 +203,18 @@ impl SpillTier {
         cache_name: &str,
         sink: &dyn SpillSink,
         now_ms: u64,
-        tombstone_ttl_ms: u64,
+        gate: ReopenGate,
         owned: impl Fn(crate::store::PartId) -> bool,
     ) -> io::Result<ReopenOutcome> {
         cfg.validate()
+            .and_then(|()| validate_cache_name(cache_name))
             .map_err(|reason| io::Error::new(io::ErrorKind::InvalidInput, reason))?;
 
         if !cfg.warm_reopen_value() {
             return Self::reopen_cold_fallback(cfg, cache_name, "disabled", 0, 0);
+        }
+        if !gate.mode_allows_warm {
+            return Self::reopen_cold_fallback(cfg, cache_name, "mode", 0, 0);
         }
 
         let dir = cfg.dir.join(cache_name);
@@ -218,7 +228,8 @@ impl SpillTier {
             region_bytes,
             region_count,
             now_ms,
-            tombstone_ttl_ms,
+            gate.tombstone_ttl_ms,
+            gate.clock_slack_ms,
         ) {
             Ok(snapshot) => snapshot,
             Err(reason) => return Self::reopen_cold_fallback(cfg, cache_name, reason, 0, 0),
@@ -273,6 +284,7 @@ impl SpillTier {
             dropped_unowned,
             dropped_expired,
             refused_present,
+            dropped_key_mismatch,
         } = install_snapshot_entries(snapshot_entries, region_count, sink, now_ms, owned);
         tracing::info!(
             cache = %cache_name,
@@ -280,6 +292,7 @@ impl SpillTier {
             dropped_expired,
             installed = records_installed,
             refused_present,
+            dropped_key_mismatch,
             "sundog spill: reopen installed snapshot entries",
         );
 
@@ -302,8 +315,7 @@ impl SpillTier {
         }
 
         let flush_queue_bytes = cfg.flush_queue_bytes_value();
-        // See open_impl's copy of this conversion.
-        let admit_permits = usize::try_from(flush_queue_bytes).unwrap_or(usize::MAX);
+        let admit_permits = admit_permits_for(flush_queue_bytes);
 
         let inner = Arc::new(Inner {
             regions: regions.into_boxed_slice(),
@@ -350,6 +362,7 @@ impl SpillTier {
             dropped_expired,
             dropped_bad,
             refused_present,
+            dropped_key_mismatch,
             max_ver,
         })
     }
@@ -377,8 +390,40 @@ impl SpillTier {
             dropped_expired: 0,
             dropped_bad,
             refused_present: 0,
+            dropped_key_mismatch: 0,
             max_ver: None,
         })
+    }
+}
+
+/// What [`SpillTier::reopen`] checks besides the config and the snapshot.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReopenGate {
+    /// Longest downtime a snapshot survives, the cluster's tombstone
+    /// retention.
+    pub(crate) tombstone_ttl_ms: u64,
+    /// How far a snapshot's close stamp may lead the reopen clock before the
+    /// reopen goes cold.
+    pub(crate) clock_slack_ms: u64,
+    /// `false` for a cache mode that has no way to reconcile a replayed
+    /// entry with what peers did during the downtime.
+    pub(crate) mode_allows_warm: bool,
+}
+
+impl ReopenGate {
+    /// The default close-stamp lead [`ReopenGate::new`] allows, one minute,
+    /// the default `ClusterConfig::max_clock_skew`.
+    pub(crate) const DEFAULT_CLOCK_SLACK_MS: u64 = 60_000;
+
+    /// A gate that allows warm reopen in any mode, with the default clock
+    /// slack.
+    #[cfg(test)]
+    pub(crate) const fn new(tombstone_ttl_ms: u64) -> Self {
+        Self {
+            tombstone_ttl_ms,
+            clock_slack_ms: Self::DEFAULT_CLOCK_SLACK_MS,
+            mode_allows_warm: true,
+        }
     }
 }
 
@@ -413,6 +458,10 @@ pub(crate) struct ReopenOutcome {
     /// Entries [`SpillSink::install_new`] refused because the key was
     /// already present, live or tombstoned.
     pub(crate) refused_present: u64,
+    /// Entries dropped because their key does not decode as the sink's key
+    /// type and re-encode to the same bytes: the tier was written under
+    /// another key type or encoding.
+    pub(crate) dropped_key_mismatch: u64,
     /// The greatest version the snapshot recorded across every validated
     /// entry, including ones the replay then dropped as expired or unowned:
     /// those stamps are this node's own history. `None` for a cold
@@ -553,11 +602,16 @@ struct InstalledRecords {
     /// Entries [`SpillSink::install_new`] refused because the key was
     /// already present, live or tombstoned.
     refused_present: u64,
+    /// Entries dropped because [`SpillSink::key_round_trips`] refused their
+    /// key.
+    dropped_key_mismatch: u64,
 }
 
 /// Installs every validated snapshot entry via [`SpillSink::install_new`],
-/// first dropping one whose `expires_at_ms` is already past `now_ms` or
-/// whose part `owned` disallows.
+/// first dropping one whose `expires_at_ms` is already past `now_ms`, whose
+/// key does not round-trip through the sink's key type, or whose part
+/// `owned` disallows. `now_ms` also starts each installed entry's idle
+/// clock.
 fn install_snapshot_entries(
     entries: Vec<SnapshotEntry>,
     region_count: u32,
@@ -573,6 +627,7 @@ fn install_snapshot_entries(
     let mut dropped_unowned = 0u64;
     let mut dropped_expired = 0u64;
     let mut refused_present = 0u64;
+    let mut dropped_key_mismatch = 0u64;
 
     for entry in entries {
         if entry
@@ -580,6 +635,10 @@ fn install_snapshot_entries(
             .is_some_and(|expires_at_ms| expires_at_ms <= now_ms)
         {
             dropped_expired += 1;
+            continue;
+        }
+        if !sink.key_round_trips(&entry.key) {
+            dropped_key_mismatch += 1;
             continue;
         }
         let hash = crate::store::engine::hash_key_bytes(&entry.key);
@@ -597,6 +656,7 @@ fn install_snapshot_entries(
             entry.expires_at_ms,
             entry.loc,
             0,
+            now_ms,
         ) {
             records_installed += 1;
             parts_installed.insert(part);
@@ -620,5 +680,6 @@ fn install_snapshot_entries(
         dropped_unowned,
         dropped_expired,
         refused_present,
+        dropped_key_mismatch,
     }
 }

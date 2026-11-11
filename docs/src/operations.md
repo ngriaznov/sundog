@@ -122,7 +122,7 @@ addresses once it forms, under `cluster formed`.
 | `sundog_spill_reopen_total{cache, outcome, reason}` | cache opens, `warm` from a checkpoint or `cold_fallback` with a reason |
 | `sundog_spill_reopen_records_total{cache}` | records a warm reopen replayed |
 | `sundog_spill_checkpoint_entries_total{cache}` | entries written by a closing checkpoint |
-| `sundog_spill_reopen_entries_total{cache}` | entries restored by a warm reopen |
+| `sundog_spill_reopen_entries_total{cache, stage}` | entries at each stage of a warm reopen: `read`, `dropped_unowned`, `dropped_expired`, `dropped_bad`, `dropped_key_mismatch`, `installed`, `refused_present` |
 
 ## Symptoms
 
@@ -413,16 +413,18 @@ fill `flush_queue_bytes` faster than their size suggests; a budget over
 12 MiB raises that share.
 
 `reason="deferred"` counts refusals that deleted nothing: the entry stays
-resident for a later eviction to retry. A `Replicated` or `Distributed`
+resident, and the flusher after each batch and the housekeeping tick retry the
+eviction while the queue has room. A `Replicated` or `Distributed`
 cache records every refusal there, and any cache records the refusals of a
 spilled-key read's eviction there, since that read never deletes an entry.
 
 ### A restart comes back cold
 
 `sundog_spill_reopen_total{outcome="cold_fallback"}` names why in
-`reason`: `disabled` when `warm_reopen` is off, `no_snapshot` after a
-crash, `downtime_exceeded` when the node was down longer than
-`tombstone_ttl`, and `stale_snapshot`, `config_mismatch` or `bad_region`
+`reason`: `disabled` when `warm_reopen` is off, `mode` for a `Mode::Invalidation`
+cache, `no_snapshot` after a crash, `downtime_exceeded` when the node was down
+longer than `tombstone_ttl`, `clock_behind_snapshot` when the snapshot's close
+stamp leads the clock at reopen by more than `max_clock_skew`, and `stale_snapshot`, `config_mismatch` or `bad_region`
 when the files on disk do not match the configuration.
 
 ## Restarting and upgrading

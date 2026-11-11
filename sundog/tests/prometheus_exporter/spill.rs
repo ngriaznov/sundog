@@ -298,6 +298,29 @@ pub(crate) async fn spill_reopen_pins_metrics(cluster: &Cluster) -> Vec<std::pat
         .expect("a tier closed longer than tombstone_ttl still opens, cold");
     dirs.push(dir);
 
+    // mode: an Invalidation cache reopens cold whatever warm_reopen says.
+    let dir = fresh_spill_dir("reopen-mode");
+    let cfg = sundog::SpillConfig::new(&dir, 1 << 20)
+        .region_bytes(4096)
+        .warm_reopen(true);
+    let cache = cluster
+        .cache::<u32, String>("spill-reopen-mode")
+        .mode(Mode::Invalidation)
+        .spill(cfg.clone())
+        .open()
+        .await
+        .expect("first open, against a brand-new directory, opens cold");
+    cache.insert(1, "one".to_string()).await.expect("insert 1");
+    cache.close().await;
+    let _invalidation = cluster
+        .cache::<u32, String>("spill-reopen-mode")
+        .mode(Mode::Invalidation)
+        .spill(cfg)
+        .open()
+        .await
+        .expect("an Invalidation cache reopens, cold");
+    dirs.push(dir);
+
     // bad_region: reopen after one region file's length mismatches region_bytes.
     let dir = fresh_spill_dir("reopen-bad-region");
     let cfg = sundog::SpillConfig::new(&dir, 1 << 20)

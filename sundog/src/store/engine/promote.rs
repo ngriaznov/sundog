@@ -14,14 +14,40 @@ use super::keys::stripe_index_from_hash;
 use super::record::{build_resident_record, decode_key, record_key, set_record};
 use super::{Engine, EntryState, OnRefusal, Stripe, Written};
 
+/// What [`Engine::spilled_loc`] found for a key.
+#[cfg(feature = "spill")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpilledLookup {
+    /// No live, unexpired entry.
+    Absent,
+    /// A live entry that is resident in RAM.
+    Resident,
+    /// A live entry on disk: its version and location.
+    Spilled(Hlc, SpillLoc),
+}
+
+#[cfg(all(feature = "spill", test))]
+impl SpilledLookup {
+    /// The version and location of a [`SpilledLookup::Spilled`], else `None`.
+    pub(crate) fn spilled(self) -> Option<(Hlc, SpillLoc)> {
+        match self {
+            Self::Spilled(ver, loc) => Some((ver, loc)),
+            Self::Absent | Self::Resident => None,
+        }
+    }
+}
+
 impl<K, V> Engine<K, V>
 where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
     /// Snapshots a currently-[`EntryState::Spilled`] entry's pointer under the
-    /// stripe read lock: `None` for a resident entry, an absent key, or one
-    /// a read at `now_ms` would see as expired. Touches `last_access_ms`.
+    /// stripe read lock: [`SpilledLookup::Resident`] for a resident entry,
+    /// [`SpilledLookup::Absent`] for an absent key or one a read at `now_ms`
+    /// would see as expired. A read that already missed in RAM takes
+    /// `Resident` to mean a promotion or overwrite landed since, and reads
+    /// RAM again. Touches `last_access_ms`.
     /// The entry's `ver` travels alongside the pointer so a later
     /// promotion can re-verify it is still current via
     /// [`spilled_is_current`]. The caller drops the read lock, reads the
@@ -29,27 +55,25 @@ where
     /// read semaphore, then reacquires the stripe write lock for
     /// [`Engine::promote_locked`].
     #[cfg(feature = "spill")]
-    pub(crate) fn spilled_loc(
-        &self,
-        key_bytes: &[u8],
-        hash: u64,
-        now_ms: u64,
-    ) -> Option<(Hlc, SpillLoc)> {
+    pub(crate) fn spilled_loc(&self, key_bytes: &[u8], hash: u64, now_ms: u64) -> SpilledLookup {
         let stripe = self.stripes[stripe_index_from_hash(hash)].read();
-        let live = stripe
+        let Some(live) = stripe
             .live
-            .find(hash, |l| record_key(&l.record) == key_bytes)?;
+            .find(hash, |l| record_key(&l.record) == key_bytes)
+        else {
+            return SpilledLookup::Absent;
+        };
         if self.is_absent(live, key_bytes, &stripe.long_ttl, now_ms) {
-            return None;
+            return SpilledLookup::Absent;
         }
         match &live.state {
             EntryState::Spilled(loc) => {
                 let loc = *loc;
                 let ver = live.ver();
                 self.touch(live, now_ms);
-                Some((ver, loc))
+                SpilledLookup::Spilled(ver, loc)
             }
-            EntryState::Resident => None,
+            EntryState::Resident => SpilledLookup::Resident,
         }
     }
 

@@ -71,6 +71,71 @@ async fn open_rejects_a_spill_config_whose_capacity_is_under_two_regions() {
 }
 
 #[tokio::test]
+async fn open_rejects_a_zero_or_oversized_read_concurrency() {
+    let cluster = Cluster::builder("cache-it-spill-read-concurrency")
+        .seeds(std::iter::empty())
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("build succeeds");
+
+    for n in [0, usize::MAX] {
+        let cfg = SpillConfig::new(fresh_spill_dir("read-concurrency"), 1 << 20)
+            .region_bytes(4096)
+            .read_concurrency(n);
+        let err = cluster
+            .cache::<u32, String>("scratch")
+            .spill(cfg)
+            .open()
+            .await
+            .expect_err("read_concurrency {n} is rejected");
+        assert!(
+            matches!(err, CacheError::InvalidSpillConfig { .. }),
+            "expected InvalidSpillConfig for {n}, got {err:?}"
+        );
+    }
+
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn open_rejects_a_cache_name_that_is_not_one_path_component() {
+    let cluster = Cluster::builder("cache-it-spill-bad-name")
+        .seeds(std::iter::empty())
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("build succeeds");
+
+    let absolute = std::env::temp_dir().join("elsewhere");
+    let absolute = absolute.to_string_lossy().into_owned();
+    for name in [
+        "",
+        ".",
+        "..",
+        "../x",
+        "a/b",
+        "a\\b",
+        "a\0b",
+        absolute.as_str(),
+    ] {
+        let cfg = SpillConfig::new(fresh_spill_dir("bad-name"), 1 << 20).region_bytes(4096);
+        let err = cluster
+            .cache::<u32, String>(name)
+            .spill(cfg)
+            .open()
+            .await
+            .expect_err("a name that is not one path component is rejected");
+        assert!(
+            matches!(err, CacheError::InvalidSpillConfig { .. }),
+            "expected InvalidSpillConfig for {name:?}, got {err:?}"
+        );
+    }
+
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
 async fn open_rejects_replicated_with_max_capacity_and_no_spill() {
     let cluster = Cluster::builder("cache-it-spill-no-spill-max-capacity")
         .seeds(std::iter::empty())
@@ -510,14 +575,17 @@ async fn merging_into_a_spilled_counter_folds_instead_of_dropping_a_side() {
     cluster.shutdown().await;
 }
 
-/// A cache in `mode` stamps key 42 a minute ahead of the system clock and
+/// A cache in `mode` stamps key 42 `lead_ms` ahead of the system clock and
 /// closes checkpointed; its successor on a fresh cluster, built without that
-/// clock, reopens the same spill directory warm and so trails the replayed
-/// stamp. Returns the successor, its cluster and the directory.
+/// clock, reopens the same spill directory and, when the reopen is warm, trails
+/// the replayed stamp. The reopen is warm unless the mode is `Invalidation` or
+/// the lead exceeds the default `max_clock_skew`, a minute. Returns the
+/// successor, its cluster and the directory.
 #[cfg(not(feature = "sim"))]
 async fn cache_reopened_warm_behind_its_replayed_stamps(
     mode: Mode,
     label: &'static str,
+    lead_ms: u64,
 ) -> (Cluster, Cache<u32, String>, std::path::PathBuf) {
     let dir = fresh_spill_dir(label);
     let spill = || {
@@ -534,7 +602,7 @@ async fn cache_reopened_warm_behind_its_replayed_stamps(
     let first = cluster
         .cache::<u32, String>("warm-clock")
         .mode(mode)
-        .clock(Arc::new(|| now_ms() + 60_000))
+        .clock(Arc::new(move || now_ms() + lead_ms))
         .spill(spill())
         .open()
         .await
@@ -556,10 +624,11 @@ async fn cache_reopened_warm_behind_its_replayed_stamps(
         .open()
         .await
         .expect("reopens");
+    let warm = !matches!(mode, Mode::Invalidation) && lead_ms <= 60_000;
     assert_eq!(
         second.get(&42).await,
-        Some("old".to_string()),
-        "the replay is warm: the old entry is readable"
+        warm.then(|| "old".to_string()),
+        "the replay is warm, the old entry readable, unless the mode or the close stamp rules it out"
     );
     (cluster, second, dir)
 }
@@ -570,6 +639,7 @@ async fn a_local_cache_reopened_warm_behind_its_replayed_stamps_accepts_a_new_wr
     let (cluster, cache, dir) = cache_reopened_warm_behind_its_replayed_stamps(
         Mode::Local,
         "cache-it-warm-clock-local-write",
+        60_000,
     )
     .await;
     cache.insert(42, "new".to_string()).await.expect("insert");
@@ -585,6 +655,7 @@ async fn a_local_cache_reopened_warm_behind_its_replayed_stamps_honours_a_remove
     let (cluster, cache, dir) = cache_reopened_warm_behind_its_replayed_stamps(
         Mode::Local,
         "cache-it-warm-clock-local-remove",
+        60_000,
     )
     .await;
     cache.remove(&42).await.expect("remove");
@@ -600,6 +671,7 @@ async fn an_invalidation_cache_reopened_warm_behind_its_replayed_stamps_accepts_
     let (cluster, cache, dir) = cache_reopened_warm_behind_its_replayed_stamps(
         Mode::Invalidation,
         "cache-it-warm-clock-inval-write",
+        60_000,
     )
     .await;
     cache.insert(42, "new".to_string()).await.expect("insert");
@@ -615,10 +687,28 @@ async fn an_invalidation_cache_reopened_warm_behind_its_replayed_stamps_honours_
     let (cluster, cache, dir) = cache_reopened_warm_behind_its_replayed_stamps(
         Mode::Invalidation,
         "cache-it-warm-clock-inval-remove",
+        60_000,
     )
     .await;
     cache.remove(&42).await.expect("remove");
     assert_eq!(cache.get(&42).await, None);
+    cache.close().await;
+    cluster.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A close stamped further ahead of the reopen clock than `max_clock_skew`
+/// leaves a downtime the reopen cannot bound, so the reopen is cold.
+#[cfg(not(feature = "sim"))]
+#[tokio::test]
+async fn a_cache_whose_close_stamp_leads_the_reopen_clock_beyond_max_clock_skew_opens_cold() {
+    let (cluster, cache, dir) = cache_reopened_warm_behind_its_replayed_stamps(
+        Mode::Local,
+        "cache-it-warm-clock-lead",
+        600_000,
+    )
+    .await;
+    assert_eq!(cache.get(&42).await, None, "nothing is replayed");
     cache.close().await;
     cluster.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);

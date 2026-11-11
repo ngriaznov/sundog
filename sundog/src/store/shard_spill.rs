@@ -36,6 +36,51 @@ pub(crate) struct AttachSpillOutcome {
     pub(crate) warm_parts: HashSet<PartId>,
 }
 
+/// Whether a cache of `mode` may replay a spill snapshot at reopen. An
+/// `Invalidation` cache runs no anti-entropy and an invalidation sent during
+/// its downtime reaches nobody, so a replayed entry could be one a peer
+/// removed or rewrote; it opens cold. Pure; unit tested directly.
+#[cfg(feature = "spill")]
+pub(super) fn warm_reopen_allowed(mode: Mode) -> bool {
+    !matches!(mode, Mode::Invalidation)
+}
+
+/// How many times a spilled-key read looks again after it loses a race: the
+/// key promoted or overwritten between the RAM miss and the lookup, or its
+/// record rotated out between the lookup and the read.
+#[cfg(feature = "spill")]
+const SPILL_READ_ROUNDS: u8 = 2;
+
+/// [`Shard::read_spilled_outcome`]'s result.
+#[cfg(feature = "spill")]
+pub(super) enum SpilledRead<V> {
+    /// The value at its version, with its encoded bytes.
+    Read(Hlc, V, Bytes),
+    /// The key is resident in RAM, so a RAM read answers it.
+    Resident,
+    /// No live entry, or one the read could not serve.
+    Absent,
+}
+
+/// Why [`Shard::get_spilled_or_resident`] found nothing to read off disk.
+#[cfg(feature = "spill")]
+pub(super) enum SpilledMiss {
+    /// The key is resident in RAM.
+    Resident,
+    /// No live entry, or one the read could not serve.
+    Absent,
+}
+
+/// One disk read of a located record, [`Shard::read_spilled_at`]'s result.
+#[cfg(feature = "spill")]
+enum LocRead<V> {
+    Read(Hlc, V, Bytes),
+    /// The record's region was reclaimed since the lookup.
+    Rotated,
+    /// The read failed or the record was unusable.
+    Failed,
+}
+
 /// Increments `sundog_spill_checkpoint_entries_total{cache,stage}` by
 /// `count` for one checkpoint phase, matching
 /// `Shard::close_spill_checkpointed`'s `info` logs.
@@ -149,7 +194,13 @@ where
             &self.name,
             sink.as_ref(),
             now_ms(),
-            self.tombstone_ttl_ms,
+            spill::ReopenGate {
+                tombstone_ttl_ms: self.tombstone_ttl_ms,
+                clock_slack_ms: self
+                    .max_clock_skew_ms
+                    .unwrap_or(spill::ReopenGate::DEFAULT_CLOCK_SLACK_MS),
+                mode_allows_warm: warm_reopen_allowed(self.mode),
+            },
             owned,
         )?;
         self.seed_clock_from_replay(outcome.max_ver);
@@ -194,6 +245,7 @@ where
             dropped_bad = outcome.dropped_bad,
             installed = outcome.records_installed,
             refused_present = outcome.refused_present,
+            dropped_key_mismatch = outcome.dropped_key_mismatch,
             "sundog spill: reopen entry accounting",
         );
         record_reopen_stage(&self.name, "read", outcome.entries_read);
@@ -202,6 +254,11 @@ where
         record_reopen_stage(&self.name, "dropped_bad", outcome.dropped_bad);
         record_reopen_stage(&self.name, "installed", outcome.records_installed);
         record_reopen_stage(&self.name, "refused_present", outcome.refused_present);
+        record_reopen_stage(
+            &self.name,
+            "dropped_key_mismatch",
+            outcome.dropped_key_mismatch,
+        );
         let tier = Arc::new(outcome.tier);
         tier.set_keep_resident_when_refused(matches!(
             self.mode,
@@ -212,6 +269,8 @@ where
         // already in place.
         tier.attach(Arc::downgrade(&sink));
         self.engine.set_spill(Arc::clone(&tier));
+        self.engine.seed_spill_entries(outcome.records_installed);
+        tier.publish_bytes_used();
         self.spill_read
             .set(SpillRead::new(&self.name, cfg.read_concurrency_value()))
             .unwrap_or_else(|_| panic!("invariant: attach_spill runs at most once per shard"));
@@ -254,13 +313,32 @@ where
     /// [`engine::Engine::promote_locked`]). No lock or permit is ever held
     /// across more than one `.await` point at a time, and no stripe lock is
     /// ever held across the disk read.
+    ///
+    /// A key that was promoted or overwritten since the RAM miss is resident
+    /// by the time this looks, and a read that finds its record rotated out
+    /// finds the key gone, promoted or elsewhere on a second look. This
+    /// reads RAM again for the first and looks again for the second, for at
+    /// most [`SPILL_READ_ROUNDS`] rounds, so a key present throughout never
+    /// reads as a miss.
     #[cfg(feature = "spill")]
     pub(super) async fn get_spilled(&self, key: &K) -> Option<V> {
         let key_bytes = encode_key(key).ok()?;
         let hash = engine::hash_key_bytes(key_bytes.as_ref());
-        self.get_spilled_by_bytes(key_bytes.as_ref(), hash)
-            .await
-            .map(|(_, value)| value)
+        for _ in 0..SPILL_READ_ROUNDS {
+            match self.read_spilled_outcome(key_bytes.as_ref(), hash).await {
+                SpilledRead::Read(ver, value, encoded) => {
+                    self.promote_read(key_bytes.as_ref(), hash, ver, &value, &encoded);
+                    return Some(value);
+                }
+                SpilledRead::Resident => {
+                    if let Some(value) = self.read_resident_key(key, self.now_ms()) {
+                        return Some(value);
+                    }
+                }
+                SpilledRead::Absent => return None,
+            }
+        }
+        None
     }
 
     /// [`Shard::get_spilled`] for a caller that already has `key_bytes` and
@@ -273,14 +351,46 @@ where
         hash: u64,
     ) -> Option<(Hlc, V)> {
         let (ver, value, encoded) = self.read_spilled_by_bytes(key_bytes, hash).await?;
+        self.promote_read(key_bytes, hash, ver, &value, &encoded);
+        Some((ver, value))
+    }
+
+    /// [`Shard::get_spilled_by_bytes`] for [`Shard::get_or_load`]'s owner arm:
+    /// on a miss, says whether the key is resident now, so the caller reads
+    /// RAM instead of loading.
+    ///
+    /// # Errors
+    ///
+    /// [`SpilledMiss::Resident`] for a key promoted or overwritten since the
+    /// caller's RAM miss, [`SpilledMiss::Absent`] otherwise.
+    #[cfg(feature = "spill")]
+    pub(super) async fn get_spilled_or_resident(
+        &self,
+        key_bytes: &[u8],
+        hash: u64,
+    ) -> Result<(Hlc, V), SpilledMiss> {
+        match self.read_spilled_outcome(key_bytes, hash).await {
+            SpilledRead::Read(ver, value, encoded) => {
+                self.promote_read(key_bytes, hash, ver, &value, &encoded);
+                Ok((ver, value))
+            }
+            SpilledRead::Resident => Err(SpilledMiss::Resident),
+            SpilledRead::Absent => Err(SpilledMiss::Absent),
+        }
+    }
+
+    /// Promotes a value [`Shard::read_spilled_by_bytes`] read back to
+    /// residency, counting `sundog_spill_promotions_total{cache}` iff the
+    /// entry flips.
+    #[cfg(feature = "spill")]
+    fn promote_read(&self, key_bytes: &[u8], hash: u64, ver: Hlc, value: &V, encoded: &Bytes) {
         if self
             .engine
-            .promote_locked(key_bytes, hash, ver, &value, &encoded, self.now_ms())
+            .promote_locked(key_bytes, hash, ver, value, encoded, self.now_ms())
             && let Some(spill_read) = self.spill_read.get()
         {
             spill_read.promotions.increment(1);
         }
-        Some((ver, value))
     }
 
     /// Reads the key's currently spilled value off disk, without promoting
@@ -297,14 +407,60 @@ where
         key_bytes: &[u8],
         hash: u64,
     ) -> Option<(Hlc, V, Bytes)> {
-        let spill_read = self.spill_read.get()?;
-        let tier = Arc::clone(self.engine.spill()?);
-        let (ver, loc) = self.engine.spilled_loc(key_bytes, hash, self.now_ms())?;
+        match self.read_spilled_outcome(key_bytes, hash).await {
+            SpilledRead::Read(ver, value, encoded) => Some((ver, value, encoded)),
+            SpilledRead::Resident | SpilledRead::Absent => None,
+        }
+    }
+
+    /// [`Shard::read_spilled_by_bytes`] naming why a key was not read:
+    /// [`SpilledRead::Resident`] when the key is now in RAM, so the caller
+    /// reads RAM, and [`SpilledRead::Absent`] otherwise. A read that finds
+    /// its record rotated out looks the key up again, for at most
+    /// [`SPILL_READ_ROUNDS`] rounds, since a rotated record's entry is gone,
+    /// resident or spilled somewhere else by then.
+    #[cfg(feature = "spill")]
+    pub(super) async fn read_spilled_outcome(&self, key_bytes: &[u8], hash: u64) -> SpilledRead<V> {
+        let (Some(spill_read), Some(tier)) = (self.spill_read.get(), self.engine.spill()) else {
+            return SpilledRead::Absent;
+        };
+        for _ in 0..SPILL_READ_ROUNDS {
+            let (ver, loc) = match self.engine.spilled_loc(key_bytes, hash, self.now_ms()) {
+                engine::SpilledLookup::Spilled(ver, loc) => (ver, loc),
+                engine::SpilledLookup::Resident => return SpilledRead::Resident,
+                engine::SpilledLookup::Absent => return SpilledRead::Absent,
+            };
+            match self
+                .read_spilled_at(spill_read, tier, key_bytes, hash, ver, loc)
+                .await
+            {
+                LocRead::Read(ver, value, encoded) => {
+                    return SpilledRead::Read(ver, value, encoded);
+                }
+                LocRead::Failed => return SpilledRead::Absent,
+                LocRead::Rotated => {}
+            }
+        }
+        SpilledRead::Absent
+    }
+
+    /// Reads the record at `loc`, the pointer [`Engine::spilled_loc`] gave
+    /// for `key_bytes` at `ver`, off disk behind the tier's read semaphore.
+    #[cfg(feature = "spill")]
+    async fn read_spilled_at(
+        &self,
+        spill_read: &SpillRead,
+        tier: &Arc<spill::SpillTier>,
+        key_bytes: &[u8],
+        hash: u64,
+        ver: Hlc,
+        loc: spill::SpillLoc,
+    ) -> LocRead<V> {
+        let tier = Arc::clone(tier);
         let started = std::time::Instant::now();
-        let permit = Arc::clone(&spill_read.semaphore)
-            .acquire_owned()
-            .await
-            .ok()?;
+        let Ok(permit) = Arc::clone(&spill_read.semaphore).acquire_owned().await else {
+            return LocRead::Failed;
+        };
         let read = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             tier.read_record(loc)
@@ -314,13 +470,13 @@ where
             Ok(Ok(SpillReadAt::Found(bytes))) => bytes,
             Ok(Ok(SpillReadAt::Rotated)) => {
                 spill_read.finish(&spill_read.reads_stale, started);
-                return None;
+                return LocRead::Rotated;
             }
             Ok(Ok(SpillReadAt::Corrupt)) => {
                 spill_read.finish(&spill_read.reads_corrupt, started);
                 self.engine
                     .drop_unreadable_spilled(key_bytes, hash, loc, Unreadable::Damaged);
-                return None;
+                return LocRead::Failed;
             }
             Ok(Err(err)) => {
                 tracing::warn!(
@@ -329,21 +485,21 @@ where
                     "sundog spill: positional read failed"
                 );
                 spill_read.finish(&spill_read.reads_io_error, started);
-                return None;
+                return LocRead::Failed;
             }
             Err(_join_err) => {
                 spill_read.finish(&spill_read.reads_io_error, started);
-                return None;
+                return LocRead::Failed;
             }
         };
         let Ok(value) = postcard::from_bytes::<V>(&bytes.encoded) else {
             spill_read.finish(&spill_read.reads_corrupt, started);
             self.engine
                 .drop_unreadable_spilled(key_bytes, hash, loc, Unreadable::Undecodable);
-            return None;
+            return LocRead::Failed;
         };
         spill_read.finish(&spill_read.reads_hit, started);
-        Some((ver, value, bytes.encoded))
+        LocRead::Read(ver, value, bytes.encoded)
     }
 
     /// Closes this shard's attached spill tier, if `Shard::attach_spill`

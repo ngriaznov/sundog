@@ -729,15 +729,12 @@ async fn a_batch_past_a_clamped_reservation_never_waits_out_its_budget() {
     }
 }
 
-/// A victim whose spill record needs more than the whole flush queue
-/// can never be admitted. The first retry holds the whole queue and
-/// covers nothing, so the batch goes straight to its closing
-/// no-reservation pass rather than retrying, or waiting, until its
-/// 5s budget runs out; that pass still brings the shard back to its
-/// cap, dropping every victim as `queue_full` on this `Mode::Local`
-/// tier.
+/// A victim whose spill record needs more than the whole flush queue is
+/// charged the whole queue, so the tier admits it whenever the queue is
+/// empty: the batch spills every victim, one at a time, with no reservation
+/// wait running out and no victim dropped as `queue_full`.
 #[tokio::test]
-async fn a_victim_larger_than_the_flush_queue_ends_the_retries_at_once() {
+async fn a_victim_larger_than_the_flush_queue_is_admitted_when_the_queue_is_empty() {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     const NAME: &str = "oversize-victims";
     const KEYS: u32 = 20;
@@ -803,22 +800,22 @@ async fn a_victim_larger_than_the_flush_queue_ends_the_retries_at_once() {
     );
     assert_eq!(
         shard.entry_count().await,
-        u64::from(CAP),
-        "the closing pass brings the shard back to its cap"
+        u64::from(KEYS),
+        "every victim is spilled, none dropped"
     );
     assert_eq!(
         dropped_for("queue_full"),
-        u64::from(KEYS - CAP),
-        "every victim the queue could never admit is dropped as queue_full"
+        0,
+        "no victim is refused for exceeding the whole queue"
     );
     assert_eq!(
         counter("sundog_spill_dropped_total"),
-        dropped_for("queue_full"),
-        "a Local write's drops record no other reason, `deferred` among them"
+        0,
+        "no drop of any reason"
     );
     assert!(
         took < Duration::from_secs(2),
-        "the batch ends its retries at once, took {took:?} of its 5s budget"
+        "the batch never waits out its 5s budget, took {took:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1411,4 +1408,189 @@ async fn a_batch_reservation_covers_the_floor_charge_of_small_values() {
     assert_eq!(tier.queued_bytes(), 0, "unspent budget returns on drop");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A key that is present throughout must never read as a miss. A `get`
+/// that snapshotted a spilled key's pointer, then lost the race to an
+/// overwrite and a region rotation, still answers the key's live value.
+#[tokio::test]
+async fn a_present_key_never_reads_as_a_miss_when_a_read_races_its_promotion() {
+    const CAP: u32 = 10;
+    let dir = temp_dir("get-race-promotion");
+    let cfg = SpillConfig::new(&dir, 16384)
+        .region_bytes(4096)
+        .spill_wait_timeout(Duration::from_secs(20));
+    let shard = Shard::<u32, String>::new(
+        SmolStr::new("get-race-promotion"),
+        Mode::Local,
+        NodeId::from(1u64),
+        u64::from(CAP),
+        None,
+        None,
+    )
+    .with_spill(&cfg)
+    .expect("tier opens");
+    for k in 0..=CAP {
+        shard.insert(k, format!("old-{k}")).await.expect("insert");
+    }
+    assert!(
+        poll_until(POLL_TIMEOUT, || {
+            shard.engine.spill().is_some_and(|t| t.bytes_used() > 0)
+        })
+        .await,
+        "one key spills"
+    );
+    let spilled = (0..=CAP)
+        .find(|k| shard.get_sync(k).is_none())
+        .expect("one key is spilled");
+
+    // Filler keys all in the stripe just before the spilled key's, so an
+    // eviction pass started at a filler's stripe always finds an older
+    // filler to evict and never reaches the overwritten key.
+    let bucket = |k: u32| usize::from(bucket_of(&key_bytes(&k)));
+    let before = (bucket(spilled) + BUCKET_COUNT - 1) % BUCKET_COUNT;
+    let mut fillers = (1000u32..).filter(|k| bucket(*k) == before);
+    for _ in 0..CAP {
+        let k = fillers.next().expect("endless");
+        shard.insert(k, "x".repeat(800)).await.expect("seed filler");
+    }
+    assert!(
+        poll_until(POLL_TIMEOUT, || shard.engine.debug_pending_spill_weight()
+            == 0)
+        .await,
+        "seed settles"
+    );
+    assert!(shard.get_sync(&spilled).is_none(), "setup: still spilled");
+
+    let hold = hold_spill_reads(&shard).await;
+    let get_fut = shard.get(&spilled);
+    tokio::pin!(get_fut);
+    let parked = tokio::time::timeout(Duration::from_millis(100), &mut get_fut).await;
+    assert!(
+        parked.is_err(),
+        "the get holds its pointer, parked on a permit"
+    );
+
+    // The key is overwritten (present and resident) ...
+    shard
+        .insert(spilled, "new".to_string())
+        .await
+        .expect("overwrite");
+    // ... and its old region rotates out under filler writes.
+    for n in 0..80 {
+        let k = fillers.next().expect("endless");
+        shard.insert(k, "x".repeat(800)).await.expect("filler");
+        // A filler's eviction pass can sample past its own stripe and spill
+        // the key; writing it again keeps it present and resident, which is
+        // all the race needs.
+        if shard.get_sync(&spilled).is_none() {
+            shard
+                .insert(spilled, "new".to_string())
+                .await
+                .expect("rewrite");
+        }
+        assert_eq!(
+            shard.get_sync(&spilled),
+            Some("new".to_string()),
+            "setup: key is resident at filler {n}"
+        );
+    }
+    assert!(
+        poll_until(POLL_TIMEOUT, || shard.engine.debug_pending_spill_weight()
+            == 0)
+        .await,
+        "fillers settle"
+    );
+    if shard.get_sync(&spilled).is_none() {
+        shard
+            .insert(spilled, "new".to_string())
+            .await
+            .expect("rewrite");
+    }
+    assert_eq!(
+        shard.get_sync(&spilled),
+        Some("new".to_string()),
+        "setup: key is resident"
+    );
+    drop(hold);
+
+    let got = tokio::time::timeout(Duration::from_secs(5), &mut get_fut)
+        .await
+        .expect("get completes");
+    assert!(
+        got.is_some(),
+        "a continuously present key {spilled} read as a miss (got {got:?})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A write burst that meets a held flush queue on a `mode` shard leaves
+/// its refused victims resident; once the queue frees, the shard settles
+/// back within its cap with no further write.
+async fn overage_settles_without_a_write(mode: Mode, name: &str) {
+    const KEYS: u32 = 8;
+    const CAP: u64 = 2;
+    let dir = temp_dir(name);
+    let cfg = SpillConfig::new(&dir, 1 << 20)
+        .region_bytes(4096)
+        .spill_wait_timeout(Duration::from_millis(200));
+    let shard = Shard::<u32, String>::new(
+        SmolStr::new(name),
+        mode,
+        NodeId::from(1u64),
+        CAP,
+        None,
+        None,
+    )
+    .with_spill(&cfg)
+    .expect("tier opens");
+    let hold = shard.debug_hold_flush_queue().await;
+    shard
+        .insert_many((0..KEYS).map(|k| (k, format!("value-{k}"))))
+        .await
+        .expect("insert_many");
+    let (live, weight) = shard.engine.debug_totals();
+    assert_eq!(live, u64::from(KEYS), "every key stays live");
+    assert!(
+        weight > CAP,
+        "setup: the refused victims stay resident, weight {weight}"
+    );
+    drop(hold);
+    assert!(
+        poll_until(POLL_TIMEOUT, || {
+            shard.engine.debug_pending_spill_weight() == 0
+        })
+        .await,
+        "no hand-off is left pending"
+    );
+    // The cluster's housekeeping task ticks `Engine::sweep` on every shard.
+    let settled = poll_until(POLL_TIMEOUT, || {
+        shard.engine.sweep(shard.now_ms(), None);
+        shard.engine.debug_totals().1 <= CAP
+    })
+    .await;
+    let (live, weight) = shard.engine.debug_totals();
+    assert!(
+        settled,
+        "{name}: with the queue free and no further write, resident weight {weight} \
+         stays above the cap {CAP} (live {live})"
+    );
+    assert_eq!(live, u64::from(KEYS), "every key stays live");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn replicated_and_distributed_spill_overage_settles_without_a_write_replicated() {
+    overage_settles_without_a_write(Mode::Replicated, "overage-replicated").await;
+}
+
+#[tokio::test]
+async fn replicated_and_distributed_spill_overage_settles_without_a_write_distributed() {
+    overage_settles_without_a_write(
+        Mode::Distributed {
+            owners: NonZeroU8::new(2).expect("nonzero"),
+        },
+        "overage-distributed",
+    )
+    .await;
 }

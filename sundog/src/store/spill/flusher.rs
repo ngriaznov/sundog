@@ -100,6 +100,7 @@ pub(super) fn flusher_loop(
             .flusher_jobs_drained
             .fetch_add(batch.len() as u64, Ordering::Relaxed);
         flush_batch(inner, sink.as_ref(), batch);
+        sink.batch_resolved();
     }
 }
 

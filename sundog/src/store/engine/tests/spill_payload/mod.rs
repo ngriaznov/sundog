@@ -324,7 +324,7 @@ fn inspect_reports_a_spilled_entry_and_leaves_it_spilled() {
     assert_eq!(last_access(&engine, 1), 0, "an inspect is no access");
     assert_eq!(
         engine.spilled_loc(kb.as_ref(), hash, 100),
-        Some((ver, l)),
+        SpilledLookup::Spilled(ver, l),
         "the entry stays spilled at the same location"
     );
 }
@@ -339,7 +339,10 @@ fn spilled_loc_snapshots_the_pointer_and_touches_last_access() {
     let l = loc(2, 8, 4, 1);
     engine.debug_insert_spilled(&kb, ver, None, l, 0);
 
-    assert_eq!(engine.spilled_loc(kb.as_ref(), hash, 100), Some((ver, l)));
+    assert_eq!(
+        engine.spilled_loc(kb.as_ref(), hash, 100),
+        SpilledLookup::Spilled(ver, l)
+    );
 
     let bucket = stripe_index_from_hash(hash);
     let stripe = engine.stripe_lock(bucket).read();
@@ -358,8 +361,8 @@ fn spilled_loc_snapshots_the_pointer_and_touches_last_access() {
     let missing = key_bytes(999);
     assert_eq!(
         engine.spilled_loc(missing.as_ref(), hash_key_bytes(missing.as_ref()), 100),
-        None,
-        "an absent key yields None"
+        SpilledLookup::Absent,
+        "an absent key yields Absent"
     );
 
     let key2 = 2u32;
@@ -375,8 +378,8 @@ fn spilled_loc_snapshots_the_pointer_and_touches_last_access() {
     );
     assert_eq!(
         engine.spilled_loc(kb2.as_ref(), hash_key_bytes(kb2.as_ref()), 100),
-        None,
-        "a resident entry yields None too"
+        SpilledLookup::Resident,
+        "a resident entry yields Resident"
     );
 }
 
@@ -729,7 +732,10 @@ fn region_reclaim_removes_only_the_entry_at_the_listed_offset() {
     let unknown = SpillSink::reclaim(&engine, 3, 0, &[ReclaimRef::new(other_stripe, hash, 40)]);
     assert_eq!(unknown, 0, "a row naming another stripe removes nothing");
     assert_eq!(
-        engine.spilled_loc(kb.as_ref(), hash, 0).map(|(_, at)| at),
+        engine
+            .spilled_loc(kb.as_ref(), hash, 0)
+            .spilled()
+            .map(|(_, at)| at),
         Some(loc(3, 40, 10, 0)),
         "the entry still points at offset 40"
     );
@@ -1031,6 +1037,7 @@ fn install_new_never_resurrects_a_tombstoned_key() {
         None,
         loc(0, 0, 4, 0),
         1,
+        0,
     );
 
     assert!(
@@ -1050,8 +1057,8 @@ fn install_new_stamped_ahead_of_the_clock_stays_live_under_tti() {
     let hash = hash_key_bytes(kb.as_ref());
     let bucket = stripe_index_from_hash(hash);
 
-    // A warm reopen stamps the entry's last access with its write version's
-    // wall time, which a restarted clock can trail.
+    // A warm reopen stamps the entry's last access with the reopen's clock;
+    // the entry's write version can lead it.
     let inserted = SpillSink::install_new(
         &engine,
         bucket,
@@ -1061,6 +1068,7 @@ fn install_new_stamped_ahead_of_the_clock_stays_live_under_tti() {
         None,
         loc(0, 0, 4, 0),
         1,
+        1_000,
     );
 
     assert!(inserted);
@@ -1101,6 +1109,7 @@ fn install_new_never_overwrites_an_already_present_live_entry() {
         None,
         loc(0, 0, 4, 0),
         1,
+        0,
     );
 
     assert!(
@@ -1407,6 +1416,7 @@ fn sweeping_an_expired_spilled_key_with_retention_leaves_a_tombstone_and_decreme
         None,
         loc(0, 0, 4, 0),
         1,
+        0,
     );
     assert!(
         !inserted,
@@ -1513,3 +1523,77 @@ fn is_spill_candidate_excludes_a_weight_zeroed_entry_across_a_longer_pending_win
 // over real filesystem I/O or the flusher's OS thread.
 #[cfg(not(feature = "sim"))]
 mod io;
+
+#[test]
+fn install_new_starts_the_idle_clock_at_the_reopen_not_the_write() {
+    let now: u64 = 10_000_000;
+    let engine = Engine::<u32, String>::new(
+        u64::MAX,
+        Some(std::time::Duration::from_secs(600)),
+        None,
+        None,
+    );
+    let install = |key: u32, wall_ms: u64| {
+        let kb = key_bytes(key);
+        let hash = hash_key_bytes(kb.as_ref());
+        assert!(SpillSink::install_new(
+            &engine,
+            stripe_index_from_hash(hash),
+            &kb,
+            hash,
+            hlc(wall_ms, 1),
+            None,
+            loc(0, 0, 4, 0),
+            1,
+            now,
+        ));
+        engine
+            .spilled_loc(kb.as_ref(), hash, now)
+            .spilled()
+            .is_some()
+    };
+    assert!(install(9, now - 1_000), "control: written a second ago");
+    assert!(
+        install(7, now - 3_600_000),
+        "an entry written an hour ago is last accessed at the reopen, not idle past a 10 minute tti"
+    );
+    assert!(
+        install(8, now + 5_000),
+        "a write stamp ahead of the clock is not an idle wrap"
+    );
+}
+
+#[test]
+fn install_new_refuses_a_key_that_does_not_round_trip_as_k() {
+    let engine = Engine::<u32, String>::new(u64::MAX, None, None, None);
+    let good = key_bytes(7);
+    assert!(engine.key_round_trips(good.as_ref()));
+    // A `String` key's bytes: a length prefix, then text. It decodes as a
+    // `u32` from the prefix alone, ignoring the tail, and re-encodes to
+    // different bytes.
+    let trailing = Bytes::from(postcard::to_stdvec("abcdef").expect("encodes"));
+    let truncated = Bytes::new();
+    for bad in [trailing, truncated] {
+        assert!(!engine.key_round_trips(bad.as_ref()), "{bad:?}");
+        let hash = hash_key_bytes(bad.as_ref());
+        assert!(
+            !SpillSink::install_new(
+                &engine,
+                stripe_index_from_hash(hash),
+                &bad,
+                hash,
+                hlc(1, 1),
+                None,
+                loc(0, 0, 4, 0),
+                1,
+                100,
+            ),
+            "a key that does not round-trip is refused: {bad:?}"
+        );
+        assert_eq!(engine.debug_totals().0, 0, "nothing is installed");
+    }
+    assert!(
+        engine.keys(0).is_empty(),
+        "keys() never decodes a refused entry"
+    );
+}

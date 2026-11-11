@@ -6,9 +6,9 @@ use crate::store::engine::OnRefusal;
 use super::open::snapshot_loc_end;
 use super::record::{build_header, decode_record_with_key, split_record};
 use super::rules::{
-    FLUSH_QUEUE_CAPACITY, FLUSH_QUEUE_SLOTS_MAX, admission_charge, next_region_index, record_fits,
-    record_fits_queue, record_too_large, records_fitting_region, refusal_drop_reason,
-    slot_charge_floor,
+    FLUSH_QUEUE_CAPACITY, FLUSH_QUEUE_SLOTS_MAX, admission_charge, admit_permits_for,
+    clamped_admission_charge, next_region_index, record_fits, record_fits_queue, record_too_large,
+    records_fitting_region, refusal_drop_reason, slot_charge_floor,
 };
 use super::*;
 
@@ -428,6 +428,64 @@ fn validate_rejects_flush_queue_bytes_over_capacity_bytes() {
         .region_bytes(64)
         .flush_queue_bytes(1024);
     assert!(ok.validate().is_ok());
+}
+
+#[test]
+fn validate_rejects_a_zero_or_oversized_read_concurrency() {
+    let ok = SpillConfig::new("/tmp/x", 1 << 30).region_bytes(1 << 20);
+    assert!(ok.validate().is_ok(), "baseline config is valid");
+    assert!(ok.clone().read_concurrency(0).validate().is_err());
+    assert!(ok.clone().read_concurrency(1).validate().is_ok());
+    assert!(
+        ok.clone()
+            .read_concurrency(tokio::sync::Semaphore::MAX_PERMITS)
+            .validate()
+            .is_ok()
+    );
+    assert!(
+        ok.read_concurrency(tokio::sync::Semaphore::MAX_PERMITS + 1)
+            .validate()
+            .is_err()
+    );
+}
+
+#[test]
+fn admit_permits_never_exceed_the_semaphore_limit() {
+    assert_eq!(admit_permits_for(0), 0);
+    assert_eq!(admit_permits_for(4096), 4096);
+    assert_eq!(
+        admit_permits_for(u64::MAX),
+        tokio::sync::Semaphore::MAX_PERMITS
+    );
+    // Would panic in `Semaphore::new` if unclamped.
+    let _ = tokio::sync::Semaphore::new(admit_permits_for(u64::MAX));
+}
+
+#[test]
+fn clamped_admission_charge_never_exceeds_the_whole_queue() {
+    assert_eq!(clamped_admission_charge(300, 0, 1000), 300, "fits");
+    assert_eq!(clamped_admission_charge(300, 0, 300), 300, "exactly fits");
+    assert_eq!(
+        clamped_admission_charge(300, 0, 64),
+        64,
+        "larger than queue"
+    );
+    assert_eq!(
+        clamped_admission_charge(10, 256, 64),
+        64,
+        "floor over queue"
+    );
+}
+
+#[test]
+fn cache_names_must_be_one_path_component() {
+    use super::config::validate_cache_name;
+    for ok in ["a", "orders", "a.b", "..a", "a..", "a b", ".hidden", "é"] {
+        assert!(validate_cache_name(ok).is_ok(), "{ok:?}");
+    }
+    for bad in ["", ".", "..", "../x", "a/b", "/abs", "a\\b", "a\0b", "x/"] {
+        assert!(validate_cache_name(bad).is_err(), "{bad:?}");
+    }
 }
 
 #[test]

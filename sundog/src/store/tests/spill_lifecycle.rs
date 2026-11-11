@@ -1440,3 +1440,242 @@ async fn a_checkpointed_close_dropped_in_a_blocking_stage_is_not_run_twice() {
     let _ = snapshot_file(&dir);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// After a warm reopen, `sundog_spill_entries` counts the replayed spilled
+/// entries, falls by exactly one as one is promoted, and
+/// `sundog_spill_bytes_used` reads the replayed bytes before any write.
+#[cfg(feature = "spill")]
+#[tokio::test]
+async fn spill_gauges_count_the_entries_a_warm_reopen_replays() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    let dir = std::env::temp_dir().join(format!(
+        "sundog-shard-warm-gauge-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id(),
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let cfg = spill::SpillConfig::new(&dir, 1 << 20)
+        .region_bytes(4096)
+        .warm_reopen(true);
+    let node = NodeId::from(305u64);
+    let build = || {
+        Shard::<u32, String>::new(
+            SmolStr::new("warm-gauge"),
+            Mode::Local,
+            node,
+            1 << 20,
+            None,
+            None,
+        )
+    };
+
+    let shard1 = build();
+    shard1.attach_spill(&cfg).expect("cold open");
+    shard1.insert(1u32, "v".repeat(40)).await.expect("insert 1");
+    shard1.insert(2u32, "w".repeat(40)).await.expect("insert 2");
+    shard1.close_spill_checkpointed().await;
+    drop(shard1);
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    // A snapshot reads every gauge and resets it to zero, so each phase takes
+    // one snapshot and reads both gauges from it.
+    let gauges = || -> (Option<f64>, Option<f64>) {
+        let mut entries = None;
+        let mut bytes = None;
+        for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+            if let DebugValue::Gauge(v) = value {
+                match key.key().name() {
+                    "sundog_spill_entries" => entries = Some(v.into_inner()),
+                    "sundog_spill_bytes_used" => bytes = Some(v.into_inner()),
+                    _ => {}
+                }
+            }
+        }
+        (entries, bytes)
+    };
+
+    let shard2 = build();
+    shard2.attach_spill(&cfg).expect("warm open");
+    let replayed = shard2.engine.debug_spill_entries_count();
+    assert_eq!(
+        replayed, 2,
+        "setup: the reopen replays both entries as spilled"
+    );
+
+    let (entries, bytes) = gauges();
+    assert_eq!(entries, Some(2.0), "entries after the reopen");
+    assert!(
+        bytes.is_some_and(|b| b > 0.0),
+        "bytes used after the reopen, before any flush: {bytes:?}"
+    );
+    assert_eq!(shard2.get(&1).await, Some("v".repeat(40)));
+    assert_eq!(
+        shard2.engine.debug_spill_entries_count(),
+        1,
+        "one entry is promoted"
+    );
+    let (entries, _) = gauges();
+    assert_eq!(
+        entries,
+        Some(-1.0),
+        "the promotion takes one off the gauge, counted from the snapshot's reset"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A warm reopen under a different key type drops the entries whose keys no
+/// longer decode, so `keys()` and `for_each_key` never panic.
+#[cfg(feature = "spill")]
+#[tokio::test]
+async fn warm_reopen_drops_entries_whose_key_no_longer_decodes() {
+    let dir = std::env::temp_dir().join(format!(
+        "sundog-key-type-change-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id(),
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let cfg = spill::SpillConfig::new(&dir, 1 << 20)
+        .region_bytes(4096)
+        .warm_reopen(true);
+    let node = NodeId::from(777u64);
+
+    let shard1 = Shard::<u32, String>::new(
+        SmolStr::new("key-type-change"),
+        Mode::Local,
+        node,
+        100,
+        None,
+        None,
+    );
+    shard1.attach_spill(&cfg).expect("cold open");
+    for k in 1_000_001u32..1_000_006 {
+        shard1.insert(k, "v".to_string()).await.expect("insert");
+    }
+    shard1.close_spill_checkpointed().await;
+
+    let shard2 = Shard::<String, String>::new(
+        SmolStr::new("key-type-change"),
+        Mode::Local,
+        node,
+        100,
+        None,
+        None,
+    );
+    let warm = shard2.attach_spill(&cfg).expect("reopens");
+    assert!(
+        warm.warm_parts.is_empty(),
+        "every entry's key fails to decode as the new key type, so none is replayed"
+    );
+
+    let keys = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shard2.keys()));
+    assert!(
+        keys.is_ok(),
+        "keys() must not panic when the spilled keys do not decode as the new K"
+    );
+    let each = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        shard2.for_each_key(|_| {});
+    }));
+    assert!(each.is_ok(), "for_each_key must not panic either");
+    assert!(
+        keys.expect("checked above").is_empty(),
+        "the entries that do not decode as the new key type are dropped at reopen"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `Mode::Invalidation` cache opens cold whatever `warm_reopen` says, since
+/// a peer's invalidation sent during the downtime reaches nobody, while a
+/// `Mode::Local` cache keeps its replayed entries.
+#[cfg(feature = "spill")]
+#[tokio::test]
+async fn invalidation_mode_opens_cold_and_local_mode_opens_warm() {
+    for (mode, warm) in [(Mode::Invalidation, false), (Mode::Local, true)] {
+        let dir = std::env::temp_dir().join(format!(
+            "sundog-shard-mode-reopen-{mode:?}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = spill::SpillConfig::new(&dir, 1 << 20)
+            .region_bytes(4096)
+            .warm_reopen(true);
+        let build = || {
+            Shard::<u32, String>::new(
+                SmolStr::new("mode-reopen"),
+                mode,
+                NodeId::from(41u64),
+                1 << 20,
+                None,
+                None,
+            )
+        };
+        let shard1 = build();
+        shard1.attach_spill(&cfg).expect("cold open");
+        shard1.insert(1u32, "v".repeat(40)).await.expect("insert");
+        shard1.close_spill_checkpointed().await;
+        drop(shard1);
+
+        let shard2 = build();
+        let outcome = shard2.attach_spill(&cfg).expect("reopens");
+        assert_eq!(
+            !outcome.warm_parts.is_empty(),
+            warm,
+            "{mode:?}: warm replay is {warm}"
+        );
+        assert_eq!(shard2.get(&1).await.is_some(), warm, "{mode:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(feature = "spill")]
+#[test]
+fn only_an_invalidation_cache_is_barred_from_a_warm_reopen() {
+    use crate::store::shard_spill::warm_reopen_allowed;
+    assert!(!warm_reopen_allowed(Mode::Invalidation));
+    assert!(warm_reopen_allowed(Mode::Local));
+    assert!(warm_reopen_allowed(Mode::Replicated));
+    assert!(warm_reopen_allowed(Mode::Distributed {
+        owners: std::num::NonZeroU8::new(2).expect("nonzero"),
+    }));
+}
+
+/// A key already resident is `Resident` to the owner arm's spilled read, so
+/// the caller reads RAM instead of loading; an absent key is `Absent`.
+#[cfg(feature = "spill")]
+#[tokio::test]
+async fn spilled_read_names_a_resident_key_apart_from_an_absent_one() {
+    use crate::store::shard_spill::SpilledMiss;
+    let dir = std::env::temp_dir().join(format!(
+        "sundog-shard-resident-miss-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id(),
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let cfg = spill::SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+    let shard = Shard::<u32, String>::new(
+        SmolStr::new("resident-miss"),
+        Mode::Local,
+        NodeId::from(42u64),
+        1 << 20,
+        None,
+        None,
+    );
+    shard.attach_spill(&cfg).expect("opens");
+    shard.insert(1u32, "v".to_string()).await.expect("insert");
+    let bytes = |k: u32| crate::store::encode_key(&k).expect("encodes");
+    let (resident, absent) = (bytes(1), bytes(2));
+    let resident_miss = shard
+        .get_spilled_or_resident(resident.as_ref(), engine::hash_key_bytes(resident.as_ref()))
+        .await
+        .err();
+    let absent_miss = shard
+        .get_spilled_or_resident(absent.as_ref(), engine::hash_key_bytes(absent.as_ref()))
+        .await
+        .err();
+    assert!(matches!(resident_miss, Some(SpilledMiss::Resident)));
+    assert!(matches!(absent_miss, Some(SpilledMiss::Absent)));
+    let _ = std::fs::remove_dir_all(&dir);
+}

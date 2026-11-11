@@ -281,6 +281,12 @@ impl SpillTier {
         self.inner.flush_queue_bytes.saturating_sub(available)
     }
 
+    /// Whether the flush queue's byte budget has any free permit left, so a
+    /// refused hand-off has room to succeed on a later attempt.
+    pub(crate) fn has_queue_room(&self) -> bool {
+        self.inner.admit.available_permits() > 0
+    }
+
     /// Test-only: parks [`flusher_loop`] at the top of its loop, before its
     /// next receive, so a job's bytes stay counted in `queued_bytes` (and,
     /// upstream, a hand-off's weight stays in

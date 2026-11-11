@@ -133,6 +133,8 @@ pub(crate) use self::merge::{Fold, MergeCap, fold_sides};
 use self::merge::{merge_version, resolve_conflict};
 #[cfg(doc)]
 use self::prefold::peek_stored_seed;
+#[cfg(feature = "spill")]
+pub(crate) use self::promote::SpilledLookup;
 use self::record::{Record, record_key};
 #[cfg(doc)]
 use self::record::{
@@ -829,6 +831,18 @@ where
         #[cfg(test)]
         self.spill_entries_test_count
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts the `count` entries a warm reopen's replay installed as
+    /// spilled into `sundog_spill_entries{cache}`. The replay runs before
+    /// [`Engine::set_spill`] creates the gauge, so those arrivals reached no
+    /// gauge; [`super::Shard::attach_spill`] calls this right after
+    /// `set_spill` so the gauge starts at the replayed count.
+    #[cfg(feature = "spill")]
+    pub(crate) fn seed_spill_entries(&self, count: u64) {
+        if let Some(gauge) = self.spill_entries_gauge.get() {
+            gauge.increment(count_f64(usize::try_from(count).unwrap_or(usize::MAX)));
+        }
     }
 
     /// This engine's spill tier, once [`Engine::set_spill`] has run.

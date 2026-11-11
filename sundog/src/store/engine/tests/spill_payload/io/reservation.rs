@@ -273,11 +273,12 @@ async fn enforce_capacity_with_reservation_returns_the_deficit_once_both_budgets
     let record_len_0 = spill_record_len(key_bytes(keys[0]).len(), encoded_len);
     let record_len_1 = spill_record_len(key_bytes(keys[1]).len(), encoded_len);
 
-    // Sized to exactly the coldest victim's record, so reserve
-    // drains the tier's whole admit budget into the reservation.
+    // Sized to the larger of the two records (a record bigger than the whole
+    // budget is charged the budget), so the reservation holds nearly the whole
+    // admit budget and keys[1]'s record does not fit what is left.
     let cfg = SpillConfig::new(&dir, 1 << 20)
         .region_bytes(4096)
-        .flush_queue_bytes(u64::from(record_len_0));
+        .flush_queue_bytes(u64::from(record_len_0.max(record_len_1)));
     let tier = Arc::new(SpillTier::open(&cfg, "enforce-capacity-deficit").expect("tier opens"));
     tier.pause_flusher();
     let weigher: Weigher<u32, String> =
@@ -386,7 +387,7 @@ async fn enforce_capacity_deletes_a_deficit_left_victim_once_reservation_retries
 
     let cfg = SpillConfig::new(&dir, 1 << 20)
         .region_bytes(4096)
-        .flush_queue_bytes(u64::from(record_len_0));
+        .flush_queue_bytes(u64::from(record_len_0.max(record_len_1)));
     let tier =
         Arc::new(SpillTier::open(&cfg, "enforce-capacity-deficit-fallback").expect("tier opens"));
     tier.pause_flusher();

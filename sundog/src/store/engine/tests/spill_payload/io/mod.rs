@@ -197,7 +197,7 @@ fn install_new_creates_a_fresh_spilled_entry_readable_via_read_record_and_folds_
     let target = Engine::<u32, String>::new(u64::MAX, None, None, None);
     let digest_before = target.digests();
 
-    let inserted = SpillSink::install_new(&target, bucket, &kb, hash, ver, Some(999), loc, 1);
+    let inserted = SpillSink::install_new(&target, bucket, &kb, hash, ver, Some(999), loc, 1, 0);
     assert!(inserted);
 
     // Resident-free: `get` reads nothing, since no value ever
@@ -267,7 +267,7 @@ fn drop_unreadable_spilled_drops_only_the_entry_still_spilled_at_that_pointer() 
     };
     let digest_before = engine.digests();
     assert!(SpillSink::install_new(
-        &engine, bucket, &kb, hash, ver, None, loc, 1
+        &engine, bucket, &kb, hash, ver, None, loc, 1, 0
     ));
     assert_eq!(engine.debug_totals().0, 1);
     assert_eq!(engine.debug_spill_entries_count(), 1);

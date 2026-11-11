@@ -51,6 +51,7 @@ fn spilled_at_five_expiring(
     );
     let (_, loc) = engine
         .spilled_loc(kb.as_ref(), hash, 0)
+        .spilled()
         .expect("a spilled entry");
     (engine, tier, kb, loc)
 }

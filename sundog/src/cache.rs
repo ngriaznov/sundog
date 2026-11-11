@@ -352,7 +352,9 @@ where
     /// `max_capacity` set with no `spill` tier configured (`tti` is
     /// rejected unconditionally, spill or not, since it is local-only by
     /// design); `CacheError::InvalidSpillConfig`, with the `spill` feature
-    /// compiled in, for an invalid `spill` config; and
+    /// compiled in, for an invalid `spill` config or a cache `name` that is
+    /// not a single path component (empty, `.`, `..`, containing `/`, `\\` or
+    /// NUL, or absolute) when a `spill` tier is set; and
     /// [`CacheError::ModeMismatch`], best-effort, if a live peer already
     /// advertises `name` under a different [`Mode`]: the check covers the
     /// advertisements this node has received, once before the open builds
@@ -459,7 +461,9 @@ where
 
         #[cfg(feature = "spill")]
         if let Some(cfg) = &spill
-            && let Err(reason) = cfg.validate()
+            && let Err(reason) = cfg
+                .validate()
+                .and_then(|()| crate::store::spill::validate_cache_name(&name))
         {
             return Err(CacheError::InvalidSpillConfig {
                 cache: name,

@@ -115,6 +115,7 @@ impl SpillSink for RecordingSink {
         expires_at_ms: Option<u64>,
         loc: SpillLoc,
         _weight: u32,
+        _now_ms: u64,
     ) -> bool {
         let mut live = self.live.lock().unwrap();
         if live.contains_key(key_bytes) {
@@ -488,8 +489,15 @@ fn checkpoint_write_resident_drops_entries_its_own_wraparound_overwrites_and_reo
     tier.close();
 
     let fresh_sink = RecordingSink::default();
-    let outcome = SpillTier::reopen(&cfg, "cache-a", &fresh_sink, 1_500, 600_000, |_| true)
-        .expect("reopen against a cleanly closed tier succeeds");
+    let outcome = SpillTier::reopen(
+        &cfg,
+        "cache-a",
+        &fresh_sink,
+        1_500,
+        ReopenGate::new(600_000),
+        |_| true,
+    )
+    .expect("reopen against a cleanly closed tier succeeds");
     assert!(
         outcome.warm,
         "the surviving entries' own on-disk bytes must still validate cleanly; reason: \

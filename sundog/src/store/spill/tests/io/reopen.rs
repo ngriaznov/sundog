@@ -1,6 +1,7 @@
 //! Tests for snapshot serialization, `install_new` and warm `reopen`.
 
 use super::*;
+use crate::store::spill::open::ReopenOutcome;
 use crate::store::spill::open::max_snapshot_version;
 
 // --- Checkpoint snapshot serialization, no fsync ---
@@ -54,7 +55,7 @@ fn write_snapshot_atomic_then_snapshot_eligibility_round_trips() {
         !snapshot_tmp_path(&dir).exists(),
         "the temporary file is renamed away, never left behind on success"
     );
-    let (header, entries) = snapshot_eligibility(&dir, 4096, 3, 1_500, 600_000)
+    let (header, entries) = snapshot_eligibility(&dir, 4096, 3, 1_500, 600_000, 60_000)
         .expect("a freshly written snapshot within tombstone_ttl is eligible");
     assert_eq!(header.closed_at_ms, 1_000);
     assert!(entries.is_empty(), "{entries:?}");
@@ -122,7 +123,7 @@ fn install_new_inserts_a_fresh_key_into_the_sinks_live_map() {
         generation: 0,
     };
 
-    let inserted = sink.install_new(0, &kb, 0, ver, Some(999), loc, 1);
+    let inserted = sink.install_new(0, &kb, 0, ver, Some(999), loc, 1, 0);
 
     assert!(inserted);
     assert_eq!(sink.install_new_count(), 1);
@@ -140,7 +141,7 @@ fn install_new_never_overwrites_an_already_present_key() {
         len: 16,
         generation: 0,
     };
-    assert!(sink.install_new(0, &kb, 0, first_ver, None, loc, 1));
+    assert!(sink.install_new(0, &kb, 0, first_ver, None, loc, 1, 0));
 
     let second_ver = hlc(2, 0);
     let second_loc = SpillLoc {
@@ -149,7 +150,7 @@ fn install_new_never_overwrites_an_already_present_key() {
         len: 16,
         generation: 0,
     };
-    let inserted = sink.install_new(0, &kb, 0, second_ver, None, second_loc, 1);
+    let inserted = sink.install_new(0, &kb, 0, second_ver, None, second_loc, 1, 0);
 
     assert!(
         !inserted,
@@ -202,8 +203,15 @@ fn reopen_warm_reload_recovers_a_record_written_before_a_clean_close() {
     write_snapshot_for_test(&cache_dir, &sink, 4096, region_count, 1_000, None);
 
     let fresh_sink = RecordingSink::default();
-    let outcome = SpillTier::reopen(&cfg, "cache-a", &fresh_sink, 1_500, 600_000, |_| true)
-        .expect("reopen against a cleanly closed tier succeeds");
+    let outcome = SpillTier::reopen(
+        &cfg,
+        "cache-a",
+        &fresh_sink,
+        1_500,
+        ReopenGate::new(600_000),
+        |_| true,
+    )
+    .expect("reopen against a cleanly closed tier succeeds");
 
     assert!(
         outcome.warm,
@@ -259,8 +267,15 @@ fn reopen_falls_back_cold_when_a_snapshot_entrys_record_fails_to_decode() {
     fs::write(&region_path, &bytes).unwrap();
 
     let fresh_sink = RecordingSink::default();
-    let outcome = SpillTier::reopen(&cfg, "cache-a", &fresh_sink, 1_500, 600_000, |_| true)
-        .expect("the cold fallback still succeeds");
+    let outcome = SpillTier::reopen(
+        &cfg,
+        "cache-a",
+        &fresh_sink,
+        1_500,
+        ReopenGate::new(600_000),
+        |_| true,
+    )
+    .expect("the cold fallback still succeeds");
 
     assert!(
         !outcome.warm,
@@ -292,8 +307,15 @@ fn reopen_falls_back_cold_when_a_snapshot_entry_points_past_its_region() {
     write_snapshot_atomic(&cache_dir, &bytes);
 
     let fresh_sink = RecordingSink::default();
-    let outcome = SpillTier::reopen(&cfg, "cache-a", &fresh_sink, 1_500, 600_000, |_| true)
-        .expect("the cold fallback still succeeds");
+    let outcome = SpillTier::reopen(
+        &cfg,
+        "cache-a",
+        &fresh_sink,
+        1_500,
+        ReopenGate::new(600_000),
+        |_| true,
+    )
+    .expect("the cold fallback still succeeds");
 
     assert!(!outcome.warm);
     assert_eq!(outcome.reason, Some("bad_region"));
@@ -323,8 +345,15 @@ fn reopen_falls_back_cold_when_the_snapshot_checksum_is_corrupt() {
     fs::write(&path, &bytes).unwrap();
 
     let fresh_sink = RecordingSink::default();
-    let outcome = SpillTier::reopen(&cfg, "cache-a", &fresh_sink, 1_500, 600_000, |_| true)
-        .expect("the cold fallback still succeeds");
+    let outcome = SpillTier::reopen(
+        &cfg,
+        "cache-a",
+        &fresh_sink,
+        1_500,
+        ReopenGate::new(600_000),
+        |_| true,
+    )
+    .expect("the cold fallback still succeeds");
 
     assert!(!outcome.warm);
     assert_eq!(
@@ -349,8 +378,15 @@ fn reopen_with_no_snapshot_falls_back_to_open_with_reason_no_snapshot() {
     let _tier = SpillTier::open(&cfg, "cache-a").unwrap();
 
     let fresh_sink = RecordingSink::default();
-    let outcome = SpillTier::reopen(&cfg, "cache-a", &fresh_sink, 1_500, 600_000, |_| true)
-        .expect("the cold fallback still succeeds");
+    let outcome = SpillTier::reopen(
+        &cfg,
+        "cache-a",
+        &fresh_sink,
+        1_500,
+        ReopenGate::new(600_000),
+        |_| true,
+    )
+    .expect("the cold fallback still succeeds");
 
     assert!(!outcome.warm);
     assert_eq!(outcome.reason, Some("no_snapshot"));
@@ -383,7 +419,7 @@ fn reopen_refuses_past_tombstone_ttl_and_falls_back_to_open() {
         "cache-a",
         &fresh_sink,
         now_ms,
-        tombstone_ttl_ms,
+        ReopenGate::new(tombstone_ttl_ms),
         |_| true,
     )
     .expect("the cold fallback still succeeds");
@@ -410,8 +446,15 @@ fn reopen_refuses_on_a_stale_snapshot_format_version_and_falls_back_to_open() {
     write_stale_snapshot_for_test(&cache_dir, 4096, region_count, 1_000);
 
     let fresh_sink = RecordingSink::default();
-    let outcome = SpillTier::reopen(&cfg, "cache-a", &fresh_sink, 1_000, 600_000, |_| true)
-        .expect("the cold fallback still succeeds");
+    let outcome = SpillTier::reopen(
+        &cfg,
+        "cache-a",
+        &fresh_sink,
+        1_000,
+        ReopenGate::new(600_000),
+        |_| true,
+    )
+    .expect("the cold fallback still succeeds");
 
     assert!(!outcome.warm);
     assert_eq!(outcome.reason, Some("stale_snapshot"));
@@ -448,9 +491,14 @@ fn reopen_refuses_on_a_region_bytes_or_region_count_mismatch_and_falls_back_to_o
         .region_bytes(2 * region_len)
         .warm_reopen(true);
     let fresh_sink = RecordingSink::default();
-    let outcome = SpillTier::reopen(&resized_cfg, "cache-a", &fresh_sink, 1_000, 600_000, |_| {
-        true
-    })
+    let outcome = SpillTier::reopen(
+        &resized_cfg,
+        "cache-a",
+        &fresh_sink,
+        1_000,
+        ReopenGate::new(600_000),
+        |_| true,
+    )
     .expect("the cold fallback still succeeds");
 
     assert!(!outcome.warm);
@@ -474,8 +522,15 @@ fn reopen_is_disabled_by_default_even_against_an_otherwise_eligible_snapshot() {
     write_snapshot_for_test(&cache_dir, &sink, 4096, region_count, 1_000, Some(999));
 
     let fresh_sink = RecordingSink::default();
-    let outcome = SpillTier::reopen(&cfg, "cache-a", &fresh_sink, 1_500, 600_000, |_| true)
-        .expect("the cold fallback still succeeds");
+    let outcome = SpillTier::reopen(
+        &cfg,
+        "cache-a",
+        &fresh_sink,
+        1_500,
+        ReopenGate::new(600_000),
+        |_| true,
+    )
+    .expect("the cold fallback still succeeds");
 
     assert!(!outcome.warm);
     assert_eq!(outcome.reason, Some("disabled"));
@@ -502,8 +557,15 @@ fn reopen_falls_back_to_open_when_a_region_file_is_missing() {
     fs::remove_file(cache_dir.join(region_file_name(1))).unwrap();
 
     let fresh_sink = RecordingSink::default();
-    let outcome = SpillTier::reopen(&cfg, "cache-a", &fresh_sink, 1_500, 600_000, |_| true)
-        .expect("the cold fallback still succeeds");
+    let outcome = SpillTier::reopen(
+        &cfg,
+        "cache-a",
+        &fresh_sink,
+        1_500,
+        ReopenGate::new(600_000),
+        |_| true,
+    )
+    .expect("the cold fallback still succeeds");
 
     assert!(!outcome.warm);
     assert_eq!(outcome.reason, Some("bad_region"));
@@ -527,8 +589,15 @@ fn reopen_filters_out_a_bucket_this_node_no_longer_owns() {
     write_snapshot_for_test(&cache_dir, &sink, 4096, region_count, 1_000, None);
 
     let fresh_sink = RecordingSink::default();
-    let outcome = SpillTier::reopen(&cfg, "cache-a", &fresh_sink, 1_500, 600_000, |_| false)
-        .expect("reopen against a cleanly closed tier succeeds");
+    let outcome = SpillTier::reopen(
+        &cfg,
+        "cache-a",
+        &fresh_sink,
+        1_500,
+        ReopenGate::new(600_000),
+        |_| false,
+    )
+    .expect("reopen against a cleanly closed tier succeeds");
 
     assert!(outcome.warm, "the tier itself still reopens warm");
     assert_eq!(
@@ -566,9 +635,14 @@ fn reopen_warm_buckets_names_only_the_buckets_a_record_survived_the_owned_filter
 
     let kept_bucket = crate::store::PartId::of_key(b"k");
     let fresh_sink = RecordingSink::default();
-    let outcome = SpillTier::reopen(&cfg, "cache-a", &fresh_sink, 1_500, 600_000, |p| {
-        p == kept_bucket
-    })
+    let outcome = SpillTier::reopen(
+        &cfg,
+        "cache-a",
+        &fresh_sink,
+        1_500,
+        ReopenGate::new(600_000),
+        |p| p == kept_bucket,
+    )
     .expect("reopen against a cleanly closed tier succeeds");
 
     assert!(outcome.warm);
@@ -597,8 +671,15 @@ fn reopen_drops_an_already_expired_record() {
     write_snapshot_for_test(&cache_dir, &sink, 4096, region_count, 1_000, Some(999));
 
     let fresh_sink = RecordingSink::default();
-    let outcome = SpillTier::reopen(&cfg, "cache-a", &fresh_sink, 1_500, 600_000, |_| true)
-        .expect("reopen against a cleanly closed tier succeeds");
+    let outcome = SpillTier::reopen(
+        &cfg,
+        "cache-a",
+        &fresh_sink,
+        1_500,
+        ReopenGate::new(600_000),
+        |_| true,
+    )
+    .expect("reopen against a cleanly closed tier succeeds");
 
     assert!(outcome.warm);
     assert_eq!(
@@ -705,8 +786,15 @@ fn reopen_reports_the_greatest_replayed_version() {
     );
 
     let fresh_sink = RecordingSink::default();
-    let outcome = SpillTier::reopen(&cfg, "cache-a", &fresh_sink, 1_500, 600_000, |_| true)
-        .expect("reopen against a cleanly closed tier succeeds");
+    let outcome = SpillTier::reopen(
+        &cfg,
+        "cache-a",
+        &fresh_sink,
+        1_500,
+        ReopenGate::new(600_000),
+        |_| true,
+    )
+    .expect("reopen against a cleanly closed tier succeeds");
 
     assert!(outcome.warm);
     assert_eq!(outcome.max_ver, Some(hlc(9, 2)));
@@ -719,8 +807,15 @@ fn reopen_reports_the_version_of_a_record_it_drops_as_expired() {
     let (cfg, dir) = closed_tier_with("reopen-max-ver-expired", &[("k", hlc(7, 1))], Some(999));
 
     let fresh_sink = RecordingSink::default();
-    let outcome = SpillTier::reopen(&cfg, "cache-a", &fresh_sink, 1_500, 600_000, |_| true)
-        .expect("reopen against a cleanly closed tier succeeds");
+    let outcome = SpillTier::reopen(
+        &cfg,
+        "cache-a",
+        &fresh_sink,
+        1_500,
+        ReopenGate::new(600_000),
+        |_| true,
+    )
+    .expect("reopen against a cleanly closed tier succeeds");
 
     assert_eq!(outcome.records_installed, 0, "the record is dropped");
     assert_eq!(
@@ -737,8 +832,15 @@ fn reopen_reports_the_version_of_a_record_it_drops_as_unowned() {
     let (cfg, dir) = closed_tier_with("reopen-max-ver-unowned", &[("k", hlc(7, 1))], None);
 
     let fresh_sink = RecordingSink::default();
-    let outcome = SpillTier::reopen(&cfg, "cache-a", &fresh_sink, 1_500, 600_000, |_| false)
-        .expect("reopen against a cleanly closed tier succeeds");
+    let outcome = SpillTier::reopen(
+        &cfg,
+        "cache-a",
+        &fresh_sink,
+        1_500,
+        ReopenGate::new(600_000),
+        |_| false,
+    )
+    .expect("reopen against a cleanly closed tier succeeds");
 
     assert_eq!(outcome.records_installed, 0, "the record is dropped");
     assert_eq!(outcome.max_ver, Some(hlc(7, 1)));
@@ -755,8 +857,15 @@ fn a_cold_fallback_reports_no_replayed_version() {
     let _tier = SpillTier::open(&cfg, "cache-a").unwrap();
 
     let fresh_sink = RecordingSink::default();
-    let outcome = SpillTier::reopen(&cfg, "cache-a", &fresh_sink, 1_500, 600_000, |_| true)
-        .expect("the cold fallback still succeeds");
+    let outcome = SpillTier::reopen(
+        &cfg,
+        "cache-a",
+        &fresh_sink,
+        1_500,
+        ReopenGate::new(600_000),
+        |_| true,
+    )
+    .expect("the cold fallback still succeeds");
 
     assert!(!outcome.warm);
     assert_eq!(outcome.max_ver, None, "no_snapshot");
@@ -765,9 +874,163 @@ fn a_cold_fallback_reports_no_replayed_version() {
     let disabled_dir = temp_dir("reopen-max-ver-disabled");
     let disabled = SpillConfig::new(&disabled_dir, 1 << 20).region_bytes(4096);
     let _tier = SpillTier::open(&disabled, "cache-a").unwrap();
-    let outcome = SpillTier::reopen(&disabled, "cache-a", &fresh_sink, 1_500, 600_000, |_| true)
-        .expect("the cold fallback still succeeds");
+    let outcome = SpillTier::reopen(
+        &disabled,
+        "cache-a",
+        &fresh_sink,
+        1_500,
+        ReopenGate::new(600_000),
+        |_| true,
+    )
+    .expect("the cold fallback still succeeds");
     assert_eq!(outcome.reason, Some("disabled"));
     assert_eq!(outcome.max_ver, None, "disabled");
     let _ = fs::remove_dir_all(&disabled_dir);
+}
+
+/// Writes a one-record tier closed at `closed_at_ms` and reopens it at
+/// `now_ms` under `gate`.
+fn reopen_snapshot_closed_at(
+    label: &str,
+    closed_at_ms: u64,
+    now_ms: u64,
+    gate: ReopenGate,
+) -> ReopenOutcome {
+    let dir = temp_dir(label);
+    let cfg = SpillConfig::new(&dir, 1 << 20)
+        .region_bytes(4096)
+        .warm_reopen(true);
+    let tier = SpillTier::open(&cfg, "cache-a").unwrap();
+    let cache_dir = dir.join("cache-a");
+    let sink = Arc::new(RecordingSink::default());
+    flush_batch(&tier.inner, &*sink, vec![job("k", b"1", hlc(1, 0))]);
+    tier.close();
+    let region_count = region_count_for(1 << 20, 4096);
+    write_snapshot_for_test(
+        &cache_dir,
+        &sink,
+        4096,
+        region_count,
+        closed_at_ms,
+        Some(999_999_999),
+    );
+    let fresh_sink = RecordingSink::default();
+    let outcome = SpillTier::reopen(&cfg, "cache-a", &fresh_sink, now_ms, gate, |_| true)
+        .expect("the cold fallback still succeeds");
+    let _ = fs::remove_dir_all(&dir);
+    outcome
+}
+
+#[test]
+fn a_snapshot_stamped_ahead_of_the_reopen_clock_opens_cold() {
+    let gate = ReopenGate {
+        tombstone_ttl_ms: 600_000,
+        clock_slack_ms: 1_000,
+        mode_allows_warm: true,
+    };
+    let outcome = reopen_snapshot_closed_at("reopen-future-snapshot", 10_000_000, 1_000, gate);
+    assert!(
+        !outcome.warm,
+        "a snapshot stamped in the future was replayed warm"
+    );
+    assert_eq!(outcome.reason, Some("clock_behind_snapshot"));
+    assert_eq!(outcome.records_installed, 0);
+}
+
+#[test]
+fn a_snapshot_stamped_within_the_clock_slack_is_replayed_warm() {
+    let gate = ReopenGate {
+        tombstone_ttl_ms: 600_000,
+        clock_slack_ms: 1_000,
+        mode_allows_warm: true,
+    };
+    let at_slack = reopen_snapshot_closed_at("reopen-slack-edge", 100_000 + 1_000, 100_000, gate);
+    assert!(at_slack.warm, "exactly the slack ahead is accepted");
+    let ahead = reopen_snapshot_closed_at("reopen-slack-over", 100_000 + 1_001, 100_000, gate);
+    assert_eq!(ahead.reason, Some("clock_behind_snapshot"));
+}
+
+#[test]
+fn a_mode_that_never_replays_opens_cold_with_reason_mode() {
+    let gate = ReopenGate {
+        mode_allows_warm: false,
+        ..ReopenGate::new(600_000)
+    };
+    let outcome = reopen_snapshot_closed_at("reopen-mode-gate", 1_000, 1_500, gate);
+    assert!(!outcome.warm);
+    assert_eq!(outcome.reason, Some("mode"));
+    assert_eq!(outcome.records_installed, 0);
+}
+
+#[test]
+fn reopen_drops_entries_whose_key_does_not_round_trip_and_counts_them() {
+    struct PickySink(RecordingSink);
+    impl SpillSink for PickySink {
+        fn install(
+            &self,
+            stripe: usize,
+            key: &Bytes,
+            hash: u64,
+            ver: Hlc,
+            loc: SpillLoc,
+            weight: u32,
+        ) -> bool {
+            self.0.install(stripe, key, hash, ver, loc, weight)
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn install_new(
+            &self,
+            stripe: usize,
+            key: &Bytes,
+            hash: u64,
+            ver: Hlc,
+            expires_at_ms: Option<u64>,
+            loc: SpillLoc,
+            weight: u32,
+            now_ms: u64,
+        ) -> bool {
+            self.0
+                .install_new(stripe, key, hash, ver, expires_at_ms, loc, weight, now_ms)
+        }
+        fn key_round_trips(&self, key_bytes: &[u8]) -> bool {
+            key_bytes != b"bad"
+        }
+        fn reclaim(&self, region: u32, generation: u32, rows: &[ReclaimRef]) -> usize {
+            self.0.reclaim(region, generation, rows)
+        }
+        fn abandon(&self, stripe: usize, key: &Bytes, hash: u64, ver: Hlc, weight: u32) {
+            self.0.abandon(stripe, key, hash, ver, weight);
+        }
+    }
+    let dir = temp_dir("reopen-key-mismatch");
+    let cfg = SpillConfig::new(&dir, 1 << 20)
+        .region_bytes(4096)
+        .warm_reopen(true);
+    let tier = SpillTier::open(&cfg, "cache-a").unwrap();
+    let cache_dir = dir.join("cache-a");
+    let sink = Arc::new(RecordingSink::default());
+    flush_batch(
+        &tier.inner,
+        &*sink,
+        vec![job("bad", b"1", hlc(1, 0)), job("good", b"2", hlc(2, 0))],
+    );
+    tier.close();
+    let region_count = region_count_for(1 << 20, 4096);
+    write_snapshot_for_test(&cache_dir, &sink, 4096, region_count, 1_000, Some(999_999));
+
+    let fresh = PickySink(RecordingSink::default());
+    let outcome = SpillTier::reopen(
+        &cfg,
+        "cache-a",
+        &fresh,
+        1_500,
+        ReopenGate::new(600_000),
+        |_| true,
+    )
+    .expect("reopens");
+    assert!(outcome.warm);
+    assert_eq!(outcome.dropped_key_mismatch, 1);
+    assert_eq!(outcome.records_installed, 1);
+    assert_eq!(fresh.0.install_new_count(), 1);
+    let _ = fs::remove_dir_all(&dir);
 }

@@ -35,7 +35,9 @@ metric.
 ## spill
 
 `CacheBuilder::spill(SpillConfig::new(dir, capacity_bytes))` gives a cache
-a disk tier. Once the cache passes `max_capacity`, eviction writes the
+a disk tier under `dir/<cache name>`. With a tier configured, `open` rejects a
+cache name that is empty, `.` or `..`, absolute, or contains `/`, `\` or a NUL
+byte, with `CacheError::InvalidSpillConfig`. Once the cache passes `max_capacity`, eviction writes the
 coldest values to a ring of region files instead of discarding them, and a
 later read promotes an entry back into RAM. A `Replicated` or `Distributed`
 cache needs a tier to take a `max_capacity` at all.
@@ -44,8 +46,8 @@ cache needs a tier to take a `max_capacity` at all.
 |---|---|---|
 | `capacity_bytes` | required | disk used by the tier; at least two regions |
 | `region_bytes` | 64 MiB | each region file in the ring |
-| `read_concurrency` | 16 | spilled reads in flight at once |
-| `flush_queue_bytes` | one region | values queued for the flusher but not yet written |
+| `read_concurrency` | 16 | spilled reads in flight at once; at least 1, at most `tokio::sync::Semaphore::MAX_PERMITS` |
+| `flush_queue_bytes` | one region | values queued for the flusher but not yet written; a record larger than the budget is admitted whenever the queue is empty |
 | `spill_wait_timeout` | 2 s | how long eviction waits for queue room |
 | `warm_reopen` | off | whether a clean close checkpoints the tier for a fast restart |
 
@@ -91,6 +93,18 @@ against the same directory replays the snapshot instead of starting empty,
 reading no values into RAM. A replayed bucket answers `fetch` only after a
 live co-owner confirms it, or after the warm-up finds no co-owner to ask.
 
+A `Mode::Invalidation` cache opens cold whatever `warm_reopen` says, with
+fallback reason `mode`. It runs no anti-entropy, and an invalidation sent while
+the node is down reaches nobody, so a replayed entry could be one a peer
+removed or rewrote. `Mode::Local`, `Replicated` and `Distributed` caches
+replay.
+
+A replayed entry counts as last accessed at the reopen, so a cache with `tti`
+gives each replayed entry a full idle window from the restart. An entry whose
+key no longer decodes as the cache's key type, or encodes to different bytes,
+is dropped at reopen and counted under
+`sundog_spill_reopen_entries_total{stage="dropped_key_mismatch"}`.
+
 A cache checkpoints once. A second `close` from another clone, or a `close`
 after `shutdown`, waits for the first to finish and writes nothing, so it
 cannot overwrite the snapshot of a cache that has reopened the directory
@@ -121,7 +135,9 @@ The snapshot holds no tombstones and no expired entries. A crash leaves no
 snapshot, a successful warm reopen deletes the one it replayed, so a second
 open with no clean close between is cold, and a node down longer than
 `tombstone_ttl` opens cold regardless, since a peer may already have
-collected a tombstone that would outvote a stale replayed entry. A node
+collected a tombstone that would outvote a stale replayed entry. A snapshot
+stamped more than `max_clock_skew` ahead of the clock at reopen also opens
+cold, since the real downtime is unknown, with reason `clock_behind_snapshot`. A node
 defers tombstone collection for its first `tombstone_ttl` after it opens, so a
 delete from a peer that is past `tombstone_ttl` but not `tombstone_max_ttl` of
 its stamp still removes an older replayed entry. The tombstone of an expired
