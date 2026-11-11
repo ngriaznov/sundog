@@ -371,6 +371,20 @@ pub(crate) enum OnRefusal {
         )
     )]
     KeepResident,
+    /// A refused victim stays resident whatever the mode, and the refusal
+    /// is not counted under `sundog_spill_dropped_total`. A capacity retry
+    /// ([`Engine::retry_capacity`]) runs under this policy: the victim was
+    /// counted when the write that left the node over its cap first met the
+    /// refusal, and a retry that finds the queue still full has dropped
+    /// nothing new.
+    #[cfg_attr(
+        not(feature = "spill"),
+        allow(
+            dead_code,
+            reason = "only the capacity retry constructs it, and the retry is spill-only"
+        )
+    )]
+    Retry,
 }
 
 /// Whether `live`'s record is currently spilled: the mirror of

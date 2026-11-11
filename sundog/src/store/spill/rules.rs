@@ -142,7 +142,8 @@ pub(crate) fn refusal_drop_reason(keeps_resident: bool, specific: &'static str) 
 }
 
 /// Whether an eviction pass leaves a victim its tier refuses resident,
-/// rather than deleting it: always under [`OnRefusal::KeepResident`], and
+/// rather than deleting it: always under [`OnRefusal::KeepResident`] and
+/// [`OnRefusal::Retry`], and
 /// under [`OnRefusal::TierPolicy`] exactly when `tier_keeps_resident`, the
 /// tier's own flag ([`SpillTier::set_keep_resident_when_refused`]), is set.
 /// Pure; unit tested directly.
@@ -151,9 +152,17 @@ pub(crate) fn keeps_refused_victim_resident(
     tier_keeps_resident: bool,
 ) -> bool {
     match on_refusal {
-        OnRefusal::KeepResident => true,
+        OnRefusal::KeepResident | OnRefusal::Retry => true,
         OnRefusal::TierPolicy => tier_keeps_resident,
     }
+}
+
+/// Whether a refusal under `on_refusal` is counted in
+/// `sundog_spill_dropped_total`: every pass counts it except a capacity
+/// retry ([`OnRefusal::Retry`]), whose victim an earlier pass already
+/// counted. Pure; unit tested directly.
+pub(crate) const fn records_refusal(on_refusal: OnRefusal) -> bool {
+    !matches!(on_refusal, OnRefusal::Retry)
 }
 
 /// The flusher's batch-splitting rule: how many of `record_lens`, taken in

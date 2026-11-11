@@ -425,8 +425,10 @@ fill `flush_queue_bytes` faster than their size suggests; a budget over
 `reason="deferred"` counts refusals that deleted nothing: the entry stays
 resident, and the flusher after each batch and the housekeeping tick retry the
 eviction while the queue has room. A `Replicated` or `Distributed`
-cache records every refusal there, and any cache records the refusals of a
-spilled-key read's eviction there, since that read never deletes an entry.
+cache records every refusal of a write's eviction there, and any cache
+records the refusals of a spilled-key read's eviction there, since that read
+never deletes an entry. A retry that the queue refuses again counts nothing:
+the write that left the node over `max_capacity` counted that entry.
 
 ### A restart comes back cold
 

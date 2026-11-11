@@ -11,7 +11,8 @@ use super::SpillConfig;
 #[cfg(doc)]
 use super::flusher::flusher_loop;
 use super::rules::{
-    keeps_refused_victim_resident, record_too_large, refusal_drop_reason, spill_record_len,
+    keeps_refused_victim_resident, record_too_large, records_refusal, refusal_drop_reason,
+    spill_record_len,
 };
 use super::{Admission, HEADER_LEN, Reservation, SpillJob, SpillTier, SpillWaitTimedOut};
 
@@ -58,6 +59,16 @@ impl SpillTier {
             keeps_refused_victim_resident(on_refusal, self.keep_resident_when_refused()),
             specific,
         )
+    }
+
+    /// Counts a refusal of `specific` under [`SpillTier::refusal_reason`],
+    /// unless `on_refusal` is a pass that does not count its refusals
+    /// ([`records_refusal`]).
+    fn record_refusal(&self, on_refusal: OnRefusal, specific: &'static str) {
+        if records_refusal(on_refusal) {
+            self.inner
+                .record_dropped(self.refusal_reason(on_refusal, specific));
+        }
     }
 
     /// Non-blocking, best-effort: `false` means the record can never fit any
@@ -127,14 +138,13 @@ impl SpillTier {
         key_len: usize,
         value_len: usize,
     ) -> Admission {
-        let refusal_reason = |specific: &'static str| self.refusal_reason(on_refusal, specific);
         if self.inner.closed.load(Ordering::Acquire) {
-            self.inner.record_dropped(refusal_reason("closed"));
+            self.record_refusal(on_refusal, "closed");
             return Admission::RefusedFinal;
         }
         let record_len_u64 = HEADER_LEN as u64 + key_len as u64 + value_len as u64;
         if record_too_large(record_len_u64, u64::from(self.inner.region_bytes)) {
-            self.inner.record_dropped(refusal_reason("too_large"));
+            self.record_refusal(on_refusal, "too_large");
             return Admission::RefusedFinal;
         }
         let charge = self.admit_charge(key_len, value_len);
@@ -150,7 +160,7 @@ impl SpillTier {
         } else if reservation_in_play {
             Admission::RefusedPending
         } else {
-            self.inner.record_dropped(refusal_reason("queue_full"));
+            self.record_refusal(on_refusal, "queue_full");
             Admission::RefusedFinal
         }
     }
@@ -256,8 +266,7 @@ impl SpillTier {
         let sent = {
             let sender = self.sender.lock();
             let Some(tx) = sender.as_ref() else {
-                self.inner
-                    .record_dropped(self.refusal_reason(on_refusal, "queue_full"));
+                self.record_refusal(on_refusal, "queue_full");
                 return Err(Box::new(job));
             };
             tx.try_send(job)
@@ -265,8 +274,7 @@ impl SpillTier {
         match sent {
             Ok(()) => Ok(()),
             Err(mpsc::TrySendError::Full(job) | mpsc::TrySendError::Disconnected(job)) => {
-                self.inner
-                    .record_dropped(self.refusal_reason(on_refusal, "queue_full"));
+                self.record_refusal(on_refusal, "queue_full");
                 Err(Box::new(job))
             }
         }

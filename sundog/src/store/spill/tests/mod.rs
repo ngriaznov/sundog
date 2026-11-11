@@ -8,7 +8,7 @@ use super::record::{build_header, decode_record_with_key, split_record};
 use super::rules::{
     FLUSH_QUEUE_CAPACITY, FLUSH_QUEUE_SLOTS_MAX, admission_charge, admit_permits_for,
     clamped_admission_charge, next_region_index, record_fits, record_fits_queue, record_too_large,
-    records_fitting_region, refusal_drop_reason, slot_charge_floor,
+    records_fitting_region, records_refusal, refusal_drop_reason, slot_charge_floor,
 };
 use super::*;
 
@@ -240,6 +240,18 @@ fn keeps_refused_victim_resident_combines_the_pass_policy_with_the_tier_flag() {
         !keeps_refused_victim_resident(OnRefusal::TierPolicy, false),
         "the tier's flag decides, unset"
     );
+    assert!(
+        keeps_refused_victim_resident(OnRefusal::Retry, false),
+        "a capacity retry never deletes, whatever the tier's flag"
+    );
+    assert!(keeps_refused_victim_resident(OnRefusal::Retry, true));
+}
+
+#[test]
+fn records_refusal_skips_only_a_capacity_retry() {
+    assert!(records_refusal(OnRefusal::TierPolicy));
+    assert!(records_refusal(OnRefusal::KeepResident));
+    assert!(!records_refusal(OnRefusal::Retry));
 }
 
 #[test]

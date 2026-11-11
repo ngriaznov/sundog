@@ -315,6 +315,89 @@ fn the_batch_and_single_passes_apply_the_on_refusal_policy_to_a_refused_victim()
     }
 }
 
+/// A capacity retry that a full flush queue refuses leaves the victim
+/// resident and counts nothing, on a tier that deletes as well as on one
+/// that keeps: the write that left the node over its cap counted the refusal
+/// already, and each retry after a flusher batch or a sweep would count it
+/// again.
+#[test]
+fn a_refused_capacity_retry_leaves_the_victim_resident_and_counts_no_drop() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    for (pass, batch) in [("batch", true), ("one", false)] {
+        for keep_resident in [true, false] {
+            let label = format!("retry-refused-{pass}-{keep_resident}");
+            let (engine, tier, dir, stuck) = engine_with_a_full_queue_on(&label, 50, keep_resident);
+            let bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(stuck).as_ref()));
+            let written = Written::default();
+            let outcome = if batch {
+                engine.evict_batch_sampled_with_reservation(
+                    bucket,
+                    150,
+                    None,
+                    &written,
+                    false,
+                    OnRefusal::Retry,
+                    3,
+                )
+            } else {
+                engine.evict_one_sampled_with_reservation(
+                    bucket,
+                    None,
+                    &written,
+                    OnRefusal::Retry,
+                    3,
+                )
+            };
+            let what = format!("{pass} pass, keep_resident {keep_resident}");
+            assert!(outcome.refused, "{what}");
+            assert_eq!(outcome.removed_weight, 0, "{what}");
+            assert_eq!(engine.get(&stuck, 3), Some("y".repeat(200)), "{what}");
+            assert_eq!(
+                crate::store::spill::dropped_since_last_snapshot(&snapshotter, &label),
+                std::collections::BTreeMap::new(),
+                "{what}"
+            );
+            tier.resume_flusher();
+            drop(engine);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+/// [`Engine::retry_capacity`] over a keep-resident node whose flush queue
+/// has a permit left but too few for the victim runs a pass that is refused,
+/// and the refusal counts nothing.
+#[test]
+fn retry_capacity_with_a_sliver_of_queue_room_counts_no_drop() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let label = "retry-capacity-sliver";
+    let (engine, tier, dir, stuck) = engine_with_a_full_queue(label, 50);
+    assert!(
+        tier.has_queue_room(),
+        "the fixture leaves a permit the 200-byte victim's charge does not fit"
+    );
+    let _ = crate::store::spill::dropped_since_last_snapshot(&snapshotter, label);
+
+    engine.retry_capacity(3);
+
+    assert_eq!(
+        engine.get(&stuck, 3),
+        Some("y".repeat(200)),
+        "stays resident"
+    );
+    assert_eq!(
+        crate::store::spill::dropped_since_last_snapshot(&snapshotter, label),
+        std::collections::BTreeMap::new()
+    );
+    tier.resume_flusher();
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A hand-off a promotion's eviction is admitted for can still
 /// fail at the channel, once its slots run out before the byte
 /// budget does. Nothing is deleted, the abandoned victim stays

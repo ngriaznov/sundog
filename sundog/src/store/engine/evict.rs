@@ -225,6 +225,9 @@ where
     /// Called by the flusher thread after each resolved batch and by
     /// [`Engine::sweep`], the periodic housekeeping, since a node whose
     /// refused hand-offs never reached the flusher gets no batch to wake it.
+    /// The pass runs under [`OnRefusal::Retry`]: a victim the tier refuses
+    /// again stays resident and is not counted, since the write that left
+    /// the node over its cap counted it.
     #[cfg(feature = "spill")]
     pub(super) fn retry_capacity(&self, now_ms: u64) {
         let Some(tier) = self.spill() else {
@@ -239,9 +242,12 @@ where
         ) {
             return;
         }
-        self.enforce_capacity(
+        self.evict_down_to(
+            self.max_capacity,
             self.next_pseudo_random_bucket(),
+            None,
             &mut Written::default(),
+            OnRefusal::Retry,
             now_ms,
         );
     }
