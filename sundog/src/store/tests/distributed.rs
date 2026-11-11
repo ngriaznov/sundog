@@ -677,3 +677,101 @@ fn ae_peer_filter_narrows_to_the_current_cohort() {
         );
     }
 }
+
+/// The byte count of a `Vec<u8>` of zeros whose postcard encoding makes a
+/// forward frame of exactly `limit` bytes for `cache_len` and `key_len`.
+fn zero_value_len_for_forward_frame(cache_len: usize, key_len: usize, limit: usize) -> usize {
+    (limit - 64..limit)
+        .find(|&n| {
+            let enc = postcard::to_stdvec(&vec![0u8; n]).expect("encodes").len();
+            wire::forward_frame_len(cache_len, key_len, enc) == limit
+        })
+        .expect("a value length hits the limit exactly")
+}
+
+/// A `Distributed` write leaves as a `ForwardBatch`, one forward header
+/// wider than a replicate frame: a value whose forward frame is exactly
+/// `MAX_FRAME` is accepted and its frame encodes, and one byte more gets
+/// `ValueTooLarge`.
+#[tokio::test]
+async fn a_distributed_insert_at_the_frame_cap_forwards_and_one_byte_over_is_refused() {
+    let self_node = NodeId::from(1);
+    let eligible = (1..=5u64).map(NodeId::from).collect::<Vec<_>>();
+    let residency = Arc::new(ResidencySet::new());
+    let (s, view, _tx) = distributed_shard::<u32, Vec<u8>>(self_node, eligible, 2, residency);
+    let unowned = find_key_by_ownership(&view, false);
+    let owned = find_key_by_ownership(&view, true);
+    let key_len = key_bytes(&unowned).len();
+    let len = zero_value_len_for_forward_frame(s.name().len(), key_len, MAX_FRAME);
+    let cap_len = postcard::to_stdvec(&vec![0u8; len]).expect("encodes").len();
+    assert_eq!(key_bytes(&owned).len(), key_len, "same key width");
+
+    s.insert(unowned, vec![0u8; len])
+        .await
+        .expect("a write at the cap is accepted");
+    s.insert_with_ttl(unowned, vec![0u8; len], Duration::from_mins(1))
+        .await
+        .expect("a write at the cap with a ttl is accepted");
+    s.insert_many([(unowned, vec![0u8; len])])
+        .await
+        .expect("a bulk write at the cap is accepted");
+    s.insert(owned, vec![0u8; len])
+        .await
+        .expect("an owned write at the cap is accepted");
+    let forwarded = s.fan_out_queue().drain();
+    let recs: Vec<_> = forwarded
+        .into_iter()
+        .filter_map(|item| match item {
+            FanOutItem::Forward(rec) => Some(rec),
+            FanOutItem::Applied(..) => None,
+        })
+        .collect();
+    assert_eq!(recs.len(), 3);
+    for rec in recs {
+        assert_eq!(rec.value.as_ref().map(Bytes::len), Some(cap_len));
+        let msgs = crate::net::batch_forward(&SmolStr::new(s.name()), 0, 0, vec![rec]);
+        wire::encode(&msgs[0]).expect("the forward batch of a write at the cap encodes");
+    }
+
+    let over = vec![0u8; len + 1];
+    assert!(matches!(
+        s.insert(unowned, over.clone()).await,
+        Err(CacheError::ValueTooLarge { .. })
+    ));
+    assert!(matches!(
+        s.insert_with_ttl(owned, over.clone(), Duration::from_mins(1))
+            .await,
+        Err(CacheError::ValueTooLarge { .. })
+    ));
+    assert!(matches!(
+        s.insert_many([(unowned, over.clone())]).await,
+        Err(CacheError::ValueTooLarge { .. })
+    ));
+    assert!(matches!(
+        s.merge(unowned, over.clone()).await,
+        Err(CacheError::ValueTooLarge { .. })
+    ));
+    assert!(matches!(
+        s.merge_with_ttl(owned, over, Duration::from_mins(1)).await,
+        Err(CacheError::ValueTooLarge { .. })
+    ));
+}
+
+/// The other modes send a replicate frame, so their cap on a value is
+/// unchanged: a value whose replicate frame is exactly `MAX_FRAME` is stored.
+#[tokio::test]
+async fn a_replicated_insert_keeps_the_replicate_frame_cap() {
+    let s = shard::<u32, Vec<u8>>(1);
+    let key_len = key_bytes(&1u32).len();
+    let len = (MAX_FRAME - 64..MAX_FRAME)
+        .find(|&n| {
+            let enc = postcard::to_stdvec(&vec![0u8; n]).expect("encodes").len();
+            wire::replicate_frame_len(s.name().len(), key_len, enc) == MAX_FRAME
+        })
+        .expect("a value length hits MAX_FRAME exactly");
+    s.insert(1, vec![0u8; len]).await.expect("at the cap");
+    assert!(matches!(
+        s.insert(2, vec![0u8; len + 1]).await,
+        Err(CacheError::ValueTooLarge { .. })
+    ));
+}

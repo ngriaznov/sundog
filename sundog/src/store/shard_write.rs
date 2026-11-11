@@ -237,6 +237,22 @@ where
         refused.map_or(Ok(()), |size| Err(self.merge_too_large(size)))
     }
 
+    /// The frame a write of `value_len` encoded bytes under a key of
+    /// `key_len` bytes travels in, the length the `ValueTooLarge` gates hold
+    /// to [`Shard::with_max_frame`]. A `Mode::Distributed` write can leave as
+    /// a forward, which always goes out as a [`wire::Msg::ForwardBatch`] and
+    /// is one forward header wider than a replicate frame
+    /// ([`wire::forward_frame_len`]); every other mode sends a replicate
+    /// frame ([`wire::replicate_frame_len`]).
+    pub(super) fn write_frame_len(&self, key_len: usize, value_len: usize) -> usize {
+        let frame_len = if matches!(self.mode, super::Mode::Distributed { .. }) {
+            wire::forward_frame_len
+        } else {
+            wire::replicate_frame_len
+        };
+        frame_len(self.name.len(), key_len, value_len)
+    }
+
     /// Whether this shard's own current ownership view owns `key_bytes`'
     /// part. `true` unconditionally for every mode but `Mode::Distributed`,
     /// which has no [`OwnershipTracker`] attached at all: every other mode
@@ -364,7 +380,10 @@ where
     ///
     /// Returns [`CacheError::ValueTooLarge`] if the wire frame this write would
     /// replicate as exceeds the configured frame cap. See
-    /// [`Shard::with_max_frame`], default [`MAX_FRAME`]. Under a merging
+    /// [`Shard::with_max_frame`], default [`MAX_FRAME`]. Under
+    /// `Mode::Distributed` the frame is the forward batch a write travels in
+    /// to the bucket's owners, one forward header (9 bytes) wider than a
+    /// replicate frame, so the cap on a value is that much lower. Under a merging
     /// resolver, a write that merges into a stored value is refused as
     /// [`Shard::merge`] is, when the merged value would pass the cap and be
     /// larger than the stored one. Returns
@@ -401,7 +420,7 @@ where
         let encoded = Bytes::from(postcard::to_stdvec(&value).map_err(CodecError::from)?);
         let ver = self.stamp_local();
         let expires_at_ms = self.expiry_for(ver.wall_ms, ttl);
-        let wire_size = wire::replicate_frame_len(self.name.len(), key_bytes.len(), encoded.len());
+        let wire_size = self.write_frame_len(key_bytes.len(), encoded.len());
         if wire_size > self.max_frame {
             return Err(CacheError::ValueTooLarge {
                 cache: self.name.clone(),
@@ -520,8 +539,7 @@ where
             };
             let ver = self.stamp_local();
             let expires_at_ms = self.expiry_for(ver.wall_ms, ttl);
-            let wire_size =
-                wire::replicate_frame_len(self.name.len(), key_bytes.len(), encoded.len());
+            let wire_size = self.write_frame_len(key_bytes.len(), encoded.len());
             if wire_size > self.max_frame {
                 failure = Some(CacheError::ValueTooLarge {
                     cache: self.name.clone(),

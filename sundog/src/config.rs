@@ -224,7 +224,9 @@ pub struct ClusterConfig {
     /// would not fit one frame fails with
     /// [`CacheError::ValueTooLarge`](crate::error::CacheError::ValueTooLarge),
     /// and so does a merge that would leave a value past the cap and larger
-    /// than it was; a merge from a peer that would is refused and counted in
+    /// than it was. Under `Mode::Distributed` a record travels in a forward
+    /// batch, 9 bytes wider than a replicate frame, and the cap counts that
+    /// width. A merge from a peer that would is refused and counted in
     /// `sundog_merge_refused_total`. Keep it equal on every node: a node under
     /// a smaller cap refuses a merged value a node under a larger one
     /// builds.

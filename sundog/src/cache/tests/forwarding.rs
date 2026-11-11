@@ -320,3 +320,55 @@ async fn a_forward_batch_under_a_stale_view_reaches_the_owner_the_writer_missed(
     b.shutdown().await;
     a.shutdown().await;
 }
+
+/// A write whose `ForwardBatch` frame is exactly `MAX_FRAME` is accepted
+/// and reaches an owner; one byte more gets `ValueTooLarge`.
+#[tokio::test]
+async fn a_distributed_write_at_the_frame_cap_reaches_an_owner() {
+    let ((a, cache_a), (b, cache_b), (c, cache_c), unowned) =
+        three_node_distributed("distributed-frame-cap", "frame-cap").await;
+    let key_len = encode_key(&unowned).expect("u32 encodes").len();
+    let len = (crate::wire::MAX_FRAME - 256..crate::wire::MAX_FRAME)
+        .find(|&n| {
+            crate::wire::forward_frame_len("frame-cap".len(), key_len, n + 4)
+                == crate::wire::MAX_FRAME
+        })
+        .expect("a length hits the cap");
+    let value = "x".repeat(len);
+    assert_eq!(
+        postcard::to_stdvec(&value).expect("encodes").len(),
+        len + 4,
+        "a string this long carries a four-byte length"
+    );
+
+    cache_a
+        .insert(unowned, value.clone())
+        .await
+        .expect("a write at the cap is accepted");
+    assert!(matches!(
+        cache_a.insert(unowned, "x".repeat(len + 1)).await,
+        Err(CacheError::ValueTooLarge { .. })
+    ));
+    assert!(matches!(
+        cache_a
+            .insert_with_ttl(unowned, "x".repeat(len + 1), Duration::from_mins(1))
+            .await,
+        Err(CacheError::ValueTooLarge { .. })
+    ));
+    wait_until(
+        Duration::from_secs(30),
+        "an owner holds the value",
+        async || {
+            cache_b.get(&unowned).await.as_deref() == Some(value.as_str())
+                || cache_c.get(&unowned).await.as_deref() == Some(value.as_str())
+        },
+    )
+    .await;
+
+    cache_a.close().await;
+    cache_b.close().await;
+    cache_c.close().await;
+    a.shutdown().await;
+    b.shutdown().await;
+    c.shutdown().await;
+}

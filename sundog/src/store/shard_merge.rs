@@ -24,10 +24,11 @@ use super::{
 };
 use crate::error::{CacheError, CodecError};
 use crate::hlc::Hlc;
-use crate::wire;
 
 #[cfg(doc)]
 use super::{BUCKET_COUNT, ConflictResolver, Event, Mode};
+#[cfg(doc)]
+use crate::wire;
 
 /// The epoch millisecond at which a [`Shard::merge`] coalescing window
 /// opened at `started_at_ms` must flush. Pure so the scheduling math behind
@@ -167,8 +168,9 @@ where
     ///
     /// A merged value stays within one frame. The value a call passes must
     /// fit the configured frame cap ([`Shard::with_max_frame`],
-    /// [`wire::MAX_FRAME`] by default) as a replicate frame, as it must for
-    /// [`Shard::insert`]. A merge whose result would pass the cap, counted as
+    /// [`wire::MAX_FRAME`] by default) as a frame, as it must for
+    /// [`Shard::insert`], which counts a `Mode::Distributed` write as a forward
+    /// batch. A merge whose result would pass the cap, counted as
     /// the forward an owner sends its co-owners, and be larger than the value
     /// it replaces is refused and changes nothing. A result that is the
     /// call's own value, as over a lapsed value or under a resolver that
@@ -389,12 +391,13 @@ where
     }
 
     /// `Err(CacheError::ValueTooLarge)` when a value of `value_len` encoded
-    /// bytes under a key of `key_len` bytes would travel as a replicate frame
-    /// over the cap, the frame [`Shard::insert`] counts for the value it is
-    /// given. Only a merged result is counted as the wider forward frame
-    /// ([`wire::forward_frame_len`]); see [`MergeCap`](super::engine::MergeCap).
+    /// bytes under a key of `key_len` bytes would travel in a frame over the
+    /// cap, the frame [`Shard::insert`] counts for the value it is given
+    /// ([`Shard::write_frame_len`]). A merged result is counted as the wider
+    /// forward frame in every mode ([`wire::forward_frame_len`]); see
+    /// [`MergeCap`](super::engine::MergeCap).
     fn check_value_frame(&self, key_len: usize, value_len: usize) -> Result<(), CacheError> {
-        let wire_size = wire::replicate_frame_len(self.name.len(), key_len, value_len);
+        let wire_size = self.write_frame_len(key_len, value_len);
         if wire_size > self.max_frame {
             return Err(CacheError::ValueTooLarge {
                 cache: self.name.clone(),
