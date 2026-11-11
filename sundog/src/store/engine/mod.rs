@@ -1016,8 +1016,27 @@ where
         removed: &RemovedLive,
         keep_count: bool,
     ) {
+        self.fold_removed_digest(bucket, part, key_bytes, removed);
+        self.account_removed_totals(removed, keep_count);
+    }
+
+    /// XORs a [`RemovedLive`]'s fingerprint out of its part digest. A caller
+    /// holds the entry's stripe guard across this, so a release of the part,
+    /// which zeroes the digest under the same guard, cannot interleave.
+    fn fold_removed_digest(
+        &self,
+        bucket: usize,
+        part: usize,
+        key_bytes: &[u8],
+        removed: &RemovedLive,
+    ) {
         self.digest[digest_slot(bucket, part)]
             .fetch_xor(entry_fingerprint(key_bytes, removed.ver), Ordering::Relaxed);
+    }
+
+    /// [`Engine::account_removed`] less the digest: weight, count and spill
+    /// bookkeeping, which a caller may apply after dropping the stripe guard.
+    fn account_removed_totals(&self, removed: &RemovedLive, keep_count: bool) {
         self.total_weight
             .fetch_sub(u64::from(removed.weight), Ordering::Relaxed);
         if !keep_count {

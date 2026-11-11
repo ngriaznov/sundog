@@ -126,14 +126,16 @@ where
                 if let Some(exp) = expires_at_ms {
                     stripe.next_expiry_ms = stripe.next_expiry_ms.min(exp);
                 }
+                // Under the guard, so a release of the part cannot zero the
+                // digest between the insert and this XOR.
+                self.digest[digest_slot(stripe_idx, part)].fetch_xor(
+                    entry_fingerprint(key_bytes.as_ref(), ver),
+                    Ordering::Relaxed,
+                );
                 true
             }
         };
         if inserted {
-            self.digest[digest_slot(stripe_idx, part)].fetch_xor(
-                entry_fingerprint(key_bytes.as_ref(), ver),
-                Ordering::Relaxed,
-            );
             self.live_count.fetch_add(1, Ordering::Relaxed);
             self.note_spill_arrival();
         }

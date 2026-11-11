@@ -222,3 +222,50 @@ fn release_buckets_skips_a_bucket_at_or_past_bucket_count_and_returns_zero() {
         "an out-of-range bucket touches nothing"
     );
 }
+
+/// A local removal folds its digest change in under the stripe guard, so a
+/// release of its bucket that runs alongside leaves every part digest at
+/// zero and the digests equal to a recompute from the (empty) contents.
+#[test]
+fn a_release_racing_local_invalidation_leaves_the_released_bucket_digest_zero() {
+    use std::sync::Barrier;
+
+    let engine = engine_u32_string(u64::MAX, None);
+    let (_, _, bucket) = same_bucket_pair(100_000);
+    let bucket_u16 = u16::try_from(bucket).expect("invariant: bucket < BUCKET_COUNT");
+    let keys: Vec<u32> = (1..2_000_000u32)
+        .filter(|&k| stripe_index_from_hash(hash_key_bytes(key_bytes(k).as_ref())) == bucket)
+        .take(64)
+        .collect();
+    assert_eq!(keys.len(), 64);
+
+    for iteration in 0..3_000 {
+        for &k in &keys {
+            let _ = put(&engine, k, key_bytes(k), "v".into(), hlc(1, 1), None, 0);
+        }
+        let barrier = Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                for &k in &keys {
+                    let kb = key_bytes(k);
+                    engine.invalidate_local(kb.as_ref(), hash_key_bytes(kb.as_ref()));
+                }
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                std::thread::yield_now();
+                engine.release_buckets(&[bucket_u16]);
+            });
+        });
+        let slots: Vec<u64> = (0..PART_COUNT)
+            .map(|part| engine.digest[digest_slot(bucket, part)].load(Ordering::Relaxed))
+            .collect();
+        assert!(
+            slots.iter().all(|&d| d == 0),
+            "iteration {iteration}: empty released bucket has nonzero part digests {slots:?}"
+        );
+        assert_eq!(engine.digests(), engine.recompute_digests_paired());
+        assert_eq!(engine.debug_totals(), (0, 0), "iteration {iteration}");
+    }
+}

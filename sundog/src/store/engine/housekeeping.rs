@@ -418,12 +418,14 @@ where
                     stripe.long_ttl.remove(key_bytes);
                 }
             }
+            // Under the guard, so a release of the part cannot zero the
+            // digest between the swap above and this XOR.
+            self.digest[digest_slot(bucket, part)].fetch_xor(
+                entry_fingerprint(key_bytes, expected_ver) ^ entry_fingerprint(key_bytes, new_ver),
+                Ordering::Relaxed,
+            );
             (old_weight, new_weight)
         };
-        self.digest[digest_slot(bucket, part)].fetch_xor(
-            entry_fingerprint(key_bytes, expected_ver) ^ entry_fingerprint(key_bytes, new_ver),
-            Ordering::Relaxed,
-        );
         self.total_weight
             .fetch_add(u64::from(new_weight), Ordering::Relaxed);
         self.total_weight

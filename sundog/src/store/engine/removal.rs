@@ -49,10 +49,11 @@ where
             return None;
         }
         let removed = remove_live(&mut stripe, hash, key_bytes)?;
+        let part = part_index_from_hash(hash);
+        self.fold_removed_digest(bucket, part, key_bytes, &removed);
         drop(stripe);
         let ver_out = removed.ver;
-        let part = part_index_from_hash(hash);
-        self.account_removed(bucket, part, key_bytes, &removed, false);
+        self.account_removed_totals(&removed, false);
         Some(ver_out)
     }
 
@@ -67,9 +68,10 @@ where
             inflight.invalidated.store(true, Ordering::Relaxed);
         }
         if let Some(removed) = remove_live(&mut stripe, hash, key_bytes) {
-            drop(stripe);
             let part = part_index_from_hash(hash);
-            self.account_removed(bucket, part, key_bytes, &removed, false);
+            self.fold_removed_digest(bucket, part, key_bytes, &removed);
+            drop(stripe);
+            self.account_removed_totals(&removed, false);
         }
     }
 
@@ -109,6 +111,11 @@ where
                 stripe.tombstones.clear();
                 stripe.long_ttl.clear();
                 stripe.next_expiry_ms = u64::MAX;
+                // Zeroed under the guard: a removal folds its digest change
+                // in under the same guard, so none lands after this store.
+                for part in 0..PART_COUNT {
+                    self.digest[digest_slot(bucket_idx, part)].store(0, Ordering::Relaxed);
+                }
                 (
                     removed_weight,
                     removed_live,
@@ -116,9 +123,6 @@ where
                     removed_spilled,
                 )
             };
-            for part in 0..PART_COUNT {
-                self.digest[digest_slot(bucket_idx, part)].store(0, Ordering::Relaxed);
-            }
             if removed_weight > 0 {
                 self.total_weight
                     .fetch_sub(removed_weight, Ordering::Relaxed);
@@ -174,6 +178,12 @@ where
                 stripe.tombstones.retain(|key, _| !released(key));
                 let removed_tombstones = before - stripe.tombstones.len();
                 stripe.long_ttl.retain(|key, _| !released(key));
+                // Zeroed under the guard, as in `release_buckets`.
+                for part in 0..PART_COUNT {
+                    if mask & (1u64 << part) != 0 {
+                        self.digest[digest_slot(bucket_idx, part)].store(0, Ordering::Relaxed);
+                    }
+                }
                 (
                     removed_weight,
                     removed_live,
@@ -181,11 +191,6 @@ where
                     removed_spilled,
                 )
             };
-            for part in 0..PART_COUNT {
-                if mask & (1u64 << part) != 0 {
-                    self.digest[digest_slot(bucket_idx, part)].store(0, Ordering::Relaxed);
-                }
-            }
             if removed_weight > 0 {
                 self.total_weight
                     .fetch_sub(removed_weight, Ordering::Relaxed);
