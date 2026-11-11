@@ -24,6 +24,19 @@ pub(super) fn arena_growth(len: usize) -> usize {
     (len / 4).max(ARENA_MIN_GROWTH)
 }
 
+/// The hash a stripe's index is probed with, given the key hash every
+/// caller passes. A stripe holds the keys whose hash agrees on the low
+/// bits that pick the stripe, and the index starts a probe from the low bits
+/// of the hash it gets, so the unmixed hash would start every key of a stripe
+/// from a few positions. Rotating by 32 moves the high half, which no
+/// stripe or part selection reads, into those bits and keeps all 64 bits in
+/// play, so the index's control tag (its top 7 bits) stays well spread. The
+/// slab applies this at every index operation, including the rehash on a
+/// resize; callers pass the unmixed hash. The index lives in memory only.
+pub(super) fn index_hash(hash: u64) -> u64 {
+    hash.rotate_right(32)
+}
+
 /// The fewest slots [`arena_growth`] adds, so a small stripe does not
 /// reallocate on every insert.
 pub(super) const ARENA_MIN_GROWTH: usize = 4;
@@ -85,7 +98,9 @@ impl<K, V> Slab<K, V> {
         mut eq: impl FnMut(&Live<K, V>) -> bool,
     ) -> Option<&Live<K, V>> {
         let entries = &self.entries;
-        let &slot = self.index.find(hash, |&i| eq(&entries[i as usize]))?;
+        let &slot = self
+            .index
+            .find(index_hash(hash), |&i| eq(&entries[i as usize]))?;
         Some(&self.entries[slot as usize])
     }
 
@@ -96,7 +111,9 @@ impl<K, V> Slab<K, V> {
         mut eq: impl FnMut(&Live<K, V>) -> bool,
     ) -> Option<&mut Live<K, V>> {
         let entries = &self.entries;
-        let slot = *self.index.find(hash, |&i| eq(&entries[i as usize]))?;
+        let slot = *self
+            .index
+            .find(index_hash(hash), |&i| eq(&entries[i as usize]))?;
         Some(&mut self.entries[slot as usize])
     }
 
@@ -114,7 +131,7 @@ impl<K, V> Slab<K, V> {
         let found = {
             let entries = &self.entries;
             self.index
-                .find(hash, |&i| eq(&entries[i as usize]))
+                .find(index_hash(hash), |&i| eq(&entries[i as usize]))
                 .copied()
         };
         match found {
@@ -150,8 +167,9 @@ impl<K, V> Slab<K, V> {
         }
         self.entries.push(value);
         let entries = &self.entries;
-        self.index
-            .insert_unique(hash, slot, |&i| hasher(&entries[i as usize]));
+        self.index.insert_unique(index_hash(hash), slot, |&i| {
+            index_hash(hasher(&entries[i as usize]))
+        });
         slot
     }
 
@@ -186,7 +204,7 @@ impl<K, V> Slab<K, V> {
         let slot_u32 = u32::try_from(slot).expect("slot is a valid arena index, so it fits a u32");
         let index_row = self
             .index
-            .find_entry(hash, |&i| i == slot_u32)
+            .find_entry(index_hash(hash), |&i| i == slot_u32)
             .expect("remove_at is only called for a slot this slab's index still names");
         index_row.remove();
         let last = self.entries.len() - 1;
@@ -200,7 +218,7 @@ impl<K, V> Slab<K, V> {
                 u32::try_from(last).expect("last is a valid arena index, so it fits a u32");
             let moved_row = self
                 .index
-                .find_mut(moved_hash, |&i| i == last_u32)
+                .find_mut(index_hash(moved_hash), |&i| i == last_u32)
                 .expect("the entry swapped into `slot` still has its own index row at `last`");
             *moved_row = slot_u32;
         }
@@ -246,7 +264,8 @@ impl<K, V> Slab<K, V> {
     pub(super) fn shrink_to_fit(&mut self, hasher: impl Fn(&Live<K, V>) -> u64) {
         self.entries.shrink_to_fit();
         let entries = &self.entries;
-        self.index.shrink_to_fit(|&i| hasher(&entries[i as usize]));
+        self.index
+            .shrink_to_fit(|&i| index_hash(hasher(&entries[i as usize])));
     }
 }
 

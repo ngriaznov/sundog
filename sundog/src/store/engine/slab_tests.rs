@@ -2,7 +2,7 @@
 
 use super::expiry::NEVER_EXPIRES;
 use super::record::{build_resident_record, decode_key, record_value};
-use super::slab::{ARENA_MIN_GROWTH, arena_growth};
+use super::slab::{ARENA_MIN_GROWTH, arena_growth, index_hash};
 use super::*;
 
 fn key_bytes(key: u32) -> Bytes {
@@ -345,5 +345,60 @@ fn slab_random_permutation_insert_remove_matches_a_hashmap_mirror() {
             .find(hash_of(k), eq_for(k))
             .expect("shrink_to_fit must not drop or misplace a surviving entry");
         assert_eq!(record_value(&found.record), [v]);
+    }
+}
+
+/// Keys of one stripe agree on the low hash bits the stripe is chosen by;
+/// the hash the index is probed with spreads them over its probe starts.
+#[test]
+fn a_stripes_keys_spread_over_the_index_probe_starts() {
+    use std::collections::HashSet;
+
+    let hashes: Vec<u64> = (0u32..)
+        .map(hash_of)
+        .filter(|&h| stripe_index_from_hash(h) == 0)
+        .take(4000)
+        .collect();
+    // hashbrown probes from `hash & bucket_mask`; a 2048-bucket table.
+    let starts: HashSet<u64> = hashes.iter().map(|&h| index_hash(h) & 2047).collect();
+    assert!(
+        starts.len() >= 1000,
+        "got {} distinct starts in 2048 buckets for 4000 same-stripe keys",
+        starts.len()
+    );
+    let unmixed: HashSet<u64> = hashes.iter().map(|&h| h & 2047).collect();
+    assert!(
+        unmixed.len() <= 2,
+        "control: the unmixed hash starts a stripe's keys from {} positions",
+        unmixed.len()
+    );
+}
+
+/// A slab of same-stripe keys finds, removes and shrinks through the
+/// mixed index hash: every insert, lookup, swap-remove repoint and resize
+/// agrees on it.
+#[test]
+fn slab_with_same_stripe_keys_finds_removes_and_shrinks_consistently() {
+    let keys: Vec<u32> = (0u32..)
+        .filter(|&k| stripe_index_from_hash(hash_of(k)) == 0)
+        .take(3000)
+        .collect();
+    let mut slab = Slab::<u32, Vec<u8>>::new();
+    for &k in &keys {
+        slab.insert_unique(hash_of(k), live_for(k, &[1]), hasher_for);
+    }
+    for &k in &keys {
+        assert!(slab.find(hash_of(k), eq_for(k)).is_some(), "key {k}");
+    }
+    for &k in keys.iter().step_by(2) {
+        assert!(slab.remove(hash_of(k), eq_for(k), hasher_for).is_some());
+    }
+    slab.shrink_to_fit(hasher_for);
+    for (i, &k) in keys.iter().enumerate() {
+        assert_eq!(
+            slab.find(hash_of(k), eq_for(k)).is_some(),
+            i % 2 == 1,
+            "key {k}"
+        );
     }
 }
