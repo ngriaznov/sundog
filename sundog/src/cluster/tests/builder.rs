@@ -513,7 +513,6 @@ async fn a_cluster_built_with_tls_before_config_runs_tls() {
     cluster.shutdown().await;
 }
 
-
 /// Every timing and detector setting that cannot drive a working cluster
 /// fails `build()` with an `InvalidConfig` that names the setting.
 #[tokio::test]
@@ -618,4 +617,3 @@ async fn build_accepts_a_discovery_with_a_zero_interval() {
         .expect("a zero interval is raised to the floor, not a panic");
     cluster.shutdown().await;
 }
-

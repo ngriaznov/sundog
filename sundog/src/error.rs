@@ -36,7 +36,12 @@ pub enum CodecError {
 /// Errors from forming, joining, or maintaining cluster membership.
 #[derive(Debug, thiserror::Error)]
 pub enum JoinError {
-    /// No discovery source produced any candidate address before its deadline.
+    /// Never returned. `ClusterBuilder::build` succeeds as a single-node
+    /// cluster when no discovery source produces a candidate address.
+    #[deprecated(
+        since = "0.6.11",
+        note = "never returned; `build()` succeeds as a single-node cluster when no seed answers"
+    )]
     #[error("no seed peers discovered before the join deadline")]
     NoSeedsFound,
     /// Binding the gossip or data-plane listening socket failed.
@@ -51,7 +56,12 @@ pub enum JoinError {
     /// The membership backend failed to start or reported a fatal error.
     #[error("membership backend failed")]
     Membership(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
-    /// A zeroconf announce/browse operation failed.
+    /// Never returned. A failed zeroconf announce is logged and `build()`
+    /// continues as a single-node cluster.
+    #[deprecated(
+        since = "0.6.11",
+        note = "never returned; a failed announce is logged and `build()` continues"
+    )]
     #[error("discovery error")]
     Discovery(#[source] io::Error),
     /// A [`crate::config::ClusterConfig`] field fails validation, or
@@ -159,7 +169,12 @@ pub enum CacheError {
     /// Encoding or decoding a key or value for the wire failed.
     #[error(transparent)]
     Codec(#[from] CodecError),
-    /// State transfer for a newly opened cache failed.
+    /// Never returned. A state transfer that fails or runs out of
+    /// `state_transfer_budget` opens the cache cold or with a partial copy.
+    #[deprecated(
+        since = "0.6.11",
+        note = "never returned; a failed or timed-out state transfer opens the cache cold or partial"
+    )]
     #[error("state transfer from donor {donor} failed")]
     StateTransfer {
         /// The node the transfer pulled from.
@@ -345,5 +360,26 @@ mod tests {
             cache: SmolStr::new("prices"),
         };
         assert!(err.to_string().contains("prices"));
+    }
+
+    #[test]
+    #[allow(
+        deprecated,
+        reason = "pins the text of variants kept for compatibility"
+    )]
+    fn deprecated_variants_keep_their_display_text() {
+        assert_eq!(
+            JoinError::NoSeedsFound.to_string(),
+            "no seed peers discovered before the join deadline"
+        );
+        assert_eq!(
+            JoinError::Discovery(io::Error::other("x")).to_string(),
+            "discovery error"
+        );
+        let err = CacheError::StateTransfer {
+            donor: NodeId::random(),
+            source: "x".into(),
+        };
+        assert!(err.to_string().contains("state transfer"));
     }
 }
