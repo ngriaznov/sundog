@@ -103,9 +103,14 @@ const REPAIR_BATCH_KEY_BYTES: usize = 512 * 1024;
 /// A jittered delay around `interval`, uniformly in `[0.5, 1.5) * interval`
 /// and floored at 1ms, so anti-entropy rounds don't land in lockstep.
 fn jittered(interval: Duration) -> Duration {
+    scaled(interval, rand::rng().random_range(0.5..1.5))
+}
+
+/// `interval` times `factor`, floored at 1ms and saturating at
+/// `Duration::MAX` where the product overflows a `Duration`.
+fn scaled(interval: Duration, factor: f64) -> Duration {
     let base = interval.max(Duration::from_millis(1)).as_secs_f64();
-    let factor = rand::rng().random_range(0.5..1.5);
-    Duration::from_secs_f64((base * factor).max(0.001))
+    Duration::try_from_secs_f64((base * factor).max(0.001)).unwrap_or(Duration::MAX)
 }
 
 /// Rounds in a row the scheduler leaves a streaming peer alone before

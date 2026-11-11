@@ -596,3 +596,14 @@ fn seeds_env_names_no_seed_only_for_a_nonblank_value_without_an_address() {
     assert!(!seeds_env_names_no_seed(Some("")));
     assert!(!seeds_env_names_no_seed(None));
 }
+
+#[test]
+fn leave_deadline_adds_the_budget_and_caps_an_unbounded_one() {
+    let now = tokio::time::Instant::now();
+    assert_eq!(
+        leave_deadline(now, Duration::from_secs(20)),
+        now + Duration::from_secs(20)
+    );
+    assert_eq!(leave_deadline(now, Duration::ZERO), now);
+    assert_eq!(leave_deadline(now, Duration::MAX), now + FAR_FUTURE);
+}

@@ -276,3 +276,19 @@ async fn cache_handle_survives_shutdown_without_panicking() {
         .expect("a local insert after shutdown neither errors nor panics");
     assert_eq!(cache.get(&1).await, Some("still local".to_string()));
 }
+
+#[tokio::test]
+async fn shutdown_completes_with_an_unbounded_state_transfer_budget() {
+    let cluster = Cluster::builder("solo-budget-max")
+        .seeds(std::iter::empty())
+        .config(ClusterConfig {
+            state_transfer_budget: Duration::MAX,
+            ..loopback_config()
+        })
+        .build()
+        .await
+        .expect("build succeeds");
+    tokio::time::timeout(Duration::from_secs(10), cluster.shutdown())
+        .await
+        .expect("shutdown completes");
+}

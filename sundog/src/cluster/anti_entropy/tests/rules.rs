@@ -317,3 +317,18 @@ fn a_repair_tally_counts_each_chunk_as_it_moves() {
     assert_eq!(repaired(), 2, "the second chunk counts its own records");
     assert_eq!(tally.repaired, 5);
 }
+
+#[test]
+fn jittered_saturates_instead_of_panicking_at_duration_max() {
+    for _ in 0..200 {
+        assert!(jittered(Duration::MAX) >= Duration::from_secs(u64::MAX / 4));
+    }
+    assert_eq!(scaled(Duration::MAX, 1.5), Duration::MAX);
+    assert_eq!(scaled(Duration::MAX, 1.0), Duration::MAX);
+}
+
+#[test]
+fn scaled_floors_at_one_millisecond_and_scales_in_range() {
+    assert_eq!(scaled(Duration::ZERO, 0.5), Duration::from_millis(1));
+    assert_eq!(scaled(Duration::from_secs(10), 0.5), Duration::from_secs(5));
+}

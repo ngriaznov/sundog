@@ -688,7 +688,10 @@ impl Cluster {
     /// ([`hand_off_step`]). Parts still diverging when a group ends log at
     /// `warn`.
     async fn hand_off_before_leaving(&self) {
-        let overall = tokio::time::Instant::now() + self.config().state_transfer_budget;
+        let overall = leave_deadline(
+            tokio::time::Instant::now(),
+            self.config().state_transfer_budget,
+        );
         let live: HashSet<NodeId> = self.live_peer_ids().into_iter().collect();
         let shards: Vec<(SmolStr, Arc<dyn ShardOps>)> = self
             .inner
@@ -760,6 +763,17 @@ struct HandOffGroup<S> {
     shard: S,
     peer: NodeId,
     parts: Vec<PartId>,
+}
+
+/// How far past `now` a leave hand-off deadline lies when the budget is too
+/// long to add to an `Instant`: about thirty years, as far as `tokio` places
+/// its own far-future timers.
+const FAR_FUTURE: Duration = Duration::from_hours(24 * 365 * 30);
+
+/// The instant `budget` after `now`; a budget too long for an `Instant`
+/// (`Duration::MAX` reads as unbounded) ends [`FAR_FUTURE`] after `now`.
+fn leave_deadline(now: tokio::time::Instant, budget: Duration) -> tokio::time::Instant {
+    now.checked_add(budget).unwrap_or_else(|| now + FAR_FUTURE)
 }
 
 /// The deadline of the group about to start, one of `groups_left` including
