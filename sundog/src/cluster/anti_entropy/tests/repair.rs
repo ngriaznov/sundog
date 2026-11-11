@@ -461,3 +461,68 @@ async fn apply_repairs_counts_no_pulled_record_the_receiver_refuses() {
     cluster_a.shutdown().await;
     cluster_b.shutdown().await;
 }
+
+/// The dirty-peer hint is per cache: one cache's scheduler picking first
+/// leaves the mark for the cache whose overflow set it.
+#[cfg(not(feature = "sim"))]
+#[tokio::test]
+async fn a_dirty_peer_is_targeted_first_by_every_cache_not_only_the_first_to_pick() {
+    use crate::cluster::test_support::{loopback_config, registered_shard, wait_for_peer_count};
+    use crate::store::Mode;
+
+    let config = crate::config::ClusterConfig {
+        ae_interval: Duration::from_secs(3600),
+        tombstone_ttl: Duration::from_secs(3600 * 4),
+        ..loopback_config()
+    };
+    let cluster_a = Cluster::builder("cluster-it-dirty-hint")
+        .seeds(std::iter::empty())
+        .config(config.clone())
+        .build()
+        .await
+        .expect("node a builds");
+    for name in ["cache-a", "cache-b"] {
+        cluster_a
+            .cache::<u32, String>(name)
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("opens");
+    }
+    let gossip_a = cluster_a.inner.membership.local_peer().gossip_addr;
+    let cluster_b = Cluster::builder("cluster-it-dirty-hint")
+        .seeds([gossip_a])
+        .config(config)
+        .build()
+        .await
+        .expect("node b builds");
+    wait_for_peer_count(&cluster_a, 1).await;
+    let node_b = cluster_b.node_id();
+    let (name_a, name_b) = (SmolStr::new("cache-a"), SmolStr::new("cache-b"));
+    let shard_a = registered_shard(&cluster_a, &name_a);
+    let shard_b = registered_shard(&cluster_a, &name_b);
+    let watch_a = cluster_a.mesh().watch_dirty(&name_a);
+    let watch_b = cluster_a.mesh().watch_dirty(&name_b);
+    cluster_a.mesh().mark_dirty(node_b);
+    let live = cluster_a.live_peer_ids();
+
+    // Cache b's scheduler wakes first and takes the mark for itself.
+    assert_eq!(
+        pick_peer(&cluster_a, &shard_b, &name_b, live.clone()),
+        Some((node_b, true))
+    );
+    // Cache a overflowed too: its own pick still sees the mark.
+    assert_eq!(
+        pick_peer(&cluster_a, &shard_a, &name_a, live.clone()),
+        Some((node_b, true)),
+        "cache a's scheduler targets the dirty peer, not a random live one"
+    );
+    // Both consumed theirs: the next pick is a plain live one.
+    assert_eq!(
+        pick_peer(&cluster_a, &shard_a, &name_a, live),
+        Some((node_b, false))
+    );
+    drop((watch_a, watch_b));
+    cluster_a.shutdown().await;
+    cluster_b.shutdown().await;
+}

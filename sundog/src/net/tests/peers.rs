@@ -1360,3 +1360,117 @@ fn a_removal_owes_a_repair_for_queued_frames_or_an_existing_mark() {
         departed + DEPARTED_DIRTY_WINDOW + Duration::from_millis(1)
     ));
 }
+
+/// A mesh with a peer 2 that never answers, and one watch per `caches`.
+async fn mesh_with_watches(caches: &[&str]) -> (Mesh, Vec<crate::net::mesh::DirtyWatch>) {
+    let (mesh, _inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+    mesh.update_peers(vec![peer_at(
+        NodeId::from(2),
+        SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 1)),
+    )]);
+    let watches = caches
+        .iter()
+        .map(|cache| mesh.watch_dirty(&SmolStr::new(cache)))
+        .collect();
+    (mesh, watches)
+}
+
+#[tokio::test]
+async fn every_watching_cache_takes_a_dirty_mark_once_whoever_asks_first() {
+    let (mesh, _watches) = mesh_with_watches(&["a", "b"]).await;
+    mesh.mark_dirty(NodeId::from(2));
+
+    assert_eq!(mesh.take_dirty_peers_for("b"), vec![NodeId::from(2)]);
+    assert_eq!(
+        mesh.take_dirty_peers_for("a"),
+        vec![NodeId::from(2)],
+        "cache b taking its mark leaves cache a's"
+    );
+    assert!(mesh.take_dirty_peers_for("a").is_empty(), "taken once");
+    assert!(mesh.take_dirty_peers_for("b").is_empty(), "taken once");
+}
+
+#[tokio::test]
+async fn a_cache_nobody_watches_gets_no_mark_and_leaves_the_marks_in_place() {
+    let (mesh, _watches) = mesh_with_watches(&["a"]).await;
+    mesh.mark_dirty(NodeId::from(2));
+
+    assert!(mesh.take_dirty_peers_for("stranger").is_empty());
+    assert_eq!(
+        mesh.take_dirty_peers_for("a"),
+        vec![NodeId::from(2)],
+        "the stranger's call took nothing from the handle"
+    );
+}
+
+#[tokio::test]
+async fn mark_dirty_for_returns_a_peer_to_one_cache_only() {
+    let (mesh, _watches) = mesh_with_watches(&["a", "b"]).await;
+    mesh.mark_dirty(NodeId::from(2));
+    assert_eq!(mesh.take_dirty_peers_for("a"), vec![NodeId::from(2)]);
+    assert_eq!(mesh.take_dirty_peers_for("b"), vec![NodeId::from(2)]);
+
+    mesh.mark_dirty_for("a", NodeId::from(2));
+    mesh.mark_dirty_for("a", NodeId::from(42));
+    mesh.mark_dirty_for("stranger", NodeId::from(2));
+
+    assert!(mesh.take_dirty_peers_for("b").is_empty(), "b settled it");
+    assert_eq!(mesh.take_dirty_peers_for("a"), vec![NodeId::from(2)]);
+    assert!(
+        mesh.take_dirty_peers_for("a").is_empty(),
+        "an unknown peer is ignored, and nobody watches the stranger"
+    );
+}
+
+#[tokio::test]
+async fn a_watch_that_drops_forgets_its_caches_marks() {
+    let (mesh, mut watches) = mesh_with_watches(&["a", "b"]).await;
+    mesh.mark_dirty(NodeId::from(2));
+    assert_eq!(mesh.take_dirty_peers_for("a"), vec![NodeId::from(2)]);
+    assert_eq!(mesh.inner.cache_dirty.lock().expect("lock").len(), 2);
+
+    watches.remove(0);
+
+    assert_eq!(
+        mesh.inner.cache_dirty.lock().expect("lock").len(),
+        1,
+        "the closed cache's set is gone"
+    );
+    assert!(mesh.take_dirty_peers_for("a").is_empty());
+    mesh.mark_dirty(NodeId::from(2));
+    assert_eq!(mesh.take_dirty_peers_for("b"), vec![NodeId::from(2)]);
+    drop(watches);
+    assert!(mesh.inner.cache_dirty.lock().expect("lock").is_empty());
+}
+
+#[tokio::test]
+async fn a_cache_marks_leave_with_a_departed_peer_and_its_next_handle_starts_dirty() {
+    let (mesh, _watches) = mesh_with_watches(&["a", "b"]).await;
+    let dead_peer = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 1));
+    mesh.mark_dirty(NodeId::from(2));
+    // Cache a takes its mark; cache b's is still owed.
+    assert_eq!(mesh.take_dirty_peers_for("a"), vec![NodeId::from(2)]);
+
+    mesh.update_peers(Vec::new());
+    assert!(
+        mesh.inner
+            .cache_dirty
+            .lock()
+            .expect("lock")
+            .values()
+            .all(HashSet::is_empty),
+        "a departed peer is in no cache's set"
+    );
+    assert!(
+        mesh.take_dirty_peers_for("b").is_empty(),
+        "no handle is left"
+    );
+
+    mesh.update_peers(vec![peer_at(NodeId::from(2), dead_peer)]);
+    assert_eq!(
+        mesh.take_dirty_peers_for("a"),
+        vec![NodeId::from(2)],
+        "the new handle carries the owed round to every cache"
+    );
+    assert_eq!(mesh.take_dirty_peers_for("b"), vec![NodeId::from(2)]);
+}

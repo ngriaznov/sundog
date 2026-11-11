@@ -362,3 +362,40 @@ fn frame_records_lists_the_records_of_a_replicate_frame_only() {
     assert_eq!(frame_records(&batch).len(), 3);
     assert!(frame_records(&wire::Msg::ReqDone).is_empty());
 }
+
+#[test]
+fn a_dirty_round_is_retried_after_a_failure_a_stale_view_or_an_empty_answer() {
+    let end = |outcome, empty_unscoped| RoundEnd {
+        outcome,
+        empty_unscoped,
+    };
+    for outcome in [RoundOutcome::Failed, RoundOutcome::Stale] {
+        assert!(dirty_round_needs_retry(true, end(outcome, false), 0));
+    }
+    assert!(
+        dirty_round_needs_retry(true, end(RoundOutcome::Reconciled, true), 0),
+        "an empty unscoped answer may be a deferral, which compared nothing"
+    );
+    assert!(
+        !dirty_round_needs_retry(true, end(RoundOutcome::Reconciled, false), 0),
+        "a round that compared and repaired is done"
+    );
+    assert!(
+        !dirty_round_needs_retry(false, end(RoundOutcome::Failed, false), 0),
+        "a round against a peer picked at random re-marks nothing"
+    );
+}
+
+#[test]
+fn a_dirty_round_is_retried_at_most_as_often_as_a_responder_defers() {
+    let empty = RoundEnd {
+        outcome: RoundOutcome::Reconciled,
+        empty_unscoped: true,
+    };
+    assert!(dirty_round_needs_retry(true, empty, MAX_DIRTY_RETRIES - 1));
+    assert!(!dirty_round_needs_retry(true, empty, MAX_DIRTY_RETRIES));
+    assert_eq!(
+        MAX_DIRTY_RETRIES, MAX_AE_DEFERRALS,
+        "the retries outlast the deferrals a responder answers in a row"
+    );
+}

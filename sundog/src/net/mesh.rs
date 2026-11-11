@@ -102,6 +102,7 @@ impl Mesh {
             ack_window: config.rebalance_ack_window_value(),
             ack_swept_at: Mutex::new(Instant::now()),
             departed_dirty: Mutex::new(HashMap::new()),
+            cache_dirty: Mutex::new(HashMap::new()),
         });
         tokio::spawn(conn::accept_loop(
             listener,
@@ -601,12 +602,13 @@ impl Mesh {
         self.inner.replicate_in_flight(peer, window)
     }
 
-    /// Marks `peer` dirty for the next [`Mesh::take_dirty_peers`], for
-    /// when the scheduler skips a round it already took the mark for.
+    /// Marks `peer` dirty for the next [`Mesh::take_dirty_peers`] and the
+    /// next [`Mesh::take_dirty_peers_for`] of every watching cache.
     ///
     /// # Panics
     ///
     /// Panics if the peer-table lock is poisoned.
+    #[cfg(all(test, not(feature = "sim")))]
     pub(crate) fn mark_dirty(&self, peer: NodeId) {
         let table = self
             .inner
@@ -689,7 +691,10 @@ impl Mesh {
     /// mark: a peer whose outbox dropped a message, or whose frames a writer
     /// could not encode, and, once its redial succeeds, a peer whose
     /// connection broke after carrying frames or while frames waited to be
-    /// resent. The next anti-entropy round targets a dirty peer first.
+    /// resent. The next anti-entropy round targets a dirty peer first. This
+    /// call takes the mark for the whole mesh; the anti-entropy schedulers
+    /// take theirs per cache through the crate-internal
+    /// `take_dirty_peers_for`, so no cache consumes another's.
     /// That repairs a `Replicated` write and an owner-to-owner write; a
     /// `Distributed` non-owner's forwarded write is held by no replica, so
     /// only the writer's resend protects it.
@@ -709,6 +714,99 @@ impl Mesh {
             .filter(|(_, handle)| handle.dirty.swap(false, Ordering::Relaxed))
             .map(|(node, _)| *node)
             .collect()
+    }
+
+    /// Starts `cache`'s own dirty-peer hint: from now on a mark any peer's
+    /// handle carries reaches `cache` through
+    /// [`Mesh::take_dirty_peers_for`], whatever another cache's scheduler
+    /// takes. The hint, and the memory it holds, lasts until the returned
+    /// watch drops.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the dirty-hint lock is poisoned.
+    pub(crate) fn watch_dirty(&self, cache: &SmolStr) -> DirtyWatch {
+        self.inner
+            .cache_dirty
+            .lock()
+            .expect("invariant: cache_dirty lock is never poisoned")
+            .entry(cache.clone())
+            .or_default();
+        DirtyWatch {
+            mesh: self.clone(),
+            cache: cache.clone(),
+        }
+    }
+
+    /// Returns the peers owing `cache` a dirty round, clearing them for
+    /// `cache` only: the marks the peer handles carry move into the set of
+    /// every watching cache first, so another cache's call leaves this
+    /// cache's mark in place. A cache that [`Mesh::watch_dirty`] is not
+    /// watching gets none, and leaves the marks where they are. Only peers
+    /// still in the peer table come back.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the peer-table or dirty-hint lock is poisoned.
+    #[must_use]
+    pub(crate) fn take_dirty_peers_for(&self, cache: &str) -> Vec<NodeId> {
+        let table = self
+            .inner
+            .peers
+            .read()
+            .expect("invariant: peers lock is never poisoned");
+        let mut watching = self
+            .inner
+            .cache_dirty
+            .lock()
+            .expect("invariant: cache_dirty lock is never poisoned");
+        if !watching.contains_key(cache) {
+            return Vec::new();
+        }
+        let fresh: Vec<NodeId> = table
+            .iter()
+            .filter(|(_, handle)| handle.dirty.swap(false, Ordering::Relaxed))
+            .map(|(node, _)| *node)
+            .collect();
+        for set in watching.values_mut() {
+            set.extend(fresh.iter().copied());
+        }
+        watching
+            .get_mut(cache)
+            .map(|set| {
+                set.drain()
+                    .filter(|peer| table.contains_key(peer))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Gives `peer` back to `cache`'s hint, for a round that took the mark
+    /// without settling it: a skipped round, a peer outside the cache's
+    /// cohort, a round that failed or compared nothing. Nothing happens for
+    /// a peer outside the peer table or a cache nobody watches.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the peer-table or dirty-hint lock is poisoned.
+    pub(crate) fn mark_dirty_for(&self, cache: &str, peer: NodeId) {
+        let table = self
+            .inner
+            .peers
+            .read()
+            .expect("invariant: peers lock is never poisoned");
+        if !table.contains_key(&peer) {
+            return;
+        }
+        if let Some(set) = self
+            .inner
+            .cache_dirty
+            .lock()
+            .expect("invariant: cache_dirty lock is never poisoned")
+            .get_mut(cache)
+        {
+            set.insert(peer);
+        }
     }
 
     /// Shuts down the mesh: stops accepting, waits up to half a second for
@@ -819,5 +917,23 @@ pub(super) fn settle_stall_latch(
             tracing::warn!(%peer, dropped, "a departed peer's fan-out frames dropped");
         }
         None => {}
+    }
+}
+
+/// One cache's dirty-peer hint ([`Mesh::watch_dirty`]); dropping it forgets
+/// the cache's set.
+pub(crate) struct DirtyWatch {
+    mesh: Mesh,
+    cache: SmolStr,
+}
+
+impl Drop for DirtyWatch {
+    fn drop(&mut self) {
+        self.mesh
+            .inner
+            .cache_dirty
+            .lock()
+            .expect("invariant: cache_dirty lock is never poisoned")
+            .remove(&self.cache);
     }
 }

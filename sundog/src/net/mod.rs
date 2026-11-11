@@ -393,6 +393,15 @@ struct MeshInner {
     /// [`DEPARTED_DIRTY_WINDOW`] ([`MeshInner::forget_aged_departures`]), so
     /// the map holds at most the peers that left inside the window.
     departed_dirty: Mutex<HashMap<NodeId, Instant>>,
+    /// The peers each anti-entropy scheduler still owes a dirty round, per
+    /// cache ([`Mesh::watch_dirty`]). A mark a peer's handle carries moves
+    /// into every watching cache's set the next time one of them asks
+    /// ([`Mesh::take_dirty_peers_for`]), so one cache's scheduler never
+    /// consumes another's hint. A set holds only peers in the peer table: a
+    /// departure removes the peer from every set ([`MeshInner::note_handle_removed`])
+    /// and a cache's set goes when its watch drops, so the map holds at most
+    /// one entry per open cache and one id per peer in each.
+    cache_dirty: Mutex<HashMap<SmolStr, HashSet<NodeId>>>,
 }
 
 /// How long a departed peer's owed repair is remembered: a peer whose handle
@@ -403,7 +412,8 @@ const DEPARTED_DIRTY_WINDOW: Duration = Duration::from_mins(10);
 
 /// Whether removing a peer's handle leaves the peer owing an anti-entropy
 /// round: `queued_frames` were discarded with it, or it was already marked
-/// (`was_dirty`) and the mark leaves with the handle. Pure; unit tested
+/// (`was_dirty`, on the handle or in a watching cache's set) and the mark
+/// leaves with the handle. Pure; unit tested
 /// directly.
 const fn removal_owes_repair(queued_frames: usize, was_dirty: bool) -> bool {
     queued_frames > 0 || was_dirty
@@ -470,7 +480,7 @@ fn shrink_ack_table(rows: &mut HashMap<AckedBucketKey, AckedBucketEntry>) {
 /// Digests from one peer answered empty in a row before the responder serves
 /// one regardless, so a steady write trickle toward that peer cannot starve
 /// its repair. Mirrors the initiator's own bound on skipped rounds.
-const MAX_AE_DEFERRALS: u32 = 3;
+pub(crate) const MAX_AE_DEFERRALS: u32 = 3;
 
 /// Whether the responder answers a digest empty: only while its outbox
 /// toward the requesting peer still holds `queued` replicate frames, and
@@ -610,7 +620,19 @@ impl MeshInner {
             metrics::counter!("sundog_backlog_dropped_total", "peer" => peer.to_string())
                 .increment(u64::try_from(queued).unwrap_or(u64::MAX));
         }
-        if removal_owes_repair(queued, handle.dirty.load(Ordering::Relaxed)) {
+        let mut watching = self
+            .cache_dirty
+            .lock()
+            .expect("invariant: cache_dirty lock is never poisoned");
+        let owed_to_a_cache = watching.values_mut().fold(false, |owed, set| {
+            // `|` not `||`: every set forgets the peer.
+            set.remove(&peer) | owed
+        });
+        drop(watching);
+        if removal_owes_repair(
+            queued,
+            handle.dirty.load(Ordering::Relaxed) || owed_to_a_cache,
+        ) {
             self.departed_dirty
                 .lock()
                 .expect("invariant: departed_dirty lock is never poisoned")
@@ -784,6 +806,7 @@ impl MeshInner {
             ack_window,
             ack_swept_at: Mutex::new(Instant::now()),
             departed_dirty: Mutex::new(HashMap::new()),
+            cache_dirty: Mutex::new(HashMap::new()),
         })
     }
 }

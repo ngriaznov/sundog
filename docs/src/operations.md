@@ -239,8 +239,16 @@ A steady rise in `sundog_ae_repaired_total` means replication messages are not
 arriving and anti-entropy is doing replication's job. Look for
 `sundog_backlog_dropped_total` on the sending side and for peers flapping in
 `sundog_live_peers`. Flapping under jitter calls for a higher `phi_threshold`.
-A peer whose connection broke after carrying frames is steered to first by the
-next anti-entropy round, once the writer has redialed it. A connection that
+A record that a full outbox dropped, or that this node refused for clock skew,
+an unowned part or a lapsed tombstone, is not a repair and does not count, so
+the counter flattens when anti-entropy stops converging: look at
+`sundog_backlog_dropped_total`, `sundog_clock_skew_rejected_total` and
+`sundog_tombstones_ignored_total` for the cause. A peer whose connection broke
+after carrying frames is steered to first by the next anti-entropy round of
+each cache, once the writer has redialed it; a cache whose round against that
+peer failed, went stale or compared nothing, because the peer deferred its
+digest while its own outbox toward this node was not empty, targets the peer
+again, up to three times in a row. A connection that
 closes within half a second of opening steers rounds only if it left frames
 waiting to be resent. A writer marks its peer at most every five seconds; a
 mark held back by that spacing is set as soon as the spacing ends, on the

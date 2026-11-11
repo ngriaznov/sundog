@@ -35,7 +35,9 @@ use xxhash_rust::xxh3::xxh3_64;
 use super::Cluster;
 use crate::error::CodecError;
 use crate::hlc::Hlc;
-use crate::net::{AeMismatch, AePartReply, AeRoundOutcome, Mesh, MsgClass, request_timeout};
+use crate::net::{
+    AeMismatch, AePartReply, AeRoundOutcome, MAX_AE_DEFERRALS, Mesh, MsgClass, request_timeout,
+};
 use crate::node::NodeId;
 use crate::sketch::{Cell, Decoded, Iblt};
 use crate::store::part::PartSet;
@@ -52,7 +54,9 @@ pub(crate) async fn scheduler_task(
     ae_interval: Duration,
     cancel: CancellationToken,
 ) {
+    let _watch = cluster.mesh().watch_dirty(&cache);
     let mut skipped: HashMap<NodeId, u32> = HashMap::new();
+    let mut dirty_retries: HashMap<NodeId, u32> = HashMap::new();
     loop {
         if cancel
             .run_until_cancelled(tokio::time::sleep(jittered(ae_interval)))
@@ -63,14 +67,15 @@ pub(crate) async fn scheduler_task(
         }
         let live = cluster.live_peer_ids();
         forget_departed_skips(&mut skipped, &live);
-        let Some((peer, was_dirty)) = pick_peer(&cluster, &shard, live) else {
+        forget_departed_skips(&mut dirty_retries, &live);
+        let Some((peer, was_dirty)) = pick_peer(&cluster, &shard, &cache, live) else {
             continue;
         };
         let skips = skipped.entry(peer).or_insert(0);
         if should_skip_round(cluster.peer_is_streaming(peer), *skips) {
             *skips += 1;
             if was_dirty {
-                cluster.mesh().mark_dirty(peer);
+                cluster.mesh().mark_dirty_for(&cache, peer);
             }
             tracing::trace!(%peer, "replicate traffic in motion; skipping this round");
             continue;
@@ -78,11 +83,51 @@ pub(crate) async fn scheduler_task(
         *skips = 0;
         // Races the whole round against `cancel` too, so a `shutdown()` in
         // progress never waits out the round's internal `REQUEST_TIMEOUT`.
-        tokio::select! {
+        let end = tokio::select! {
             biased;
             () = cancel.cancelled() => return,
-            _ = run_round_against(cluster.mesh(), &shard, &cache, peer) => {}
+            end = run_round_noted(cluster.mesh(), &shard, &cache, peer) => end,
+        };
+        let retries = dirty_retries.entry(peer).or_insert(0);
+        if dirty_round_needs_retry(was_dirty, end, *retries) {
+            *retries += 1;
+            cluster.mesh().mark_dirty_for(&cache, peer);
+        } else {
+            dirty_retries.remove(&peer);
         }
+    }
+}
+
+/// How a dirty-targeted round ended, for the decision to target the peer
+/// again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RoundEnd {
+    outcome: RoundOutcome,
+    /// The round's digest exchange was the unscoped one and reported no
+    /// mismatch. A responder that defers the digest while its Replicate
+    /// outbox toward this node is non-empty answers the same way, so the
+    /// round proved nothing.
+    empty_unscoped: bool,
+}
+
+/// Dirty rounds in a row against one peer that the scheduler repeats
+/// because the round failed, went stale, or came back empty: the most
+/// deferrals in a row a responder answers, so a deferred round is retried
+/// until the responder answers, and a peer that keeps failing is not
+/// targeted ahead of every other one for longer.
+const MAX_DIRTY_RETRIES: u32 = MAX_AE_DEFERRALS;
+
+/// Whether a round that was targeted at a dirty peer (`was_dirty`) and ended
+/// `end` re-marks the peer: it failed, its view had diverged, or its empty
+/// answer may be a deferral, and `retries_so_far` rounds in a row were
+/// already repeated for it. Pure; unit tested directly.
+const fn dirty_round_needs_retry(was_dirty: bool, end: RoundEnd, retries_so_far: u32) -> bool {
+    if !was_dirty || retries_so_far >= MAX_DIRTY_RETRIES {
+        return false;
+    }
+    match end.outcome {
+        RoundOutcome::Failed | RoundOutcome::Stale => true,
+        RoundOutcome::Reconciled => end.empty_unscoped,
     }
 }
 
@@ -155,23 +200,30 @@ fn choose_peer(
     live.choose(rng).map(|&peer| (peer, false, Vec::new()))
 }
 
-/// The peer for this round out of the `live` ids, and whether it came from the
-/// dirty set; a skipped round can hand the mark back. `shard`'s
-/// [`ShardOps::ae_peer_filter`] narrows both candidate sets to its current
-/// cohort first: identity for every mode but `Mode::Distributed`, whose
-/// override drops a peer sharing no bucket this shard currently owns or is
-/// mid disown-grace on, since such a peer has nothing to reconcile.
+/// The peer for this round out of the `live` ids, and whether it came from
+/// `cache`'s dirty set. `shard`'s [`ShardOps::ae_peer_filter`] narrows both
+/// candidate sets to its current cohort first: identity for every mode but
+/// `Mode::Distributed`, whose override drops a peer sharing no bucket this
+/// shard currently owns or is mid disown-grace on, since such a peer has
+/// nothing to reconcile now. A dirty peer outside the cohort, and every
+/// dirty peer not chosen, stays in the cache's set for a later round.
 fn pick_peer(
     cluster: &Cluster,
     shard: &Arc<dyn ShardOps>,
+    cache: &SmolStr,
     live: Vec<NodeId>,
 ) -> Option<(NodeId, bool)> {
     let mut rng = rand::rng();
-    let dirty = cluster.mesh().take_dirty_peers();
-    let (dirty, live) = shard.ae_peer_filter(dirty, live);
-    let (peer, was_dirty, give_back) = choose_peer(dirty, live, &mut rng)?;
+    let marked = cluster.mesh().take_dirty_peers_for(cache);
+    let (dirty, live) = shard.ae_peer_filter(marked.clone(), live);
+    let out_of_cohort = marked.into_iter().filter(|peer| !dirty.contains(peer));
+    for peer in out_of_cohort {
+        cluster.mesh().mark_dirty_for(cache, peer);
+    }
+    let chosen = choose_peer(dirty, live, &mut rng);
+    let (peer, was_dirty, give_back) = chosen?;
     for other in give_back {
-        cluster.mesh().mark_dirty(other);
+        cluster.mesh().mark_dirty_for(cache, other);
     }
     Some((peer, was_dirty))
 }
@@ -211,13 +263,28 @@ pub enum RoundOutcome {
 /// Takes `mesh` directly, not a whole `&Cluster`: `tests/sim/` drives
 /// this same seam under `feature = "sim"` against a hand-built
 /// `Mesh`/`ShardOps` pair, skipping a real `Cluster`'s gossip and discovery.
-#[tracing::instrument(skip_all, fields(cache = %cache, peer = %peer))]
 pub async fn run_round_against(
     mesh: &Mesh,
     shard: &Arc<dyn ShardOps>,
     cache: &SmolStr,
     peer: NodeId,
 ) -> RoundOutcome {
+    run_round_noted(mesh, shard, cache, peer).await.outcome
+}
+
+/// [`run_round_against`], reporting also whether the round's only evidence
+/// was an empty unscoped digest reply ([`RoundEnd`]).
+#[tracing::instrument(skip_all, fields(cache = %cache, peer = %peer))]
+async fn run_round_noted(
+    mesh: &Mesh,
+    shard: &Arc<dyn ShardOps>,
+    cache: &SmolStr,
+    peer: NodeId,
+) -> RoundEnd {
+    let ended = |outcome| RoundEnd {
+        outcome,
+        empty_unscoped: false,
+    };
     // Read once per round: a resolver that merges or reads values has both
     // sides exchange a mismatched key instead of only the greater version
     // pushing to the lesser side. See `ShardOps::ae_exchanges_both`.
@@ -240,11 +307,11 @@ pub async fn run_round_against(
                         responder_view_hash,
                         "anti-entropy round ended: responder's view has diverged"
                     );
-                    return RoundOutcome::Stale;
+                    return ended(RoundOutcome::Stale);
                 }
                 Err(error) => {
                     tracing::debug!(%error, "anti-entropy scoped digest exchange failed");
-                    return RoundOutcome::Failed;
+                    return ended(RoundOutcome::Failed);
                 }
             }
         }
@@ -264,22 +331,25 @@ pub async fn run_round_against(
             Ok(mismatched) => (mismatched, None),
             Err(error) => {
                 tracing::debug!(%error, "anti-entropy digest exchange failed");
-                return RoundOutcome::Failed;
+                return ended(RoundOutcome::Failed);
             }
         },
     };
     if mismatched.is_empty() {
         tracing::trace!("no mismatched buckets");
-        return RoundOutcome::Reconciled;
+        return RoundEnd {
+            outcome: RoundOutcome::Reconciled,
+            empty_unscoped: in_scope.is_none(),
+        };
     }
 
     let repairs =
         reconcile_mismatches(mesh, shard, cache, peer, mismatched, in_scope, both_ways).await;
-    if repairs.complete {
+    ended(if repairs.complete {
         RoundOutcome::Reconciled
     } else {
         RoundOutcome::Failed
-    }
+    })
 }
 
 /// What one round's repairs did: the wire bytes they moved, and whether
