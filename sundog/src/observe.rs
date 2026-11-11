@@ -242,7 +242,8 @@ impl ObserverBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`JoinError::Bind`] if a port-0 `gossip_bind_addr` cannot be
+    /// Returns [`JoinError::InvalidConfig`] if `SUNDOG_SEEDS` names no seed
+    /// and no discovery is set, [`JoinError::Bind`] if a port-0 `gossip_bind_addr` cannot be
     /// probed for a free port, or [`JoinError::Membership`] if the gossip
     /// backend fails to start, including when a fixed `gossip_bind_addr` is
     /// already taken.
@@ -257,7 +258,7 @@ impl ObserverBuilder {
         // mechanism of its own, as the mDNS daemon does, stops when the
         // observer's loop ends.
         let mut seeds =
-            candidates_holding(Arc::new(resolve_discovery(discovery, &name, &node_name)));
+            candidates_holding(Arc::new(resolve_discovery(discovery, &name, &node_name)?));
         let seed_nodes = collect_initial_seeds(&mut seeds).await;
         // The empty key list is the seam: without a `node_id` key no member's
         // `parse_peer` accepts this entry, so it is never a peer. No

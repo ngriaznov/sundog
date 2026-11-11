@@ -74,7 +74,7 @@ fn seed_specs_from(raw: Option<&str>) -> Vec<String> {
     raw.map(parse_seed_list).unwrap_or_default()
 }
 
-fn parse_seed_list(raw: &str) -> Vec<String> {
+pub(crate) fn parse_seed_list(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(str::trim)
         .filter(|spec| !spec.is_empty())

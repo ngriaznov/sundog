@@ -57,7 +57,8 @@ pub enum JoinError {
     /// A [`crate::config::ClusterConfig`] field fails validation, or
     /// [`crate::ClusterBuilder::node_id`] is given a merge-derived node id
     /// (one only the engine's merge-version combinator ever mints), which no
-    /// real node may use.
+    /// real node may use, or `SUNDOG_SEEDS` is set to text that names no
+    /// seed address.
     #[error("invalid cluster config: {0}")]
     InvalidConfig(String),
 }

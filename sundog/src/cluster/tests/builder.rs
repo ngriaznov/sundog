@@ -585,3 +585,14 @@ async fn build_accepts_the_boundary_values_of_the_timing_rules() {
         .expect("boundary values are valid");
     cluster.shutdown().await;
 }
+
+#[test]
+fn seeds_env_names_no_seed_only_for_a_nonblank_value_without_an_address() {
+    assert!(seeds_env_names_no_seed(Some(",")));
+    assert!(seeds_env_names_no_seed(Some(" , ,, ")));
+    assert!(!seeds_env_names_no_seed(Some("host:4000")));
+    assert!(!seeds_env_names_no_seed(Some(", host:4000 ,")));
+    assert!(!seeds_env_names_no_seed(Some("   ")));
+    assert!(!seeds_env_names_no_seed(Some("")));
+    assert!(!seeds_env_names_no_seed(None));
+}

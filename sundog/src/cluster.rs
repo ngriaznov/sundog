@@ -1104,7 +1104,7 @@ impl ClusterBuilder {
         // The seed stream holds the source, so a source that runs a
         // mechanism of its own, as the mDNS daemon does, stops when the
         // membership loop ends.
-        let discovery = Arc::new(resolve_discovery(discovery, &name, &node_name));
+        let discovery = Arc::new(resolve_discovery(discovery, &name, &node_name)?);
         let has_seeds = discovery.has_seeds();
 
         let data_listener = BoundListener::bind(config.data_bind_addr).await?;
@@ -1360,7 +1360,46 @@ fn validate_tombstones(config: &ClusterConfig) -> Result<(), JoinError> {
             config.tombstone_max_ttl, config.tombstone_ttl
         )));
     }
+    Ok(())
+}
+
+/// Resolves the discovery mechanism `build()` uses: the caller's explicit
+/// choice, else [`use_static_from_env`]'s pick between `Static::from_env()`
+/// and the zeroconf `Mdns` default.
+///
+/// # Errors
+///
+/// Returns [`JoinError::InvalidConfig`] when no discovery is configured and
+/// `SUNDOG_SEEDS` is set to text that names no seed, such as `","`.
+pub(crate) fn resolve_discovery(
+    discovery: Option<DiscoveryKind>,
+    name: &SmolStr,
+    node_name: &NodeName,
+) -> Result<DiscoveryKind, JoinError> {
+    let discovery_set = discovery.is_some();
+    let seeds_env = std::env::var(crate::discovery::statics::SUNDOG_SEEDS_ENV).ok();
+    if !discovery_set && seeds_env_names_no_seed(seeds_env.as_deref()) {
+        return Err(JoinError::InvalidConfig(format!(
+            "{} is set but names no seed address",
+            crate::discovery::statics::SUNDOG_SEEDS_ENV
+        )));
+    }
+    Ok(discovery.unwrap_or_else(|| {
+        if use_static_from_env(discovery_set, seeds_env.as_deref()) {
+            DiscoveryKind::Static(Static::from_env())
+        } else {
+            DiscoveryKind::Mdns(Mdns::new(name.clone(), node_name.to_string()))
         }
+    }))
+}
+
+/// Whether a `SUNDOG_SEEDS` value is non-blank yet lists no seed: only
+/// separators, as a template that renders an empty list as `","` produces.
+/// A blank or unset variable is not such a value; it selects the mDNS
+/// default.
+fn seeds_env_names_no_seed(seeds_env: Option<&str>) -> bool {
+    seeds_env.is_some_and(|raw| {
+        !raw.trim().is_empty() && crate::discovery::statics::parse_seed_list(raw).is_empty()
     })
 }
 

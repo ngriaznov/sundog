@@ -85,6 +85,9 @@ values:
 - `tombstone_ttl` under `3 × ae_interval`
 - `tombstone_max_ttl` under `tombstone_ttl`
 
+A `SUNDOG_SEEDS` that is not blank yet names no address, such as `","`,
+fails `build()` too; unset or blank, it leaves the mDNS default.
+
 ## Merge resolvers
 
 | Field | Default | Change it when |
