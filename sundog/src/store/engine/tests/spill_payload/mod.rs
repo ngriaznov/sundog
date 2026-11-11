@@ -1447,7 +1447,9 @@ fn complete_fresh_load_over_a_spilled_key_decrements_spill_entries() {
     );
     assert_eq!(
         outcome,
-        FillOutcome::Installed { had_live: true },
+        FillOutcome::Installed {
+            replaced_visible: true
+        },
         "the spilled entry counted as already-live for complete_fresh_load's purposes"
     );
     assert_eq!(engine.get(&key, 0), Some("loaded".to_string()));

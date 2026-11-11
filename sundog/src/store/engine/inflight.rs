@@ -24,9 +24,10 @@ use super::{Engine, Inflight, Live, Written, is_resident, remove_live};
 /// What [`Engine::complete_fresh_load`] did with a fill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FillOutcome {
-    /// The loaded value is installed; `had_live` says whether it replaced a
-    /// live entry.
-    Installed { had_live: bool },
+    /// The loaded value is installed; `replaced_visible` says whether it
+    /// replaced an entry a read could return, so an expired or idle entry a
+    /// sweep has not yet removed does not count.
+    Installed { replaced_visible: bool },
     /// A write or removal at least as new as the fill landed while the
     /// loader ran, and stays in place of the loaded value.
     Superseded,
@@ -237,6 +238,13 @@ where
                 inflight.finish();
                 return FillOutcome::Superseded;
             }
+            // Judged before `remove_live` clears the entry's `long_ttl` row.
+            let replaced_visible = stripe
+                .live
+                .find(hash, |l| record_key(&l.record) == key_bytes.as_ref())
+                .is_some_and(|live| {
+                    !self.is_absent(live, key_bytes.as_ref(), &stripe.long_ttl, now_ms)
+                });
             let mut had_live = false;
             if let Some(t) = stripe.tombstones.remove(key_bytes.as_ref()) {
                 self.digest[digest_slot(bucket, part)].fetch_xor(
@@ -280,7 +288,7 @@ where
             }
             self.total_weight
                 .fetch_add(u64::from(weight), Ordering::Relaxed);
-            FillOutcome::Installed { had_live }
+            FillOutcome::Installed { replaced_visible }
         };
         inflight.finish();
         self.enforce_capacity(bucket, &mut Written::of(hash), now_ms);

@@ -611,3 +611,53 @@ async fn a_swept_expired_overwrite_still_rejects_the_value_it_overwrote() {
         "a write newer than the expired overwrite still lands"
     );
 }
+
+#[tokio::test]
+async fn a_fill_over_an_expired_unswept_entry_emits_created() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let clock = Arc::new(AtomicU64::new(1_000_000));
+    let s = clocked_shard(1, None, &clock);
+    s.insert_with_ttl(1, "a".into(), Duration::from_secs(1))
+        .await
+        .expect("insert");
+    let mut events = s.events();
+    clock.store(1_005_000, Ordering::SeqCst);
+    assert_eq!(s.get(&1).await, None, "expired");
+
+    let loaded = s
+        .get_or_load(&1, async |_| Ok::<_, std::io::Error>("b".to_string()))
+        .await
+        .expect("fill");
+    assert_eq!(loaded, "b");
+    match events.try_recv() {
+        Ok(Event::Created {
+            key: 1,
+            value,
+            origin: Origin::Local,
+        }) => assert_eq!(value, "b"),
+        other => panic!("a fill over an expired entry is a creation, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_load_over_an_expired_unswept_entry_emits_created() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let clock = Arc::new(AtomicU64::new(1_000_000));
+    let s =
+        clocked_shard(1, None, &clock).with_loader(Loader::batch(|keys: Vec<u32>| async move {
+            Ok::<_, std::io::Error>(keys.into_iter().map(|k| (k, "b".to_string())).collect())
+        }));
+    s.insert_with_ttl(1, "a".into(), Duration::from_secs(1))
+        .await
+        .expect("insert");
+    let mut events = s.events();
+    clock.store(1_005_000, Ordering::SeqCst);
+
+    assert_eq!(s.load(&1).await.expect("load"), Some("b".to_string()));
+    assert!(
+        matches!(events.try_recv(), Ok(Event::Created { key: 1, .. })),
+        "a load over an expired entry is a creation"
+    );
+}

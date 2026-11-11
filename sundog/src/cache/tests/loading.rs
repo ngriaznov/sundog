@@ -1007,3 +1007,44 @@ async fn refresh_ahead_needs_a_loader_a_ttl_and_a_mode_that_carries_values() {
     );
     cluster.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_load_over_an_expired_unswept_entry_emits_created() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let clock = Arc::new(AtomicU64::new(now_ms()));
+    let reader = Arc::clone(&clock);
+    let cluster = Cluster::builder("cache-it-load-expired-created")
+        .seeds(std::iter::empty())
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("node builds");
+    let cache = cluster
+        .cache::<u32, String>("prices")
+        .mode(Mode::Local)
+        .clock(Arc::new(move || reader.load(Ordering::SeqCst)))
+        .batch_loader(|keys: Vec<u32>| async move {
+            Ok::<_, SourceDown>(
+                keys.into_iter()
+                    .map(|key| (key, "b".to_string()))
+                    .collect::<HashMap<_, _>>(),
+            )
+        })
+        .open()
+        .await
+        .expect("opens");
+    cache
+        .insert_with_ttl(1, "a".to_string(), Duration::from_secs(1))
+        .await
+        .expect("insert");
+    let mut events = cache.events();
+    clock.fetch_add(5_000, Ordering::SeqCst);
+
+    assert_eq!(cache.load(&1).await.expect("load"), Some("b".to_string()));
+    assert!(
+        matches!(events.try_recv(), Ok(Event::Created { key: 1, .. })),
+        "a fill over an expired entry no sweep removed is a creation"
+    );
+    cluster.shutdown().await;
+}

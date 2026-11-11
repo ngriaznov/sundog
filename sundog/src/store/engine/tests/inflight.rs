@@ -50,7 +50,9 @@ async fn stampede_collapses_to_one_loader_n_minus_one_hits() {
                         );
                         assert_eq!(
                             outcome,
-                            FillOutcome::Installed { had_live: false },
+                            FillOutcome::Installed {
+                                replaced_visible: false
+                            },
                             "a genuine miss sees no prior live entry"
                         );
                         guard.complete();
@@ -224,7 +226,9 @@ fn complete_fresh_load_replaces_a_tombstone_and_keeps_digest_and_weight_correct(
     );
     assert_eq!(
         outcome,
-        FillOutcome::Installed { had_live: false },
+        FillOutcome::Installed {
+            replaced_visible: false
+        },
         "an older tombstone gives way, and it is not a live entry"
     );
     assert_eq!(engine.get(&key, 0), Some("fresh".to_string()));
@@ -412,6 +416,74 @@ fn an_invalidation_before_the_load_starts_leaves_the_next_fill_alone() {
         0,
         &inflight,
     );
-    assert_eq!(outcome, FillOutcome::Installed { had_live: false });
+    assert_eq!(
+        outcome,
+        FillOutcome::Installed {
+            replaced_visible: false
+        }
+    );
     assert_eq!(engine.get(&key, 0), Some("fresh".to_string()));
+}
+
+/// Runs one fill of `key` at `now_ms` and returns what the engine did with it.
+fn fill_at(engine: &Engine<u32, String>, key: u32, ver: Hlc, now_ms: u64) -> FillOutcome {
+    let kb = key_bytes(key);
+    let hash = hash_key_bytes(kb.as_ref());
+    let JoinOutcome::Owner(inflight) = engine.miss_or_join(&kb, hash, now_ms) else {
+        panic!("the key has no load in flight");
+    };
+    let encoded = Bytes::from(postcard::to_stdvec("b").expect("encode"));
+    engine.complete_fresh_load(
+        FreshLoad {
+            key: &key,
+            key_bytes: &kb,
+            hash,
+            ver,
+            value: "b".to_string(),
+            encoded,
+            expires_at_ms: None,
+        },
+        now_ms,
+        &inflight,
+    )
+}
+
+#[test]
+fn a_fill_over_an_expired_unswept_entry_replaces_nothing_visible() {
+    let engine = engine_u32_string(u64::MAX, None);
+    let _ = put(&engine, 1, key_bytes(1), "a".into(), hlc(1, 1), Some(50), 0);
+    // Past the deadline, no sweep has run.
+    assert_eq!(
+        fill_at(&engine, 1, hlc(200, 1), 100),
+        FillOutcome::Installed {
+            replaced_visible: false
+        }
+    );
+    assert_eq!(engine.get(&1, 100), Some("b".to_string()));
+    assert_eq!(
+        engine.live_entry_count(),
+        1,
+        "the slot is replaced, not added"
+    );
+}
+
+#[test]
+fn a_fill_over_a_visible_entry_replaces_something_visible() {
+    let engine = engine_u32_string(u64::MAX, None);
+    let _ = put(
+        &engine,
+        1,
+        key_bytes(1),
+        "a".into(),
+        hlc(1, 1),
+        Some(500),
+        0,
+    );
+    assert_eq!(
+        fill_at(&engine, 1, hlc(200, 1), 100),
+        FillOutcome::Installed {
+            replaced_visible: true
+        }
+    );
+    assert_eq!(engine.live_entry_count(), 1);
 }

@@ -63,7 +63,9 @@ where
     /// `ver`, and a copy of another node's record keeps that record's
     /// expiry, so one already past it is handed out like a value stored
     /// nowhere. A stored value fans out per [`fill_fans_out`] and
-    /// emits [`Event::Created`], or [`Event::Updated`] over a live entry; one
+    /// emits [`Event::Created`], or [`Event::Updated`] over an entry a read
+    /// could return, so a fill over an expired entry no sweep has removed
+    /// is a creation; one
     /// a write, removal or invalidation overtook stores and sends nothing,
     /// and a value stored nowhere sends nothing and emits no event. Returns
     /// whether the value was stored.
@@ -113,7 +115,7 @@ where
             now_ms,
             inflight,
         );
-        let engine::FillOutcome::Installed { had_live } = outcome else {
+        let engine::FillOutcome::Installed { replaced_visible } = outcome else {
             return false;
         };
         // A refusal means the cache is closing; the loaded value still
@@ -124,7 +126,7 @@ where
         if self.events.receiver_count() > 0 {
             let key = key.clone();
             let origin = Origin::Local;
-            let _ = self.events.send(if had_live {
+            let _ = self.events.send(if replaced_visible {
                 Event::Updated { key, value, origin }
             } else {
                 Event::Created { key, value, origin }

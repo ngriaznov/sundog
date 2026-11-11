@@ -395,7 +395,9 @@ fn a_rejected_record_older_than_a_tombstone_leaves_a_load_in_flight_alone() {
 
     assert_eq!(
         finish_load(&engine, &inflight, &["fresh"], hlc(11_000, 1), 11_000),
-        FillOutcome::Installed { had_live: false },
+        FillOutcome::Installed {
+            replaced_visible: false
+        },
         "a record older than the stored tombstone announces nothing new"
     );
     assert_eq!(engine.get(&KEY, 11_000), Some(string_set(&["fresh"])));
