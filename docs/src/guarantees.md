@@ -134,10 +134,13 @@ differ by the stamps until one anti-entropy exchange merges them, the later
 stamp winning. A receipt stamped more than its lifetime ahead of a replica's
 clock expires there instead of outliving the others. The replicas of a part
 hold the same writers, so they fold nested sets of writers and the merge of
-their folded totals is exact; anti-entropy keeps it so, except for a replica
-cut off from before the fold until after the receipt expires, which still
-holds the slot every other replica has folded and counts that writer's
-contribution twice when it reconnects. Like `tombstone_max_ttl` for deletes,
+their folded totals is exact; anti-entropy keeps it so. A replica cut off from before the fold that
+still holds the folded writer's live slot is covered by the receipt while the
+receipt lives: the merge drops that slot, so the writer is never counted
+twice, and a write only that replica saw after the fold is lost, a bounded
+undercount. Once the receipt expires the slot is no longer covered, and a
+replica cut off past the receipt's life counts that writer's contribution
+twice when it reconnects. Like `tombstone_max_ttl` for deletes,
 below, the bound trusts that a replica gone this long no longer holds the
 state.
 

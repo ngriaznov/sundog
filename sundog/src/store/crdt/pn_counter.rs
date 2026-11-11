@@ -145,7 +145,12 @@ impl PnCounter {
     /// the two, never their sum, which is exact when one side's folded
     /// writers include the other's and loses the smaller total when two folds
     /// cover disjoint writers. `p`/`n` are the pointwise maximum of both
-    /// sides, excluding every writer now `retired`.
+    /// sides, excluding every writer now `retired` and every writer one
+    /// side has folded (a receipt, and no live or retired entry) while the
+    /// other side still holds its live slot: the receipt covers that slot,
+    /// so a replica cut off since before the fold never counts the writer a
+    /// second time. The writes only that replica saw after the fold are
+    /// dropped with the slot, a bounded undercount.
     ///
     /// `merge_is_commutative_for_any_shape` and
     /// `merge_is_idempotent_for_any_shape` hold unconditionally;
@@ -219,8 +224,26 @@ impl PnCounter {
             !(by_self || by_other)
         });
 
-        let p = pointwise_max_excluding(&self.p, &other.p, &retired);
-        let n = pointwise_max_excluding(&self.n, &other.n, &retired);
+        // A side's receipt for `w` honors the fold against the other
+        // side's live slot too: that slot is a stale copy of a contribution
+        // the folded bound already holds, so it is dropped instead of added
+        // on top. Writes only the stale side saw after the fold are lost, a
+        // bounded undercount in place of a double count.
+        let live_unfolded = |live: &BTreeMap<WriterId, u64>, folder: &Self| {
+            let mut kept = live.clone();
+            kept.retain(|&w, _| !already_folded(folder, w));
+            kept
+        };
+        let p = pointwise_max_excluding(
+            &live_unfolded(&self.p, other),
+            &live_unfolded(&other.p, self),
+            &retired,
+        );
+        let n = pointwise_max_excluding(
+            &live_unfolded(&self.n, other),
+            &live_unfolded(&other.n, self),
+            &retired,
+        );
 
         let bound_self = (
             self.folded_p.saturating_add(credit_self.0),
@@ -543,6 +566,107 @@ mod tests {
                  later-discovered, still-retired entry for the exact same writer — instead \
                  it came back: {merged:?}"
             );
+        }
+    }
+
+    /// One replica's view of a single writer `w` that holds `amount` of
+    /// increments and `dec` of decrements: still live, retired and not yet
+    /// folded, or folded with a receipt.
+    fn replica_view(w: WriterId, kind: u8, amount: u64, dec: u64) -> PnCounter {
+        match kind {
+            0 => PnCounter {
+                p: BTreeMap::from([(w, amount)]),
+                n: BTreeMap::from([(w, dec)]),
+                ..PnCounter::default()
+            },
+            1 => PnCounter {
+                retired: BTreeMap::from([(
+                    w,
+                    Retired {
+                        p: amount,
+                        n: dec,
+                        since_ms: 10,
+                    },
+                )]),
+                ..PnCounter::default()
+            },
+            _ => PnCounter {
+                folded_p: amount,
+                folded_n: dec,
+                folded_at: BTreeMap::from([(w, 500)]),
+                ..PnCounter::default()
+            },
+        }
+    }
+
+    /// A receipt covers the other side's live slot of the same writer.
+    #[test]
+    fn merge_honors_a_receipt_against_the_other_sides_live_slot() {
+        let w = wid(1, 0);
+        let bounds = CompactionBounds::three_bounds(1_000);
+        let folded = PnCounter::local_delta(w, 100)
+            .compact(0, &|writer| writer == w, Quiescence::Churning, bounds)
+            .expect("stage one")
+            .compact(2_001, &|_| false, Quiescence::Settled, bounds)
+            .expect("stage two");
+        assert!(
+            folded.folded_at.contains_key(&w),
+            "receipt present: {folded:?}"
+        );
+        let stale = PnCounter::local_delta(w, 100);
+        for merged in [folded.merge(&stale), stale.merge(&folded)] {
+            assert_eq!(
+                merged.value(),
+                100,
+                "receipt covers the live slot: {merged:?}"
+            );
+            assert!(
+                merged.p.is_empty() && merged.retired.is_empty(),
+                "{merged:?}"
+            );
+        }
+    }
+
+    /// The three-way case from the issue: A folded, B retired and not
+    /// folded, C live. Every association gives the exact value.
+    #[test]
+    fn merge_with_a_receipt_is_associative_across_folded_retired_and_live() {
+        let w = wid(1, 0);
+        let a = replica_view(w, 2, 100, 0);
+        let b = replica_view(w, 1, 100, 0);
+        let c = replica_view(w, 0, 100, 0);
+        assert_eq!(a.merge(&b).merge(&c), a.merge(&b.merge(&c)));
+        assert_eq!(a.merge(&b).merge(&c).value(), 100);
+    }
+
+    proptest! {
+        /// One writer seen by three replicas in any mix of live, retired
+        /// and folded states: every ordering and association merges to the
+        /// same bytes and the exact value, and a merge is idempotent.
+        #[test]
+        fn merge_with_receipts_is_order_free_and_exact_for_one_writer(
+            kinds in proptest::array::uniform3(0u8..3),
+            amount in 0u64..1_000,
+            dec in 0u64..1_000,
+        ) {
+            let w = wid(1, 0);
+            let r: Vec<PnCounter> = kinds.iter().map(|&k| replica_view(w, k, amount, dec)).collect();
+            let want = i128::from(amount) - i128::from(dec);
+            let mut first: Option<Vec<u8>> = None;
+            for (x, y, z) in [(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)] {
+                for merged in [
+                    r[x].merge(&r[y]).merge(&r[z]),
+                    r[x].merge(&r[y].merge(&r[z])),
+                ] {
+                    prop_assert_eq!(merged.value(), want);
+                    let bytes = merged.encode().expect("encodes");
+                    match &first {
+                        Some(f) => prop_assert_eq!(f, &bytes),
+                        None => first = Some(bytes),
+                    }
+                    prop_assert_eq!(merged.merge(&merged), merged);
+                }
+            }
         }
     }
 
@@ -889,8 +1013,8 @@ mod tests {
     /// anywhere to reconcile the two. This is the same trust boundary
     /// `tombstone_max_ttl` already documents ("a member gone longer than
     /// this may resurrect data"), not a new failure mode introduced by
-    /// compaction: the merge cannot know its own stale fold and the live
-    /// slot name the same writer, so it counts both, bounded by exactly
+    /// compaction: with no receipt on either side the merge cannot know its
+    /// own stale fold and the live slot name the same writer, so it counts both, bounded by exactly
     /// the stale snapshot, never unbounded, and only once a writer has
     /// reached stage three, unlike the unconditional loss a coincidental
     /// cross-writer watermark would cause at any staleness at all.
