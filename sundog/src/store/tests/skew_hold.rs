@@ -163,22 +163,29 @@ async fn apply_remote_batch_counted_answers_how_many_records_the_stamp_check_dro
     let clock = TestClock::at(START_MS);
     let (s, view, _tx, _residency) = skew_shard::<String>(&clock);
     let key = owned_key(&view);
+    let unowned = find_key_by_ownership(&view, false);
     let batch = vec![
         forward(key, "skewed", 10_000),
-        forward(key.wrapping_add(1), "late-but-fine", 0),
+        forward(key, "late-but-fine", 0),
+        forward(unowned, "elsewhere", 0),
     ];
-    assert_eq!(ShardOps::apply_remote_batch_counted(&s, batch).await, 1);
+    let applied = ShardOps::apply_remote_batch_counted(&s, batch).await;
+    assert_eq!(
+        applied,
+        BatchApplied::new(1, 1),
+        "one refused for skew, one taken in, and a record for a part the node does not own is neither"
+    );
     assert_eq!(s.skew_held(), (0, 0), "a replicated record is dropped");
 
     let held = vec![forward(key, "skewed", 10_000)];
     assert_eq!(
         ShardOps::apply_remote_batch_counted(&s, held).await,
-        1,
+        BatchApplied::new(1, 0),
         "the same record through the counted entry point is refused again"
     );
     assert_eq!(
         ShardOps::apply_remote_batch_counted(&s, Vec::new()).await,
-        0,
+        BatchApplied::default(),
         "an empty batch refuses nothing"
     );
     ShardOps::apply_forwarded_batch(&s, vec![forward(key, "skewed", 10_000)]).await;

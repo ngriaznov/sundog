@@ -885,7 +885,7 @@ fn wire_record_len(cache_len: usize, record: &WireRecord) -> u64 {
 /// Applies a round's classified push/pull/hash-pull sets against `peer`, in
 /// chunks of at most [`REPAIR_BATCH`] (pulls follow [`pull_repairs`]'s limit
 /// for the peer), counts each chunk under `sundog_ae_repaired_total{cache}` as
-/// it moves ([`RepairTally::add`]), and returns the total wire bytes moved
+/// it lands ([`RepairTally::land`]), and returns the total wire bytes landed
 /// (pushed plus pulled) and whether every pull was answered and every push
 /// reached `peer`'s outbox.
 ///
@@ -943,7 +943,7 @@ async fn apply_repairs(
     }
 }
 
-/// Records and wire bytes one round's repairs moved, both directions.
+/// Records and wire bytes one round's repairs landed, both directions.
 #[derive(Default)]
 struct RepairTally {
     repaired: u64,
@@ -951,21 +951,49 @@ struct RepairTally {
 }
 
 impl RepairTally {
-    /// Counts one chunk of `records` moved for `cache`, and adds it to
-    /// `sundog_ae_repaired_total{cache}` at once, not at the end of the
-    /// round, so the counter keeps up with the bytes a long round has
-    /// already sent.
-    fn add(&mut self, cache: &SmolStr, records: &[WireRecord]) {
-        if !records.is_empty() {
+    /// Counts `records` records of `bytes` wire bytes that landed for
+    /// `cache`, and adds them to `sundog_ae_repaired_total{cache}` at once,
+    /// not at the end of the round, so the counter keeps up with what a long
+    /// round has already moved. A record lands when its frame reaches the
+    /// peer's outbox, or when this shard takes a pulled record in.
+    fn land(&mut self, cache: &SmolStr, records: u64, bytes: u64) {
+        if records > 0 {
             metrics::counter!("sundog_ae_repaired_total", "cache" => cache.to_string())
-                .increment(records.len() as u64);
+                .increment(records);
         }
-        self.repaired += records.len() as u64;
-        self.bytes_moved += records
-            .iter()
-            .map(|rec| wire_record_len(cache.len(), rec))
-            .sum::<u64>();
+        self.repaired += records;
+        self.bytes_moved += bytes;
     }
+}
+
+/// The wire size of `records`, framed as `Msg::Replicate` for `cache`.
+fn records_wire_len(cache: &SmolStr, records: &[WireRecord]) -> u64 {
+    records
+        .iter()
+        .map(|rec| wire_record_len(cache.len(), rec))
+        .sum()
+}
+
+/// The records a replicate frame carries; none for any other message.
+fn frame_records(msg: &wire::Msg) -> &[WireRecord] {
+    match msg {
+        wire::Msg::Replicate { rec, .. } => std::slice::from_ref(rec),
+        wire::Msg::ReplicateBatch { recs, .. } => recs,
+        _ => &[],
+    }
+}
+
+/// How many wire bytes of the `offered_bytes` a pull offered count as landed
+/// when the shard took in `accepted` of the `offered` records: pro rata, as
+/// the shard does not say which records it refused. Pure; unit tested
+/// directly.
+fn landed_pull_bytes(offered_bytes: u64, offered: usize, accepted: usize) -> u64 {
+    if offered == 0 {
+        return 0;
+    }
+    let accepted = accepted.min(offered);
+    let landed = u128::from(offered_bytes) * accepted as u128 / offered as u128;
+    u64::try_from(landed).unwrap_or(u64::MAX)
 }
 
 /// Whether a record stored at `local` still needs pushing to a peer whose
@@ -1146,11 +1174,34 @@ async fn push_repairs(
     for batch in push_keys.chunks(REPAIR_BATCH) {
         let mut records = shard.skip_unframeable(shard.records_for(batch.to_vec()).await);
         records.retain(|rec| push_needed(rec.ver, pulled.get(&rec.key).copied()));
-        tally.add(cache, &records);
-        // `net::batch_replicate` chunks this into a handful of full frames, not
-        // one `Msg::Replicate` per record.
-        let msgs = crate::net::batch_replicate(cache, records);
-        enqueued &= mesh.send_many_enqueued(peer, MsgClass::Replicate, msgs);
+        enqueued &= enqueue_pushed(mesh, peer, cache, records, tally);
+    }
+    enqueued
+}
+
+/// Queues `records` for `peer` as `Replicate` frames and counts the records
+/// of each frame that reached `peer`'s outbox: a frame a full outbox drops,
+/// or a peer the mesh does not know, is no repair. `net::batch_replicate`
+/// chunks the records into a handful of full frames, not one `Msg::Replicate`
+/// per record. Answers whether every frame was queued.
+fn enqueue_pushed(
+    mesh: &Mesh,
+    peer: NodeId,
+    cache: &SmolStr,
+    records: Vec<WireRecord>,
+    tally: &mut RepairTally,
+) -> bool {
+    let mut enqueued = true;
+    for msg in crate::net::batch_replicate(cache, records) {
+        let (count, bytes) = {
+            let carried = frame_records(&msg);
+            (carried.len() as u64, records_wire_len(cache, carried))
+        };
+        let queued = mesh.send_many_enqueued(peer, MsgClass::Replicate, [msg]);
+        if queued {
+            tally.land(cache, count, bytes);
+        }
+        enqueued &= queued;
     }
     enqueued
 }
@@ -1197,9 +1248,15 @@ async fn pull_repairs(
             match reply {
                 Ok(records) => {
                     failures = 0;
-                    tally.add(cache, &records);
                     pulled.extend(records.iter().map(|rec| (rec.key.clone(), rec.ver)));
-                    shard.apply_remote_batch(records).await;
+                    let (offered, offered_bytes) =
+                        (records.len(), records_wire_len(cache, &records));
+                    let applied = shard.apply_remote_batch_counted(records).await;
+                    tally.land(
+                        cache,
+                        applied.accepted.min(offered) as u64,
+                        landed_pull_bytes(offered_bytes, offered, applied.accepted),
+                    );
                 }
                 Err(error) => {
                     tracing::debug!(%error, "anti-entropy pull failed; keeping progress");

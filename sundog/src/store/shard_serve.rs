@@ -21,11 +21,11 @@ use super::spill::{SpillReadAt, Unreadable};
 #[cfg(feature = "spill")]
 use super::spilled_needs_read;
 use super::{
-    BUCKET_COUNT, BucketDigest, BucketEntries, BucketLen, BucketPart, BucketPartDigests,
-    CompactPassOutcome, CompactionBounds, Event, FanOutItem, FanOutRecords, Incoming, KeyVersion,
-    Mode, Origin, PartEntries, PartId, PartMask, Quiescence, Scope, ScopedDigests, Shard, ShardOps,
-    chunk_records_for_snapshot, compacted_version, crdt, encode_key, engine, fan_out_ships_values,
-    partition_writes,
+    BUCKET_COUNT, BatchApplied, BucketDigest, BucketEntries, BucketLen, BucketPart,
+    BucketPartDigests, CompactPassOutcome, CompactionBounds, Event, FanOutItem, FanOutRecords,
+    Incoming, KeyVersion, Mode, Origin, PartEntries, PartId, PartMask, Quiescence, Scope,
+    ScopedDigests, Shard, ShardOps, chunk_records_for_snapshot, compacted_version, crdt,
+    encode_key, engine, fan_out_ships_values, partition_writes,
 };
 use crate::hlc::Hlc;
 use crate::node::NodeId;
@@ -98,7 +98,11 @@ where
         clippy::too_many_lines,
         reason = "one inbound path's guard, decode, reserve and apply steps read best kept together"
     )]
-    pub(super) async fn apply_inbound(&self, recs: Vec<WireRecord>, inbound: Inbound) -> usize {
+    pub(super) async fn apply_inbound(
+        &self,
+        recs: Vec<WireRecord>,
+        inbound: Inbound,
+    ) -> BatchApplied {
         #[cfg(feature = "spill")]
         if self.inbound_held() {
             tracing::trace!(
@@ -106,7 +110,7 @@ where
                 records = recs.len(),
                 "inbound batch for a cache still attaching its spill tier; dropped"
             );
-            return 0;
+            return BatchApplied::default();
         }
         // The inbound-apply guard: a `Mode::Distributed` shard never
         // applies a record for a bucket its own *current* view does not
@@ -159,6 +163,7 @@ where
             decoded.push((hash, key, rec.key, rec.ver, incoming, origin));
         }
 
+        let decodable = decoded.len();
         // One reservation for the whole decoded batch (see
         // `Shard::reserve_for_batch`) throttles replication, anti-entropy
         // repair, and state-transfer apply alike through this one method.
@@ -225,7 +230,12 @@ where
         self.note_ignored_tombstones(written.ignored_tombstones(), inbound);
         self.retry_reservation_deficit(0, deficit, wait_left, &mut written)
             .await;
-        refused
+        BatchApplied::new(
+            refused,
+            decodable.saturating_sub(
+                usize::try_from(written.ignored_tombstones()).unwrap_or(usize::MAX),
+            ),
+        )
     }
 
     /// The write a wire record stands for: a put of its decoded value, or the
@@ -729,7 +739,7 @@ where
         })
     }
 
-    fn apply_remote_batch_counted(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, usize> {
+    fn apply_remote_batch_counted(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, BatchApplied> {
         Box::pin(self.apply_inbound(recs, Inbound::Replicated))
     }
 

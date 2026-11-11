@@ -268,7 +268,7 @@ fn chunk_mismatches_splits_into_bounded_chunks_preserving_order() {
 /// counted, before the round ends, so a reader of the counter mid-round sees
 /// every record the round has already sent.
 #[test]
-fn a_repair_tally_counts_each_chunk_as_it_moves() {
+fn a_repair_tally_counts_each_chunk_as_it_lands() {
     use metrics_util::MetricKind;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
@@ -289,30 +289,16 @@ fn a_repair_tally_counts_each_chunk_as_it_moves() {
             })
     };
     let cache = SmolStr::new("it");
-    let chunk = |from: u8, n: u8| -> Vec<WireRecord> {
-        (from..from + n)
-            .map(|k| WireRecord {
-                key: Bytes::from(vec![k]),
-                value: Some(Bytes::from_static(b"v")),
-                ver: Hlc {
-                    wall_ms: 1,
-                    logical: 0,
-                    node: NodeId::from(1),
-                },
-                expires_at_ms: None,
-            })
-            .collect()
-    };
     let mut tally = RepairTally::default();
 
-    tally.add(&cache, &chunk(0, 3));
+    tally.land(&cache, 3, 0);
     assert_eq!(
         repaired(),
         3,
         "the first chunk counts before the round ends"
     );
-    tally.add(&cache, &[]);
-    tally.add(&cache, &chunk(3, 2));
+    tally.land(&cache, 0, 0);
+    tally.land(&cache, 2, 0);
     // A snapshot drains the counter, so this one reads the second chunk only.
     assert_eq!(repaired(), 2, "the second chunk counts its own records");
     assert_eq!(tally.repaired, 5);
@@ -331,4 +317,48 @@ fn jittered_saturates_instead_of_panicking_at_duration_max() {
 fn scaled_floors_at_one_millisecond_and_scales_in_range() {
     assert_eq!(scaled(Duration::ZERO, 0.5), Duration::from_millis(1));
     assert_eq!(scaled(Duration::from_secs(10), 0.5), Duration::from_secs(5));
+}
+
+#[test]
+fn landed_pull_bytes_is_pro_rata_to_the_records_the_shard_took_in() {
+    assert_eq!(landed_pull_bytes(1000, 4, 4), 1000, "all taken in");
+    assert_eq!(landed_pull_bytes(1000, 4, 0), 0, "all refused");
+    assert_eq!(landed_pull_bytes(1000, 4, 1), 250);
+    assert_eq!(
+        landed_pull_bytes(1000, 0, 0),
+        0,
+        "an empty pull moves nothing"
+    );
+    assert_eq!(
+        landed_pull_bytes(1000, 4, 9),
+        1000,
+        "more accepted than offered counts as all offered"
+    );
+    assert_eq!(landed_pull_bytes(u64::MAX, 2, 2), u64::MAX);
+}
+
+#[test]
+fn frame_records_lists_the_records_of_a_replicate_frame_only() {
+    let rec = |k: u8| WireRecord {
+        key: Bytes::from(vec![k]),
+        value: None,
+        ver: Hlc {
+            wall_ms: 1,
+            logical: 0,
+            node: NodeId::from(1),
+        },
+        expires_at_ms: None,
+    };
+    let cache = SmolStr::new("it");
+    let one = wire::Msg::Replicate {
+        cache: cache.clone(),
+        rec: rec(1),
+    };
+    assert_eq!(frame_records(&one).len(), 1);
+    let batch = wire::Msg::ReplicateBatch {
+        cache,
+        recs: vec![rec(1), rec(2), rec(3)],
+    };
+    assert_eq!(frame_records(&batch).len(), 3);
+    assert!(frame_records(&wire::Msg::ReqDone).is_empty());
 }

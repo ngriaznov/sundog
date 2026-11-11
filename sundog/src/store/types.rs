@@ -201,6 +201,34 @@ pub struct BucketDigest {
     pub digest: u64,
 }
 
+/// What a shard did with one inbound batch, as
+/// [`ShardOps::apply_remote_batch_counted`] answers it.
+///
+/// [`ShardOps::apply_remote_batch_counted`]: crate::store::ShardOps::apply_remote_batch_counted
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BatchApplied {
+    /// Records refused for a stamp further ahead of the shard's clock than
+    /// `max_clock_skew` and dropped.
+    pub refused_for_skew: usize,
+    /// Records the shard took in: not refused for skew, owned, decodable,
+    /// and not a tombstone already past its retention. A record an older
+    /// version of which the shard already holds is still taken in.
+    pub accepted: usize,
+}
+
+impl BatchApplied {
+    /// A batch result of `refused_for_skew` refusals and `accepted` records
+    /// taken in.
+    #[must_use]
+    pub const fn new(refused_for_skew: usize, accepted: usize) -> Self {
+        Self {
+            refused_for_skew,
+            accepted,
+        }
+    }
+}
+
 /// A key paired with the version stamped on it, as an anti-entropy or
 /// state-transfer listing carries it.
 #[derive(Debug, Clone, PartialEq, Eq)]

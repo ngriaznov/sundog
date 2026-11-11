@@ -52,7 +52,7 @@ addresses once it forms, under `cluster formed`.
 | `sundog_sync_skipped_total{cache, reason}` | records left out of anti-entropy, state transfer or a rebalance chunk: `too_large`, a record that does not fit one frame. It stays on its node and every other key syncs; a warning, at most once a minute for each cache, identifies the largest by `largest_key_hash` and `largest_key_len` |
 | `sundog_fan_out_backlog{cache}` | written keys not yet sent to peers |
 | `sundog_fan_out_wait_timeouts_total{cache}` | writes that waited out `fan_out_wait_timeout` for backlog room and proceeded over capacity |
-| `sundog_ae_repaired_total{cache}` | entries anti-entropy repaired, counted per batch as each moves |
+| `sundog_ae_repaired_total{cache}` | entries anti-entropy repaired, counted per batch as each lands: a pushed record counts once its frame is in the peer's outbox, a pulled record once this node takes it in |
 | `sundog_ae_sketch_total{cache, outcome}` | sketch reconciliations of large buckets and of buckets whose listing would pass half a frame, `decoded` or `fallback`; a `fallback` lists the whole bucket, in several frames of about 2 MiB when it is large |
 | `sundog_ae_parts_total{cache, outcome}` | part-level reconciliations, `listing`, `sketch` or `fallback` |
 | `sundog_state_transfer_records_total{cache}` | records a joining node pulled from its donor |

@@ -10,6 +10,7 @@
 
 #![cfg(all(feature = "prometheus", not(feature = "sim")))]
 
+mod ae_repaired;
 mod closed;
 #[path = "../common/mod.rs"]
 mod common;
@@ -19,6 +20,7 @@ mod seeds;
 mod spill;
 mod support;
 
+use crate::ae_repaired::ae_repaired_pin_metrics;
 use crate::closed::{
     closed_cache_gauge_pins, closed_skew_hold_gauge_pins, shut_down_cluster_gauge_pins,
 };
@@ -124,6 +126,8 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     read_durations_pin_metrics(&cluster).await;
     fan_out_wait_timeout_pin_metrics().await;
     clock_skew_pin_metrics().await;
+    // Independent: both its nodes shut down before it returns.
+    ae_repaired_pin_metrics(metrics_addr).await;
     tombstone_ignored_pin_metrics().await;
     merge_refused_pin_metric().await;
     sync_skipped_pin_metric().await;

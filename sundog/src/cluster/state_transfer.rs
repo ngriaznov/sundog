@@ -536,7 +536,10 @@ where
                 // versioned-apply path live `Replicate` uses.
                 chunks += 1;
                 applied += chunk.len() as u64;
-                refused += shard.apply_remote_batch_counted(chunk).await;
+                refused += shard
+                    .apply_remote_batch_counted(chunk)
+                    .await
+                    .refused_for_skew;
             }
             Some(Ok(BucketStreamItem::BucketDone { bucket, veto })) => {
                 if !vouches_for_bucket(std::mem::take(&mut refused)) {
