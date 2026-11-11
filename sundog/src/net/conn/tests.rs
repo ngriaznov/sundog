@@ -41,11 +41,16 @@ fn loaded_replies_split_past_the_budget_and_keep_every_entry() {
         rec(b"k3", b"cccc"),
     ];
     let uncached = vec![(Bytes::from_static(b"k4"), Bytes::from_static(b"dddd"))];
-    let replies = super::serve::loaded_replies(found.clone(), uncached.clone(), 12);
+    let record_cost = 6 + crate::wire::LOADED_RECORD_MAX_WIRE_LEN;
+    let uncached_cost = 6 + crate::wire::LOADED_UNCACHED_MAX_WIRE_LEN;
+    let replies = super::serve::loaded_replies(found.clone(), uncached.clone(), 2 * record_cost);
     assert_eq!(
         reply_sizes(&replies),
         vec![12, 12],
-        "6 bytes an entry, two a reply"
+        "two records fill a reply; the third record and the uncached pair share the next \
+         ({} of {} budget)",
+        record_cost + uncached_cost,
+        2 * record_cost
     );
     let (mut all_found, mut all_uncached) = (Vec::new(), Vec::new());
     for reply in replies {
@@ -1930,4 +1935,47 @@ async fn handle_accepted_records_a_bucket_ack_that_arrives_after_any_serve_st_bu
 
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(2), accepted_task).await;
+}
+
+/// Every `Loaded` reply of many tiny entries at the widest varints encodes
+/// within `MAX_FRAME`, and no entry is lost or reordered.
+#[test]
+fn loaded_replies_fit_a_frame_for_entries_smaller_than_their_fixed_fields() {
+    let wide = Hlc {
+        wall_ms: u64::MAX,
+        logical: u32::MAX,
+        node: NodeId::from(u64::MAX),
+    };
+    let found: Vec<WireRecord> = (0..300_000u32)
+        .map(|i| WireRecord {
+            key: Bytes::copy_from_slice(&i.to_be_bytes()),
+            value: Some(Bytes::copy_from_slice(&i.to_be_bytes())),
+            ver: wide,
+            expires_at_ms: Some(u64::MAX),
+        })
+        .collect();
+    let uncached: Vec<(Bytes, Bytes)> = (0..100_000u32)
+        .map(|i| {
+            (
+                Bytes::copy_from_slice(&i.to_be_bytes()),
+                Bytes::copy_from_slice(&i.to_be_bytes()),
+            )
+        })
+        .collect();
+    let replies = super::serve::loaded_replies(
+        found.clone(),
+        uncached.clone(),
+        super::serve::LOADED_REPLY_BUDGET,
+    );
+    assert!(replies.len() > 1, "the answer is split");
+    let (mut all_found, mut all_uncached) = (Vec::new(), Vec::new());
+    for reply in &replies {
+        crate::wire::encode(reply).expect("every Loaded reply fits MAX_FRAME");
+        if let Msg::Loaded { found, uncached } = reply {
+            all_found.extend(found.iter().cloned());
+            all_uncached.extend(uncached.iter().cloned());
+        }
+    }
+    assert_eq!(all_found, found);
+    assert_eq!(all_uncached, uncached);
 }

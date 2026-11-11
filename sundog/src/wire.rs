@@ -717,6 +717,17 @@ pub(crate) fn forward_frame_len(cache_len: usize, key_len: usize, value_len: usi
 /// fields at its maximum varint width.
 pub(crate) const CELL_MAX_WIRE_LEN: usize = 5 + 10 + 10 + 5 + 10 + 10;
 
+/// The widest postcard encoding of one found [`WireRecord`] of a
+/// [`Msg::Loaded`] reply, beyond its key's and value's own bytes: the key's
+/// length, the value's presence tag and length, the version's `wall_ms`,
+/// `logical` and `node`, and the expiry's presence tag and `u64`, each at its
+/// maximum varint width.
+pub(crate) const LOADED_RECORD_MAX_WIRE_LEN: usize = 10 + (1 + 10) + (10 + 5 + 10) + (1 + 10);
+
+/// The widest postcard encoding of one `uncached` pair of a [`Msg::Loaded`]
+/// reply, beyond the key's and value's own bytes: the two lengths.
+pub(crate) const LOADED_UNCACHED_MAX_WIRE_LEN: usize = 10 + 10;
+
 /// The widest postcard encoding of one `(key, version)` entry of a
 /// [`Msg::AeBucket`] or [`Msg::AePart`] listing, beyond the key's own bytes:
 /// the key's length, then the version's `wall_ms`, `logical` and `node`, each

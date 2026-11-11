@@ -69,6 +69,47 @@ async fn load_returns_the_responders_records_and_uncached_values() {
     );
 }
 
+/// A `Load` whose answer is many records smaller than their fixed fields
+/// comes back whole: the responder splits it into several `Loaded` replies
+/// that each fit a frame, where one reply would pass `MAX_FRAME` and drop the
+/// connection.
+#[tokio::test]
+async fn load_returns_a_huge_answer_of_tiny_records_in_several_replies() {
+    let wide = Hlc {
+        wall_ms: u64::MAX,
+        logical: u32::MAX,
+        node: NodeId::from(u64::MAX),
+    };
+    let found: Vec<WireRecord> = (0..140_000u32)
+        .map(|i| WireRecord {
+            key: Bytes::copy_from_slice(&i.to_be_bytes()),
+            value: Some(Bytes::copy_from_slice(&i.to_be_bytes())),
+            ver: wide,
+            expires_at_ms: Some(u64::MAX),
+        })
+        .collect();
+    let keys: Vec<Bytes> = found.iter().map(|rec| rec.key.clone()).collect();
+    let handler = Arc::new(FixtureHandler {
+        load_fixture: LoadFixture::Loaded(found.clone(), Vec::new()),
+        ..Default::default()
+    });
+    let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+    let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+    client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+
+    let outcome = client
+        .load(NodeId::from(1), SmolStr::new("users"), keys)
+        .await
+        .expect("the load answers instead of dropping the connection");
+    assert_eq!(
+        outcome,
+        LoadOutcome::Loaded {
+            found,
+            uncached: Vec::new(),
+        }
+    );
+}
+
 #[tokio::test]
 async fn load_reports_the_responders_loader_failure() {
     let handler = Arc::new(FixtureHandler {

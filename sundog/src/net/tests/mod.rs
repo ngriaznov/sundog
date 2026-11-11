@@ -246,6 +246,7 @@ impl RequestHandler for FixtureHandler {
 
     fn load(&self, _cache: SmolStr, keys: Vec<Bytes>) -> BoxFuture<'_, LoadServe> {
         Box::pin(async move {
+            let keys: std::collections::HashSet<Bytes> = keys.into_iter().collect();
             match &self.load_fixture {
                 LoadFixture::Loaded(found, uncached) => LoadServe::Loaded {
                     found: found

@@ -228,14 +228,28 @@ pub(super) async fn serve_load(
     send_batch_or_cancelled(framed, &replies, cancel).await
 }
 
-/// The bytes of keys and values one [`Msg::Loaded`] carries before
-/// [`loaded_replies`] starts the next: half a frame, leaving room for the
-/// records' fixed fields.
-const LOADED_REPLY_BUDGET: usize = MAX_FRAME / 2;
+/// The encoded bytes one [`Msg::Loaded`] carries before [`loaded_replies`]
+/// starts the next: half a frame. Each entry counts its key and value bytes
+/// plus the widest fixed fields it encodes with ([`loaded_entry_cost`]).
+pub(super) const LOADED_REPLY_BUDGET: usize = MAX_FRAME / 2;
 
-/// Splits a load's answer into [`Msg::Loaded`] messages, each holding at
-/// most `budget` bytes of keys and values unless one entry alone is
-/// larger; always at least one message. Pure; unit tested directly.
+/// What one entry adds to a [`Msg::Loaded`] at most: its key and value bytes
+/// plus [`wire::LOADED_RECORD_MAX_WIRE_LEN`] for a found record or
+/// [`wire::LOADED_UNCACHED_MAX_WIRE_LEN`] for an uncached pair.
+fn loaded_entry_cost(entry: &Result<WireRecord, (Bytes, Bytes)>) -> usize {
+    match entry {
+        Ok(rec) => {
+            rec.key.len()
+                + rec.value.as_ref().map_or(0, Bytes::len)
+                + wire::LOADED_RECORD_MAX_WIRE_LEN
+        }
+        Err((key, value)) => key.len() + value.len() + wire::LOADED_UNCACHED_MAX_WIRE_LEN,
+    }
+}
+
+/// Splits a load's answer into [`Msg::Loaded`] messages, each encoding to at
+/// most `budget` bytes, counted by [`loaded_entry_cost`], unless one entry
+/// alone is larger; always at least one message. Pure; unit tested directly.
 pub(super) fn loaded_replies(
     found: Vec<WireRecord>,
     uncached: Vec<(Bytes, Bytes)>,
@@ -249,10 +263,7 @@ pub(super) fn loaded_replies(
         .map(Ok)
         .chain(uncached.into_iter().map(Err));
     for entry in entries {
-        let len = match &entry {
-            Ok(rec) => rec.key.len() + rec.value.as_ref().map_or(0, Bytes::len),
-            Err((key, value)) => key.len() + value.len(),
-        };
+        let len = loaded_entry_cost(&entry);
         if used > 0 && used + len > budget {
             let (found, uncached) = std::mem::take(&mut current);
             replies.push(Msg::Loaded { found, uncached });
