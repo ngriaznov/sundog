@@ -225,9 +225,14 @@ cap like any other source.
 A connection from an address that is not a peer's holds a slot among at most
 2048 such open connections for as long as it lives, and the node closes any
 further one as it accepts it. Such a connection that sends no frame for 60
-seconds after its hello is closed, and a peer behind NAT redials its idle
-broadcast link at that rate. A connection from a peer's address waits for a
-frame without limit, as an idle broadcast link does. Every connection that
+seconds after its hello is closed, unless its hello names a node in the peer
+table of the same cluster: a peer behind NAT, a published container port or
+an overlay dials from an address it does not advertise, and its idle
+broadcast link stays open. A connection from a peer's address, or one whose
+hello names a peer, waits for a frame without limit, as an idle broadcast
+link does. The node id in a hello is not authenticated, so a connection that
+names a peer still holds its slot among the 2048, counted by its source
+address. Every connection that
 stops inside a frame, its length prefix received and the rest not arriving,
 for 30 seconds is closed; the 30 seconds restart whenever more of the frame
 arrives. The limits are fixed.

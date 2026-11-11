@@ -51,23 +51,53 @@ pub(super) fn read_wait(mid_frame: bool, idle: Option<Duration>) -> Option<Durat
     }
 }
 
+/// Whether the wait for a connection's first frame is bounded by
+/// [`FIRST_FRAME_TIMEOUT`]: the connection holds a slot among those from
+/// sources that are not peer addresses (`unknown_source`), and its `Hello`
+/// names no current mesh peer of the node's cluster (`hello_names_peer`). A
+/// peer behind NAT, a published container port or an overlay dials from an
+/// address it does not gossip, so its source IP looks unknown, yet its
+/// `Hello` names a node in the peer table and its idle broadcast link must
+/// stay open. The node id in a `Hello` is not authenticated, so a connection
+/// that names a peer keeps its slot among the open connections, which is
+/// keyed by its source IP, and is bounded by that cap and by
+/// [`FRAME_STALL_TIMEOUT`] inside a frame. Pure; unit tested directly.
+pub(super) const fn first_frame_bound_applies(
+    unknown_source: bool,
+    hello_names_peer: bool,
+) -> bool {
+    unknown_source && !hello_names_peer
+}
+
+/// [`first_frame_bound_applies`] for the connection `from` names, asked only
+/// while no frame has arrived: the peer table is not read for a link that is
+/// already serving frames.
+fn first_frame_is_bounded(
+    mesh: &MeshInner,
+    from: NodeId,
+    unknown_source: bool,
+    frames_received: usize,
+) -> bool {
+    frames_received == 0 && first_frame_bound_applies(unknown_source, mesh.is_peer_node(from))
+}
+
 /// How long a connection waits for its next frame to start. A connection
 /// that has served a request is a pooling candidate and waits
-/// [`REQ_CONN_IDLE_TIMEOUT`]. One from an unknown source (`unknown_source`)
-/// that has received no frame since its `Hello` waits
-/// [`FIRST_FRAME_TIMEOUT`]. Every other connection waits without bound: a
-/// persistent broadcast link from a peer is idle for as long as the peer has
-/// nothing to send, before its first frame and between frames, and the
-/// acceptor cannot tell it from a connection that has served nothing.
-/// Pure; unit tested directly.
+/// [`REQ_CONN_IDLE_TIMEOUT`]. One whose first frame is bounded
+/// (`first_frame_bounded`, [`first_frame_bound_applies`]) and that has
+/// received no frame since its `Hello` waits [`FIRST_FRAME_TIMEOUT`]. Every
+/// other connection waits without bound: a persistent broadcast link from a
+/// peer is idle for as long as the peer has nothing to send, before its first
+/// frame and between frames, and the acceptor cannot tell it from a
+/// connection that has served nothing. Pure; unit tested directly.
 pub(super) fn frame_idle_timeout(
     served_requests: usize,
     frames_received: usize,
-    unknown_source: bool,
+    first_frame_bounded: bool,
 ) -> Option<Duration> {
     if served_requests > 0 {
         Some(REQ_CONN_IDLE_TIMEOUT)
-    } else if unknown_source && frames_received == 0 {
+    } else if first_frame_bounded && frames_received == 0 {
         Some(FIRST_FRAME_TIMEOUT)
     } else {
         None
@@ -298,12 +328,13 @@ async fn open_link(stream: TcpStream, tls: &TlsCtx) -> Option<OpenedLink> {
 /// caps: a slot among the open connections until the handler returns, and a
 /// slot among those waiting for their `Hello` until the `Hello` decodes. A
 /// known source holds none. After its `Hello` a connection from an unknown
-/// source that sends no frame for [`FIRST_FRAME_TIMEOUT`] is closed and
-/// counted in `sundog_accept_dropped_total{reason="first_frame_timeout"}`;
-/// every connection that stops inside a frame for [`FRAME_STALL_TIMEOUT`] is
-/// closed and counted under `reason="frame_stall"`. A connection from a
-/// peer's IP that is between frames waits without bound, as a broadcast link
-/// does.
+/// source whose `Hello` names no peer in the peer table, and that sends no
+/// frame for [`FIRST_FRAME_TIMEOUT`], is closed and counted in
+/// `sundog_accept_dropped_total{reason="first_frame_timeout"}`; every
+/// connection that stops inside a frame for [`FRAME_STALL_TIMEOUT`] is closed
+/// and counted under `reason="frame_stall"`. A connection from a peer's IP,
+/// or one whose `Hello` names a peer, that is between frames waits without
+/// bound, as a broadcast link does.
 ///
 /// Every read and write below races against `mesh`'s accept token, tearing
 /// a slow snapshot or AE reply down promptly on [`crate::net::Mesh::shutdown`].
@@ -368,7 +399,8 @@ pub(super) async fn handle_accepted(
     let mut frames_received: usize = 0;
     loop {
         // See `frame_idle_timeout` for which connections wait without bound.
-        let idle_timeout = frame_idle_timeout(served_requests, frames_received, unknown_source);
+        let bounded = first_frame_is_bounded(&mesh, from, unknown_source, frames_received);
+        let idle_timeout = frame_idle_timeout(served_requests, frames_received, bounded);
         let received = tokio::select! {
             biased;
             () = cancel.cancelled() => return,

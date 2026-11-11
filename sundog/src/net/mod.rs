@@ -609,6 +609,15 @@ impl MeshInner {
         }
     }
 
+    /// Whether `node` is in the peer table: a current live member of the
+    /// mesh, however its connections arrive.
+    fn is_peer_node(&self, node: NodeId) -> bool {
+        self.peers
+            .read()
+            .expect("invariant: peers lock is never poisoned")
+            .contains_key(&node)
+    }
+
     /// Accounts for `handle`, which [`Mesh::update_peers`] removes from the
     /// table for `peer`: the frames still queued in its outboxes go with it
     /// and are added to `sundog_backlog_dropped_total{peer}`, and the peer's
@@ -738,6 +747,36 @@ impl MeshInner {
             conn::Admission::new(),
             Duration::from_secs(60),
         )
+    }
+
+    /// Adds a peer for `node` to the table with no writer behind it, at
+    /// `data_addr`: a node the table lists as live, for the tests that drive
+    /// `handle_accepted` and need it to name one.
+    #[cfg(all(test, not(feature = "sim")))]
+    pub(super) fn add_test_peer(&self, node: NodeId, data_addr: SocketAddr) {
+        let (replicate_tx, _replicate_rx) =
+            replicate_outbox(self.outbox_capacity, self.outbox_bytes);
+        let handle = PeerHandle {
+            data_addr,
+            invalidate: Arc::new(DropOldestQueue::new(
+                self.outbox_capacity,
+                self.outbox_bytes,
+            )),
+            replicate_tx,
+            dirty: Arc::new(AtomicBool::new(false)),
+            stalled: Arc::new(AtomicU64::new(0)),
+            pull_limits: Mutex::new(HashMap::new()),
+            pull_warned: Mutex::new(HashSet::new()),
+            last_replicate_enqueued: Arc::new(AtomicU64::new(0)),
+            ae_deferrals: AtomicU32::new(0),
+            cancel: CancellationToken::new(),
+            req_pool: Arc::new(conn::ReqPool::new()),
+            protocol: AtomicU16::new(wire::PROTOCOL_VERSION),
+        };
+        self.peers
+            .write()
+            .expect("invariant: peers lock is never poisoned")
+            .insert(node, handle);
     }
 
     /// [`MeshInner::for_tests`] with `ack_window` as the age past which an

@@ -10,11 +10,14 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt as _;
 
 use super::{Accepted, Dropped, hello, invalidate, send_each, spawn_accepted};
-use crate::net::conn::accept::{ReadTimeout, frame_idle_timeout, read_timeout_reason, read_wait};
+use crate::net::conn::accept::{
+    ReadTimeout, first_frame_bound_applies, frame_idle_timeout, read_timeout_reason, read_wait,
+};
 use crate::net::conn::admit::{FIRST_FRAME_TIMEOUT, FRAME_STALL_TIMEOUT};
 use crate::net::conn::framing::frame_started;
 use crate::net::conn::pool::REQ_CONN_IDLE_TIMEOUT;
 use crate::net::conn::tests::no_tls;
+use crate::node::NodeId;
 
 const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
@@ -61,6 +64,20 @@ fn only_an_unknown_source_with_no_frame_yet_waits_a_bounded_time_for_its_first()
         "a source that has sent a broadcast frame is a link, bounded by the cap"
     );
     assert_eq!(frame_idle_timeout(0, 3, false), None);
+}
+
+#[test]
+fn the_first_frame_wait_is_bounded_only_for_an_unknown_source_that_names_no_peer() {
+    assert!(first_frame_bound_applies(true, false), "a stranger");
+    assert!(
+        !first_frame_bound_applies(true, true),
+        "a peer behind a translated address names itself in its hello"
+    );
+    assert!(
+        !first_frame_bound_applies(false, false),
+        "a peer's address is never cut"
+    );
+    assert!(!first_frame_bound_applies(false, true));
 }
 
 #[test]
@@ -258,4 +275,82 @@ async fn a_frame_that_keeps_arriving_is_not_cut_and_completes() {
         invalidate(1)
     );
     assert!(!accepted.task.is_finished());
+}
+
+/// An accepted connection from loopback, which is no peer's address, whose
+/// mesh lists `listed` as a peer at a foreign address, as a NAT, a published
+/// port or an overlay leaves a real peer: its source IP is not the one it
+/// gossips. The hello names node 9.
+async fn greeted_behind_translated_address(listed: NodeId) -> Accepted {
+    let mesh =
+        crate::net::MeshInner::for_tests(no_tls(), tokio_util::sync::CancellationToken::new());
+    mesh.add_test_peer(listed, "203.0.113.7:7946".parse().expect("valid address"));
+    mesh.admission
+        .set_known_sources(["203.0.113.7".parse::<IpAddr>().expect("valid address")]);
+    let mut accepted = super::spawn_handler(super::loopback_pair().await, &mesh);
+    assert!(
+        !mesh.admission.is_known_source(LOOPBACK),
+        "the connection arrives from an address no peer gossips"
+    );
+    send_each(&mut accepted.client, &[hello()]).await;
+    settle().await;
+    accepted
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_idle_link_whose_hello_names_a_peer_at_a_foreign_address_stays_open() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let dropped = Dropped::new(recorder.snapshotter());
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let mut accepted = greeted_behind_translated_address(super::peer()).await;
+    assert_eq!(
+        accepted.mesh.admission.open(),
+        1,
+        "it still holds a slot among the open connections, keyed by its source IP"
+    );
+
+    pass(FIRST_FRAME_TIMEOUT + 10 * SECOND).await;
+    assert!(
+        !accepted.task.is_finished(),
+        "open past the first-frame timeout"
+    );
+    pass(Duration::from_hours(1)).await;
+    assert!(!accepted.task.is_finished(), "and an hour on");
+    assert_eq!(dropped.total("first_frame_timeout"), None);
+
+    send_each(&mut accepted.client, &[invalidate(1)]).await;
+    settle().await;
+    assert_eq!(
+        accepted.inbound.try_recv().expect("served").msg,
+        invalidate(1)
+    );
+    assert_eq!(accepted.mesh.admission.open(), 1, "the slot is kept");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_idle_link_whose_hello_names_no_peer_at_a_foreign_address_is_closed() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let dropped = Dropped::new(recorder.snapshotter());
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    // Node 10 is a peer; the hello names node 9, which the table lacks.
+    let accepted = greeted_behind_translated_address(NodeId::from(10)).await;
+
+    pass(FIRST_FRAME_TIMEOUT + 10 * SECOND).await;
+    assert!(accepted.task.is_finished(), "closed at the timeout");
+    assert_eq!(dropped.total("first_frame_timeout"), Some(1));
+    assert_eq!(accepted.mesh.admission.open(), 0, "the slot is free");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hello_that_names_a_peer_does_not_lift_the_stall_timeout() {
+    let mut accepted = greeted_behind_translated_address(super::peer()).await;
+    accepted
+        .client
+        .write_all(&partial_frame(100, 10))
+        .await
+        .expect("a prefix and part of the body");
+    settle().await;
+
+    pass(FRAME_STALL_TIMEOUT + SECOND).await;
+    assert!(accepted.task.is_finished(), "closed inside the frame");
 }

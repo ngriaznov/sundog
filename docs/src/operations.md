@@ -168,9 +168,11 @@ addresses once it forms, under `cluster formed`.
   few, so the cap admits hundreds of them; a larger count is a client that
   opens connections and keeps them.
 - `first_frame_timeout` closes a connection from an address that is not a
-  peer's that sent no frame for 60 seconds after its hello. A peer behind
-  NAT with nothing to replicate sees its broadcast link close at that rate
-  and redial it.
+  peer's, whose hello names no node in the peer table, that sent no frame for
+  60 seconds after its hello. A peer behind NAT with nothing to replicate
+  names itself in its hello, so its broadcast link stays open; a peer that the
+  node does not list yet, because gossip has not reached it, is closed and
+  redials.
 - `frame_stall` closes a connection, from any address, that stopped inside a
   frame for 30 seconds.
 

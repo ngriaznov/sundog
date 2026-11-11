@@ -37,15 +37,17 @@ pub(super) const MAX_PRE_HELLO_CONNS: usize = 512;
 /// `Hello` and then stalls can hold.
 pub(super) const MAX_UNKNOWN_SOURCE_CONNS: usize = 2048;
 
-/// How long a connection from a source that is not a mesh peer may wait,
-/// after its `Hello`, for its first frame. A request connection sends its
+/// How long a connection may wait, after its `Hello`, for its first frame
+/// when it comes from a source that is not a mesh peer's address and its
+/// `Hello` names no node in the peer table. A request connection sends its
 /// first frame in the same flush as its `Hello`, and a broadcast link from
 /// a peer waits for its first frame as long as the peer has none to send,
 /// and the acceptor cannot tell the two apart before that frame arrives.
-/// A connection from a peer's IP therefore waits without bound, and one
-/// from any other source is closed after this long: a peer behind a
-/// translated address redials its broadcast link at that rate while it has
-/// nothing to send.
+/// A connection from a peer's IP, or one whose `Hello` names a live peer
+/// whatever address it arrives from, therefore waits without bound, and one
+/// from any other source is closed after this long: a stranger that sends a
+/// valid `Hello` and then idles. A peer behind NAT, a published port or an
+/// overlay is the second kind, so its idle broadcast link stays open.
 pub(super) const FIRST_FRAME_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// How long a connection may sit inside a frame, its length prefix received
