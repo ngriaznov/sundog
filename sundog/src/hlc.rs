@@ -57,10 +57,10 @@ impl HlcClock {
     /// stamp regardless of wall-clock behavior.
     pub fn now(&mut self, physical_now_ms: u64) -> Hlc {
         let wall_ms = physical_now_ms.max(self.last.wall_ms);
-        let logical = if wall_ms == self.last.wall_ms {
-            self.last.logical + 1
+        let (wall_ms, logical) = if wall_ms == self.last.wall_ms {
+            successor(wall_ms, self.last.logical)
         } else {
-            0
+            (wall_ms, 0)
         };
         self.last = Hlc {
             wall_ms,
@@ -77,14 +77,14 @@ impl HlcClock {
     /// always compares greater than `remote` afterward.
     pub fn observe(&mut self, physical_now_ms: u64, remote: Hlc) -> Hlc {
         let wall_ms = physical_now_ms.max(self.last.wall_ms).max(remote.wall_ms);
-        let logical = if wall_ms == self.last.wall_ms && wall_ms == remote.wall_ms {
-            self.last.logical.max(remote.logical) + 1
+        let (wall_ms, logical) = if wall_ms == self.last.wall_ms && wall_ms == remote.wall_ms {
+            successor(wall_ms, self.last.logical.max(remote.logical))
         } else if wall_ms == self.last.wall_ms {
-            self.last.logical + 1
+            successor(wall_ms, self.last.logical)
         } else if wall_ms == remote.wall_ms {
-            remote.logical + 1
+            successor(wall_ms, remote.logical)
         } else {
-            0
+            (wall_ms, 0)
         };
         self.last = Hlc {
             wall_ms,
@@ -119,6 +119,19 @@ impl HlcClock {
     #[must_use]
     pub fn lead_ms(&self, physical_now_ms: u64) -> u64 {
         self.last.wall_ms.saturating_sub(physical_now_ms)
+    }
+}
+
+/// The `(wall_ms, logical)` pair one past `(wall_ms, logical)`: the next
+/// `logical`, carrying into `wall_ms` (with `logical` back at 0) when
+/// `logical` is at `u32::MAX`, and saturating at `(u64::MAX, u32::MAX)`,
+/// the largest stamp, where nothing larger exists. A peer stamp at
+/// `logical == u32::MAX` takes the carry path. Pure; unit tested directly.
+fn successor(wall_ms: u64, logical: u32) -> (u64, u32) {
+    match (logical.checked_add(1), wall_ms.checked_add(1)) {
+        (Some(logical), _) => (wall_ms, logical),
+        (None, Some(wall_ms)) => (wall_ms, 0),
+        (None, None) => (u64::MAX, u32::MAX),
     }
 }
 
@@ -239,6 +252,81 @@ mod tests {
     }
 
     #[test]
+    fn successor_increments_carries_and_saturates() {
+        assert_eq!(successor(7, 3), (7, 4));
+        assert_eq!(successor(7, u32::MAX - 1), (7, u32::MAX));
+        assert_eq!(successor(7, u32::MAX), (8, 0));
+        assert_eq!(successor(u64::MAX, u32::MAX), (u64::MAX, u32::MAX));
+        assert_eq!(successor(u64::MAX, 5), (u64::MAX, 6));
+    }
+
+    #[test]
+    fn observe_of_a_peer_stamp_at_the_logical_maximum_carries_into_wall_ms() {
+        let mut clock = HlcClock::new(node(1));
+        let remote = Hlc {
+            wall_ms: 5_000,
+            logical: u32::MAX,
+            node: node(2),
+        };
+        let merged = clock.observe(1_000, remote);
+        assert!(merged > remote, "{merged:?} vs {remote:?}");
+        assert_eq!((merged.wall_ms, merged.logical), (5_001, 0));
+        assert!(clock.now(1_000) > merged, "the clock keeps advancing");
+    }
+
+    #[test]
+    fn now_from_a_last_stamp_at_the_logical_maximum_carries_into_wall_ms() {
+        let mut clock = HlcClock::new(node(1));
+        let _ = clock.observe(
+            0,
+            Hlc {
+                wall_ms: 9,
+                logical: u32::MAX - 2,
+                node: node(2),
+            },
+        );
+        let at_max = clock.now(0);
+        assert_eq!((at_max.wall_ms, at_max.logical), (9, u32::MAX));
+        let carried = clock.now(0);
+        assert!(carried > at_max);
+        assert_eq!((carried.wall_ms, carried.logical), (10, 0));
+    }
+
+    #[test]
+    fn observe_with_both_logicals_at_the_maximum_carries_once() {
+        let mut clock = HlcClock::new(node(1));
+        let _ = clock.observe(
+            0,
+            Hlc {
+                wall_ms: 5,
+                logical: u32::MAX - 1,
+                node: node(3),
+            },
+        );
+        let remote = Hlc {
+            wall_ms: 5,
+            logical: u32::MAX,
+            node: node(2),
+        };
+        let merged = clock.observe(0, remote);
+        assert_eq!((merged.wall_ms, merged.logical), (6, 0));
+    }
+
+    #[test]
+    fn the_clock_saturates_at_the_largest_stamp() {
+        let mut clock = HlcClock::new(node(1));
+        let top = Hlc {
+            wall_ms: u64::MAX,
+            logical: u32::MAX,
+            node: node(2),
+        };
+        let merged = clock.observe(0, top);
+        assert_eq!((merged.wall_ms, merged.logical), (u64::MAX, u32::MAX));
+        let next = clock.now(0);
+        assert_eq!((next.wall_ms, next.logical), (u64::MAX, u32::MAX));
+    }
+
+    #[test]
     fn repeated_observe_never_goes_backwards() {
         let mut clock = HlcClock::new(node(1));
         let mut prev = clock.now(0);
@@ -271,11 +359,16 @@ mod kani_proofs {
         }
     }
 
+    /// Whether `hlc` is at the largest `(wall_ms, logical)`, where no larger stamp exists.
+    fn is_top(hlc: Hlc) -> bool {
+        hlc.wall_ms == u64::MAX && hlc.logical == u32::MAX
+    }
+
     /// A local stamp is greater than the previous one and never behind the physical clock.
     #[kani::proof]
     fn now_advances_past_the_last_stamp() {
         let last = any_hlc();
-        kani::assume(last.logical < u32::MAX);
+        kani::assume(!is_top(last));
         let mut clock = HlcClock {
             node: last.node,
             last,
@@ -292,8 +385,8 @@ mod kani_proofs {
     fn observe_advances_past_the_last_and_the_remote_stamp() {
         let last = any_hlc();
         let remote = any_hlc();
-        kani::assume(last.logical < u32::MAX);
-        kani::assume(remote.logical < u32::MAX);
+        kani::assume(!is_top(last));
+        kani::assume(!is_top(remote));
         let mut clock = HlcClock {
             node: last.node,
             last,
