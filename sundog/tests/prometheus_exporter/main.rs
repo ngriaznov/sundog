@@ -23,10 +23,10 @@ use crate::closed::{closed_cache_gauge_pins, shut_down_cluster_gauge_pins};
 use crate::pins::{
     SKEW_HOLD_PIN_CAPACITY, TOMBSTONE_PIN_COUNT, accept_drop_pin_metrics, clock_skew_pin_metrics,
     count_hits_and_misses, fan_out_wait_timeout_pin_metrics, loader_calls_pin_metric,
-    memory_ceiling_pin_metrics, merge_refused_pin_metric, read_durations_pin_metrics,
-    refresh_hints_pin_metric, refresh_outcomes_pin_metrics, skew_hold_pin_bytes,
-    skew_hold_pin_metrics, sync_skipped_pin_metric, tombstone_ignored_pin_metrics,
-    tombstone_pin_metrics,
+    loader_failure_miss_pin_metric, memory_ceiling_pin_metrics, merge_refused_pin_metric,
+    read_durations_pin_metrics, refresh_hints_pin_metric, refresh_outcomes_pin_metrics,
+    skew_hold_pin_bytes, skew_hold_pin_metrics, sync_skipped_pin_metric,
+    tombstone_ignored_pin_metrics, tombstone_pin_metrics,
 };
 use crate::seeds::{
     FAN_OUT_STALL_PIN, seed_crdt_compaction_metrics, seed_distributed_metrics,
@@ -129,6 +129,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     );
     assert!(ceiling_pin_bytes > 0.0);
     loader_calls_pin_metric(&cluster).await;
+    loader_failure_miss_pin_metric(&cluster).await;
     let tombstone_node = tombstone_pin_metrics().await;
     let (skew_hold_node, skew_hold_peer) = skew_hold_pin_metrics().await;
     refresh_outcomes_pin_metrics(&cluster).await;
@@ -325,6 +326,15 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     );
     // sundog_loader_calls_total: pinned by loader_calls_pin_metric and
     // refresh_outcomes_pin_metrics; a cache without a loader has no series.
+    assert_eq!(
+        scraped_metric_value(
+            &body,
+            "sundog_cache_misses_total",
+            &[("cache", "load-fail-pin")]
+        ),
+        Some(5.0),
+        "each failed loader run counts a miss; got body:\n{body}"
+    );
     assert_eq!(
         scraped_metric_value(&body, "sundog_loader_calls_total", &[("cache", "load-pin")]),
         Some(2.0),

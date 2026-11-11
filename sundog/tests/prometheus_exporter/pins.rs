@@ -222,6 +222,34 @@ pub(crate) async fn loader_calls_pin_metric(cluster: &Cluster) {
     }
 }
 
+/// Drives `sundog_cache_misses_total{cache}` through failing loader runs on a
+/// `Mode::Local` cache whose source is down: two failing `get_or_load`s and
+/// one failing `load_many` of three keys are five misses, and nothing is
+/// stored.
+pub(crate) async fn loader_failure_miss_pin_metric(cluster: &Cluster) {
+    let cache = cluster
+        .cache::<u32, String>("load-fail-pin")
+        .mode(Mode::Local)
+        .batch_loader(|_keys: Vec<u32>| async move {
+            Err::<std::collections::HashMap<u32, String>, _>(SourceDown)
+        })
+        .open()
+        .await
+        .expect("cache opens");
+    for key in [1, 2] {
+        let err = cache
+            .get_or_load(&key, async |_key| Err::<String, _>(SourceDown))
+            .await
+            .expect_err("the source is down");
+        assert!(matches!(err, CacheError::Loader(_)));
+    }
+    cache
+        .load_many([3, 4, 5])
+        .await
+        .expect_err("the source is down");
+    assert_eq!(cache.entry_count().await, 0);
+}
+
 /// Drives `sundog_refreshes_total{cache, outcome}` on a `Mode::Local` cache
 /// with a 1s TTL and refresh-ahead at 0.5: three keys load together, then,
 /// once due, each is read in turn and reloads alone, one into a new value

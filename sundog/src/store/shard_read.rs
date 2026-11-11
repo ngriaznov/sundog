@@ -291,7 +291,8 @@ where
     /// the same missing key collapse into one `loader` call.
     ///
     /// Counts `sundog_cache_misses_total{cache}` exactly once per `loader`
-    /// execution, from the fill's owner. Every other call, a cache hit or a
+    /// execution, from the fill's owner, whether the execution fills or
+    /// fails. Every other call, a cache hit or a
     /// collapsed caller, counts `sundog_cache_hits_total{cache}` instead.
     ///
     /// On a `feature = "spill"` build, the collapse extends to a spilled
@@ -474,6 +475,9 @@ where
                             Ok(value)
                         }
                         Err(err) => {
+                            // The run found no entry here and could not fill
+                            // one: a miss, as a run that fills counts.
+                            self.misses.increment(1);
                             let err: Arc<dyn std::error::Error + Send + Sync> = Arc::new(err);
                             self.engine.fail_inflight(
                                 &key_bytes,

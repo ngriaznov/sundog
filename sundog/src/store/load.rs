@@ -530,7 +530,7 @@ where
                     } => {
                         let _ = done.wait_for(|done| *done).await;
                         let resolved = resolve_joined(&inflight);
-                        if !matches!(resolved, Resolved::Retry) {
+                        if !matches!(resolved, Resolved::Retry | Resolved::Failed(_)) {
                             self.hits.increment(1);
                         }
                         (key, resolved)
@@ -769,7 +769,7 @@ where
     /// a `Mode::Distributed` non-owner answers without storing, under the
     /// deadline its [`FillExpiry`] sets; one it returns to answer with ends
     /// uncached, a key it leaves out ends absent, and a failure fails every
-    /// key. Each counts as a miss.
+    /// key. Each counts as a miss, a failed key included.
     /// Dropping this future mid-call releases every load it holds.
     async fn run_chunk(&self, source: &SourceFn<'_, K, V>, chunk: Vec<Queued<K, V>>) {
         let guards: Vec<_> = chunk
@@ -820,6 +820,7 @@ where
             Err(err) => {
                 let err: Arc<dyn std::error::Error + Send + Sync> = Arc::from(err);
                 for (item, guard) in chunk.into_iter().zip(guards) {
+                    self.misses.increment(1);
                     let _ = item.slot.set(Err(Arc::clone(&err)));
                     self.engine.fail_inflight(
                         &item.key_bytes,

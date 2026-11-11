@@ -1048,3 +1048,45 @@ async fn a_load_over_an_expired_unswept_entry_emits_created() {
     );
     cluster.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_failed_loader_run_through_the_cache_counts_misses() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let cluster = Cluster::builder("cache-it-load-fail-misses")
+        .seeds(std::iter::empty())
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("node builds");
+    let cache = cluster
+        .cache::<u32, String>("prices")
+        .mode(Mode::Local)
+        .batch_loader(|_keys: Vec<u32>| async move { Err::<HashMap<u32, String>, _>(SourceDown) })
+        .open()
+        .await
+        .expect("opens");
+    cache.load(&1).await.expect_err("source down");
+    cache.load_many([2, 3]).await.expect_err("source down");
+    cache
+        .get_or_load(&4, async |_key| Err::<String, _>(SourceDown))
+        .await
+        .expect_err("source down");
+
+    let misses: u64 = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter_map(|(key, _, _, value)| match value {
+            metrics_util::debugging::DebugValue::Counter(n)
+                if key.key().name() == "sundog_cache_misses_total" =>
+            {
+                Some(n)
+            }
+            _ => None,
+        })
+        .sum();
+    assert_eq!(misses, 4, "one per failed run of a key: 1 + 2 + 1");
+    cluster.shutdown().await;
+}

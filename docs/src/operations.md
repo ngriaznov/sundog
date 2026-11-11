@@ -41,7 +41,7 @@ addresses once it forms, under `cluster formed`.
 | Metric | Meaning |
 |---|---|
 | `sundog_cache_hits_total{cache}` | reads answered from this node's copy |
-| `sundog_cache_misses_total{cache}` | reads that found no entry on this node, one per `get_or_load` fill, whether its loader or, on a `Distributed` non-owner, an owner supplies the value |
+| `sundog_cache_misses_total{cache}` | reads that found no entry on this node, one per `get_or_load` fill, whether its loader or, on a `Distributed` non-owner, an owner supplies the value; a loader run that fails counts one miss per key it was asked for |
 | `sundog_read_duration_seconds{cache, outcome}` | histogram of `get` and `get_sync` durations, `hit` or `miss`, about one read in 256 per thread |
 | `sundog_cache_entries{cache}` | live entries on this node; a cache's per-cache gauges (this one, `sundog_tombstones`, `sundog_cache_bytes`, `sundog_owned_parts`, `sundog_owned_buckets`) read 0 once the cache closes |
 | `sundog_tombstones{cache}` | tombstones this node holds: its deletes and, in a `Replicated` or `Distributed` cache whose resolver does not merge, its swept expired entries, until they are collected: an expired entry's for `tombstone_ttl` after its expiry, a delete's for `tombstone_ttl` after its stamp and up to `tombstone_max_ttl` while the node defers |

@@ -461,3 +461,114 @@ async fn get_or_insert_with_fills_on_miss_and_skips_make_on_hit() {
     assert_eq!(hit, "loaded");
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
+
+/// Misses counted by `sundog_cache_misses_total` in `snapshotter`.
+fn counted_misses(snapshotter: &metrics_util::debugging::Snapshotter) -> u64 {
+    use metrics_util::debugging::DebugValue;
+    let mut misses = 0;
+    for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+        if let ("sundog_cache_misses_total", DebugValue::Counter(n)) = (key.key().name(), value) {
+            misses += n;
+        }
+    }
+    misses
+}
+
+#[tokio::test]
+async fn a_failed_get_or_load_run_counts_one_miss() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let s = shard::<u32, String>(1);
+    for key in [1u32, 2] {
+        let err = s
+            .get_or_load(&key, async move |_key: &u32| -> Result<String, BoomError> {
+                Err(BoomError)
+            })
+            .await
+            .expect_err("loader failed");
+        assert!(matches!(err, CacheError::Loader(_)));
+    }
+    assert_eq!(
+        counted_misses(&snapshotter),
+        2,
+        "each failed loader execution counts one miss"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_run_counts_one_miss_for_its_owner_and_none_for_joined_callers() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let s = Arc::new(shard::<u32, String>(1));
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let started = Arc::new(tokio::sync::Notify::new());
+    let owner = tokio::spawn({
+        let s = Arc::clone(&s);
+        let gate = Arc::clone(&gate);
+        let started = Arc::clone(&started);
+        async move {
+            s.get_or_load(&1, async move |_key: &u32| -> Result<String, BoomError> {
+                started.notify_one();
+                gate.notified().await;
+                Err(BoomError)
+            })
+            .await
+        }
+    });
+    // The owner holds the in-flight entry before the joiners ask.
+    started.notified().await;
+    let joiners: Vec<_> = (0..3)
+        .map(|_| {
+            let s = Arc::clone(&s);
+            tokio::spawn(async move {
+                s.get_or_load(&1, async |_key: &u32| -> Result<String, BoomError> {
+                    panic!("a joined call never runs its loader")
+                })
+                .await
+            })
+        })
+        .collect();
+    // The joiners subscribe to the in-flight entry before it fails.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    gate.notify_one();
+    owner.await.expect("owner").expect_err("loader failed");
+    for joiner in joiners {
+        joiner
+            .await
+            .expect("joiner")
+            .expect_err("shares the failure");
+    }
+    assert_eq!(counted_misses(&snapshotter), 1);
+}
+
+#[tokio::test]
+async fn a_failed_load_many_run_counts_one_miss_per_key() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let s = shard::<u32, String>(1).with_loader(Loader::batch(|_keys: Vec<u32>| async move {
+        Err::<HashMap<u32, String>, _>(BoomError)
+    }));
+    s.load_many([1u32, 2, 3]).await.expect_err("source down");
+    assert_eq!(
+        counted_misses(&snapshotter),
+        3,
+        "each key of a failed batch run counts one miss"
+    );
+}
+
+#[tokio::test]
+async fn a_successful_run_counts_one_miss() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let s = shard::<u32, String>(1);
+    s.get_or_load(&1, async move |_key: &u32| -> Result<String, BoomError> {
+        Ok("x".into())
+    })
+    .await
+    .expect("ok");
+    assert_eq!(counted_misses(&snapshotter), 1);
+}
