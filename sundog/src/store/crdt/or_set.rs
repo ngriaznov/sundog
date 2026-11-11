@@ -315,6 +315,13 @@ where
     /// happens. A pre-existing receipt past its lifetime is pruned first,
     /// against `self`'s state before that drop, so a writer advances at
     /// most one stage per call. Never touches `adds`.
+    ///
+    /// `retire` is asked only about a writer that is neither retired nor
+    /// receipted, so a writer folded away is not retired again while its
+    /// receipt lives. The tags stay in `adds`, so once the receipt expires
+    /// a dead writer that still has tags is retired and folded again: the
+    /// cycle repeats about every five `retire_after_ms` bounds, never
+    /// sooner.
     #[must_use]
     pub(crate) fn compact(
         &self,
@@ -333,7 +340,10 @@ where
             .chain(self.seen.keys().copied())
             .collect();
         for writer in writers {
-            if retire(writer) && !out.retired.contains_key(&writer) {
+            if !out.retired.contains_key(&writer)
+                && !out.folded_at.contains_key(&writer)
+                && retire(writer)
+            {
                 out.retired.insert(writer, now_ms);
                 changed = true;
             }
@@ -823,6 +833,58 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// Compaction is idempotent after stage two: a folded writer whose tags
+    /// remain in `adds` is not retired again, `retire` is not asked about
+    /// it, and a writer is never both retired and receipted.
+    #[test]
+    fn compact_does_not_retire_a_folded_writer_again() {
+        let w = wid(1, 0);
+        let bounds = CompactionBounds::three_bounds(100);
+        let asked = std::cell::Cell::new(0u32);
+        let dead = |writer: WriterId| {
+            asked.set(asked.get() + 1);
+            writer == w
+        };
+        let s = OrSet::add(w, 0, "x".to_string());
+        let one = s
+            .compact(1_000, bounds, &dead, Quiescence::Settled)
+            .expect("stage one");
+        let two = one
+            .compact(1_250, bounds, &dead, Quiescence::Settled)
+            .expect("stage two folds");
+        assert!(two.folded_at.contains_key(&w), "folded: {two:?}");
+        assert!(two.retired.is_empty(), "retired dropped: {two:?}");
+        let asked_before = asked.get();
+        let three = two.compact(1_251, bounds, &dead, Quiescence::Settled);
+        assert!(
+            three.is_none(),
+            "a folded writer is not re-retired by the next sweep: {three:?}"
+        );
+        assert_eq!(asked.get(), asked_before, "retire is not asked again");
+    }
+
+    /// After the receipt expires the writer's remaining tags retire again:
+    /// the cycle lengthens to about five bounds and does not end.
+    #[test]
+    fn compact_retires_a_folded_writer_again_once_its_receipt_expires() {
+        let w = wid(1, 0);
+        let bounds = CompactionBounds::three_bounds(100);
+        let dead = |writer: WriterId| writer == w;
+        let folded = OrSet::add(w, 0, "x".to_string())
+            .compact(1_000, bounds, &dead, Quiescence::Settled)
+            .and_then(|s| s.compact(1_250, bounds, &dead, Quiescence::Settled))
+            .expect("folds");
+        let expired_at = 1_250 + bounds.receipt_ttl_ms + 1;
+        let pruned = folded
+            .compact(expired_at, bounds, &dead, Quiescence::Settled)
+            .expect("the expired receipt is pruned");
+        assert!(pruned.folded_at.is_empty(), "{pruned:?}");
+        let again = pruned
+            .compact(expired_at + 1, bounds, &dead, Quiescence::Settled)
+            .expect("the writer retires again");
+        assert!(again.retired.contains_key(&w), "{again:?}");
     }
 
     /// Stage two: a retired writer's `seen`/`retired` entries age out once

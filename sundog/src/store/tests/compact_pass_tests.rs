@@ -854,6 +854,39 @@ async fn an_or_set_late_fold_leaves_a_receipt_the_merge_apply_keeps() {
     }
 }
 
+/// A folded `OrSet` writer whose tags remain in the set is not retired,
+/// reported or rewritten again while its receipt lives, so
+/// `sundog_crdt_retired_writers_total` counts the writer once.
+#[tokio::test]
+async fn an_or_set_folded_writer_is_not_reported_or_rewritten_by_the_next_pass() {
+    let bounds = CompactionBounds::three_bounds(1_000);
+    let s = shard::<u32, OrSet<String>>(1)
+        .with_resolver(Arc::new(OrSetResolver::<String>::new()))
+        .with_crdt_bounds(bounds);
+    let dead = writer(9);
+    s.merge(1, OrSet::add(dead, 0, "x".to_string()))
+        .await
+        .expect("add");
+    let retire = move |w: crdt::WriterId| w == dead;
+    let first = ShardOps::compact_pass(&s, 1_000, &retire, Quiescence::Settled, bounds, 100).await;
+    assert_eq!(first.retired, vec![dead]);
+    let fold = ShardOps::compact_pass(&s, 3_500, &retire, Quiescence::Settled, bounds, 100).await;
+    assert_eq!(fold.compacted, 1, "stage two folds with a receipt");
+    let next = ShardOps::compact_pass(&s, 3_501, &retire, Quiescence::Settled, bounds, 100).await;
+    assert_eq!(
+        next.retired,
+        Vec::<crdt::WriterId>::new(),
+        "not reported again"
+    );
+    assert_eq!(next.compacted, 0, "not rewritten again");
+    assert!(
+        s.get(&1)
+            .await
+            .expect("resident")
+            .contains(&"x".to_string())
+    );
+}
+
 /// Only `Invalidation` declines to fold: nodes there hold different
 /// writers, so two nodes' folds can be of disjoint writer sets, which the
 /// folded totals' merge cannot add up.
