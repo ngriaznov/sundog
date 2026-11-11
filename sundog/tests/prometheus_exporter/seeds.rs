@@ -278,9 +278,15 @@ pub(crate) async fn seed_crdt_compaction_metrics(cluster: &Cluster, metrics_addr
 /// scrapes. Folded into the main test for the same process-global
 /// recorder reason `spill_writes_and_promotes_pin_metrics` is; the shared
 /// recorder also means `sundog_owned_parts{cache="prices"}`'s pin stays
-/// a positivity check, and `sundog_owned_buckets` is pinned to it over 64.
+/// a positivity check, which it takes from `metrics_addr` while every node
+/// still holds the cache open, and `sundog_owned_buckets` is pinned to it
+/// over 64. The cache closes when this returns, and its gauges then read 0.
 #[allow(clippy::too_many_lines, reason = "one scripted end-to-end scenario")]
-pub(crate) async fn seed_distributed_metrics(cluster: &Cluster, peer: &Cluster) {
+pub(crate) async fn seed_distributed_metrics(
+    cluster: &Cluster,
+    peer: &Cluster,
+    metrics_addr: SocketAddr,
+) {
     let owners = NonZeroU8::new(2).expect("nonzero");
     let name = "prices";
     let gossip_a = cluster.local_gossip_addr();
@@ -462,6 +468,21 @@ pub(crate) async fn seed_distributed_metrics(cluster: &Cluster, peer: &Cluster) 
     })
     .await
     .expect("cluster releases the displaced bucket once the disown grace elapses");
+
+    // Before the crashes below: a node that stops zeroes its own gauges, and
+    // the nodes of this scenario share one recorder.
+    let body = scrape_metrics(metrics_addr).await.expect("scrape");
+    let owned_parts = scraped_metric_value(&body, "sundog_owned_parts", &[("cache", name)]);
+    assert!(
+        owned_parts.is_some_and(|owned| owned > 0.0),
+        "expected a positive sundog_owned_parts for the open distributed 'prices' cache; got \
+         body:\n{body}"
+    );
+    assert_eq!(
+        scraped_metric_value(&body, "sundog_owned_buckets", &[("cache", name)]),
+        owned_parts.map(|parts| parts / 64.0),
+        "sundog_owned_buckets is the owned part count over 64; got body:\n{body}"
+    );
 
     // outcome="error": every real owner of some key cluster never owned
     // crashes; both dials fail before the failure detector reacts. A

@@ -1103,9 +1103,33 @@ fn publish_owned_parts(cache: &SmolStr, view: &OwnershipView, message: &'static 
 /// through this cache: the `sundog_owned_parts` and `sundog_owned_buckets`
 /// gauges only move on a real ownership change. The hash is known before
 /// the view is built, so an unchanged view costs no ranking at all.
+///
+/// When the task ends, the cache is closing or the cluster shutting down: it
+/// sets both gauges to 0 as its last act, so a closed cache reports no owned
+/// parts and no later write from this task can follow the zero.
 pub(crate) async fn refresh_task(
     cluster: Cluster,
     cache: SmolStr,
+    k: NonZeroU8,
+    tx: watch::Sender<Arc<OwnershipView>>,
+    residency: Arc<ResidencySet>,
+    cancel: CancellationToken,
+) {
+    refresh_views(cluster, &cache, k, tx, residency, cancel).await;
+    clear_owned_parts(&cache);
+}
+
+/// Sets `cache`'s `sundog_owned_parts` and `sundog_owned_buckets` gauges to 0.
+fn clear_owned_parts(cache: &SmolStr) {
+    metrics::gauge!("sundog_owned_parts", "cache" => cache.to_string()).set(0.0);
+    metrics::gauge!("sundog_owned_buckets", "cache" => cache.to_string()).set(0.0);
+}
+
+/// [`refresh_task`]'s loop, which returns when `cancel` fires or membership
+/// ends.
+async fn refresh_views(
+    cluster: Cluster,
+    cache: &SmolStr,
     k: NonZeroU8,
     tx: watch::Sender<Arc<OwnershipView>>,
     residency: Arc<ResidencySet>,
@@ -1134,7 +1158,7 @@ pub(crate) async fn refresh_task(
         // The hash alone says whether anything changed; the view itself is
         // built only when it did, from the current one, and at part
         // granularity off the async workers.
-        let eligible = eligible_owners(self_node, &peers_snapshot, &modes_snapshot, &cache, k);
+        let eligible = eligible_owners(self_node, &peers_snapshot, &modes_snapshot, cache, k);
         let granularity = ownership_granularity(self_node, &peers_snapshot, &eligible);
         let new_hash = view_hash_at(&eligible, granularity);
         if tx.borrow().view_hash() == new_hash {
@@ -1167,7 +1191,7 @@ pub(crate) async fn refresh_task(
             }
         });
         if published {
-            publish_owned_parts(&cache, &view, "ownership view republished");
+            publish_owned_parts(cache, &view, "ownership view republished");
         }
     }
 }

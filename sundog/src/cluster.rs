@@ -1523,10 +1523,10 @@ async fn membership_to_mesh_task(
     mesh.update_peers(initial);
     loop {
         let Some(changed) = cancel.run_until_cancelled(peers.changed()).await else {
-            return;
+            break;
         };
         if changed.is_err() {
-            return; // membership shut down
+            break; // membership shut down
         }
         let current = peers.borrow_and_update().clone();
         tracing::info!(peer_count = current.len(), "membership view changed");
@@ -1534,6 +1534,9 @@ async fn membership_to_mesh_task(
         activity.retain_live(&current);
         mesh.update_peers(current);
     }
+    // The node is out of the cluster: `sundog_live_peers` reads 0, as it
+    // does on a node that never had a peer.
+    set_live_peers_gauge(0);
 }
 
 /// The cache-mode-mismatch late-detection sweep. Two nodes opening the same
@@ -1630,11 +1633,14 @@ fn set_live_peers_gauge(count: usize) {
 /// Periodically republishes the count of open caches as the
 /// `sundog_open_caches` gauge. A gauge, not an event-driven update, since
 /// [`crate::cache::CacheBuilder::open`] has no hook back into telemetry.
+/// When `cancel` fires, the cluster is shutting down: the task sets the gauge
+/// to 0 as its last act, so no later write can overwrite the zero.
 async fn open_cache_gauge_task(shards: ShardRegistry, cancel: CancellationToken) {
     let mut ticker = tokio::time::interval(Duration::from_secs(5));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         if cancel.run_until_cancelled(ticker.tick()).await.is_none() {
+            metrics::gauge!("sundog_open_caches").set(0.0);
             return;
         }
         let count = shards.read_shards().len();
@@ -1750,7 +1756,10 @@ pub(crate) async fn tombstone_gc_task(
 /// ceiling: set immediately, then refreshed every 5 seconds from
 /// [`Shard::entry_count`], [`Shard::tombstone_count`] and
 /// [`Shard::resident_bytes`] for as long as the cache stays open. The counts
-/// are only advisory until pending housekeeping flushes.
+/// are only advisory until pending housekeeping flushes. When `cancel` fires,
+/// the cache is closing: the task sets each gauge it published to 0 as its
+/// last act, so a closed cache reports nothing and no later write from this
+/// task can follow the zero.
 pub(crate) async fn cache_entries_gauge_task<K, V>(
     shard: Arc<Shard<K, V>>,
     name: SmolStr,
@@ -1780,6 +1789,11 @@ pub(crate) async fn cache_entries_gauge_task<K, V>(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         if cancel.run_until_cancelled(ticker.tick()).await.is_none() {
+            gauge.set(0.0);
+            tombstone_gauge.set(0.0);
+            if let Some(bytes_gauge) = &bytes_gauge {
+                bytes_gauge.set(0.0);
+            }
             return;
         }
         gauge.set(entry_count_f64(shard.entry_count().await));

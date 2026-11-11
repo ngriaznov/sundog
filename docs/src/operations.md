@@ -43,7 +43,7 @@ addresses once it forms, under `cluster formed`.
 | `sundog_cache_hits_total{cache}` | reads answered from this node's copy |
 | `sundog_cache_misses_total{cache}` | reads that found no entry on this node, one per `get_or_load` fill, whether its loader or, on a `Distributed` non-owner, an owner supplies the value |
 | `sundog_read_duration_seconds{cache, outcome}` | histogram of `get` and `get_sync` durations, `hit` or `miss`, about one read in 256 per thread |
-| `sundog_cache_entries{cache}` | live entries on this node |
+| `sundog_cache_entries{cache}` | live entries on this node; a cache's per-cache gauges (this one, `sundog_tombstones`, `sundog_cache_bytes`, `sundog_owned_parts`, `sundog_owned_buckets`) read 0 once the cache closes |
 | `sundog_tombstones{cache}` | tombstones this node holds: its deletes and, in a `Replicated` or `Distributed` cache whose resolver does not merge, its swept expired entries, until they are collected: an expired entry's for `tombstone_ttl` after its expiry, a delete's for `tombstone_ttl` after its stamp and up to `tombstone_max_ttl` while the node defers |
 | `sundog_tombstones_ignored_total{cache}` | tombstones a peer sent that arrived already past their retention and were ignored: stored nowhere, deleting nothing. A late delete, an expiry tombstone past its `tombstone_ttl` and a delete offered by a node that defers all count. A forwarded delete among them, a non-owner's or an owner's own to its co-owners, is lost, since every node ignores it alike, and also logs a warning, at most once a minute; see [guarantees](guarantees.md#deletes) |
 | `sundog_cache_bytes{cache}` | a cache with a `max_resident_bytes` ceiling: resident bytes of this node's live entries, as `Cache::resident_bytes` counts them |
@@ -65,8 +65,8 @@ addresses once it forms, under `cluster formed`.
 
 | Metric | Meaning |
 |---|---|
-| `sundog_live_peers` | peers this node sees alive: one for each remote node id, at its newest incarnation, so a node that restarted under a persisted id before its old incarnation was reaped counts once. A live process that carries this node's own id is not a peer; see [Two nodes share a node id](#two-nodes-share-a-node-id) |
-| `sundog_open_caches` | caches open on this node |
+| `sundog_live_peers` | peers this node sees alive: one for each remote node id, at its newest incarnation, so a node that restarted under a persisted id before its old incarnation was reaped counts once. A live process that carries this node's own id is not a peer; see [Two nodes share a node id](#two-nodes-share-a-node-id). 0 once the node has shut down |
+| `sundog_open_caches` | caches open on this node; 0 once the node has shut down |
 | `sundog_frames_sent_total` | data-plane frames sent |
 | `sundog_bytes_sent_total` | data-plane bytes sent |
 | `sundog_accept_dropped_total{reason}` | data-plane connections this node closed before they sent a hello: `hello_timeout` (no complete hello within 10 seconds of the connection's handler first running, TLS handshake included) or `over_cap` (512 connections from addresses that are not a peer's already waited for their hello) |

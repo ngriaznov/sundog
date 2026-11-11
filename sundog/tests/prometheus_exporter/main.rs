@@ -10,6 +10,7 @@
 
 #![cfg(all(feature = "prometheus", not(feature = "sim")))]
 
+mod closed;
 #[path = "../common/mod.rs"]
 mod common;
 mod pins;
@@ -18,6 +19,7 @@ mod seeds;
 mod spill;
 mod support;
 
+use crate::closed::{closed_cache_gauge_pins, shut_down_cluster_gauge_pins};
 use crate::pins::{
     SKEW_HOLD_PIN_CAPACITY, TOMBSTONE_PIN_COUNT, accept_drop_pin_metrics, clock_skew_pin_metrics,
     count_hits_and_misses, fan_out_wait_timeout_pin_metrics, loader_calls_pin_metric,
@@ -154,9 +156,11 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     // Also independent: its three nodes are crashed or shut down before it
     // returns.
     seed_fan_out_stall_metrics(metrics_addr).await;
+    // Closes the caches it opens, so nothing after it sees them.
+    closed_cache_gauge_pins(&cluster, metrics_addr).await;
     // Runs last: it shuts down two of its own scenario-local nodes once it
     // is done with them, and `peer` isn't touched by anything after it.
-    seed_distributed_metrics(&cluster, &peer).await;
+    seed_distributed_metrics(&cluster, &peer, metrics_addr).await;
 
     // `sundog_open_caches` comes from a periodic background routine and the
     // sketch/parts counters from an anti-entropy round, so poll until every
@@ -509,17 +513,15 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         "expected at least one part listing on the 'parts' cache; got body:\n{body}"
     );
 
-    let owned_parts = scraped_metric_value(&body, "sundog_owned_parts", &[("cache", "prices")]);
-    assert!(
-        owned_parts.is_some_and(|owned| owned > 0.0),
-        "expected a positive sundog_owned_parts for the distributed 'prices' cache; got \
-         body:\n{body}"
-    );
-    assert_eq!(
-        scraped_metric_value(&body, "sundog_owned_buckets", &[("cache", "prices")]),
-        owned_parts.map(|parts| parts / 64.0),
-        "sundog_owned_buckets is the owned part count over 64; got body:\n{body}"
-    );
+    // `seed_distributed_metrics` pinned the open cache's owned parts; its
+    // cache has closed since, and both gauges read 0.
+    for metric in ["sundog_owned_parts", "sundog_owned_buckets"] {
+        assert_eq!(
+            scraped_metric_value(&body, metric, &[("cache", "prices")]),
+            Some(0.0),
+            "{metric} reads 0 for the closed 'prices' cache; got body:\n{body}"
+        );
+    }
     for outcome in ["local", "remote", "miss", "error"] {
         assert!(
             scraped_metric_value(
@@ -1000,6 +1002,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     drop((accept_drop_silent, accept_drop_partial));
     accept_drop_node.shutdown().await;
     cluster.shutdown().await;
+    shut_down_cluster_gauge_pins(metrics_addr).await;
     #[cfg(feature = "spill")]
     for dir in &spill_dirs {
         let _ = std::fs::remove_dir_all(dir);

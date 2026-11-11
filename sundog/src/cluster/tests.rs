@@ -11,6 +11,7 @@ mod builder;
 mod distributed;
 mod forget_cache;
 mod forget_departed;
+mod gauge_lifetime;
 mod gc_task;
 mod hand_off;
 mod inbound;
