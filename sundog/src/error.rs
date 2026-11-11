@@ -115,9 +115,12 @@ pub enum CacheError {
         /// The mode observed elsewhere.
         remote: crate::store::Mode,
     },
-    /// The cache is opened as [`crate::store::Mode::Replicated`] with a
-    /// finite `max_capacity` or `tti`. Every `Replicated` node holds every
-    /// entry, so anti-entropy would silently re-pull an evicted entry back.
+    /// The cache is opened as [`crate::store::Mode::Replicated`] or
+    /// [`crate::store::Mode::Distributed`] with a `tti`, or with a finite
+    /// `max_capacity` and no spill tier. A spill tier lifts only the
+    /// capacity case; a `tti` is always rejected. Every replica holds every
+    /// entry it owns, so anti-entropy would silently re-pull an evicted
+    /// entry back.
     /// Use [`crate::store::Mode::Invalidation`] for a bounded local cache.
     #[error(
         "cache {cache:?} combines Mode::Replicated with a finite max_capacity or tti, which anti-entropy would silently defeat"

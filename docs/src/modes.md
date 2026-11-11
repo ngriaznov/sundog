@@ -59,11 +59,13 @@ that already holds it before `open` returns, then runs one anti-entropy
 round against that peer to catch writes made during the pull. A background anti-entropy loop keeps the copies equal
 while the cache is open.
 
-A `Replicated` cache takes no `max_capacity` or `tti` without a spill tier:
-evicting an entry on one node would only have anti-entropy pull it back
-from the others. Bound it with TTLs, or attach the [spill tier](features.md#spill)
-to move cold entries to disk. `open` returns
-`CacheError::ReplicatedWithLocalEviction` for a capacity without a tier.
+A `Replicated` cache takes no `tti`, and takes a finite `max_capacity` only
+with a spill tier: evicting an entry on one node would only have
+anti-entropy pull it back from the others. Bound it with TTLs, or attach the
+[spill tier](features.md#spill) to move cold entries to disk. A spill tier
+lifts the capacity limit and nothing else. `open` returns
+`CacheError::ReplicatedWithLocalEviction` for a `tti`, and for a capacity
+without a tier.
 A [memory ceiling](sizing.md#memory-ceiling) evicts nothing, so it needs no
 tier.
 
