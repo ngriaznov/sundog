@@ -37,6 +37,10 @@ pub(crate) struct FanOutQueue<K> {
     /// Whether a push lands in `pending` at all: `false` for a
     /// `Mode::Local` shard, whose writes never fan out and are not errors.
     accepting: AtomicBool,
+    /// Whether the queue has published `sundog_fan_out_backlog{cache}`:
+    /// [`FanOutQueue::close`] zeroes only a gauge that exists, so a cache
+    /// that never queued a key gets no series.
+    published: AtomicBool,
     /// Set by [`FanOutQueue::seal`] and [`FanOutQueue::close`]: the cache is
     /// closing, and a write from here on is refused with
     /// [`CacheError::Closed`] rather than accepted and never sent. Read and
@@ -54,6 +58,7 @@ impl<K> FanOutQueue<K> {
             notify: tokio::sync::Notify::new(),
             drained: tokio::sync::Notify::new(),
             accepting: AtomicBool::new(accepting),
+            published: AtomicBool::new(false),
             closed: StdMutex::new(false),
         }
     }
@@ -61,6 +66,7 @@ impl<K> FanOutQueue<K> {
     /// Publishes `sundog_fan_out_backlog{cache}` as `len`, the one place
     /// every mutation of `pending` reports its length through.
     fn publish_backlog(&self, len: usize) {
+        self.published.store(true, Ordering::Relaxed);
         metrics::gauge!("sundog_fan_out_backlog", "cache" => self.name.to_string())
             .set(fan_out_backlog_gauge_value(len));
     }
@@ -81,7 +87,9 @@ impl<K> FanOutQueue<K> {
         let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
         *self.closed.lock().unwrap_or_else(PoisonError::into_inner) = true;
         pending.clear();
-        self.publish_backlog(0);
+        if self.published.load(Ordering::Relaxed) {
+            self.publish_backlog(0);
+        }
         self.drained.notify_waiters();
     }
 

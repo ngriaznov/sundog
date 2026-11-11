@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use sundog::store::{Shard, ShardOps};
 use sundog::{
-    CacheError, Cluster, ConflictResolver, Merged, Mode, NodeId, RecordView, Winner, later_deadline,
+    Cache, CacheError, Cluster, ConflictResolver, Merged, Mode, NodeId, RecordView, Winner,
+    later_deadline,
 };
 
 use crate::support::{node_config, reserve_tcp_addr};
@@ -718,9 +719,10 @@ pub(crate) async fn accept_drop_pin_metrics()
 /// the hold full, and one stamped three days ahead is past its horizon.
 /// Pins `sundog_clock_skew_held`, `sundog_clock_skew_held_bytes`,
 /// `sundog_clock_skew_hold_dropped_total{reason}` and, one refusal per
-/// record, `sundog_clock_skew_rejected_total`. Returns the node and the
-/// peer's socket, which stay up until the metrics are scraped.
-pub(crate) async fn skew_hold_pin_metrics() -> (Cluster, tokio::net::TcpStream) {
+/// record, `sundog_clock_skew_rejected_total`. Returns the node, its cache and
+/// the peer's socket, which stay up until the metrics are scraped.
+pub(crate) async fn skew_hold_pin_metrics() -> (Cluster, Cache<u32, String>, tokio::net::TcpStream)
+{
     use sundog::wire::{self, Msg, WireRecord};
     use tokio::io::AsyncWriteExt;
 
@@ -736,7 +738,7 @@ pub(crate) async fn skew_hold_pin_metrics() -> (Cluster, tokio::net::TcpStream) 
         .build()
         .await
         .expect("node builds");
-    let _cache = node
+    let cache = node
         .cache::<u32, String>("skew-hold-pin")
         .mode(Mode::Distributed {
             owners: NonZeroU8::new(2).expect("nonzero"),
@@ -744,8 +746,8 @@ pub(crate) async fn skew_hold_pin_metrics() -> (Cluster, tokio::net::TcpStream) 
         .open()
         .await
         .expect("cache opens");
-    // The cache stays open until the node shuts down: dropping a handle
-    // does not close it.
+    // The cache stays open until the caller closes it or the node shuts
+    // down: dropping a handle does not close it.
 
     let writer = NodeId::from(0x5eed_0001);
     let mut stream = tokio::net::TcpStream::connect(data_addr)
@@ -814,5 +816,5 @@ pub(crate) async fn skew_hold_pin_metrics() -> (Cluster, tokio::net::TcpStream) 
         },
     )
     .await;
-    (node, stream)
+    (node, cache, stream)
 }

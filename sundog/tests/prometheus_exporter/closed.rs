@@ -3,7 +3,7 @@
 use crate::support::{scrape_metrics, scraped_metric_value, scraped_unlabelled_value};
 use std::net::SocketAddr;
 use std::time::Duration;
-use sundog::{Cluster, Mode};
+use sundog::{Cache, Cluster, Mode};
 
 /// Scrapes until `metric{cache}` reads `want`, panicking after `bound`.
 async fn await_cache_gauge(
@@ -103,6 +103,10 @@ pub(crate) async fn closed_cache_gauge_pins(cluster: &Cluster, metrics_addr: Soc
         );
     }
 
+    closed_fan_out_gauge_pins(cluster, metrics_addr, &body).await;
+    #[cfg(feature = "spill")]
+    closed_spill_gauge_pins(cluster, metrics_addr).await;
+
     let reopened = open_local().await;
     reopened.insert(7, "value".into()).await.expect("insert");
     await_cache_gauge(
@@ -124,6 +128,123 @@ pub(crate) async fn shut_down_cluster_gauge_pins(metrics_addr: SocketAddr) {
             scraped_unlabelled_value(&body, metric),
             Some(0.0),
             "{metric} reads 0 after shutdown; body:\n{body}"
+        );
+    }
+}
+
+/// Closes a `Replicated` cache that queued writes for its peer, and pins
+/// `sundog_fan_out_backlog` at 0 for it. `local_body`, scraped after the
+/// `Local` cache `closed-gauge-pin` closed, pins that a cache that never
+/// queued a key for a peer has no series to zero.
+///
+/// The caches of this file's pins carry names no other node of the test
+/// opens: a gauge is one series for every cache of that name in the process,
+/// so a second live cache of the name would hold it off the zero.
+async fn closed_fan_out_gauge_pins(cluster: &Cluster, metrics_addr: SocketAddr, local_body: &str) {
+    assert_eq!(
+        scraped_metric_value(
+            local_body,
+            "sundog_fan_out_backlog",
+            &[("cache", "closed-gauge-pin")]
+        ),
+        None,
+        "a Local cache queues nothing for a peer and exports no backlog series; body:\n{local_body}"
+    );
+    let replicated = cluster
+        .cache::<u32, String>("closed-gauge-fan-out")
+        .mode(Mode::Replicated)
+        .open()
+        .await
+        .expect("replicated cache opens");
+    for key in 0..8 {
+        replicated
+            .insert(key, "value".into())
+            .await
+            .expect("insert");
+    }
+    let body = scrape_metrics(metrics_addr).await.expect("scrape");
+    assert!(
+        scraped_metric_value(
+            &body,
+            "sundog_fan_out_backlog",
+            &[("cache", "closed-gauge-fan-out")]
+        )
+        .is_some(),
+        "a cache that queued writes for its peer publishes a backlog; body:\n{body}"
+    );
+    replicated.close().await;
+    let body = scrape_metrics(metrics_addr).await.expect("scrape");
+    assert_eq!(
+        scraped_metric_value(
+            &body,
+            "sundog_fan_out_backlog",
+            &[("cache", "closed-gauge-fan-out")]
+        ),
+        Some(0.0),
+        "sundog_fan_out_backlog reads 0 once the cache is closed; body:\n{body}"
+    );
+}
+
+/// Closes a spill cache that holds spilled entries and pins
+/// `sundog_spill_entries` and `sundog_spill_bytes_used` at 0, and that a
+/// cache reopened under the name counts its own entries from there.
+#[cfg(feature = "spill")]
+async fn closed_spill_gauge_pins(cluster: &Cluster, metrics_addr: SocketAddr) {
+    let dir = crate::spill::fresh_spill_dir("closed-gauges");
+    let name = "closed-gauge-spill";
+    let open = async || {
+        cluster
+            .cache::<u32, String>(name)
+            .mode(Mode::Local)
+            .max_capacity(3)
+            .spill(sundog::SpillConfig::new(&dir, 1 << 20).region_bytes(4096))
+            .open()
+            .await
+            .expect("spill cache opens")
+    };
+    let cache = open().await;
+    for key in 0..20 {
+        cache.insert(key, "value".into()).await.expect("insert");
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let body = scrape_metrics(metrics_addr).await.unwrap_or_default();
+        let entries = scraped_metric_value(&body, "sundog_spill_entries", &[("cache", name)]);
+        let bytes = scraped_metric_value(&body, "sundog_spill_bytes_used", &[("cache", name)]);
+        if entries.is_some_and(|n| n > 0.0) && bytes.is_some_and(|n| n > 0.0) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "entries spill; last {entries:?} entries, {bytes:?} bytes"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    cache.close().await;
+    let body = scrape_metrics(metrics_addr).await.expect("scrape");
+    for metric in ["sundog_spill_entries", "sundog_spill_bytes_used"] {
+        assert_eq!(
+            scraped_metric_value(&body, metric, &[("cache", name)]),
+            Some(0.0),
+            "{metric} reads 0 once the cache is closed; body:\n{body}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Closes the cache holding the skew hold's records and pins the hold's
+/// gauges at 0.
+pub(crate) async fn closed_skew_hold_gauge_pins(
+    cache: Cache<u32, String>,
+    metrics_addr: SocketAddr,
+) {
+    cache.close().await;
+    let body = scrape_metrics(metrics_addr).await.expect("scrape");
+    for metric in ["sundog_clock_skew_held", "sundog_clock_skew_held_bytes"] {
+        assert_eq!(
+            scraped_metric_value(&body, metric, &[("cache", "skew-hold-pin")]),
+            Some(0.0),
+            "{metric} reads 0 once the cache is closed; body:\n{body}"
         );
     }
 }

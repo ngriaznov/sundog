@@ -549,6 +549,10 @@ where
     /// Notified whenever a record is held, so the release task recomputes
     /// its sleep (mirrors `merge_wake`).
     skew_wake: Notify,
+    /// Whether the hold has published `sundog_clock_skew_held{cache}` and
+    /// its bytes twin: the close zeroes only gauges that exist, so a cache
+    /// that never held a forward gets no series.
+    skew_published: AtomicBool,
     /// Set once the first forwarded record dropped instead of held has been
     /// logged at `warn`; later drops log at `debug` and only count.
     skew_drop_warned: AtomicBool,

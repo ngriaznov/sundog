@@ -21,13 +21,13 @@ const OUTSIDER: u64 = 99;
 /// A clock the test sets, with a queue of readings served first: a
 /// stand-in for a system clock that steps back between two reads.
 #[derive(Default)]
-struct TestClock {
+pub(super) struct TestClock {
     now_ms: AtomicU64,
     script: Mutex<VecDeque<u64>>,
 }
 
 impl TestClock {
-    fn at(now_ms: u64) -> Arc<Self> {
+    pub(super) fn at(now_ms: u64) -> Arc<Self> {
         Arc::new(Self {
             now_ms: AtomicU64::new(now_ms),
             script: Mutex::default(),
@@ -63,7 +63,7 @@ type SkewShard<V> = (
 
 /// A five-node `Mode::Distributed` shard of node 1, two owners per part,
 /// on `clock`, refusing a stamp more than [`SKEW_MS`] ahead of it.
-fn skew_shard<V>(clock: &Arc<TestClock>) -> SkewShard<V>
+pub(super) fn skew_shard<V>(clock: &Arc<TestClock>) -> SkewShard<V>
 where
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
@@ -83,7 +83,7 @@ where
 }
 
 /// A record the outsider forwards, stamped `lead_ms` ahead of [`START_MS`].
-fn forward(key: u32, value: &str, lead_ms: u64) -> WireRecord {
+pub(super) fn forward(key: u32, value: &str, lead_ms: u64) -> WireRecord {
     wire_record(key, value, hlc(START_MS + lead_ms, OUTSIDER))
 }
 
@@ -102,7 +102,7 @@ fn held_bytes(key: u32, value: &str) -> usize {
 
 /// Owned by node 1 and, as the outsider is no node of the view, never
 /// owned by the writer.
-fn owned_key(view: &OwnershipView) -> u32 {
+pub(super) fn owned_key(view: &OwnershipView) -> u32 {
     find_key_by_ownership(view, true)
 }
 

@@ -4,8 +4,8 @@ use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 use tokio::sync::Semaphore;
@@ -131,6 +131,7 @@ impl SpillTier {
             region_bytes: region_bytes_u32,
             active: AtomicU32::new(0),
             bytes_used: AtomicU64::new(0),
+            bytes_gauge: OnceLock::new(),
             closed: AtomicBool::new(false),
             cache_name: cache_name.to_string(),
             dir,
@@ -322,6 +323,7 @@ impl SpillTier {
             region_bytes: region_bytes_u32,
             active: AtomicU32::new(0),
             bytes_used: AtomicU64::new(bytes_used_total),
+            bytes_gauge: OnceLock::new(),
             closed: AtomicBool::new(false),
             cache_name: cache_name.to_string(),
             dir: dir.clone(),

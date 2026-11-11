@@ -797,7 +797,7 @@ async fn checkpoint_and_close_spill<K, V>(
         let snapshot_tier = Arc::clone(&tier);
         let closed = tokio::task::spawn_blocking(move || {
             snapshot_tier.write_checkpoint_snapshot(&entries, now);
-            snapshot_tier.close();
+            snapshot_tier.close_and_zero_gauges();
         })
         .await;
         if let Err(err) = closed {
@@ -808,6 +808,17 @@ async fn checkpoint_and_close_spill<K, V>(
             );
         }
     } else {
-        tier.close();
+        let closing_tier = Arc::clone(&tier);
+        if let Err(err) =
+            tokio::task::spawn_blocking(move || closing_tier.close_and_zero_gauges()).await
+        {
+            tracing::warn!(
+                cache = %name,
+                error = %err,
+                "sundog spill: close task panicked",
+            );
+        }
     }
+    // The tier's flusher has stopped, so nothing installs an entry any more.
+    engine.zero_spill_entries();
 }

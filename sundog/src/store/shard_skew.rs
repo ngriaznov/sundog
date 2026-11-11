@@ -137,6 +137,7 @@ where
     /// Publishes `sundog_clock_skew_held{cache}` and
     /// `sundog_clock_skew_held_bytes{cache}` from `hold`.
     fn publish_skew_hold(&self, hold: &SkewHold) {
+        self.skew_published.store(true, Ordering::Relaxed);
         metrics::gauge!("sundog_clock_skew_held", "cache" => self.name.to_string())
             .set(gauge_value(hold.len()));
         metrics::gauge!("sundog_clock_skew_held_bytes", "cache" => self.name.to_string())
@@ -207,7 +208,9 @@ where
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let handed = hold.close();
-        self.publish_skew_hold(&hold);
+        if self.skew_published.load(Ordering::Relaxed) {
+            self.publish_skew_hold(&hold);
+        }
         if handed.is_empty() {
             return;
         }

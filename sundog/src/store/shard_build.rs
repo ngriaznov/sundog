@@ -174,6 +174,7 @@ where
             skew_hold: StdMutex::new(SkewHold::new(SKEW_HOLD_MAX_RECORDS, SKEW_HOLD_MAX_BYTES)),
             skew_wake: Notify::new(),
             skew_drop_warned: AtomicBool::new(false),
+            skew_published: AtomicBool::new(false),
             ignored_forward_warned_ms: AtomicU64::new(u64::MAX),
             merge_refused_warned_ms: AtomicU64::new(u64::MAX),
             sync_skips,

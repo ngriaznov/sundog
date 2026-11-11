@@ -31,9 +31,9 @@
 use std::fs::File;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -349,6 +349,9 @@ struct Inner {
     region_bytes: u32,
     active: AtomicU32,
     bytes_used: AtomicU64,
+    /// `sundog_spill_bytes_used{cache}`, resolved at its first publication,
+    /// so the close zeroes only a gauge that exists.
+    bytes_gauge: OnceLock<metrics::Gauge>,
     /// Set by [`SpillTier::close`]; a `try_spill` after this always falls
     /// through to the caller's unconditional-delete fallback.
     closed: AtomicBool,
@@ -468,7 +471,10 @@ impl Inner {
     }
 
     fn publish_bytes_used(&self) {
-        metrics::gauge!("sundog_spill_bytes_used", "cache" => self.cache_name.clone())
+        self.bytes_gauge
+            .get_or_init(
+                || metrics::gauge!("sundog_spill_bytes_used", "cache" => self.cache_name.clone()),
+            )
             .set(bytes_used_f64(self.bytes_used.load(Ordering::Acquire)));
     }
 
@@ -706,6 +712,21 @@ impl SpillTier {
     pub(crate) fn close(&self) {
         self.inner.closed.store(true, Ordering::Release);
         *self.sender.lock() = None;
+    }
+
+    /// Closes the tier, waits for its flusher thread to exit, and sets
+    /// `sundog_spill_bytes_used{cache}` to 0 if it was ever published: the
+    /// flusher is the last writer of that gauge, so the zero is the last
+    /// write, and a tier reopened under the name publishes after it. Blocks
+    /// on the flusher; run it in a blocking context.
+    pub(crate) fn close_and_zero_gauges(&self) {
+        self.close();
+        if let Some(handle) = self.flusher_handle.lock().take() {
+            let _ = handle.join();
+        }
+        if let Some(gauge) = self.inner.bytes_gauge.get() {
+            gauge.set(0.0);
+        }
     }
 
     /// Whether [`SpillConfig::warm_reopen`] is on for this tier.

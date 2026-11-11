@@ -19,7 +19,9 @@ mod seeds;
 mod spill;
 mod support;
 
-use crate::closed::{closed_cache_gauge_pins, shut_down_cluster_gauge_pins};
+use crate::closed::{
+    closed_cache_gauge_pins, closed_skew_hold_gauge_pins, shut_down_cluster_gauge_pins,
+};
 use crate::pins::{
     SKEW_HOLD_PIN_CAPACITY, TOMBSTONE_PIN_COUNT, accept_drop_pin_metrics, clock_skew_pin_metrics,
     count_hits_and_misses, fan_out_wait_timeout_pin_metrics, loader_calls_pin_metric,
@@ -132,7 +134,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     loader_calls_pin_metric(&cluster).await;
     loader_failure_miss_pin_metric(&cluster).await;
     let tombstone_node = tombstone_pin_metrics().await;
-    let (skew_hold_node, skew_hold_peer) = skew_hold_pin_metrics().await;
+    let (skew_hold_node, skew_hold_cache, skew_hold_peer) = skew_hold_pin_metrics().await;
     refresh_outcomes_pin_metrics(&cluster).await;
     refresh_discarded_pin_metric(&cluster).await;
     refresh_hints_pin_metric(&cluster, &peer).await;
@@ -489,14 +491,14 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     // The skew hold: pinned by skew_hold_pin_metrics. A raw peer that is no
     // owner forwards 16,385 distinct keys stamped an hour ahead and one
     // stamped three days ahead to a cache that owns every part.
-    let skew_hold_cache = [("cache", "skew-hold-pin")];
+    let skew_hold_labels = [("cache", "skew-hold-pin")];
     assert_eq!(
-        scraped_metric_value(&body, "sundog_clock_skew_held", &skew_hold_cache),
+        scraped_metric_value(&body, "sundog_clock_skew_held", &skew_hold_labels),
         Some(f64::from(SKEW_HOLD_PIN_CAPACITY)),
         "the hold keeps its capacity of records; got body:\n{body}"
     );
     assert_eq!(
-        scraped_metric_value(&body, "sundog_clock_skew_held_bytes", &skew_hold_cache),
+        scraped_metric_value(&body, "sundog_clock_skew_held_bytes", &skew_hold_labels),
         Some(skew_hold_pin_bytes()),
         "each held record costs its key, its value and 64 bytes; got body:\n{body}"
     );
@@ -519,7 +521,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         "the record three days ahead is dropped as past the horizon; got body:\n{body}"
     );
     assert_eq!(
-        scraped_metric_value(&body, "sundog_clock_skew_rejected_total", &skew_hold_cache),
+        scraped_metric_value(&body, "sundog_clock_skew_rejected_total", &skew_hold_labels),
         Some(f64::from(SKEW_HOLD_PIN_CAPACITY) + 2.0),
         "every forwarded record is refused once, held or not; got body:\n{body}"
     );
@@ -885,10 +887,9 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
             "expected the first and second open of 'spill-reopen-mode' both to fall back on `mode`; \
              got body:\n{body}"
         );
-        // The warm reopen seeds both gauges from the replayed tier. This
-        // process shares the gauge between the first open's shard, which
-        // checkpointed two entries to disk and is still alive, and the
-        // reopened one, which replays those two: 2 + 2. The replayed bytes
+        // The warm reopen seeds both gauges from the replayed tier. The
+        // first open's cache closed and zeroed the entry gauge, so the
+        // reopened shard's two replayed entries read 2. The replayed bytes
         // are published before any flush.
         assert_eq!(
             scraped_metric_value(
@@ -896,8 +897,8 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
                 "sundog_spill_entries",
                 &[("cache", "spill-reopen-warm")]
             ),
-            Some(4.0),
-            "expected sundog_spill_entries = 4 on 'spill-reopen-warm'; got body:\n{body}"
+            Some(2.0),
+            "expected sundog_spill_entries = 2 on 'spill-reopen-warm'; got body:\n{body}"
         );
         assert!(
             scraped_metric_value(
@@ -1103,6 +1104,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         "expected POST /metrics to answer 405 with Allow: GET, HEAD; got {post}"
     );
 
+    closed_skew_hold_gauge_pins(skew_hold_cache, metrics_addr).await;
     peer.shutdown().await;
     tombstone_node.shutdown().await;
     drop(skew_hold_peer);

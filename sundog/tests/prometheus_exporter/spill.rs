@@ -11,7 +11,7 @@ use sundog::{Cluster, Mode};
 /// call, and `label`. Never created on disk; [`sundog::SpillConfig::new`]'s
 /// `SpillTier::open` creates it.
 #[cfg(feature = "spill")]
-fn fresh_spill_dir(label: &str) -> std::path::PathBuf {
+pub(crate) fn fresh_spill_dir(label: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
         "sundog-it-prometheus-spill-{label}-{}-{}",
         std::process::id(),

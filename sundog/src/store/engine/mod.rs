@@ -637,6 +637,11 @@ pub(crate) struct Engine<K, V> {
     /// [`EntryState::Spilled`] entry from `live`.
     #[cfg(feature = "spill")]
     spill_entries_gauge: OnceLock<metrics::Gauge>,
+    /// Whether [`Engine::zero_spill_entries`] has detached the gauge. Every
+    /// update of `spill_entries_gauge` holds this lock, so no update can
+    /// follow the zero.
+    #[cfg(feature = "spill")]
+    spill_entries_detached: parking_lot::Mutex<bool>,
     /// Test-only mirror of `spill_entries_gauge`'s value, updated in
     /// lockstep everywhere the gauge is. The `metrics` crate's default
     /// recorder is a silent no-op with nothing for a unit test to read
@@ -751,6 +756,8 @@ where
             spill: OnceLock::new(),
             #[cfg(feature = "spill")]
             spill_entries_gauge: OnceLock::new(),
+            #[cfg(feature = "spill")]
+            spill_entries_detached: parking_lot::Mutex::new(false),
             #[cfg(all(feature = "spill", test))]
             spill_entries_test_count: AtomicI64::new(0),
             #[cfg(feature = "spill")]
@@ -815,9 +822,7 @@ where
             if count == 0 {
                 return;
             }
-            if let Some(gauge) = self.spill_entries_gauge.get() {
-                gauge.decrement(count_f64(count));
-            }
+            self.update_spill_entries(|gauge| gauge.decrement(count_f64(count)));
             #[cfg(test)]
             self.spill_entries_test_count
                 .fetch_sub(i64::try_from(count).unwrap_or(i64::MAX), Ordering::Relaxed);
@@ -839,9 +844,7 @@ where
     /// wherever a `live` entry newly becomes [`EntryState::Spilled`].
     #[cfg(feature = "spill")]
     fn note_spill_arrival(&self) {
-        if let Some(gauge) = self.spill_entries_gauge.get() {
-            gauge.increment(1.0);
-        }
+        self.update_spill_entries(|gauge| gauge.increment(1.0));
         #[cfg(test)]
         self.spill_entries_test_count
             .fetch_add(1, Ordering::Relaxed);
@@ -854,8 +857,31 @@ where
     /// `set_spill` so the gauge starts at the replayed count.
     #[cfg(feature = "spill")]
     pub(crate) fn seed_spill_entries(&self, count: u64) {
-        if let Some(gauge) = self.spill_entries_gauge.get() {
+        self.update_spill_entries(|gauge| {
             gauge.increment(count_f64(usize::try_from(count).unwrap_or(usize::MAX)));
+        });
+    }
+
+    /// Applies `update` to `sundog_spill_entries{cache}` unless the gauge is
+    /// unset or [`Engine::zero_spill_entries`] has detached it.
+    #[cfg(feature = "spill")]
+    fn update_spill_entries(&self, update: impl FnOnce(&metrics::Gauge)) {
+        let detached = self.spill_entries_detached.lock();
+        if !*detached && let Some(gauge) = self.spill_entries_gauge.get() {
+            update(gauge);
+        }
+    }
+
+    /// Sets `sundog_spill_entries{cache}` to 0 and stops every later update
+    /// of it: the cache is closed, and an entry that a straggling read
+    /// promotes or a write displaces afterwards must not move the gauge off
+    /// the zero or below it. A no-op without a spill tier.
+    #[cfg(feature = "spill")]
+    pub(crate) fn zero_spill_entries(&self) {
+        let mut detached = self.spill_entries_detached.lock();
+        *detached = true;
+        if let Some(gauge) = self.spill_entries_gauge.get() {
+            gauge.set(0.0);
         }
     }
 

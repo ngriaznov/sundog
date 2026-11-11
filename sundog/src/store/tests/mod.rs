@@ -17,6 +17,7 @@ use crate::ownership::{Granularity, OwnershipView};
 mod apply;
 mod builders;
 mod capacity;
+mod closed_gauges;
 /// [`ShardOps::compact_pass`]'s real, non-default implementation on
 /// [`Shard`]: shard-level plumbing tests covering a fake retire
 /// predicate injected directly, the compacted record's shape, its
