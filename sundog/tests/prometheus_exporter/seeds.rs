@@ -506,6 +506,17 @@ pub(crate) async fn seed_distributed_metrics(
         ),
         "outcome=error"
     );
+
+    // Whichever of the scenario-local nodes owned no part of that key is still running, and
+    // would keep publishing the process-global `sundog_live_peers` and `sundog_open_caches`
+    // gauges past the shutdown pins at the end of the test.
+    futures::future::join_all(
+        [third, fourth]
+            .into_iter()
+            .filter(|up| !error_owners.contains(&up.node_id()))
+            .map(Cluster::crash),
+    )
+    .await;
 }
 
 /// The `Distributed` cache [`seed_fan_out_stall_metrics`] stalls.
