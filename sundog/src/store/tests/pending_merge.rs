@@ -848,3 +848,60 @@ fn a_clear_tombstones_only_the_pending_keys_it_owns() {
         crate::store::shard_merge::split_pending_for_clear(Vec::<(u32, bool)>::new());
     assert!(owned.is_empty() && foreign.is_empty());
 }
+
+/// No sweep flushes a fold parked after the seal, so a merge after the seal
+/// applies at once: visible to a read, as the `Cache::close` rustdoc says of a
+/// detached clone.
+#[tokio::test]
+async fn a_merge_after_the_seal_applies_at_once_instead_of_parking() {
+    let s = coalescing_shard();
+    s.seal_for_close();
+
+    s.merge(1, 5).await.expect("merge after the seal");
+    s.merge_with_ttl(2, 6, Duration::from_mins(1))
+        .await
+        .expect("merge_with_ttl after the seal");
+    s.merge_sequenced(
+        3,
+        crate::store::crdt::WriterId::new(NodeId::from(1), 7),
+        |_, seq| u32::try_from(seq).unwrap_or(0),
+    )
+    .await
+    .expect("merge_sequenced after the seal");
+
+    assert_eq!(s.pending_merge_count(), 0, "nothing parks behind the seal");
+    assert_eq!(s.get(&1).await, Some(5));
+    assert_eq!(s.get(&2).await, Some(6));
+    assert_eq!(s.get(&3).await, Some(1));
+}
+
+/// A `Distributed` merge for a key this node does not own has no local copy to
+/// land in after the seal, so it fails with `Closed` as an unwindowed one does.
+#[tokio::test]
+async fn a_non_owner_merge_after_the_seal_fails_closed() {
+    let (s, owned, unowned) = distributed_coalescing_shard();
+    s.seal_for_close();
+
+    assert!(matches!(
+        s.merge(unowned, 3).await,
+        Err(CacheError::Closed { .. })
+    ));
+    assert!(matches!(
+        s.merge_with_ttl(unowned, 3, Duration::from_mins(1)).await,
+        Err(CacheError::Closed { .. })
+    ));
+    assert!(matches!(
+        s.merge_sequenced(
+            unowned,
+            crate::store::crdt::WriterId::new(NodeId::from(1), 7),
+            |_, _| 3u32
+        )
+        .await,
+        Err(CacheError::Closed { .. })
+    ));
+    s.merge(owned, 4)
+        .await
+        .expect("an owned key applies locally");
+    assert_eq!(s.get(&owned).await, Some(4));
+    assert_eq!(s.pending_merge_count(), 0);
+}

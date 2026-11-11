@@ -291,7 +291,7 @@ where
         let encoded = Bytes::from(postcard::to_stdvec(&value).map_err(CodecError::from)?);
         self.check_value_frame(key_bytes.len(), encoded.len())?;
         let ver = self.stamp_local();
-        if self.merge_window.is_zero() {
+        if self.merge_applies_immediately() {
             self.wait_for_fan_out_room().await;
             let expires_at_ms = self.expiry_for(ver.wall_ms, ttl);
             return self.apply_or_forward(
@@ -336,7 +336,7 @@ where
     ) -> Result<(), CacheError> {
         self.check_ceiling()?;
         let key_bytes = encode_key(&key)?;
-        let windowed = !self.merge_window.is_zero();
+        let windowed = !self.merge_applies_immediately();
         if !windowed {
             self.wait_for_fan_out_room().await;
         }
@@ -371,6 +371,15 @@ where
         );
         drop(stripe);
         applied
+    }
+
+    /// Whether a merge applies at once instead of folding into a pending
+    /// window: the shard has no window, or its fan-out queue is sealed or
+    /// closed. No sweep flushes a fold parked after the seal, so such a merge
+    /// applies locally for a key this node holds and fails with
+    /// [`CacheError::Closed`] for a `Mode::Distributed` key it does not own.
+    fn merge_applies_immediately(&self) -> bool {
+        self.merge_window.is_zero() || !self.fan_out.is_open()
     }
 
     /// The next number [`Shard::merge_sequenced`] hands to `make`: 1 for the

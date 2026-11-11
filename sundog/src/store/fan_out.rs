@@ -87,7 +87,7 @@ impl<K> FanOutQueue<K> {
 
     /// Whether a write may still be accepted: `false` once sealed or
     /// closed.
-    fn is_open(&self) -> bool {
+    pub(super) fn is_open(&self) -> bool {
         !*self.closed.lock().unwrap_or_else(PoisonError::into_inner)
     }
 

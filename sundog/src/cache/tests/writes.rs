@@ -559,3 +559,35 @@ async fn a_merge_after_a_remove_counts_only_the_later_contribution() {
     );
     cluster.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_windowed_merge_on_a_clone_after_close_applies_locally() {
+    let cluster = Cluster::builder("cache-it-merge-after-close")
+        .seeds(std::iter::empty())
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("build succeeds");
+    let cache = cluster
+        .cache::<u32, PnCounter>("counters")
+        .resolver(Arc::new(PnCounterResolver))
+        .merge_coalesce_window(Duration::from_millis(50))
+        .open()
+        .await
+        .expect("open succeeds");
+    let late = cache.clone();
+    let writer = cache.writer_id();
+
+    cache.close().await;
+
+    late.merge(1, PnCounter::local_delta(writer, 3))
+        .await
+        .expect("a detached clone accepts a merge for a key it holds");
+    late.merge_with_ttl(2, PnCounter::local_delta(writer, 4), Duration::from_mins(1))
+        .await
+        .expect("merge_with_ttl likewise");
+    assert_eq!(late.get(&1).await.map(|c| c.value()), Some(3));
+    assert_eq!(late.get(&2).await.map(|c| c.value()), Some(4));
+
+    cluster.shutdown().await;
+}
