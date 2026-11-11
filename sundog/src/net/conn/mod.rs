@@ -39,4 +39,6 @@ pub(super) use reply::{
     collect_ae_round_scoped, collect_fetch_reply, collect_load_reply, collect_pulled_records,
     state_stream,
 };
+#[cfg(all(test, not(feature = "sim")))]
+pub(crate) use serve::UNAVAILABLE_VIEW_HASH;
 pub(super) use writer::{PeerTarget, dial_with_hello_and, run_peer_writer};

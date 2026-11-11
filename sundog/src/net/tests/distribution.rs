@@ -417,7 +417,7 @@ async fn ae_round_scoped_reports_stale_when_the_responders_view_hash_differs() {
 }
 
 #[tokio::test]
-async fn ae_round_scoped_reports_no_mismatches_against_the_default_handler_body() {
+async fn ae_round_scoped_reports_stale_against_the_default_handler_body() {
     let (server, _server_inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
     let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
     client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
@@ -428,8 +428,11 @@ async fn ae_round_scoped_reports_no_mismatches_against_the_default_handler_body(
         .expect("scoped ae round succeeds even against a handler that never overrode it");
     assert_eq!(
         result,
-        AeRoundOutcome::Mismatches(Vec::new()),
-        "the default RequestHandler::ae_digest_scoped body degrades to no mismatches"
+        AeRoundOutcome::Stale {
+            responder_view_hash: crate::net::conn::UNAVAILABLE_VIEW_HASH
+        },
+        "the default RequestHandler::ae_digest_scoped body declines, which is no \
+         comparison and never reads as every digest matching"
     );
 }
 
@@ -462,7 +465,7 @@ async fn ae_round_masked_answers_each_bucket_whose_masked_fold_differs_with_its_
 }
 
 #[tokio::test]
-async fn ae_round_masked_reports_stale_and_degrades_against_the_default_handler_body() {
+async fn ae_round_masked_reports_stale_against_a_stale_and_against_the_default_handler_body() {
     let handler = Arc::new(FixtureHandler {
         ae_scoped_fixture: AeScopedFixture::Stale(777),
         ..Default::default()
@@ -491,8 +494,10 @@ async fn ae_round_masked_reports_stale_and_degrades_against_the_default_handler_
     );
     assert_eq!(
         round(3).await.expect("masked ae round succeeds"),
-        AeRoundOutcome::Mismatches(Vec::new()),
-        "the default RequestHandler::ae_digest_masked body degrades to no mismatches"
+        AeRoundOutcome::Stale {
+            responder_view_hash: crate::net::conn::UNAVAILABLE_VIEW_HASH
+        },
+        "the default RequestHandler::ae_digest_masked body declines, which is no comparison"
     );
 }
 

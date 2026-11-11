@@ -76,6 +76,18 @@ pub(crate) fn registry_entry(cluster: &Cluster, cache: &SmolStr) -> Option<Arc<d
     cluster.shards().read_shards().get(cache).cloned()
 }
 
+/// Takes `cluster`'s shard for `cache` out of the registry, leaving its
+/// gossiped mode in place: a node whose cache just closed, as a peer's view
+/// still sees it until gossip lands. [`register_shard`] puts it back.
+pub(crate) fn unregister_shard(cluster: &Cluster, cache: &SmolStr) -> Option<Arc<dyn ShardOps>> {
+    cluster.shards().write_shards().remove(cache)
+}
+
+/// Puts `shard` back into `cluster`'s registry as `cache`'s.
+pub(crate) fn register_shard(cluster: &Cluster, cache: &SmolStr, shard: Arc<dyn ShardOps>) {
+    cluster.shards().write_shards().insert(cache.clone(), shard);
+}
+
 /// Polls `cond` every 20ms until it returns `true`, or panics with `msg` once
 /// `budget` elapses.
 pub(crate) async fn wait_until(budget: Duration, msg: &str, mut cond: impl AsyncFnMut() -> bool) {

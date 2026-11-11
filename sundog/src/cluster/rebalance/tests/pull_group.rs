@@ -583,3 +583,56 @@ async fn try_donor_parts_shares_credited_parts_across_repeated_calls_for_one_gro
 fn two_buckets() -> Vec<PartId> {
     PartId::of_bucket(0).chain(PartId::of_bucket(1)).collect()
 }
+
+/// A responder that never opened the cache declines every anti-entropy
+/// exchange; the requester must not read that as "every digest matches": no
+/// part counts as matched, and the owner is not unreached either, so a
+/// release holds back like it does for an owner whose digests differ.
+#[tokio::test]
+async fn an_unavailable_responder_matches_no_part_and_is_not_unreached() {
+    use crate::net::test_support::{BucketPullHandler, peer_at, spawn_mesh};
+
+    let cache = SmolStr::new("prices");
+    let (donor_node, requester_node) = (NodeId::from(141), NodeId::from(142));
+    let modes: crate::membership::CacheModes = std::collections::HashMap::new();
+    let k = NonZeroU8::new(2).expect("nonzero");
+    let (ownership, tx) = OwnershipTracker::seed(requester_node, &[], &modes, &cache, k);
+    tx.send(Arc::new(view(
+        requester_node,
+        vec![requester_node, donor_node],
+        2,
+    )))
+    .expect("tracker keeps the channel");
+    let donor_handler = Arc::new(BucketPullHandler {
+        ae_unavailable: true,
+        ..Default::default()
+    });
+    let (donor, _donor_inbound) = spawn_mesh(donor_node, donor_handler).await;
+    let (requester, _requester_inbound) =
+        spawn_mesh(requester_node, Arc::new(BucketPullHandler::default())).await;
+    requester.update_peers(vec![peer_at(donor_node, donor.local_addr())]);
+
+    let residency = Arc::new(ResidencySet::new());
+    let shard = owned_shard(&ownership, &residency);
+    let part = PartId::new(3, 0);
+    assert!(ownership.current().owners_of(part).contains(&donor_node));
+
+    let parts_round =
+        anti_entropy::run_round_for_parts(&requester, &shard, &cache, donor_node, &[part]).await;
+    let against = anti_entropy::run_round_against(&requester, &shard, &cache, donor_node).await;
+    donor.shutdown().await;
+    requester.shutdown().await;
+
+    assert!(parts_round.matched.is_empty(), "{parts_round:?}");
+    assert_eq!(
+        parts_round.still_diverged,
+        HashSet::from([part]),
+        "the part is still unconfirmed"
+    );
+    assert!(
+        !parts_round.unreached,
+        "an owner that answered unavailable is not unreached, so it holds the release \
+         until the overdue bound rather than dropping out of the owners to wait for"
+    );
+    assert_eq!(against, anti_entropy::RoundOutcome::Stale);
+}

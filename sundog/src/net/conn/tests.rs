@@ -1067,7 +1067,7 @@ async fn collect_ae_buckets_skips_an_unrelated_hello_mid_reply() {
 }
 
 #[test]
-fn a_declined_scoped_round_replies_stale_view_or_nothing() {
+fn a_declined_scoped_round_replies_stale_view_and_digests_reply_nothing() {
     let cache = SmolStr::new("users");
     assert_eq!(
         super::serve::declined_replies(
@@ -1085,7 +1085,14 @@ fn a_declined_scoped_round_replies_stale_view_or_nothing() {
         cache.clone(),
         &crate::net::AeServeOutcome::<()>::Unavailable,
     );
-    assert!(unavailable_replies.is_empty(), "{unavailable_replies:?}");
+    assert_eq!(
+        unavailable_replies,
+        vec![Msg::StaleView {
+            cache: cache.clone(),
+            responder_view_hash: super::serve::UNAVAILABLE_VIEW_HASH
+        }],
+        "an unavailable responder must not read as all digests matched"
+    );
     let digests_replies =
         super::serve::declined_replies(cache, &crate::net::AeServeOutcome::Digests(()));
     assert!(digests_replies.is_empty(), "{digests_replies:?}");

@@ -65,7 +65,9 @@ and state transfer do not hold what they are refused: a record a receiver
 refuses for skew is not applied there. The receiver sends no bucket ack for a
 bucket with a refused record, and a node that loses a part releases it only
 after a round against each new owner finds that part's digest equal to its own,
-so the former owner keeps the part and retries each anti-entropy interval. It
+so the former owner keeps the part and retries each anti-entropy interval. An
+owner that has no open cache of that name answers the round with a stale view,
+which confirms nothing, so the former owner waits for it as well. It
 gives the part up at the tombstone-retention cutoff, within the hold's
 horizon, with a warning that names the cache, the part count and the owners.
 

@@ -345,8 +345,19 @@ pub(super) async fn serve_ae_digest_masked(
     send_batch_or_cancelled(framed, &replies, cancel).await
 }
 
+/// The view hash a `StaleView` carries when the responder holds no view for
+/// the cache: it never opened it, or closed it, or has no ownership view.
+/// The requester reads any `StaleView` as "the responder cannot confirm
+/// this round" whatever the hash, and a responder on the previous release
+/// sends and understands the same message, so no new message kind exists
+/// for it.
+pub(crate) const UNAVAILABLE_VIEW_HASH: u64 = 0;
+
 /// What a scoped round the responder answered without digests replies
-/// ahead of `ReqDone`: a `StaleView` when the views differ, else nothing.
+/// ahead of `ReqDone`: a `StaleView` when the views differ, and one with
+/// [`UNAVAILABLE_VIEW_HASH`] when the responder holds no view for the
+/// cache. A bare `ReqDone` would read as "every digest matched" to the
+/// requester, which is a comparison that never happened.
 pub(super) fn declined_replies<T>(cache: SmolStr, outcome: &AeServeOutcome<T>) -> Vec<Msg> {
     match *outcome {
         AeServeOutcome::Stale {
@@ -355,7 +366,11 @@ pub(super) fn declined_replies<T>(cache: SmolStr, outcome: &AeServeOutcome<T>) -
             cache,
             responder_view_hash,
         }],
-        AeServeOutcome::Digests(_) | AeServeOutcome::Unavailable => Vec::new(),
+        AeServeOutcome::Unavailable => vec![Msg::StaleView {
+            cache,
+            responder_view_hash: UNAVAILABLE_VIEW_HASH,
+        }],
+        AeServeOutcome::Digests(_) => Vec::new(),
     }
 }
 

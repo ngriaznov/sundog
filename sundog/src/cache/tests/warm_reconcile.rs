@@ -909,3 +909,76 @@ async fn reconcile_warm_buckets_stops_at_the_byte_budget_and_leaves_the_bucket_c
     c.shutdown().await;
     b.shutdown().await;
 }
+
+/// A co-owner whose cache is not open answers the part-scoped digest as
+/// unavailable, which is no confirmation: the converge loop marks nothing
+/// serving, where a bare `ReqDone` would have read as every digest matching.
+#[tokio::test]
+async fn reconcile_warm_buckets_leaves_parts_cold_against_a_co_owner_without_the_cache() {
+    use crate::cluster::test_support::{register_shard, registry_entry, unregister_shard};
+
+    let name = SmolStr::new("reconcile-unavailable");
+    let b = Cluster::builder("cache-it-reconcile-unavailable")
+        .seeds(std::iter::empty())
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("b builds");
+    let _cache_b = b
+        .cache::<u32, String>(name.clone())
+        .mode(Mode::distributed())
+        .open()
+        .await
+        .expect("b opens alone, owning every bucket");
+    let c = Cluster::builder("cache-it-reconcile-unavailable")
+        .seeds([b.local_gossip_addr()])
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("c builds");
+    wait_for_peer_count(&b, 1).await;
+    wait_for_peer_count(&c, 1).await;
+    c.advertise_cache_mode(&name, Mode::distributed());
+    let (shard_ops_c, distributed_c) = distributed_context_for_test(&c, &name);
+    let warm_parts: Vec<PartId> = distributed_c.ownership.current().owned_parts().collect();
+    let reconcile = async || {
+        distributed_c.residency.mark_cold(&warm_parts);
+        reconcile_warm_buckets(
+            &c,
+            &shard_ops_c,
+            &name,
+            &distributed_c.ownership,
+            &distributed_c.residency,
+            &warm_parts,
+        )
+        .await
+    };
+    // The control: with b's cache open, both views list the other node and
+    // the round confirms every part.
+    wait_until(
+        Duration::from_secs(10),
+        "b's view catches up to c joining, so the round against it reconciles",
+        async || reconcile().await.len() == warm_parts.len(),
+    )
+    .await;
+
+    // b's cache closes; c's view lists b until gossip says otherwise.
+    let shard_b = unregister_shard(&b, &name).expect("b's shard was registered");
+    let reconciled = reconcile().await;
+    assert!(
+        reconciled.is_empty(),
+        "a co-owner without the cache confirmed {} parts it never compared",
+        reconciled.len()
+    );
+    assert!(
+        warm_parts
+            .iter()
+            .all(|&part| distributed_c.residency.is_cold(part)),
+        "no part serves unchecked"
+    );
+
+    register_shard(&b, &name, shard_b);
+    assert!(registry_entry(&b, &name).is_some());
+    c.shutdown().await;
+    b.shutdown().await;
+}

@@ -86,7 +86,7 @@ addresses once it forms, under `cluster formed`.
 | `sundog_fetch_duration_seconds{cache, outcome}` | histogram of every `fetch` that asked an owner, under its outcome: `remote`, `miss`, `error`, or `local` after a view change |
 | `sundog_forwarded_writes_total{cache}` | writes sent on to a part's owners, or passed on because they arrived under another node's view |
 | `sundog_fan_out_lost_writes_total{cache}` | writes whose only copy was a fan-out frame that missed: a forwarded write no owner's outbox took, and a departed write's invalidation an owner missed, because the owners stalled past `fan_out_stall_timeout` or left the mesh |
-| `sundog_stale_view_total{cache}` | anti-entropy rounds a peer declined over a different ownership view |
+| `sundog_stale_view_total{cache}` | anti-entropy rounds a peer declined over a different ownership view, or because it holds no open cache of that name |
 | `sundog_unowned_inbound_dropped_total{cache}` | inbound records dropped for a part this node does not own |
 
 ### Registered loaders
@@ -254,7 +254,10 @@ connection then live.
 cold. A short burst right after a join or a leave is the second case. Check whether owners are overloaded or unreachable, and
 whether a node's `sundog_owned_parts` dropped to 0 after a restart.
 `sundog_stale_view_total` rising briefly during a membership change is
-normal; rising steadily means gossip is not converging.
+normal; rising steadily means gossip is not converging. An owner whose cache
+is closed or not yet open answers a part-scoped round the same way a node with
+another view does, so a round against it never counts as a match and a hand-off
+to it waits.
 
 ### Explaining one read
 

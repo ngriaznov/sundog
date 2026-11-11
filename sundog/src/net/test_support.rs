@@ -54,12 +54,17 @@ pub(crate) fn peer_at(node: NodeId, addr: SocketAddr) -> Peer {
 /// `st_bucket_chunks` replays `chunks` (already bucket-tagged) verbatim,
 /// optionally stalling forever afterward. A part-scoped anti-entropy
 /// digest exchange at `view_hash` finds nothing differing, as a donor with
-/// nothing more to give answers, unless `ae_stale` declines it. Every
+/// nothing more to give answers, unless `ae_stale` or `ae_unavailable`
+/// declines it. Every
 /// other lookup answers empty, never exercised by a bucket-pull test. Used by `cluster::rebalance`'s
 /// tests, which need to control exactly which bucket a chunk belongs to and
 /// whether a bucket's stream ever completes, without reimplementing the
 /// rest of `RequestHandler`'s surface at that call site.
 #[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag scripts one independent donor behavior for a test"
+)]
 pub(crate) struct BucketPullHandler {
     pub(crate) view_hash: u64,
     pub(crate) chunks: Vec<(u16, Vec<WireRecord>)>,
@@ -75,12 +80,18 @@ pub(crate) struct BucketPullHandler {
     /// When `true`, every anti-entropy digest exchange answers `Stale`, as
     /// a donor whose view has moved on since it declined the pull does.
     pub(crate) ae_stale: bool,
+    /// When `true`, every anti-entropy digest exchange is declined as
+    /// `Unavailable`, as a node that never opened the cache answers.
+    pub(crate) ae_unavailable: bool,
 }
 
 impl BucketPullHandler {
     /// `Digests(empty)` at this donor's view hash, `Stale` at another one
     /// or whenever `ae_stale` is set.
     fn ae_answer<T: Default>(&self, view_hash: u64) -> AeServeOutcome<T> {
+        if self.ae_unavailable {
+            return AeServeOutcome::Unavailable;
+        }
         if view_hash == self.view_hash && !self.ae_stale {
             AeServeOutcome::Digests(T::default())
         } else {
