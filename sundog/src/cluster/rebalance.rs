@@ -14,7 +14,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use super::anti_entropy::{self, RoundOutcome};
+use super::anti_entropy;
 use super::state_transfer::{self, DonorResult, Outcome};
 use super::{Cluster, group_in_order};
 use crate::net::{BucketPull, Mesh};
@@ -966,8 +966,8 @@ async fn release_without_hand_off(
 fn acked_by_part(
     granularity: Granularity,
     acked: HashMap<u16, HashSet<NodeId>>,
-) -> HashMap<PartId, HashSet<NodeId>> {
-    let mut out: HashMap<PartId, HashSet<NodeId>> = HashMap::new();
+) -> PartConfirmations {
+    let mut out = PartConfirmations::new();
     for (id, owners) in acked {
         for part in parts_of_wire_id(granularity, id) {
             out.entry(part).or_default().extend(owners.iter().copied());
@@ -976,38 +976,89 @@ fn acked_by_part(
     out
 }
 
+/// Per part, the owners that confirmed it: by a round that compared the
+/// part's digest equal, or by an ack naming it.
+pub(crate) type PartConfirmations = HashMap<PartId, HashSet<NodeId>>;
+
+/// Whether `owner` has confirmed `part`, either by a round that found its
+/// digest equal to this node's (`matched`) or by an ack naming that
+/// specific part (`acked`, never treated as confirming any other part that
+/// owner holds).
+fn is_confirmed(
+    part: PartId,
+    owner: NodeId,
+    matched: &PartConfirmations,
+    acked: &PartConfirmations,
+) -> bool {
+    [matched, acked].iter().any(|confirmed| {
+        confirmed
+            .get(&part)
+            .is_some_and(|owners| owners.contains(&owner))
+    })
+}
+
+/// The parts of `due` that `owner` co-owns under `view` and has not yet
+/// confirmed. A round that pushed or pulled records for a part leaves it
+/// here: only a later round that finds the digests equal moves it out.
+pub(crate) fn unconfirmed_parts(
+    view: &OwnershipView,
+    owner: NodeId,
+    due: &[PartId],
+    matched: &PartConfirmations,
+    acked: &PartConfirmations,
+) -> Vec<PartId> {
+    due.iter()
+        .copied()
+        .filter(|&part| {
+            view.owners_of(part).contains(&owner) && !is_confirmed(part, owner, matched, acked)
+        })
+        .collect()
+}
+
 /// The parts in `due` a release may drop now: those `view` does not give
-/// this node and whose every current owner is in `reconciled` (its round
-/// completed since the part came due), has acked that specific part per
-/// `acked` (keyed by part, never treated as reconciling any other part that
-/// owner holds), or, once `overdue`, is in `unreachable`. An owner whose view
-/// still differs from this node's is none of these, so the part stays
-/// resident until the views converge. A part `view` gives this node again is
-/// regained, not released, even where this node is its only owner and no
-/// other owner has anything to answer.
+/// this node and whose every current owner has confirmed the part, by a
+/// round that found its digest equal (`matched`) or by an ack naming that
+/// specific part (`acked`), or, once `overdue`, is in `unreachable`. A round
+/// that merely enqueued repair records, or whose records the owner refused,
+/// confirms nothing, so the part stays resident until a later round agrees.
+/// An owner whose view still differs from this node's is none of these, so
+/// the part stays resident until the views converge. A part `view` gives
+/// this node again is regained, not released, even where this node is its
+/// only owner and no other owner has anything to answer.
 pub(crate) fn parts_to_release(
     view: &OwnershipView,
     self_node: NodeId,
     due: &[PartId],
     overdue: &PartSet,
-    reconciled: &HashSet<NodeId>,
-    acked: &HashMap<PartId, HashSet<NodeId>>,
+    matched: &PartConfirmations,
+    acked: &PartConfirmations,
     unreachable: &HashSet<NodeId>,
 ) -> Vec<PartId> {
     due.iter()
         .copied()
         .filter(|&part| {
             !view.owns(part)
-                && view.owners_of(part).iter().all(|owner| {
-                    *owner == self_node
-                        || reconciled.contains(owner)
-                        || acked
-                            .get(&part)
-                            .is_some_and(|owners| owners.contains(owner))
-                        || (overdue.contains(part) && unreachable.contains(owner))
+                && view.owners_of(part).iter().all(|&owner| {
+                    owner == self_node
+                        || is_confirmed(part, owner, matched, acked)
+                        || (overdue.contains(part) && unreachable.contains(&owner))
                 })
         })
         .collect()
+}
+
+/// How many confirming rounds one owner gets in one tick: the first
+/// repairs, the second checks that the repair landed. A part still
+/// unconfirmed after both waits for the next tick.
+const CONFIRM_ROUNDS: usize = 2;
+
+/// Whether a confirming round that left `remaining` parts unconfirmed is
+/// followed by another this tick: only when it completed, moved records
+/// (`bytes_moved`), and so may have brought the owner level, never after a
+/// failed round or one that had nothing to repair. Pure; unit tested
+/// directly.
+pub(crate) const fn confirm_follow_up(remaining: usize, failed: bool, bytes_moved: u64) -> bool {
+    remaining > 0 && !failed && bytes_moved > 0
 }
 
 /// Whether a view published while a tick ran its hand-off rounds moved past
@@ -1028,34 +1079,21 @@ pub(crate) fn not_owned(view: &OwnershipView, parts: Vec<PartId>) -> Vec<PartId>
 }
 
 /// Which of `hand_off_owners`'s `owners` still need a confirming
-/// anti-entropy round: an owner already in `reconciled` needs none;
-/// otherwise an owner is skipped only once [`crate::net::Mesh::acked_owners`]
-/// covers every part in `due` that owner co-owns, never on a single acked
+/// anti-entropy round: an owner is skipped only once every part in `due`
+/// it co-owns is confirmed, by a round that matched it (`matched`) or by an
+/// ack ([`crate::net::Mesh::acked_owners`]), never on a single confirmed
 /// part among several.
 fn owners_needing_confirmation(
     view: &OwnershipView,
     owners: &[NodeId],
     due: &[PartId],
-    reconciled: &HashSet<NodeId>,
-    acked: &HashMap<PartId, HashSet<NodeId>>,
+    matched: &PartConfirmations,
+    acked: &PartConfirmations,
 ) -> Vec<NodeId> {
     owners
         .iter()
         .copied()
-        .filter(|owner| {
-            if reconciled.contains(owner) {
-                return false;
-            }
-            let fully_acked = due
-                .iter()
-                .filter(|&&part| view.owners_of(part).contains(owner))
-                .all(|&part| {
-                    acked
-                        .get(&part)
-                        .is_some_and(|owners| owners.contains(owner))
-                });
-            !fully_acked
-        })
+        .filter(|&owner| !unconfirmed_parts(view, owner, due, matched, acked).is_empty())
         .collect()
 }
 
@@ -1068,15 +1106,19 @@ fn owners_needing_confirmation(
 /// alone reaches them without waiting out the grace. On a tick piggybacked
 /// on `ae_interval`, hands off whichever parts' disown grace has elapsed to
 /// their live current owners ([`hand_off_owners`]), then calls
-/// [`ShardOps::release_parts`] for the parts every owner answered
-/// ([`parts_to_release`]), unless a view published during the rounds moved
+/// [`ShardOps::release_parts`] for the parts every owner confirmed
+/// ([`parts_to_release`]): a part is confirmed by a part-scoped round that
+/// finds the owner's digest equal to this node's, so a round that pushed or
+/// pulled records, or whose records the owner refused, leaves the part
+/// resident until a later round matches ([`CONFIRM_ROUNDS`] per owner per
+/// tick, [`confirm_follow_up`]), unless a view published during the rounds moved
 /// past the one they ran under ([`view_moved`]): that tick releases none of
 /// the parts it handed off, and the view change replans first. A part released past the hand-off
 /// cutoff without a round is still one the current view does not give this
 /// node ([`not_owned`]). An owner that never answers keeps the part
 /// resident until it is reachable again or its view converges. An owner that
 /// acked a specific due part, within the ack window and current view hash,
-/// counts as reconciled for that part without a redundant confirming round;
+/// counts as confirmed for that part without a redundant confirming round;
 /// an ack is scoped to the parts its wire id names, so
 /// [`owners_needing_confirmation`] still runs a round unless every due part
 /// that owner co-owns was acked. `disown_grace` still gates which parts
@@ -1275,10 +1317,9 @@ pub(crate) async fn rebalance_task(
                     let self_node = cluster.node_id();
                     let live: HashSet<NodeId> = cluster.peers().iter().map(|peer| peer.node).collect();
                     // An owner that already acked a due part counts as
-                    // reconciled for that part without a redundant round;
-                    // kept separate from `reconciled` (AE-round derived,
-                    // owner-global) since an ack names one wire id, never
-                    // every part the owner co-owns.
+                    // confirmed for that part without a redundant round;
+                    // an ack names one wire id, never every part the owner
+                    // co-owns.
                     let acked = acked_by_part(
                         view.granularity(),
                         cluster.mesh().acked_owners(
@@ -1288,7 +1329,7 @@ pub(crate) async fn rebalance_task(
                             view.view_hash(),
                         ),
                     );
-                    let mut reconciled: HashSet<NodeId> = HashSet::new();
+                    let mut matched = PartConfirmations::new();
                     // An owner missing from gossip is unreachable by
                     // definition; the view drops it on its next refresh.
                     let mut unreachable: HashSet<NodeId> = due
@@ -1297,20 +1338,24 @@ pub(crate) async fn rebalance_task(
                         .filter(|owner| *owner != self_node && !live.contains(owner))
                         .collect();
                     let hand_off = hand_off_owners(&view, self_node, &due, &live);
-                    for owner in owners_needing_confirmation(&view, &hand_off, &due, &reconciled, &acked) {
-                        let outcome = tokio::select! {
-                            biased;
-                            () = cancel.cancelled() => return,
-                            outcome = anti_entropy::run_round_against(cluster.mesh(), &shard, &cache, owner) => outcome,
-                        };
-                        match outcome {
-                            RoundOutcome::Reconciled => {
-                                reconciled.insert(owner);
+                    for owner in owners_needing_confirmation(&view, &hand_off, &due, &matched, &acked) {
+                        let mut remaining = unconfirmed_parts(&view, owner, &due, &matched, &acked);
+                        for _ in 0..CONFIRM_ROUNDS {
+                            let outcome = tokio::select! {
+                                biased;
+                                () = cancel.cancelled() => return,
+                                outcome = anti_entropy::run_round_for_parts(cluster.mesh(), &shard, &cache, owner, &remaining) => outcome,
+                            };
+                            for &part in &outcome.matched {
+                                matched.entry(part).or_default().insert(owner);
                             }
-                            RoundOutcome::Failed => {
+                            remaining.retain(|part| !outcome.matched.contains(part));
+                            if outcome.unreached {
                                 unreachable.insert(owner);
                             }
-                            RoundOutcome::Stale => {}
+                            if !confirm_follow_up(remaining.len(), outcome.failed, outcome.bytes_moved) {
+                                break;
+                            }
                         }
                     }
                     let overdue: PartSet = residency.expired(disown_grace.saturating_mul(2)).into_iter().collect();
@@ -1319,7 +1364,7 @@ pub(crate) async fn rebalance_task(
                         self_node,
                         &due,
                         &overdue,
-                        &reconciled,
+                        &matched,
                         &acked,
                         &unreachable,
                     );
@@ -1331,7 +1376,7 @@ pub(crate) async fn rebalance_task(
                     } else if due.is_empty() {
                         tracing::debug!(
                             cache = %cache,
-                            reconciled = reconciled.len(),
+                            matched = matched.len(),
                             acked = acked.len(),
                             "no released part's owners all answered its hand-off; holding until the next tick"
                         );
@@ -1348,7 +1393,7 @@ pub(crate) async fn rebalance_task(
                             cache = %cache,
                             parts = due.len(),
                             removed,
-                            reconciled = reconciled.len(),
+                            matched = matched.len(),
                             acked = acked.len(),
                             "released parts past their disown grace"
                         );

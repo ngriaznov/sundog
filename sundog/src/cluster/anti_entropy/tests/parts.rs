@@ -417,6 +417,49 @@ async fn run_round_for_parts_treats_every_requested_bucket_as_still_diverged_whe
     );
     assert!(outcome.matched.is_empty());
     assert_eq!(outcome.bytes_moved, 0);
+    assert!(
+        outcome.unreached,
+        "a peer that cannot be asked counts as not answering"
+    );
+
+    cluster.shutdown().await;
+}
+
+/// A shard with no ownership view cannot scope a round: it fails without the
+/// peer being at fault, so a release never counts the peer as unreachable.
+#[tokio::test]
+async fn run_round_for_parts_on_a_shard_without_a_view_fails_without_blaming_the_peer() {
+    use crate::cluster::test_support::loopback_config;
+    use crate::store::Mode;
+
+    let cluster = Cluster::builder("cluster-it-scoped-no-view")
+        .seeds(std::iter::empty())
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("cluster builds alone");
+    let name = SmolStr::new("scoped-round-no-view");
+    let shard: Arc<dyn ShardOps> = Arc::new(crate::store::Shard::<u32, String>::new(
+        name.clone(),
+        Mode::distributed(),
+        NodeId::random(),
+        1024,
+        None,
+        None,
+    ));
+    let requested = [PartId::from_raw(1)];
+
+    let outcome = run_round_for_parts(
+        cluster.mesh(),
+        &shard,
+        &name,
+        NodeId::from(u64::MAX),
+        &requested,
+    )
+    .await;
+
+    assert!(outcome.failed && !outcome.unreached);
+    assert!(outcome.matched.is_empty());
 
     cluster.shutdown().await;
 }

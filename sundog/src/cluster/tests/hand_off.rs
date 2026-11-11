@@ -90,6 +90,7 @@ impl ScriptedPeer {
             still_diverged,
             bytes_moved: 0,
             failed,
+            unreached: false,
         })
     }
 

@@ -28,6 +28,7 @@ fn cold_round_settles_nothing_on_a_round_that_never_reached_the_donor() {
         still_diverged: HashSet::new(),
         bytes_moved: 0,
         failed,
+        unreached: false,
     };
 
     let mut diverging = vec![a, b];

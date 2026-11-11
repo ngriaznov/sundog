@@ -441,16 +441,23 @@ pub(crate) struct PartRoundOutcome {
     /// the peer answered `Stale`, so no repair ran; or a repair request
     /// after the exchange failed, so the repairs are incomplete.
     pub(crate) failed: bool,
+    /// The failure was the peer not answering: the digest exchange errored,
+    /// or a repair request to it failed. `false` for a round that failed
+    /// without a fault of the peer's, one the shard could not scope or the
+    /// peer answered `Stale`. A release counts only an unreached peer as
+    /// unreachable once a part is overdue.
+    pub(crate) unreached: bool,
 }
 
 /// [`run_round_for_parts`]'s outcome for a round that could not be scoped
 /// or answered at all: everything requested counts as `still_diverged`.
-fn every_part_diverged(requested: &HashSet<PartId>) -> PartRoundOutcome {
+fn every_part_diverged(requested: &HashSet<PartId>, unreached: bool) -> PartRoundOutcome {
     PartRoundOutcome {
         matched: HashSet::new(),
         still_diverged: requested.clone(),
         bytes_moved: 0,
         failed: true,
+        unreached,
     }
 }
 
@@ -494,7 +501,7 @@ pub(crate) async fn run_round_for_parts(
 ) -> PartRoundOutcome {
     let requested: HashSet<PartId> = parts.iter().copied().collect();
     let Some(mut scoped) = shard.ae_scoped_digests_for(peer).await else {
-        return every_part_diverged(&requested);
+        return every_part_diverged(&requested, false);
     };
     let wanted: PartSet = parts.iter().copied().collect();
     scoped.scope.retain(|bucket, mask| {
@@ -513,11 +520,11 @@ pub(crate) async fn run_round_for_parts(
                 responder_view_hash,
                 "anti-entropy part-scoped round ended: responder's view has diverged"
             );
-            return every_part_diverged(&requested);
+            return every_part_diverged(&requested, false);
         }
         Err(error) => {
             tracing::debug!(%error, "anti-entropy part-scoped digest exchange failed");
-            return every_part_diverged(&requested);
+            return every_part_diverged(&requested, true);
         }
     };
     let named_mismatched: HashSet<u16> = mismatched.iter().map(AeMismatch::bucket).collect();
@@ -529,6 +536,7 @@ pub(crate) async fn run_round_for_parts(
             still_diverged,
             bytes_moved: 0,
             failed: false,
+            unreached: false,
         };
     }
     let in_scope = covered.into_iter().collect();
@@ -547,6 +555,7 @@ pub(crate) async fn run_round_for_parts(
         still_diverged,
         bytes_moved: repairs.bytes_moved,
         failed: !repairs.complete,
+        unreached: !repairs.complete,
     }
 }
 

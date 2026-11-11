@@ -2,6 +2,24 @@
 
 use super::*;
 
+/// What a round that found every part in `parts` equal on each of `owners`
+/// (for the parts they co-own under `view`) records.
+fn confirmed_by(
+    owners: &HashSet<NodeId>,
+    parts: &[PartId],
+    view: &OwnershipView,
+) -> PartConfirmations {
+    let mut out = PartConfirmations::new();
+    for &part in parts {
+        for owner in view.owners_of(part) {
+            if owners.contains(owner) {
+                out.entry(part).or_default().insert(*owner);
+            }
+        }
+    }
+    out
+}
+
 #[test]
 fn unpullable_losses_names_every_bucket_a_lone_owner_loses() {
     let self_node = NodeId::from(1);
@@ -199,7 +217,7 @@ fn parts_to_release_holds_a_bucket_until_every_owner_answered_or_it_is_overdue()
         self_node,
         &due,
         &PartSet::new(),
-        &none,
+        &PartConfirmations::new(),
         &no_acked,
         &none,
     );
@@ -214,7 +232,7 @@ fn parts_to_release_holds_a_bucket_until_every_owner_answered_or_it_is_overdue()
         self_node,
         &due,
         &PartSet::new(),
-        &answered,
+        &confirmed_by(&answered, &due, &view),
         &no_acked,
         &none,
     );
@@ -241,25 +259,46 @@ fn parts_to_release_holds_a_bucket_until_every_owner_answered_or_it_is_overdue()
     // Overdue: a stale owner still holds the bucket, an unreachable
     // one does not.
     let overdue: PartSet = due.iter().copied().collect();
-    let still_held = parts_to_release(&view, self_node, &due, &overdue, &none, &no_acked, &none);
+    let no_matched = PartConfirmations::new();
+    let still_held = parts_to_release(
+        &view,
+        self_node,
+        &due,
+        &overdue,
+        &no_matched,
+        &no_acked,
+        &none,
+    );
     assert_eq!(
         still_held, held,
         "an overdue bucket whose owners are merely stale stays resident"
     );
     let everyone: HashSet<NodeId> = (2..=5u64).map(NodeId::from).collect();
     let dropped = parts_to_release(
-        &view, self_node, &due, &overdue, &none, &no_acked, &everyone,
+        &view,
+        self_node,
+        &due,
+        &overdue,
+        &no_matched,
+        &no_acked,
+        &everyone,
     );
     assert_eq!(
         dropped, due,
         "an overdue bucket whose owners are all unreachable is released"
     );
     let mixed = parts_to_release(
-        &view, self_node, &due, &overdue, &answered, &no_acked, &everyone,
+        &view,
+        self_node,
+        &due,
+        &overdue,
+        &confirmed_by(&answered, &due, &view),
+        &no_acked,
+        &everyone,
     );
     assert_eq!(
         mixed, due,
-        "reconciled and unreachable owners together release"
+        "confirmed and unreachable owners together release"
     );
 }
 
@@ -279,13 +318,13 @@ fn parts_to_release_accepts_an_acked_owner_without_a_confirming_ae_round() {
 
     let none: HashSet<NodeId> = HashSet::new();
     let no_acked: HashMap<PartId, HashSet<NodeId>> = HashMap::new();
-    let release = |reconciled: &HashSet<NodeId>, acked: &HashMap<PartId, HashSet<NodeId>>| {
+    let release = |matched: &HashSet<NodeId>, acked: &HashMap<PartId, HashSet<NodeId>>| {
         parts_to_release(
             &view,
             self_node,
             &[bucket],
             &PartSet::new(),
-            reconciled,
+            &confirmed_by(matched, &[bucket], &view),
             acked,
             &none,
         )
@@ -330,8 +369,12 @@ fn parts_to_release_never_releases_a_co_owned_bucket_whose_owner_only_acked_a_di
     let (bucket_acked, bucket_unacked) = (owner_due[0], owner_due[1]);
 
     let none: HashSet<NodeId> = HashSet::new();
-    // The buckets' other owner is reconciled, so only `other`'s acks decide.
-    let reconciled: HashSet<NodeId> = HashSet::from([rest]);
+    // The buckets' other owner is matched, so only `other`'s acks decide.
+    let matched = confirmed_by(
+        &HashSet::from([rest]),
+        &[bucket_acked, bucket_unacked],
+        &view,
+    );
     // `other` acked `bucket_acked` only.
     let acked: HashMap<PartId, HashSet<NodeId>> =
         HashMap::from([(bucket_acked, HashSet::from([other]))]);
@@ -340,7 +383,7 @@ fn parts_to_release_never_releases_a_co_owned_bucket_whose_owner_only_acked_a_di
         self_node,
         &[bucket_acked, bucket_unacked],
         &PartSet::new(),
-        &reconciled,
+        &matched,
         &acked,
         &none,
     );
@@ -365,16 +408,16 @@ fn owners_needing_confirmation_skips_an_already_reconciled_owner() {
     // least one bucket in `due`, so an empty range here would
     // vacuously look reconciled.
     let due: Vec<PartId> = PartId::all().take(256).collect();
-    let reconciled: HashSet<NodeId> = [NodeId::from(2)].into_iter().collect();
+    let matched = confirmed_by(&HashSet::from([NodeId::from(2)]), &due, &view);
     let no_acked: HashMap<PartId, HashSet<NodeId>> = HashMap::new();
     assert_eq!(
-        owners_needing_confirmation(&view, &owners, &due, &reconciled, &no_acked),
+        owners_needing_confirmation(&view, &owners, &due, &matched, &no_acked),
         vec![NodeId::from(3)],
         "an owner already reconciled, e.g. via a round covering every bucket it co-owns, \
          needs no round"
     );
     assert_eq!(
-        owners_needing_confirmation(&view, &owners, &due, &HashSet::new(), &no_acked),
+        owners_needing_confirmation(&view, &owners, &due, &PartConfirmations::new(), &no_acked),
         owners,
         "with nobody reconciled yet and no acks, every owner still needs a round"
     );
@@ -406,7 +449,7 @@ fn owners_needing_confirmation_still_runs_a_round_for_an_owner_who_only_partly_a
         "`other` co-owns at least two due buckets at this eligible set/k"
     );
 
-    let reconciled: HashSet<NodeId> = HashSet::new();
+    let reconciled = PartConfirmations::new();
     // Acked only the first of the buckets `other` co-owns.
     let acked: HashMap<PartId, HashSet<NodeId>> =
         HashMap::from([(owner_due[0], HashSet::from([other]))]);
@@ -464,7 +507,13 @@ fn parts_to_release_never_releases_a_part_the_view_gives_this_node_again() {
     let everyone: HashSet<NodeId> = (2..=5u64).map(NodeId::from).collect();
     assert!(
         parts_to_release(
-            &alone, self_node, &regained, &overdue, &everyone, &no_acked, &everyone
+            &alone,
+            self_node,
+            &regained,
+            &overdue,
+            &confirmed_by(&everyone, &regained, &alone),
+            &no_acked,
+            &everyone
         )
         .is_empty(),
         "a part this node owns alone is regained, never released"
@@ -481,7 +530,7 @@ fn parts_to_release_never_releases_a_part_the_view_gives_this_node_again() {
             self_node,
             &co_owned,
             &PartSet::new(),
-            &answered,
+            &confirmed_by(&answered, &co_owned, &pair),
             &no_acked,
             &none
         )
@@ -528,5 +577,72 @@ fn not_owned_keeps_only_the_parts_the_view_gives_other_nodes() {
     assert!(
         not_owned(&view(self_node, vec![self_node], 2), parts).is_empty(),
         "a node that owns everything releases nothing without a hand-off"
+    );
+}
+
+#[test]
+fn a_part_a_round_only_repaired_stays_unconfirmed_until_a_later_round_matches_it() {
+    let self_node = NodeId::from(1);
+    let view = view(self_node, (1..=3u64).map(NodeId::from).collect(), 2);
+    let other = NodeId::from(2);
+    let due: Vec<PartId> = PartId::all()
+        .take(256)
+        .filter(|&p| !view.owns(p) && view.owners_of(p).contains(&other))
+        .take(2)
+        .collect();
+    assert_eq!(due.len(), 2, "`other` co-owns two parts this node lost");
+    let no_acked = PartConfirmations::new();
+
+    // The first round pushed records for `due[0]` and found `due[1]` equal.
+    let after_repair = confirmed_by(&HashSet::from([other]), &due[1..], &view);
+    assert_eq!(
+        unconfirmed_parts(&view, other, &due, &after_repair, &no_acked),
+        vec![due[0]],
+        "the repaired part waits for a round that matches it"
+    );
+    assert_eq!(
+        owners_needing_confirmation(&view, &[other], &due, &after_repair, &no_acked),
+        vec![other]
+    );
+    let released = parts_to_release(
+        &view,
+        self_node,
+        &due,
+        &PartSet::new(),
+        &confirmed_by(&HashSet::from([other, NodeId::from(3)]), &due[1..], &view),
+        &no_acked,
+        &HashSet::new(),
+    );
+    assert_eq!(
+        released,
+        vec![due[1]],
+        "only the part both owners matched releases"
+    );
+
+    // The follow-up round matches it.
+    let after_follow_up = confirmed_by(&HashSet::from([other]), &due, &view);
+    assert!(unconfirmed_parts(&view, other, &due, &after_follow_up, &no_acked).is_empty());
+    assert!(
+        owners_needing_confirmation(&view, &[other], &due, &after_follow_up, &no_acked).is_empty()
+    );
+}
+
+#[test]
+fn confirm_follow_up_runs_another_round_only_after_a_completed_round_that_moved_records() {
+    assert!(
+        confirm_follow_up(2, false, 10),
+        "a completed round that moved records is checked once"
+    );
+    assert!(
+        !confirm_follow_up(0, false, 10),
+        "nothing remains unconfirmed"
+    );
+    assert!(
+        !confirm_follow_up(2, true, 10),
+        "a failed round waits for the next tick"
+    );
+    assert!(
+        !confirm_follow_up(2, false, 0),
+        "a round with nothing to repair gains nothing from another"
     );
 }
