@@ -5,6 +5,26 @@ All notable changes to this project are documented in this file. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`CacheError::InvalidConfig`.** `open` returns it for a `max_capacity` of
+  zero or a `tti` under one millisecond.
+- **`Health::twin_nodes`.** The number of other live processes that report
+  this node's own id.
+- **`ShardOps::apply_remote_batch_counted` and `BatchApplied`.** A provided
+  method that answers how many records of a batch the shard took in and how
+  many it refused for clock skew.
+- **`sundog_refreshes_total{outcome="discarded"}`.** A refresh-ahead reload
+  that is not stored counts here.
+- **Reopen reasons `mode` and `clock_behind_snapshot`** on
+  `sundog_spill_reopen_total`, and the stage `dropped_key_mismatch` on
+  `sundog_spill_reopen_entries_total`.
+- **Drop reasons `open_cap`, `first_frame_timeout` and `frame_stall`** on
+  `sundog_accept_dropped_total`.
+- **The test node's `fwdskew` command**, which sends a forward stamped ahead
+  of the clock, and a previous-release container test that pins how a 0.6.9
+  owner holds it.
+
 ### Changed
 
 - **`build` rejects a zero `crdt_compact_batch` or `outbox_capacity`.** A
@@ -28,6 +48,68 @@ All notable changes to this project are documented in this file. Format follows
   `tombstone_ttl` of 4 seconds. The gc task collects on the period's
   wall-clock grid, so a healthy gap never passes one period by more than
   scheduler jitter.
+- **`build` rejects tombstone and timing settings that cannot work.** A
+  `tombstone_ttl` under `3 * ae_interval`, a `tombstone_max_ttl` under
+  `tombstone_ttl`, a zero `gossip_interval`, `phi_sampling_window_size` or
+  `fetch_timeout`, a `phi_threshold` that is NaN, infinite, zero or negative,
+  and `crdt_sweep_interval = Some(Duration::ZERO)` fail with
+  `JoinError::InvalidConfig`. A retention shorter than three anti-entropy
+  intervals let a peer that learned of a delete only through anti-entropy
+  bring the key back.
+- **`SUNDOG_SEEDS` that names no seed fails `build`.** A value of only
+  separators, such as `","`, selected static discovery with an empty list and
+  started a node with no seeds and no mDNS. `ClusterBuilder::build` and
+  `ObserverBuilder::build` return `InvalidConfig`. A blank or unset variable
+  keeps the mDNS default.
+- **`JoinError::NoSeedsFound`, `JoinError::Discovery` and
+  `CacheError::StateTransfer` are deprecated.** They are never returned and
+  stay in their enums.
+- **`open` rejects a `max_capacity` of zero and a `tti` under one
+  millisecond**, with `CacheError::InvalidConfig`. Zero evicted every entry
+  as it was written, and a `tti` that rounds to zero made every entry idle
+  at birth. A `tti` above the 48.7-day cap keeps the clamp and logs one
+  warning at open. The per-stripe preallocation from `capacity_hint` is
+  capped at 1,024 entries.
+- **A `Mode::Invalidation` cache opens cold whatever `warm_reopen` says**,
+  with fallback reason `mode`. The mode runs no anti-entropy, so a replayed
+  entry that a peer removed or rewrote during the downtime had nothing to
+  correct it.
+- **A cache with a spill tier rejects a name that is not one path
+  component**: empty, `.`, `..`, absolute, or holding `/`, `\` or NUL. `open`
+  returns `InvalidSpillConfig`.
+- **`SpillConfig::read_concurrency` of zero or above the semaphore limit is
+  rejected at open.** Zero left every spilled read waiting forever.
+- **An Invalidation or Replicated open on a node with seeds and no known
+  peer waits for the first gossip round**, five gossip intervals and at most
+  two seconds, so the mode check sees a peer that is already there.
+- **A `Distributed` open waits for a first peer under DNS SRV and custom
+  discovery as well as a static seed list.** The bound is five seconds or
+  `state_transfer_budget`, whichever is shorter. mDNS does not wait.
+- **A `Distributed` write counts the nine-byte forward header against
+  `max_frame`.** A value that fit the replicate frame and not the forward
+  frame passed the size check and was dropped by the fan-out; it returns
+  `CacheError::ValueTooLarge`. Other modes keep their cap.
+- **`sundog_ae_repaired_total` and anti-entropy's byte count measure what
+  landed.** A push counts the records of the frames that reached the peer's
+  outbox, and a pull counts the records the shard took in. A push a full
+  outbox dropped and a pulled record refused for clock skew, an unowned part,
+  a bad encoding or a lapsed tombstone count nothing.
+- **A failed loader run counts as a miss.** `sundog_cache_misses_total`
+  rises by one for a failed `get_or_load` run and by one per key of a failed
+  `load` or `load_many` run. A caller joined to a failed run counts nothing.
+- **`sundog_refreshes_total{outcome="loaded"}` counts only reloads that are
+  stored.**
+- **A background pass shrinks sparse stripes of every cache.** A stripe at
+  or under an eighth of its capacity is shrunk by the sweep, by a release and
+  by a pass that visits 256 stripes a second, so memory follows the entry
+  count after a peak, and an unused `capacity_hint` is reclaimed within
+  seconds.
+- **The scale gate bounds fetch errors.** `ops/scale-gate.json` sets
+  `max_fetch_errors` to 0, and a failed fetch stays out of the latency
+  histogram.
+- **The deployment guide states the skew-hold windows of a rolling
+  upgrade**, and the operations guide has a runbook step for
+  `sundog_clock_skew_held` before an owner stops.
 
 ### Fixed
 
@@ -38,6 +120,121 @@ All notable changes to this project are documented in this file. Format follows
   missed a delete could hand its older value back. A step past the jitter
   room now counts as a pause and defers collection for another
   `tombstone_ttl`.
+- **A node releases a part it lost only after the new owner's copy
+  matches.** The release counted an owner as reconciled once a repair push
+  sat in the outbox, so a frame lost in transit took the only copy with it.
+  The release waits for a part-scoped anti-entropy round that finds the
+  owner's digest equal, or for an ack that names the part.
+- **A part stays resident while its new owner refuses its records for clock
+  skew.** The receiver acked the bucket and the donor released the part. The
+  receiver sends no ack for a bucket with a refused record, and the donor
+  retries each interval until the tombstone-retention cutoff, then releases
+  with a warning that names the cache, the part count and the owners.
+- **An owner without the cache does not read as matching every digest.** A
+  responder whose cache was closed answered a scoped digest with a bare
+  `ReqDone`, which the requester read as every digest equal. It replies
+  `StaleView`, so the round is stale and the release or reconcile retries.
+- **A peer marked dirty is targeted by every cache's anti-entropy.** The
+  hint was one flag for the mesh, taken by the first cache to wake. Each
+  cache has its own, and a dirty round that fails, goes stale or compares
+  nothing marks the peer again, at most three times in a row.
+- **The warm-up's give-up marks only the parts it planned as serving**, so a
+  part a rebalance pull is still fetching answers `FetchUnavailable` until
+  the pull lands.
+- **A warm reopen keeps distrusting replayed parts on the warm-up's first
+  pass.** The warm-up follows the open's sole-owner decision until it sees a
+  view change or one anti-entropy interval passes.
+- **`ModeMismatch` fires for a cache opened right after `build`.** The open
+  checks the peers' modes again just before it advertises its own.
+- **A node restarted under a persisted `NodeId` is listed once.** Membership
+  keeps the highest incarnation of each node, so the mesh dials the running
+  generation. A second live process that reports this node's own id is left
+  out of the peer set, logged once and counted in `Health::twin_nodes`.
+- **mDNS announces the chosen gossip IP.** With `advertise_ip` or a specific
+  bind IP set, the registration carries that address alone.
+- **A weigher that returns 0 no longer makes an entry unevictable.** The
+  result is floored at 1; 0 stays reserved for a spill hand-off in flight.
+- **The HLC logical counter carries into the wall clock** where a peer stamp
+  at `u32::MAX` overflowed it.
+- **A stripe's keys spread over its index probe starts.** The index hash no
+  longer shares its low bits with the stripe selection.
+- **Part digests stay exact across a release.** Digest changes are applied
+  under the stripe guard, and a release zeroes the digests under it.
+- **Digest reads for anti-entropy sweep lapsed entries first**, so a swept
+  and an unswept replica of a merging cache agree.
+- **A loader panic no longer leaves later chunks' keys loading forever.**
+  Every in-flight load holds its drop guard from the moment it is
+  registered, through the batch queue, until its chunk completes.
+- **A loaded value that fails to serialize returns `CacheError::Codec`** to
+  the caller and every joined waiter. It panicked the single-flight leader.
+- **A read-through fill over an expired entry no sweep has removed emits
+  `Created`.**
+- **Refresh-ahead judges its window from the expiry alone.** An entry is due
+  once the time left is at most `1 - fraction` of the cache's default TTL, so
+  `touch`, `expire` and a leading clock do not move the refresh point.
+- **A `get_or_load` hit asks for a refresh-ahead reload.**
+- **A refresh hint is not lost to clock skew or a dropped frame.** A hinted
+  request is not judged again on the receiver's clock, a skipped request
+  releases its claim, and the hinter asks again after one second.
+- **A refresh reload stores only over the version it read.** A `persist`,
+  `expire`, `touch`, write or removal made during the loader call wins, and
+  a removed key is not brought back.
+- **`Cache::close` and `Cluster::shutdown` do not wait on a hung
+  refresh-ahead loader.**
+- **A refresh hint goes only to a peer that runs refresh-ahead for the
+  cache.** Nodes gossip a `refresh:<cache>` key, and a node reloads the key
+  itself when no loader peer advertises it.
+- **A warm reopen starts each replayed entry's idle clock at the reopen**,
+  so a `tti` cache keeps its hot keys across a restart.
+- **A spilled read does not report a miss for a key that is present
+  throughout.** A key promoted or overwritten between a read's RAM miss and
+  its disk read is read again, in `get`, `get_or_load` and `load_many`.
+- **`sundog_spill_entries` and `sundog_spill_bytes_used` count what a warm
+  reopen replays.**
+- **An idle `Replicated` or `Distributed` node settles back under
+  `max_capacity`.** Capacity eviction runs again after each flusher batch
+  and on each sweep; a victim the queue refuses again stays resident and
+  counts no drop.
+- **A snapshot stamped ahead of the reopen clock by more than
+  `max_clock_skew` opens cold**, with reason `clock_behind_snapshot`.
+- **A warm reopen drops entries whose key no longer decodes as the cache's
+  key type**, so `keys` and `clear` do not panic after a key type change.
+- **A record larger than `flush_queue_bytes` is admitted when the queue is
+  empty**, where it was refused as `queue_full` forever.
+- **A windowed merge on a clone kept past close applies at once**, where it
+  returned `Ok` and never applied.
+- **`remove_many` tombstones the keys before one that fails to encode**,
+  then returns the error, as `insert_many` does.
+- **A `Loaded` reply of many tiny entries fits the frame limit.** Each entry
+  counts its fixed fields, so the responder splits the answer.
+- **Accepted data-plane connections are bounded after the hello.** At most
+  2,048 connections from addresses that are not a peer's are open at once,
+  one whose hello names no peer and that sends no frame for 60 seconds is
+  closed, and any connection that stops inside a frame for 30 seconds is
+  closed.
+- **A steady invalidation stream no longer starves a peer's replicate
+  outbox.** The writer sends one replicate burst after four invalidate
+  bursts in a row.
+- **Frames queued for a removed or re-addressed peer are counted** in
+  `sundog_backlog_dropped_total`, and the peer's next handle starts dirty.
+- **A closed cache's gauges and a stopped cluster's gauges read 0.**
+- **A failed `build` leaves no Prometheus recorder installed**, so a retry
+  in the same process succeeds.
+- **`Duration::MAX` in `state_transfer_budget` or `ae_interval` no longer
+  panics**, and a zero discovery interval is raised to one millisecond.
+- **A fold receipt covers a live `PnCounter` slot of the same writer.** A
+  replica cut off since before the fold counted the writer twice. The writes
+  only that replica saw after the fold are dropped with the slot.
+- **A folded `OrSet` writer is not retired again** while its receipt lives.
+- **The weekly Scale job fails when the demo exits non-zero**,
+  `weekly-fuzz` runs `crdt_decode_never_panics` and CI checks every fuzz
+  target has a weekly step, and `yank.yml` validates its version input.
+- **The counters recipe keeps a total per page**, the test node's
+  `sum_counter` merge keeps the later deadline, and the lens counts a reset
+  parts-in counter with parts pulled as a pull.
+- **The docs state** the 1,024-event capacity of `Cache::events`, that a
+  dropped `Cache` handle flushes nothing, and that a spill tier lifts only
+  the `Replicated` capacity limit.
 
 ## [0.6.10] – 2026-11-05
 
