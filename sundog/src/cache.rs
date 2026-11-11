@@ -1322,6 +1322,15 @@ where
 
     /// Subscribes to this cache's change events, each tagged with its
     /// [`crate::store::Origin`].
+    ///
+    /// The stream is a bounded [`tokio::sync::broadcast`] channel of 1024
+    /// events, and the returned receiver sees events sent after this call.
+    /// A receiver that falls more than 1024 events behind gets
+    /// [`broadcast::error::RecvError::Lagged`] from its next `recv`, which
+    /// carries the number of events it missed, and then continues from the
+    /// oldest event still held. Writers never wait for a slow receiver. A
+    /// subscriber that mirrors the cache treats `Lagged` as a signal to
+    /// resync: re-read [`Cache::keys`] or the affected entries.
     #[must_use]
     pub fn events(&self) -> broadcast::Receiver<Event<K, V>> {
         self.shard.events()

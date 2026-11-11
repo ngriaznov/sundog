@@ -78,8 +78,9 @@ sundog-distributed-demo -- --nodes 5` (a `Distributed` cache).
   or your own `ConflictResolver` instead of overwriting each other, in every
   mode and with TTLs. Merging is a [per-cache choice][resolvers]; the
   default is last-write-wins.
-- **Change events and explain.** `Cache::events` streams every created,
-  updated and removed key with its origin. `Cache::explain` says why a read of
+- **Change events and explain.** `Cache::events` streams created,
+  updated and removed keys with their origin; a subscriber that lags past
+  the 1024-event channel gets a lag error and resyncs. `Cache::explain` says why a read of
   a key answers what it does.
 - **Production hooks.** Mutual TLS, Prometheus metrics with health probes, a
   [Grafana dashboard](https://github.com/ngriaznov/sundog/blob/main/ops/grafana-dashboard.json) and rolling upgrades.

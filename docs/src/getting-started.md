@@ -54,8 +54,11 @@ node.
   its value, and `ttl_of` reads what is left.
 - `insert_many` and `remove_many` apply a batch under one lock per stripe.
 - `contains_key`, `keys` and `for_each_key` inspect this node's copy.
-- `events` streams every `Created`, `Updated` and `Removed` change, tagged
-  with whether it came from this node or a peer.
+- `events` streams `Created`, `Updated` and `Removed` changes, tagged with
+  whether they came from this node or a peer. It returns a
+  `tokio::sync::broadcast::Receiver` over a channel of 1024 events. A
+  receiver that falls further behind gets `RecvError::Lagged(n)` and misses
+  `n` events; re-read `keys` or the affected entries to resync.
 - `get_sync`, `insert_sync`, `remove_sync` and `contains_key_sync` work
   without an async runtime.
 - `fetch` reads a `Distributed` cache from a key's owner when this node does
