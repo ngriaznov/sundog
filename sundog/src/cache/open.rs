@@ -252,9 +252,11 @@ pub(super) async fn await_first_gossip_round(cluster: &Cluster) {
 
 /// Whether [`CacheBuilder::open`]'s `Mode::Distributed` path blocks for a
 /// first known peer before computing the initial ownership view:
-/// `true` only with a fixed seed list (`has_seeds`) and no peer known yet.
-pub(super) fn should_await_first_peer(has_seeds: bool, peers_known: bool) -> bool {
-    has_seeds && !peers_known
+/// `true` only under a discovery that can report candidates
+/// (`awaits_first_peer`: a static seed list, `DnsSrv` or a custom source,
+/// never mDNS) and with no peer known yet.
+pub(super) fn should_await_first_peer(awaits_first_peer: bool, peers_known: bool) -> bool {
+    awaits_first_peer && !peers_known
 }
 
 /// The rule behind `trust_sole_owner` for
@@ -267,8 +269,8 @@ pub(super) fn trust_sole_owner_at_open(membership_settled: bool, replayed: usize
 
 /// [`CacheBuilder::open`]'s bounded wait for a first known peer,
 /// `Mode::Distributed` only, run before `attach_ownership` computes the
-/// first view. When [`should_await_first_peer`] says this cluster has seeds
-/// and knows no peer yet, blocks for the first peers-watch update, bounded
+/// first view. When [`should_await_first_peer`] says this cluster's discovery
+/// can report candidates and it knows no peer yet, blocks for the first peers-watch update, bounded
 /// by `min(ClusterConfig::state_transfer_budget, INITIAL_PEER_WAIT_CAP)`.
 /// Without this, a lone node's transient "I own everything" view could
 /// outlive a peer that shows up moments later. Returns whether the wait,
@@ -276,7 +278,7 @@ pub(super) fn trust_sole_owner_at_open(membership_settled: bool, replayed: usize
 /// wait happens.
 pub(super) async fn await_initial_peers(cluster: &Cluster) -> bool {
     let peers_known = !cluster.peers().is_empty();
-    if !should_await_first_peer(cluster.has_seeds(), peers_known) {
+    if !should_await_first_peer(cluster.awaits_first_peer(), peers_known) {
         return true;
     }
     let bound = cluster

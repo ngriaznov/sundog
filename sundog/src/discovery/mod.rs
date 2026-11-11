@@ -45,15 +45,20 @@ pub enum DiscoveryKind {
 }
 
 impl DiscoveryKind {
-    /// Whether this discovery source names a fixed, nonempty seed list:
-    /// only [`Self::Static`] ever does, and only when its own
-    /// [`statics::Static::has_seeds`] says so. `Mdns`, `DnsSrv`, and a
-    /// caller-supplied [`Self::Custom`] source all find peers on their own
-    /// schedule rather than naming any upfront, so a lone node under any of
-    /// them is a legitimate standalone cluster, not evidence of a
-    /// membership race `Cache::open` should wait out.
-    pub(crate) fn has_seeds(&self) -> bool {
-        matches!(self, Self::Static(discovery) if discovery.has_seeds())
+    /// Whether a `Distributed` [`Cache::open`](crate::Cache) waits for a
+    /// first peer under this source: every source that can report
+    /// candidates does. [`Self::Static`] qualifies with a nonempty seed list
+    /// ([`statics::Static::has_seeds`]), [`Self::DnsSrv`] and a
+    /// caller-supplied [`Self::Custom`] source always, since their peers
+    /// arrive asynchronously the way seeds do. [`Self::Mdns`] never does:
+    /// finding nobody is the ordinary single-node case there, and a wait on
+    /// every open of a lone node would only slow it down.
+    pub(crate) fn awaits_first_peer(&self) -> bool {
+        match self {
+            Self::Static(discovery) => discovery.has_seeds(),
+            Self::DnsSrv(_) | Self::Custom(_) => true,
+            Self::Mdns(_) => false,
+        }
     }
 }
 
@@ -218,17 +223,22 @@ mod tests {
     }
 
     #[test]
-    fn has_seeds_is_true_only_for_a_static_source_with_a_nonempty_seed_list() {
+    fn a_first_peer_wait_applies_to_every_source_that_can_report_candidates_but_mdns() {
         let seed_addr: SocketAddr = "127.0.0.1:4000".parse().expect("valid addr");
         let seeded: DiscoveryKind = statics::Static::new([seed_addr]).into();
         let seedless: DiscoveryKind = statics::Static::new(std::iter::empty()).into();
         let mdns: DiscoveryKind = mdns::Mdns::new("test-cluster", "test-node").into();
         let dns: DiscoveryKind = dns::DnsSrv::new("_sundog._tcp.local.", 7946).into();
 
-        assert!(seeded.has_seeds());
-        assert!(!seedless.has_seeds());
-        assert!(!mdns.has_seeds());
-        assert!(!dns.has_seeds());
+        assert!(seeded.awaits_first_peer());
+        assert!(!seedless.awaits_first_peer());
+        assert!(!mdns.awaits_first_peer());
+        assert!(dns.awaits_first_peer());
+        let custom: DiscoveryKind =
+            DiscoveryKind::Custom(Box::new(statics::Static::new(["127.0.0.1:4000"
+                .parse::<SocketAddr>()
+                .expect("valid addr")])));
+        assert!(custom.awaits_first_peer());
     }
 
     #[tokio::test]

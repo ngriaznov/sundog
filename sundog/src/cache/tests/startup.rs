@@ -105,6 +105,37 @@ async fn await_initial_peers_times_out_when_seeded_but_nobody_answers() {
     cluster.shutdown().await;
 }
 
+/// A caller-supplied discovery can report candidates, so the open waits for
+/// a first peer under it as it does under a seed list.
+#[tokio::test]
+async fn await_initial_peers_waits_under_a_custom_discovery_whose_candidate_never_answers() {
+    let config = ClusterConfig {
+        state_transfer_budget: Duration::from_millis(200),
+        ..loopback_config()
+    };
+    let cluster = Cluster::builder("cache-it-await-peers-custom")
+        .discovery(crate::discovery::statics::Static::new([
+            dead_gossip_addr().await
+        ]))
+        .config(config)
+        .build()
+        .await
+        .expect("cluster builds even though its one candidate answers nobody");
+    assert!(cluster.awaits_first_peer());
+
+    let start = Instant::now();
+    let settled = await_initial_peers(&cluster).await;
+    let elapsed = start.elapsed();
+
+    assert!(!settled, "nobody answers, so the wait times out");
+    assert!(
+        elapsed >= Duration::from_millis(180) && elapsed < Duration::from_secs(3),
+        "the wait runs to its 200ms bound, took {elapsed:?}"
+    );
+
+    cluster.shutdown().await;
+}
+
 /// A loopback TCP address nobody listens on, distinct from [`dead_gossip_addr`]'s UDP one.
 fn dead_tcp_addr() -> SocketAddr {
     let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))

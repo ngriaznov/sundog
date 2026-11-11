@@ -49,22 +49,22 @@ fn record_reads_names_what_decode_live_value_makes_of_a_record() {
 }
 
 #[test]
-fn should_await_first_peer_only_when_seeded_and_genuinely_alone() {
+fn should_await_first_peer_only_when_discovery_reports_candidates_and_genuinely_alone() {
     assert!(
         should_await_first_peer(true, false),
-        "seeds present and peers empty waits"
+        "a discovery that reports candidates and peers empty waits"
     );
     assert!(
         !should_await_first_peer(false, false),
-        "no seeds does not wait, even with peers still empty"
+        "a discovery that reports none, mDNS or an empty seed list, does not wait"
     );
     assert!(
         !should_await_first_peer(true, true),
-        "peers already known does not wait, even with seeds configured"
+        "peers already known does not wait, even under a discovery that reports candidates"
     );
     assert!(
         !should_await_first_peer(false, true),
-        "no seeds and peers already known: nothing to wait for either way"
+        "no candidates and peers already known: nothing to wait for either way"
     );
 }
 

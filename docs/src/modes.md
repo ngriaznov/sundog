@@ -134,11 +134,18 @@ shows how a read of a key decides on this node and what each owner answers.
 {{#include ../cookbook/src/deploy.rs:distributed}}
 ```
 
-A `Distributed` cache opened on a fixed seed list with no known peer waits
-up to 5 seconds, or `state_transfer_budget` if shorter, for a first peer
-before it computes ownership, so `open` can take that long on the first node
-of a seeded cluster. The wait keeps a node from taking itself for the sole
-owner of every part just because no peer has reported in yet.
+A `Distributed` cache opened with no known peer waits up to 5 seconds, or
+`state_transfer_budget` if shorter, for a first peer before it computes
+ownership, so `open` can take that long on the first node of a cluster. The
+wait keeps a node from taking itself for the sole owner of every part just
+because no peer has reported in yet. It applies to every discovery that can
+report candidates: a fixed seed list with at least one seed, DNS SRV, and a
+discovery you supply with `ClusterBuilder::discovery`. A cluster with an empty
+seed list does not wait. mDNS, the zero-config default, never waits: finding
+nobody is the ordinary single-node case there, and a lone node opens at once.
+A warm reopen whose wait times out does not vouch for the parts it replayed
+from its spill tier until the warm-up sees a view change or one
+anti-entropy interval passes.
 
 When a node joins or leaves, ownership follows gossip within a few gossip
 intervals. A node that gains a part pulls it from the previous owners, and

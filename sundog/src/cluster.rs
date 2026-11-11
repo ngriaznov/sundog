@@ -130,12 +130,13 @@ struct ClusterInner {
     node: NodeId,
     name: SmolStr,
     membership: Membership,
-    /// Whether `ClusterBuilder::build` resolved a fixed, nonempty seed
-    /// list. `open()` waits briefly for a first peer only when this is
-    /// `true` and `Cluster::peers` is still empty; a seedless cluster is a
-    /// legitimate one-node cluster, not a membership race to wait out. See
-    /// `cache::open::should_await_first_peer`.
-    has_seeds: bool,
+    /// Whether the resolved discovery can report candidates
+    /// (`DiscoveryKind::awaits_first_peer`): a nonempty static seed list,
+    /// `DnsSrv` or a custom source. `open()` waits briefly for a first peer
+    /// only when this is `true` and `Cluster::peers` is still empty; an mDNS
+    /// or seedless cluster is a legitimate one-node cluster, not a membership
+    /// race to wait out. See `cache::open::should_await_first_peer`.
+    awaits_first_peer: bool,
     mesh: Mesh,
     shards: ShardRegistry,
     /// The sequence counter of each cache name that ever opened on this
@@ -420,10 +421,10 @@ impl Cluster {
         self.inner.membership.peers().borrow().clone()
     }
 
-    /// Whether this cluster was built with a fixed, nonempty seed list; see
-    /// [`ClusterInner::has_seeds`].
-    pub(crate) fn has_seeds(&self) -> bool {
-        self.inner.has_seeds
+    /// Whether a `Distributed` open waits for a first peer on this cluster;
+    /// see [`ClusterInner::awaits_first_peer`].
+    pub(crate) fn awaits_first_peer(&self) -> bool {
+        self.inner.awaits_first_peer
     }
 
     /// Whether this node is ready to serve: the data-plane listener is bound
@@ -1126,7 +1127,7 @@ impl ClusterBuilder {
         // mechanism of its own, as the mDNS daemon does, stops when the
         // membership loop ends.
         let discovery = Arc::new(resolve_discovery(discovery, &name, &node_name, &config)?);
-        let has_seeds = discovery.has_seeds();
+        let awaits_first_peer = discovery.awaits_first_peer();
 
         let data_listener = BoundListener::bind(config.data_bind_addr).await?;
         let data_bind_addr = data_listener.local_addr();
@@ -1176,7 +1177,7 @@ impl ClusterBuilder {
                 node,
                 name: name.clone(),
                 membership,
-                has_seeds,
+                awaits_first_peer,
                 mesh,
                 shards,
                 merge_seqs: Mutex::new(HashMap::new()),
