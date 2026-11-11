@@ -64,6 +64,8 @@ SUNDOG_BENCH=1 cargo test --release -p sundog --test entry_diet_bench \
 `CacheBuilder::capacity_hint` preallocates for an expected entry count at
 `open`, which avoids growing each table as it fills. Pass this
 node's own share, not the cluster total.
+Each of the 1024 stripes presizes for at most 1024 entries, so a hint above
+about a million entries presizes that many and the tables grow past it as usual.
 
 ## Tombstones
 

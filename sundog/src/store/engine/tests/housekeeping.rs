@@ -187,3 +187,12 @@ fn should_shrink_stripe_false_near_or_above_its_allocation() {
         "never allocated: nothing to shrink further"
     );
 }
+
+#[test]
+fn stripe_prealloc_divides_the_hint_across_stripes_and_caps_it() {
+    assert_eq!(stripe_prealloc(0), 0);
+    assert_eq!(stripe_prealloc(1), 1);
+    assert_eq!(stripe_prealloc(BUCKET_COUNT as u64 * 10), 10);
+    assert_eq!(stripe_prealloc(u64::MAX), MAX_STRIPE_PREALLOC);
+    assert_eq!(stripe_prealloc(1 << 60), MAX_STRIPE_PREALLOC);
+}

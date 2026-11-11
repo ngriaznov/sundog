@@ -157,6 +157,16 @@ pub enum CacheError {
         /// The cache's name.
         cache: SmolStr,
     },
+    /// The builder's limits are unusable: a `max_capacity` of zero, which
+    /// evicts every write at once, or a `tti` under one millisecond, which
+    /// lapses an entry the moment it is written.
+    #[error("cache {cache:?} has an invalid config: {reason}")]
+    InvalidConfig {
+        /// The cache's name.
+        cache: SmolStr,
+        /// Why the config is rejected.
+        reason: &'static str,
+    },
     /// The builder's loading options do not fit together, such as a batch
     /// window with no loader.
     #[error("cache {cache:?} has an invalid load config: {reason}")]
@@ -313,6 +323,17 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("prices"));
         assert!(text.contains('1'));
+    }
+
+    #[test]
+    fn invalid_config_message_names_the_cache_and_the_reason() {
+        let err = CacheError::InvalidConfig {
+            cache: SmolStr::new("prices"),
+            reason: "max_capacity must be at least 1",
+        };
+        let text = err.to_string();
+        assert!(text.contains("prices"), "{text}");
+        assert!(text.contains("max_capacity must be at least 1"), "{text}");
     }
 
     #[test]

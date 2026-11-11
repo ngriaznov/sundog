@@ -83,7 +83,7 @@ pub const PART_COUNT: usize = 64;
 
 #[cfg(all(test, not(feature = "sim")))]
 pub(crate) use engine::pause_gap_ms;
-pub(crate) use engine::{gc_period_ms, hash_key_bytes};
+pub(crate) use engine::{MAX_TTI_MS, gc_period_ms, hash_key_bytes};
 #[cfg(feature = "sim")]
 #[doc(hidden)]
 pub use fan_out::SimFanOut;

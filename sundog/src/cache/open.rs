@@ -19,7 +19,7 @@ use crate::error::CacheError;
 use crate::ownership::{OwnershipTracker, OwnershipView, ResidencySet};
 #[cfg(feature = "spill")]
 use crate::store::spill::SpillConfig;
-use crate::store::{Mode, PartId, Shard, ShardOps, refresh_permille};
+use crate::store::{MAX_TTI_MS, Mode, PartId, Shard, ShardOps, refresh_permille};
 
 #[cfg(doc)]
 use super::tasks::distributed_warm_and_rebalance;
@@ -100,6 +100,31 @@ pub(super) fn validate_mode(
         });
     }
     Ok(())
+}
+
+/// Rejects the builder limits that leave a cache unusable: a zero
+/// `max_capacity`, whose first eviction pass drops the entry just written,
+/// and a `tti` under one millisecond, which the engine's millisecond clock
+/// reads as already idle. Pure; unit tested directly.
+pub(super) fn validate_limits(
+    max_capacity: u64,
+    tti: Option<Duration>,
+) -> Result<(), &'static str> {
+    if max_capacity == 0 {
+        return Err("max_capacity must be at least 1");
+    }
+    if tti.is_some_and(|tti| tti < Duration::from_millis(1)) {
+        return Err("tti must be at least 1 ms");
+    }
+    Ok(())
+}
+
+/// The effective idle timeout in milliseconds when the engine shortens
+/// `tti` to its cap, `None` when `tti` is unset or fits. Pure; unit tested
+/// directly.
+pub(super) fn tti_clamped_to_ms(tti: Option<Duration>) -> Option<u64> {
+    tti.filter(|tti| tti.as_millis() > u128::from(MAX_TTI_MS))
+        .map(|_| MAX_TTI_MS)
 }
 
 /// Whether [`CacheBuilder::merge_coalesce_window`] combined with the

@@ -66,7 +66,7 @@ pub(super) const MAX_STAMP_LEAD_MS: u64 = 86_400_000;
 /// [`clamp_tti_ms`] enforces: the stamp ring less [`MAX_STAMP_LEAD_MS`]
 /// (~48.71 days). Gaps and leads share one ring, so they cannot both own all
 /// of it.
-pub(super) const MAX_TTI_MS: u64 = (u32::MAX as u64) - MAX_STAMP_LEAD_MS;
+pub(crate) const MAX_TTI_MS: u64 = (u32::MAX as u64) - MAX_STAMP_LEAD_MS;
 
 const _: () = assert!(
     MAX_TTI_MS + MAX_STAMP_LEAD_MS == u32::MAX as u64 && MAX_TTI_MS <= MAX_INLINE_TTL_MS,

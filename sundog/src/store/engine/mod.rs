@@ -117,7 +117,7 @@ pub(crate) use self::expiry::pause_gap_ms;
 #[cfg(doc)]
 use self::expiry::{LONG_TTL, decode_expiry, idle_elapsed_ms};
 pub(crate) use self::expiry::{
-    Lapsed, TombstoneRetention, expiry_tombstone_retention, gc_period_ms,
+    Lapsed, MAX_TTI_MS, TombstoneRetention, expiry_tombstone_retention, gc_period_ms,
 };
 use self::expiry::{absent_at, absent_under, clamp_tti_ms, touch_stamp};
 pub(crate) use self::housekeeping::{
@@ -264,6 +264,20 @@ fn is_resident<K, V>(live: &Live<K, V>) -> bool {
 /// second time while pending. Pure; unit tested directly.
 fn is_spill_candidate<K, V>(live: &Live<K, V>) -> bool {
     is_resident(live) && live.weight > 0
+}
+
+/// The most entries one stripe presizes for, so a hint far above any real
+/// resident count (`1 << 60`) cannot overflow or exhaust an allocation in
+/// `Engine::new`. Across all stripes it presizes 1 Mi entries; a stripe
+/// that holds more grows as usual.
+const MAX_STRIPE_PREALLOC: usize = 1024;
+
+/// The per-stripe presize for a `capacity_hint` of `hint` entries:
+/// `ceil(hint / BUCKET_COUNT)`, capped at [`MAX_STRIPE_PREALLOC`]. Pure;
+/// unit tested directly.
+fn stripe_prealloc(hint: u64) -> usize {
+    usize::try_from(hint.div_ceil(BUCKET_COUNT as u64))
+        .map_or(MAX_STRIPE_PREALLOC, |n| n.min(MAX_STRIPE_PREALLOC))
 }
 
 /// The weight an entry carries: the weigher's result floored at `1`, or `1`
@@ -691,10 +705,7 @@ where
         weigher: Option<Weigher<K, V>>,
         capacity_hint: Option<u64>,
     ) -> Self {
-        let per_stripe_capacity = capacity_hint.map(|hint| {
-            usize::try_from(hint.div_ceil(BUCKET_COUNT as u64))
-                .expect("invariant: a capacity hint divided by BUCKET_COUNT fits in usize")
-        });
+        let per_stripe_capacity = capacity_hint.map(stripe_prealloc);
         Self {
             stripes: (0..BUCKET_COUNT)
                 .map(|_| {

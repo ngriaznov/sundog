@@ -56,7 +56,7 @@ use load::routes_loads;
 use open::attach_spill_and_record_warm;
 use open::{
     LoadConfig, OpenGuard, attach_ownership, await_initial_peers, reserve_name, tear_down,
-    validate_load_config, validate_merge_window, validate_mode,
+    tti_clamped_to_ms, validate_limits, validate_load_config, validate_merge_window, validate_mode,
 };
 use tasks::spawn_cache_tasks;
 
@@ -162,6 +162,8 @@ where
     /// in `Mode::Distributed`. Clamped to [`CacheBuilder::max_capacity`] at
     /// [`CacheBuilder::open`] unless [`CacheBuilder::weigher`] is set, since a
     /// weigher turns `max_capacity` into a weight budget, not an entry count.
+    /// Each stripe presizes for at most 1024 entries, so a hint above 1 Mi
+    /// entries presizes that much and the stripes grow past it as usual.
     pub fn capacity_hint(mut self, entries: u64) -> Self {
         self.capacity_hint = Some(entries);
         self
@@ -176,7 +178,10 @@ where
     }
 
     /// Sets a local-only max-idle (TTI), not cluster-replicated. Capped at
-    /// about 48.7 days. Default: no idle expiry.
+    /// about 48.7 days: a longer `tti` opens with the cap as its effective
+    /// value and logs one warning that names both. A `tti` under one
+    /// millisecond is rejected at [`CacheBuilder::open`]. Default: no idle
+    /// expiry.
     pub fn tti(mut self, tti: Duration) -> Self {
         self.tti = Some(tti);
         self
@@ -339,6 +344,8 @@ where
     /// [`CacheError::ZeroStateTransferBudget`] if `mode` is
     /// [`Mode::Distributed`] under a `tombstone_ttl` shorter than the bucket
     /// release window or a zero `state_transfer_budget`;
+    /// [`CacheError::InvalidConfig`] if `max_capacity` is zero or `tti` is
+    /// under one millisecond;
     /// [`CacheError::ReplicatedWithLocalEviction`] if `mode` is
     /// [`Mode::Replicated`] or [`Mode::Distributed`] with `tti` set, or
     /// `max_capacity` set with no `spill` tier configured (`tti` is
@@ -403,6 +410,21 @@ where
 
         let local_eviction = tti.is_some() || (max_capacity != u64::MAX && !spill_configured);
         validate_mode(&name, mode, local_eviction, cluster.config())?;
+
+        if let Err(reason) = validate_limits(max_capacity, tti) {
+            return Err(CacheError::InvalidConfig {
+                cache: name,
+                reason,
+            });
+        }
+        if let Some(effective_ms) = tti_clamped_to_ms(tti) {
+            tracing::warn!(
+                cache = %name,
+                requested_tti = ?tti,
+                effective_tti_ms = effective_ms,
+                "tti exceeds the idle-stamp range; entries idle out at the effective tti"
+            );
+        }
 
         if !validate_merge_window(merge_coalesce_window, resolver.merges()) {
             return Err(CacheError::MergeWindowRequiresMergingResolver { cache: name });

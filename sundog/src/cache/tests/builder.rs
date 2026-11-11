@@ -92,6 +92,69 @@ async fn a_zero_weigher_result_counts_as_one_through_the_cache() {
     cluster.shutdown().await;
 }
 
+/// Opens a `Local` cache named `name` through `configure`, for the open-time
+/// config checks.
+async fn open_local(
+    name: &str,
+    configure: impl FnOnce(CacheBuilder<u32, String>) -> CacheBuilder<u32, String>,
+) -> (Cluster, Result<Cache<u32, String>, CacheError>) {
+    let cluster = Cluster::builder(name)
+        .seeds(std::iter::empty())
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("node builds");
+    let result = configure(cluster.cache::<u32, String>("c").mode(Mode::Local))
+        .open()
+        .await;
+    (cluster, result)
+}
+
+#[tokio::test]
+async fn open_rejects_a_sub_millisecond_tti() {
+    for tti in [Duration::ZERO, Duration::from_micros(500)] {
+        let (cluster, result) = open_local("cache-it-tti-sub-ms", |b| b.tti(tti)).await;
+        assert!(
+            matches!(&result, Err(CacheError::InvalidConfig { cache, .. }) if cache == "c"),
+            "{tti:?}: {:?}",
+            result.err()
+        );
+        cluster.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn open_rejects_a_zero_max_capacity() {
+    let (cluster, result) = open_local("cache-it-zero-cap", |b| b.max_capacity(0)).await;
+    assert!(
+        matches!(&result, Err(CacheError::InvalidConfig { .. })),
+        "{:?}",
+        result.err()
+    );
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn open_accepts_an_oversized_capacity_hint() {
+    let (cluster, result) = open_local("cache-it-huge-hint", |b| b.capacity_hint(1 << 60)).await;
+    let cache = result.expect("opens");
+    cache.insert(1, "v".to_string()).await.expect("insert");
+    assert_eq!(cache.get(&1).await.as_deref(), Some("v"));
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn open_accepts_a_tti_above_the_cap() {
+    let (cluster, result) = open_local("cache-it-tti-over-cap", |b| {
+        b.tti(Duration::from_secs(90 * 24 * 3600))
+    })
+    .await;
+    let cache = result.expect("opens with the capped tti");
+    cache.insert(1, "v".to_string()).await.expect("insert");
+    assert_eq!(cache.get(&1).await.as_deref(), Some("v"));
+    cluster.shutdown().await;
+}
+
 #[tokio::test]
 async fn merge_coalesce_window_rejects_a_non_merging_resolver() {
     let cluster = Cluster::builder("cache-it-merge-window-rejects-non-merging")

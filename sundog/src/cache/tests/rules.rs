@@ -4,7 +4,7 @@
 use super::*;
 use crate::cache::fetch::{decode_live_value, record_reads};
 use crate::cache::load::copy_expiry;
-use crate::cache::open::should_await_first_peer;
+use crate::cache::open::{should_await_first_peer, tti_clamped_to_ms, validate_limits};
 use crate::cache::reconcile::{
     RECONCILE_MAX_ROUNDS, ReconcileBudget, retry_delay, should_keep_reconciling, split_round_result,
 };
@@ -623,4 +623,41 @@ fn validate_merge_window_accepts_zero_regardless_of_the_resolver() {
 fn validate_merge_window_requires_a_merging_resolver_once_nonzero() {
     assert!(!validate_merge_window(Duration::from_millis(1), false));
     assert!(validate_merge_window(Duration::from_millis(1), true));
+}
+
+#[test]
+fn validate_limits_rejects_zero_capacity_and_a_sub_millisecond_tti() {
+    assert_eq!(validate_limits(1, None), Ok(()));
+    assert_eq!(
+        validate_limits(u64::MAX, Some(Duration::from_millis(1))),
+        Ok(())
+    );
+    assert_eq!(
+        validate_limits(0, None),
+        Err("max_capacity must be at least 1")
+    );
+    assert_eq!(
+        validate_limits(10, Some(Duration::ZERO)),
+        Err("tti must be at least 1 ms")
+    );
+    assert_eq!(
+        validate_limits(10, Some(Duration::from_micros(999))),
+        Err("tti must be at least 1 ms")
+    );
+}
+
+#[test]
+fn tti_clamped_to_ms_names_the_cap_only_for_a_tti_above_it() {
+    use crate::store::MAX_TTI_MS;
+    assert_eq!(tti_clamped_to_ms(None), None);
+    assert_eq!(tti_clamped_to_ms(Some(Duration::from_secs(3600))), None);
+    assert_eq!(
+        tti_clamped_to_ms(Some(Duration::from_millis(MAX_TTI_MS))),
+        None
+    );
+    assert_eq!(
+        tti_clamped_to_ms(Some(Duration::from_millis(MAX_TTI_MS + 1))),
+        Some(MAX_TTI_MS)
+    );
+    assert_eq!(tti_clamped_to_ms(Some(Duration::MAX)), Some(MAX_TTI_MS));
 }

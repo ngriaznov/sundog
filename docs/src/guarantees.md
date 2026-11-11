@@ -367,7 +367,9 @@ node's clock. A read, a sweep or a merge that sampled its clock before a
 later touch, or after the wall clock stepped back by up to 24 hours, counts
 the entry as just used: it is never idle because of that, and eviction ranks
 it hottest. A step back of more than 24 hours is not covered. A `tti` longer
-than about 48.7 days is capped at that, and idle time, both for `tti` and for
+than about 48.7 days is capped at that, with one warning logged at `open`
+that names both values, and a `tti` under one millisecond is rejected at
+`open`. Idle time, both for `tti` and for
 the eviction ranking in every mode with a capacity, is exact only up to that
 span: an entry that sat unswept for longer is not guaranteed to stay deleted.
 
