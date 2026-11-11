@@ -1524,6 +1524,147 @@ async fn a_present_key_never_reads_as_a_miss_when_a_read_races_its_promotion() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A key that is present throughout never loads when a batched read races
+/// its overwrite. A `load_many` that snapshotted a spilled key's pointer,
+/// then lost the race to an overwrite and a region rotation, answers the
+/// key's live value from RAM and does not call the loader for it.
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scripted race: spill, park a read, overwrite, rotate the region"
+)]
+async fn a_batched_load_of_a_present_key_never_calls_the_loader_when_its_read_races_an_overwrite() {
+    const CAP: u32 = 10;
+    let dir = temp_dir("claim-race-promotion");
+    let cfg = SpillConfig::new(&dir, 16384)
+        .region_bytes(4096)
+        .spill_wait_timeout(Duration::from_secs(20));
+    let loader_calls = Arc::new(AtomicUsize::new(0));
+    let shard = Shard::<u32, String>::new(
+        SmolStr::new("claim-race-promotion"),
+        Mode::Local,
+        NodeId::from(1u64),
+        u64::from(CAP),
+        None,
+        None,
+    )
+    .with_loader(crate::store::load::Loader::batch({
+        let loader_calls = Arc::clone(&loader_calls);
+        move |keys: Vec<u32>| {
+            let loader_calls = Arc::clone(&loader_calls);
+            async move {
+                loader_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, std::io::Error>(
+                    keys.into_iter()
+                        .map(|key| (key, "loaded".to_string()))
+                        .collect::<HashMap<_, _>>(),
+                )
+            }
+        }
+    }))
+    .with_spill(&cfg)
+    .expect("tier opens");
+    for k in 0..=CAP {
+        shard.insert(k, format!("old-{k}")).await.expect("insert");
+    }
+    assert!(
+        poll_until(POLL_TIMEOUT, || {
+            shard.engine.spill().is_some_and(|t| t.bytes_used() > 0)
+        })
+        .await,
+        "one key spills"
+    );
+    let spilled = (0..=CAP)
+        .find(|k| shard.get_sync(k).is_none())
+        .expect("one key is spilled");
+
+    // Filler keys all in the stripe just before the spilled key's, so an
+    // eviction pass started at a filler's stripe always finds an older
+    // filler to evict and never reaches the overwritten key.
+    let bucket = |k: u32| usize::from(bucket_of(&key_bytes(&k)));
+    let before = (bucket(spilled) + BUCKET_COUNT - 1) % BUCKET_COUNT;
+    let mut fillers = (1000u32..).filter(|k| bucket(*k) == before);
+    for _ in 0..CAP {
+        let k = fillers.next().expect("endless");
+        shard.insert(k, "x".repeat(800)).await.expect("seed filler");
+    }
+    assert!(
+        poll_until(POLL_TIMEOUT, || shard.engine.debug_pending_spill_weight()
+            == 0)
+        .await,
+        "seed settles"
+    );
+    assert!(shard.get_sync(&spilled).is_none(), "setup: still spilled");
+
+    let hold = hold_spill_reads(&shard).await;
+    let claiming = shard.load_many([spilled]);
+    tokio::pin!(claiming);
+    let parked = tokio::time::timeout(Duration::from_millis(100), &mut claiming).await;
+    assert!(
+        parked.is_err(),
+        "the claim holds its pointer, parked on a permit"
+    );
+
+    // The key is overwritten (present and resident), and its old region
+    // rotates out under filler writes.
+    shard
+        .insert(spilled, "new".to_string())
+        .await
+        .expect("overwrite");
+    for n in 0..80 {
+        let k = fillers.next().expect("endless");
+        shard.insert(k, "x".repeat(800)).await.expect("filler");
+        // A filler's eviction pass can sample past its own stripe and spill
+        // the key; writing it again keeps it present and resident, which is
+        // all the race needs.
+        if shard.get_sync(&spilled).is_none() {
+            shard
+                .insert(spilled, "new".to_string())
+                .await
+                .expect("rewrite");
+        }
+        assert_eq!(
+            shard.get_sync(&spilled),
+            Some("new".to_string()),
+            "setup: key is resident at filler {n}"
+        );
+    }
+    assert!(
+        poll_until(POLL_TIMEOUT, || shard.engine.debug_pending_spill_weight()
+            == 0)
+        .await,
+        "fillers settle"
+    );
+    if shard.get_sync(&spilled).is_none() {
+        shard
+            .insert(spilled, "new".to_string())
+            .await
+            .expect("rewrite");
+    }
+    assert_eq!(
+        shard.get_sync(&spilled),
+        Some("new".to_string()),
+        "setup: key is resident"
+    );
+    drop(hold);
+
+    let found = tokio::time::timeout(Duration::from_secs(5), &mut claiming)
+        .await
+        .expect("load_many completes")
+        .expect("load_many");
+    assert_eq!(
+        found.get(&spilled),
+        Some(&"new".to_string()),
+        "the present key answers with its live value"
+    );
+    assert_eq!(
+        loader_calls.load(Ordering::SeqCst),
+        0,
+        "a resident key is not loaded"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A write burst that meets a held flush queue on a `mode` shard leaves
 /// its refused victims resident; once the queue frees, the shard settles
 /// back within its cap with no further write.

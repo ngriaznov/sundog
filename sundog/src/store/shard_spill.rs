@@ -49,7 +49,7 @@ pub(super) fn warm_reopen_allowed(mode: Mode) -> bool {
 /// key promoted or overwritten between the RAM miss and the lookup, or its
 /// record rotated out between the lookup and the read.
 #[cfg(feature = "spill")]
-const SPILL_READ_ROUNDS: u8 = 2;
+pub(super) const SPILL_READ_ROUNDS: u8 = 2;
 
 /// [`Shard::read_spilled_outcome`]'s result.
 #[cfg(feature = "spill")]
@@ -341,23 +341,10 @@ where
         None
     }
 
-    /// [`Shard::get_spilled`] for a caller that already has `key_bytes` and
-    /// its hash, such as [`Shard::get_or_load`]'s owner arm, with the
-    /// version the value was spilled at.
-    #[cfg(feature = "spill")]
-    pub(super) async fn get_spilled_by_bytes(
-        &self,
-        key_bytes: &[u8],
-        hash: u64,
-    ) -> Option<(Hlc, V)> {
-        let (ver, value, encoded) = self.read_spilled_by_bytes(key_bytes, hash).await?;
-        self.promote_read(key_bytes, hash, ver, &value, &encoded);
-        Some((ver, value))
-    }
-
-    /// [`Shard::get_spilled_by_bytes`] for [`Shard::get_or_load`]'s owner arm:
-    /// on a miss, says whether the key is resident now, so the caller reads
-    /// RAM instead of loading.
+    /// Reads a spilled key for a caller that already has `key_bytes` and its
+    /// hash, [`Shard::get_or_load`]'s and the batch claim's owner arm, with
+    /// the version the value was spilled at. On a miss, says whether the key
+    /// is resident now, so the caller reads RAM instead of loading.
     ///
     /// # Errors
     ///

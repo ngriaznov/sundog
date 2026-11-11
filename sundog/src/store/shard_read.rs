@@ -12,7 +12,7 @@ use super::engine::JoinOutcome;
 use super::fan_out::{FillRoute, ReadThroughRoute, fill_fans_out, fill_route, read_through_route};
 use super::load::{Fill, FillDeadline, FillPlan, fill_deadline};
 #[cfg(feature = "spill")]
-use super::shard_spill::SpilledMiss;
+use super::shard_spill::{SPILL_READ_ROUNDS, SpilledMiss};
 use super::{
     EncodeFailure, Event, FanOutItem, Origin, PartId, Shard, SharedLoaderFailure, encode_key,
     engine, read_timing, shared_failure,
@@ -536,7 +536,7 @@ where
                         }
                         // Promoted or overwritten since the miss above: the
                         // fast path reads it, with no load.
-                        Err(SpilledMiss::Resident) if spill_races < 2 => {
+                        Err(SpilledMiss::Resident) if spill_races < SPILL_READ_ROUNDS => {
                             spill_races += 1;
                             drop(guard);
                             continue;

@@ -23,6 +23,8 @@ use serde::de::DeserializeOwned;
 use tokio::sync::{Notify, watch};
 
 use super::engine::{self, Inflight, JoinOutcome};
+#[cfg(feature = "spill")]
+use super::shard_spill::{SPILL_READ_ROUNDS, SpilledMiss};
 use super::{PartId, Shard, ShardOps, encode_key, shared_failure};
 use crate::error::{CacheError, CodecError};
 use crate::hlc::Hlc;
@@ -719,7 +721,14 @@ where
     ) -> (Vec<Queued<K, V>>, Vec<Wait<K, V>>) {
         let mut owned = Vec::new();
         let mut waits = Vec::with_capacity(todo.len());
-        for (key, key_bytes, hash) in todo {
+        #[cfg_attr(
+            not(feature = "spill"),
+            allow(
+                unused_labels,
+                reason = "only the spill build leaves the loop from a nested one"
+            )
+        )]
+        'keys: for (key, key_bytes, hash) in todo {
             let now = self.now_ms();
             if let Some(value) = self.read_resident(&key, key_bytes.as_ref(), hash, now) {
                 self.hits.increment(1);
@@ -751,23 +760,48 @@ where
                         completed: false,
                     };
                     #[cfg(feature = "spill")]
-                    if let Some((ver, value)) =
-                        self.get_spilled_by_bytes(key_bytes.as_ref(), hash).await
                     {
-                        self.hits.increment(1);
-                        // Joined waiters answer with the value, promoted
-                        // back to RAM or not, iff the key still holds it.
-                        self.engine.finish_spilled_read(
-                            &key_bytes,
-                            hash,
-                            &inflight,
-                            ver,
-                            value.clone(),
-                            self.now_ms(),
-                        );
-                        guard.complete();
-                        found.insert(key, value);
-                        continue;
+                        let mut rounds = 0u8;
+                        loop {
+                            match self.get_spilled_or_resident(key_bytes.as_ref(), hash).await {
+                                Ok((ver, value)) => {
+                                    self.hits.increment(1);
+                                    // Joined waiters answer with the value,
+                                    // promoted back to RAM or not, iff the
+                                    // key still holds it.
+                                    self.engine.finish_spilled_read(
+                                        &key_bytes,
+                                        hash,
+                                        &inflight,
+                                        ver,
+                                        value.clone(),
+                                        self.now_ms(),
+                                    );
+                                    guard.complete();
+                                    found.insert(key, value);
+                                    continue 'keys;
+                                }
+                                // Promoted or overwritten since the miss
+                                // above: RAM answers it, with no load. The
+                                // guard frees the fill, so a call joined to
+                                // it reads RAM too.
+                                Err(SpilledMiss::Resident) if rounds < SPILL_READ_ROUNDS => {
+                                    rounds += 1;
+                                    if let Some(value) = self.read_resident(
+                                        &key,
+                                        key_bytes.as_ref(),
+                                        hash,
+                                        self.now_ms(),
+                                    ) {
+                                        self.hits.increment(1);
+                                        drop(guard);
+                                        found.insert(key, value);
+                                        continue 'keys;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
                     }
                     let slot = Arc::new(OnceLock::new());
                     let done = inflight.subscribe();
