@@ -9,7 +9,7 @@ use smol_str::SmolStr;
 use sundog::NodeId;
 
 use super::derive::{self, FetchMix, QUIET_SCRAPES};
-use super::series::{CounterTrack, RING_LEN, Ring};
+use super::series::{CounterTrack, Observation, RING_LEN, Ring};
 use crate::source::expo::Sample;
 use crate::source::names;
 
@@ -213,19 +213,24 @@ impl NodeMetrics {
         self.values.clear();
         self.rates.clear();
         let mut created = Vec::new();
+        let mut reset = Vec::new();
         for sample in samples {
             let key = SeriesKey::of(sample);
             if is_counter(&sample.name) && sample.value.is_finite() {
                 if !self.tracks.contains_key(&key) {
                     created.push(key.clone());
                 }
-                if let Some(rate) = self
+                match self
                     .tracks
                     .entry(key.clone())
                     .or_default()
                     .observe(at, sample.value)
                 {
-                    self.rates.insert(key.clone(), rate);
+                    Observation::Rate(rate) => {
+                        self.rates.insert(key.clone(), rate);
+                    }
+                    Observation::Reset => reset.push(key.clone()),
+                    Observation::First | Observation::Dropped => {}
                 }
             }
             self.values.insert(key, sample.value);
@@ -235,7 +240,7 @@ impl NodeMetrics {
         let active = xfer.is_some_and(|rate| rate > 0.0);
         let xfer_started = active && !self.xfer_active;
         self.xfer_active = active;
-        self.fold_caches(at, first, &created);
+        self.fold_caches(at, first, &created, &reset);
         self.fold_cache_histories(first);
         if !first {
             let bypassing: f64 = ["remote", "miss", "error"]
@@ -312,7 +317,13 @@ impl NodeMetrics {
         }
     }
 
-    fn fold_caches(&mut self, at: Instant, first: bool, created: &[SeriesKey]) {
+    fn fold_caches(
+        &mut self,
+        at: Instant,
+        first: bool,
+        created: &[SeriesKey],
+        reset: &[SeriesKey],
+    ) {
         let caches: Vec<SmolStr> = self
             .values
             .keys()
@@ -330,13 +341,18 @@ impl NodeMetrics {
                 && created
                     .iter()
                     .any(|key| key.matches(names::REBALANCE_PARTS, &into));
+            let restarted = reset
+                .iter()
+                .any(|key| key.matches(names::REBALANCE_PARTS, &into));
+            let since_zero = |value: f64| if span > 0.0 { value / span } else { value };
             let in_rate = match self.rate(names::REBALANCE_PARTS, &into) {
                 Some(rate) => Some(rate),
                 // The exporter creates the series at the first pull: the
                 // parts it holds arrived since the previous fold.
-                None if appeared => {
-                    present.map(|value| if span > 0.0 { value / span } else { value })
-                }
+                None if appeared => present.map(since_zero),
+                // A counter that restarted below its old value counts from
+                // zero: a nonzero value is parts pulled since the restart.
+                None if restarted => present.filter(|&value| value > 0.0).map(since_zero),
                 // Until then nothing has been pulled in.
                 None if present.is_none() && !first => Some(0.0),
                 None => None,
@@ -903,6 +919,55 @@ mod tests {
             metrics.rebalance_in("it").unwrap().to_vec(),
             [0.0, 0.0, 5000.0, 0.0]
         );
+    }
+
+    #[test]
+    fn a_reset_pull_counter_with_parts_pulled_is_a_pull() {
+        let base = Instant::now();
+        let owned = sample(names::OWNED_PARTS, &[("cache", "it")], 100.0);
+        let pulled = |value| {
+            sample(
+                names::REBALANCE_PARTS,
+                &[("cache", "it"), ("direction", "in")],
+                value,
+            )
+        };
+        let mut metrics = NodeMetrics::new(node());
+        for secs in 0..3 {
+            metrics.fold(at(base, secs), &[owned.clone(), pulled(10.0)]);
+        }
+        assert_eq!(metrics.quiet_scrapes("it"), 2);
+        // The node restarts and pulls 3 parts in: the counter reads below
+        // its old value, but the node is pulling and is not quiet.
+        metrics.fold(at(base, 3), &[owned.clone(), pulled(3.0)]);
+        assert_eq!(metrics.quiet_scrapes("it"), 0);
+        assert_eq!(metrics.quiet_scrapes_since("it", base), 0);
+        assert_eq!(
+            metrics.rebalance_in("it").unwrap().to_vec(),
+            [0.0, 0.0, 3.0]
+        );
+        // Holding still afterwards is quiet again.
+        metrics.fold(at(base, 4), &[owned.clone(), pulled(3.0)]);
+        assert_eq!(metrics.quiet_scrapes("it"), 1);
+    }
+
+    #[test]
+    fn a_pull_counter_reset_to_zero_leaves_the_quiet_count() {
+        let base = Instant::now();
+        let owned = sample(names::OWNED_PARTS, &[("cache", "it")], 100.0);
+        let pulled = |value| {
+            sample(
+                names::REBALANCE_PARTS,
+                &[("cache", "it"), ("direction", "in")],
+                value,
+            )
+        };
+        let mut metrics = NodeMetrics::new(node());
+        for secs in 0..3 {
+            metrics.fold(at(base, secs), &[owned.clone(), pulled(10.0)]);
+        }
+        metrics.fold(at(base, 3), &[owned.clone(), pulled(0.0)]);
+        assert_eq!(metrics.quiet_scrapes("it"), 2);
     }
 
     #[test]

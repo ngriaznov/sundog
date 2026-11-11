@@ -5,6 +5,20 @@ use std::time::Instant;
 /// The number of samples a chart keeps: three minutes at one sample a second.
 pub const RING_LEN: usize = 180;
 
+/// What one sample of a counter adds to its [`CounterTrack`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Observation {
+    /// The first sample of the track: a baseline with no rate.
+    First,
+    /// The per-second rate since the previous sample.
+    Rate(f64),
+    /// The value is below the previous one (the node restarted): no rate,
+    /// and the track continues from the new value.
+    Reset,
+    /// The sample is at or before the previous time and is dropped.
+    Dropped,
+}
+
 /// Turns a monotonic counter's samples into rates.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct CounterTrack {
@@ -18,22 +32,29 @@ impl CounterTrack {
         Self { last: None }
     }
 
-    /// Records a sample of `value` at `t` and returns the rate per second
-    /// since the previous sample. The first sample has no rate. A sample at or
-    /// before the previous time has none either and is dropped. A value below
-    /// the previous one is a counter reset (the node restarted): it has no
-    /// rate, and the track continues from it.
-    pub fn observe(&mut self, t: Instant, value: f64) -> Option<f64> {
+    /// Records a sample of `value` at `t` and reports it: the first sample
+    /// is a baseline, a later one carries the rate per second since the
+    /// previous sample, and a sample at or before the previous time is
+    /// dropped. A value below the previous one is a counter reset (the node
+    /// restarted): it has no rate, is reported as [`Observation::Reset`],
+    /// and the track continues from it.
+    pub fn observe(&mut self, t: Instant, value: f64) -> Observation {
         let Some((last_t, last_value)) = self.last else {
             self.last = Some((t, value));
-            return None;
+            return Observation::First;
         };
-        let dt = t.checked_duration_since(last_t)?.as_secs_f64();
+        let dt = t
+            .checked_duration_since(last_t)
+            .map_or(0.0, |d| d.as_secs_f64());
         if dt <= 0.0 {
-            return None;
+            return Observation::Dropped;
         }
         self.last = Some((t, value));
-        (value >= last_value).then(|| (value - last_value) / dt)
+        if value >= last_value {
+            Observation::Rate((value - last_value) / dt)
+        } else {
+            Observation::Reset
+        }
     }
 
     /// The last sample's value.
@@ -135,7 +156,7 @@ mod tests {
     fn the_first_sample_has_no_rate() {
         let base = Instant::now();
         let mut track = CounterTrack::new();
-        assert_eq!(track.observe(base, 100.0), None);
+        assert_eq!(track.observe(base, 100.0), Observation::First);
         assert_eq!(track.last_value(), Some(100.0));
     }
 
@@ -144,10 +165,10 @@ mod tests {
         let base = Instant::now();
         let mut track = CounterTrack::new();
         track.observe(base, 100.0);
-        assert_eq!(track.observe(at(base, 1), 150.0), Some(50.0));
-        assert_eq!(track.observe(at(base, 2), 200.0), Some(50.0));
-        assert_eq!(track.observe(at(base, 4), 300.0), Some(50.0));
-        assert_eq!(track.observe(at(base, 5), 300.0), Some(0.0));
+        assert_eq!(track.observe(at(base, 1), 150.0), Observation::Rate(50.0));
+        assert_eq!(track.observe(at(base, 2), 200.0), Observation::Rate(50.0));
+        assert_eq!(track.observe(at(base, 4), 300.0), Observation::Rate(50.0));
+        assert_eq!(track.observe(at(base, 5), 300.0), Observation::Rate(0.0));
     }
 
     #[test]
@@ -155,8 +176,8 @@ mod tests {
         let base = Instant::now();
         let mut track = CounterTrack::new();
         track.observe(base, 1000.0);
-        assert_eq!(track.observe(at(base, 1), 10.0), None);
-        assert_eq!(track.observe(at(base, 2), 30.0), Some(20.0));
+        assert_eq!(track.observe(at(base, 1), 10.0), Observation::Reset);
+        assert_eq!(track.observe(at(base, 2), 30.0), Observation::Rate(20.0));
     }
 
     #[test]
@@ -164,9 +185,9 @@ mod tests {
         let base = Instant::now();
         let mut track = CounterTrack::new();
         track.observe(base, 10.0);
-        assert_eq!(track.observe(base, 99.0), None);
+        assert_eq!(track.observe(base, 99.0), Observation::Dropped);
         assert_eq!(track.last_value(), Some(10.0));
-        assert_eq!(track.observe(at(base, 2), 30.0), Some(10.0));
+        assert_eq!(track.observe(at(base, 2), 30.0), Observation::Rate(10.0));
     }
 
     #[test]
@@ -174,7 +195,7 @@ mod tests {
         let base = Instant::now();
         let mut track = CounterTrack::new();
         track.observe(at(base, 5), 10.0);
-        assert_eq!(track.observe(base, 20.0), None);
+        assert_eq!(track.observe(base, 20.0), Observation::Dropped);
         assert_eq!(track.last_value(), Some(10.0));
     }
 
