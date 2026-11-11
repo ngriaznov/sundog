@@ -55,8 +55,9 @@ use load::routes_loads;
 #[cfg(feature = "spill")]
 use open::attach_spill_and_record_warm;
 use open::{
-    LoadConfig, OpenGuard, attach_ownership, await_initial_peers, reserve_name, tear_down,
-    tti_clamped_to_ms, validate_limits, validate_load_config, validate_merge_window, validate_mode,
+    LoadConfig, OpenGuard, attach_ownership, await_first_gossip_round, await_initial_peers,
+    mode_mismatch, reserve_name, tear_down, tti_clamped_to_ms, validate_limits,
+    validate_load_config, validate_merge_window, validate_mode,
 };
 use tasks::spawn_cache_tasks;
 
@@ -353,7 +354,13 @@ where
     /// design); `CacheError::InvalidSpillConfig`, with the `spill` feature
     /// compiled in, for an invalid `spill` config; and
     /// [`CacheError::ModeMismatch`], best-effort, if a live peer already
-    /// advertises `name` under a different [`Mode`].
+    /// advertises `name` under a different [`Mode`]: the check covers the
+    /// advertisements this node has received, once before the open builds
+    /// the cache and again just before it advertises its own mode. A node
+    /// with seeds and no known peer first waits for its first gossip round,
+    /// five gossip intervals at most and never over two seconds, and a
+    /// `Mode::Distributed` open waits under `state_transfer_budget`. A
+    /// conflict that arrives later is logged at `error`, not returned.
     ///
     /// # Cancel safety
     ///
@@ -460,16 +467,14 @@ where
             });
         }
 
-        if let Some(remote) = cluster
-            .advertised_cache_modes()
-            .values()
-            .find_map(|caches| caches.get(&name).filter(|&&m| m != mode).copied())
-        {
-            return Err(CacheError::ModeMismatch {
-                cache: name,
-                local: mode,
-                remote,
-            });
+        // A `Distributed` open waits for its first peer below, once it holds
+        // the shard; the other clustered modes wait here, so the check sees
+        // the modes that peer gossips. `Local` talks to no peer.
+        if matches!(mode, Mode::Invalidation | Mode::Replicated) {
+            await_first_gossip_round(&cluster).await;
+        }
+        if let Some(error) = mode_mismatch(&cluster, &name, mode) {
+            return Err(error);
         }
 
         let mut shard = Shard::<K, V>::new(
@@ -557,6 +562,13 @@ where
             });
         }
 
+        // The last check before the mode is gossiped: it sees the modes of
+        // the peers the waits above landed and of any gossip that arrived
+        // while the shard was built.
+        if let Some(error) = mode_mismatch(&cluster, &name, mode) {
+            guard.abort();
+            return Err(error);
+        }
         cluster.advertise_cache_mode(&name, mode);
         if has_loader {
             cluster.advertise_loader(&name);

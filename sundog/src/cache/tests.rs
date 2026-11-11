@@ -18,6 +18,7 @@ mod merge_cap;
 mod merge_expiry;
 mod merge_sequenced;
 mod merge_shutdown;
+mod mode_check;
 mod nonowner_fill;
 mod nonowner_read_through;
 mod observability;

@@ -8,8 +8,17 @@
 | `Distributed` | the parts it owns | goes to the key's owners | `get` is local; `fetch` asks an owner | the dataset is too large for one node and must survive a node loss |
 
 Every node gossips the mode of each cache it has open. Opening a name
-under a mode that conflicts with a live peer's fails with
-`CacheError::ModeMismatch`. TTL and capacity are local settings and may
+under a mode that conflicts with a peer's fails with
+`CacheError::ModeMismatch` when the open sees that peer's advertisement.
+The open checks the peers known when it starts and again just before it
+advertises its own mode. A node with a seed list and no known peer first
+waits up to five gossip intervals, at most two seconds, for its first
+peer, and a `Distributed` open waits for its first peer under
+`state_transfer_budget` instead; a node without seeds, such as a lone mDNS
+node, does not wait. A conflict that surfaces later, because a peer's
+advertisement arrives after the open or two nodes open the name at once
+under different modes, does not fail the cache: the node logs it at `error`
+once for each peer and cache. TTL and capacity are local settings and may
 differ between nodes.
 
 ## Local

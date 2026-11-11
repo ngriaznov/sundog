@@ -197,6 +197,59 @@ pub(super) struct DistributedContext {
 /// gossip round or two, short enough a bad seed list never stalls `open()`.
 const INITIAL_PEER_WAIT_CAP: Duration = Duration::from_secs(5);
 
+/// The [`Mode`] a live peer advertises for `name` when it differs from
+/// `mode`.
+pub(super) fn conflicting_mode(
+    advertised: &crate::membership::CacheModes,
+    name: &SmolStr,
+    mode: Mode,
+) -> Option<Mode> {
+    advertised
+        .values()
+        .find_map(|caches| caches.get(name).filter(|&&m| m != mode).copied())
+}
+
+/// [`CacheError::ModeMismatch`] when a live peer advertises `name` under a
+/// mode other than `mode`, from the peers the cluster knows right now.
+pub(super) fn mode_mismatch(cluster: &Cluster, name: &SmolStr, mode: Mode) -> Option<CacheError> {
+    conflicting_mode(&cluster.advertised_cache_modes(), name, mode).map(|remote| {
+        CacheError::ModeMismatch {
+            cache: name.clone(),
+            local: mode,
+            remote,
+        }
+    })
+}
+
+/// The longest [`first_gossip_wait`] allows, however slow the gossip interval.
+const FIRST_GOSSIP_WAIT_CAP: Duration = Duration::from_secs(2);
+
+/// How long an `Invalidation` or `Replicated` open waits for the first
+/// gossip round to land a peer: five gossip intervals, at most
+/// [`FIRST_GOSSIP_WAIT_CAP`], so a node whose seeds are all down, such as the
+/// first node of a cluster that lists itself, opens within that bound.
+pub(super) fn first_gossip_wait(gossip_interval: Duration) -> Duration {
+    gossip_interval.saturating_mul(5).min(FIRST_GOSSIP_WAIT_CAP)
+}
+
+/// The bounded wait of an `Invalidation` or `Replicated` open for the first
+/// known peer, so the mode check sees the modes that peer gossips. It waits
+/// under the same rule as [`await_initial_peers`], seeds configured and no
+/// peer known yet, and for [`first_gossip_wait`] at most; a node with no seeds
+/// returns at once.
+pub(super) async fn await_first_gossip_round(cluster: &Cluster) {
+    let bound = first_gossip_wait(cluster.config().gossip_interval);
+    if tokio::time::timeout(bound, await_initial_peers(cluster))
+        .await
+        .is_err()
+    {
+        tracing::debug!(
+            bound_ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
+            "no peer gossiped within the open's wait; checking the cache mode against the peers known"
+        );
+    }
+}
+
 /// Whether [`CacheBuilder::open`]'s `Mode::Distributed` path blocks for a
 /// first known peer before computing the initial ownership view:
 /// `true` only with a fixed seed list (`has_seeds`) and no peer known yet.
@@ -460,7 +513,6 @@ where
     /// The `open` fails before it starts a task or advertises the cache:
     /// frees the name at once, so the error reaches a caller that finds it
     /// free.
-    #[cfg(feature = "spill")]
     pub(super) fn abort(mut self) {
         if let Some(registration) = self.armed.take() {
             registration.release();

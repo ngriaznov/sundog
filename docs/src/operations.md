@@ -167,7 +167,12 @@ addresses once it forms, under `cluster formed`.
 ### Opening a cache fails with `ModeMismatch`
 
 A live peer has the same cache name open under another mode, or with
-another `owners` count. Deploy the same cache configuration everywhere, or
+another `owners` count, and the open saw its advertisement; see
+[modes](modes.md#choosing-a-mode). A conflict whose advertisement arrives
+after the open does not fail it. The node logs an `error` naming the peer,
+the cache and both modes, and keeps running the cache under its own mode,
+so a rolling change of a cache's mode runs two modes under one name until
+the old nodes leave. Deploy the same cache configuration everywhere, or
 give the new configuration a new cache name.
 
 ### Two nodes share a node id
