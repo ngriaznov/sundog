@@ -31,6 +31,9 @@ pub struct Mdns {
     cluster_name: SmolStr,
     instance_name: String,
     daemon: Option<ServiceDaemon>,
+    /// Whether [`Discovery::announce`] registers only the IP of the address
+    /// it is given, rather than every address of every interface.
+    pin_address: bool,
 }
 
 impl Mdns {
@@ -47,7 +50,22 @@ impl Mdns {
             cluster_name: cluster_name.into(),
             instance_name: instance_name.into(),
             daemon,
+            pin_address: false,
         }
+    }
+
+    /// Whether the announcement carries exactly the IP of the gossip address
+    /// it announces, instead of every address of every interface the daemon
+    /// has enabled. [`crate::cluster::ClusterBuilder::build`] pins it when
+    /// the node has an explicit `advertise_ip` or a specific gossip bind IP,
+    /// the cases where the operator chose the address peers use; with
+    /// neither, the announcement carries the interface addresses, which on a
+    /// multi-homed LAN reach a browsing peer on whichever interface it
+    /// shares.
+    #[must_use]
+    pub(crate) fn pinned(mut self, pin: bool) -> Self {
+        self.pin_address = pin;
+        self
     }
 }
 
@@ -88,21 +106,39 @@ impl Discovery for Mdns {
             let Some(daemon) = &self.daemon else {
                 return Ok(());
             };
-            let service_info =
-                build_service_info(&self.cluster_name, &self.instance_name, gossip_addr)
-                    .map_err(io::Error::other)?;
+            let service_info = build_service_info(
+                &self.cluster_name,
+                &self.instance_name,
+                gossip_addr,
+                self.pin_address,
+            )
+            .map_err(io::Error::other)?;
             daemon.register(service_info).map_err(io::Error::other)
         })
     }
 }
 
+/// The service registration for `gossip_addr`: its port, and either its IP
+/// alone (`pin`) or, with `pin` unset, the addresses of every interface the
+/// daemon has enabled.
 fn build_service_info(
     cluster_name: &str,
     instance_name: &str,
     gossip_addr: SocketAddr,
+    pin: bool,
 ) -> mdns_sd::Result<ServiceInfo> {
     let host_name = format!("{instance_name}.local.");
     let properties = [(CLUSTER_TXT_KEY, cluster_name)];
+    if pin {
+        return ServiceInfo::new(
+            SERVICE_TYPE,
+            instance_name,
+            &host_name,
+            gossip_addr.ip(),
+            gossip_addr.port(),
+            &properties[..],
+        );
+    }
     ServiceInfo::new(
         SERVICE_TYPE,
         instance_name,
@@ -133,18 +169,12 @@ fn resolved_addr(event: &ServiceEvent, cluster_name: &str) -> Option<SocketAddr>
 }
 
 /// Picks the best candidate IP out of a resolved service's advertised
-/// addresses: the first IPv4 address, or, absent one, whichever address
-/// appears first. Pure and independent of `mdns_sd`'s own types, so it's
+/// addresses: the lowest IPv4 address, or, absent one, the lowest address.
+/// The result does not depend on the iteration order of the set the daemon
+/// resolves. Pure and independent of `mdns_sd`'s own types, so it's
 /// unit-testable with hand-built addresses.
 fn select_ip(addresses: impl IntoIterator<Item = IpAddr>) -> Option<IpAddr> {
-    let mut first = None;
-    for ip in addresses {
-        if ip.is_ipv4() {
-            return Some(ip);
-        }
-        first.get_or_insert(ip);
-    }
-    first
+    addresses.into_iter().min_by_key(|ip| (ip.is_ipv6(), *ip))
 }
 
 #[cfg(test)]
@@ -183,9 +213,32 @@ mod tests {
     #[test]
     fn build_service_info_embeds_cluster_txt_and_gossip_port() {
         let addr: SocketAddr = "127.0.0.1:7000".parse().expect("valid addr");
-        let info = build_service_info("demo", "node1-aaaa", addr).expect("service info builds");
+        let info =
+            build_service_info("demo", "node1-aaaa", addr, false).expect("service info builds");
         assert_eq!(info.get_port(), addr.port());
         assert_eq!(info.get_property_val_str(CLUSTER_TXT_KEY), Some("demo"));
+    }
+
+    #[test]
+    fn a_pinned_announcement_carries_only_the_advertised_ip() {
+        let addr: SocketAddr = "10.9.8.7:7000".parse().expect("valid addr");
+        let info =
+            build_service_info("demo", "node1-aaaa", addr, true).expect("service info builds");
+        let announced: std::collections::HashSet<IpAddr> = info.get_addresses().clone();
+        assert_eq!(announced, std::collections::HashSet::from([addr.ip()]));
+        assert!(
+            !info.is_addr_auto(),
+            "the interface addresses are not added"
+        );
+        assert_eq!(info.get_port(), addr.port());
+    }
+
+    #[test]
+    fn an_unpinned_announcement_asks_for_the_interface_addresses() {
+        let addr: SocketAddr = "10.9.8.7:7000".parse().expect("valid addr");
+        let info =
+            build_service_info("demo", "node1-aaaa", addr, false).expect("service info builds");
+        assert!(info.is_addr_auto());
     }
 
     #[test]
@@ -200,6 +253,16 @@ mod tests {
         let first: IpAddr = "fe80::1".parse().expect("valid addr");
         let second: IpAddr = "fe80::2".parse().expect("valid addr");
         assert_eq!(select_ip([first, second]), Some(first));
+    }
+
+    #[test]
+    fn select_ip_does_not_depend_on_the_iteration_order() {
+        let low: IpAddr = "10.0.0.1".parse().expect("valid addr");
+        let high: IpAddr = "192.168.1.5".parse().expect("valid addr");
+        let v6: IpAddr = "fe80::1".parse().expect("valid addr");
+        for order in [[low, high, v6], [v6, high, low], [high, v6, low]] {
+            assert_eq!(select_ip(order), Some(low));
+        }
     }
 
     #[test]
@@ -221,6 +284,7 @@ mod tests {
             cluster_name: "test-cluster".into(),
             instance_name: "test-node".to_owned(),
             daemon: None,
+            pin_address: false,
         };
         let mut candidates = discovery.candidates();
         assert!(

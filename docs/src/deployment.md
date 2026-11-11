@@ -21,7 +21,9 @@ when its build fails.
 
 A node binds two ports: gossip over UDP and the data plane over TCP. Both
 default to port 0, a free port chosen at startup, which suits a LAN with
-mDNS: each node announces the gossip port it bound. Seeds and DNS records
+mDNS: each node announces the gossip port it bound, and, when it has an
+explicit `advertise_ip` or binds a specific gossip IP, that address alone;
+with neither, it announces the addresses of its interfaces. Seeds and DNS records
 name a gossip port instead, so every node they name must bind that port.
 With the default ports nothing listens at the address a seed names, the
 nodes never reach each other, and each runs as a cluster of one, with no

@@ -617,3 +617,22 @@ async fn build_accepts_a_discovery_with_a_zero_interval() {
         .expect("a zero interval is raised to the floor, not a panic");
     cluster.shutdown().await;
 }
+
+#[test]
+fn the_mdns_announcement_is_pinned_only_when_the_operator_chose_the_address() {
+    let specific = |ip: &str| SocketAddr::new(ip.parse().expect("valid ip"), 0);
+    let default = ClusterConfig::default();
+    assert!(
+        default.gossip_bind_addr.ip().is_unspecified(),
+        "the default binds the wildcard"
+    );
+    assert!(!pins_mdns_address(&default));
+    assert!(pins_mdns_address(&ClusterConfig {
+        advertise_ip: Some("10.9.8.7".parse().expect("valid ip")),
+        ..default.clone()
+    }));
+    assert!(pins_mdns_address(&ClusterConfig {
+        gossip_bind_addr: specific("10.1.2.3"),
+        ..default
+    }));
+}

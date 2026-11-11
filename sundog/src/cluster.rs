@@ -1125,7 +1125,7 @@ impl ClusterBuilder {
         // The seed stream holds the source, so a source that runs a
         // mechanism of its own, as the mDNS daemon does, stops when the
         // membership loop ends.
-        let discovery = Arc::new(resolve_discovery(discovery, &name, &node_name)?);
+        let discovery = Arc::new(resolve_discovery(discovery, &name, &node_name, &config)?);
         let has_seeds = discovery.has_seeds();
 
         let data_listener = BoundListener::bind(config.data_bind_addr).await?;
@@ -1371,7 +1371,8 @@ fn validate_tombstones(config: &ClusterConfig) -> Result<(), JoinError> {
 
 /// Resolves the discovery mechanism `build()` uses: the caller's explicit
 /// choice, else [`use_static_from_env`]'s pick between `Static::from_env()`
-/// and the zeroconf `Mdns` default.
+/// and the zeroconf `Mdns` default. An `Mdns` source, chosen or default,
+/// announces only the gossip IP when `config` fixes it ([`pins_mdns_address`]).
 ///
 /// # Errors
 ///
@@ -1381,6 +1382,7 @@ pub(crate) fn resolve_discovery(
     discovery: Option<DiscoveryKind>,
     name: &SmolStr,
     node_name: &NodeName,
+    config: &ClusterConfig,
 ) -> Result<DiscoveryKind, JoinError> {
     let discovery_set = discovery.is_some();
     let seeds_env = std::env::var(crate::discovery::statics::SUNDOG_SEEDS_ENV).ok();
@@ -1390,13 +1392,23 @@ pub(crate) fn resolve_discovery(
             crate::discovery::statics::SUNDOG_SEEDS_ENV
         )));
     }
-    Ok(discovery.unwrap_or_else(|| {
+    let resolved = discovery.unwrap_or_else(|| {
         if use_static_from_env(discovery_set, seeds_env.as_deref()) {
             DiscoveryKind::Static(Static::from_env())
         } else {
             DiscoveryKind::Mdns(Mdns::new(name.clone(), node_name.to_string()))
         }
-    }))
+    });
+    Ok(match resolved {
+        DiscoveryKind::Mdns(mdns) => DiscoveryKind::Mdns(mdns.pinned(pins_mdns_address(config))),
+        other => other,
+    })
+}
+
+/// Whether the node's mDNS announcement carries only the gossip IP: the
+/// operator set it, with `advertise_ip` or a specific gossip bind IP.
+fn pins_mdns_address(config: &ClusterConfig) -> bool {
+    config.advertise_ip.is_some() || !config.gossip_bind_addr.ip().is_unspecified()
 }
 
 /// Whether a `SUNDOG_SEEDS` value is non-blank yet lists no seed: only
