@@ -796,3 +796,56 @@ async fn every_engine_rebuild_keeps_the_start_deferral() {
     let local = clocked::<String>(Mode::Local, &clock).with_capacity_hint(16);
     assert!(!local.engine.gc_deferring(), "a rebuilt Local engine");
 }
+
+/// A `Replicated` shard under the merging [`SumResolver`] holding key 1,
+/// expiring at [`EXPIRES_AT_MS`], and key 2, which never expires.
+async fn merging_shard_with_an_expiring_entry(clock: &Arc<AtomicU64>) -> Shard<u32, u32> {
+    let reader = Arc::clone(clock);
+    let s = Shard::<u32, u32>::new(
+        SmolStr::new("test"),
+        Mode::Replicated,
+        NodeId::from(1),
+        10_000,
+        None,
+        None,
+    )
+    .with_resolver(Arc::new(SumResolver))
+    .with_clock(Arc::new(move || reader.load(Ordering::SeqCst)));
+    for (key, expires_at_ms) in [(1u32, Some(EXPIRES_AT_MS)), (2, None)] {
+        let rec = WireRecord {
+            key: key_bytes(&key),
+            value: Some(Bytes::from(postcard::to_stdvec(&5u32).expect("encodes"))),
+            ver: writer(2_000),
+            expires_at_ms,
+        };
+        ShardOps::apply_remote(&s, rec).await;
+    }
+    s
+}
+
+/// Two replicas of a merging cache hold the same live data once an entry
+/// has expired, one having swept it and one not: every digest read an
+/// anti-entropy round makes agrees between them.
+#[tokio::test]
+async fn digests_of_a_swept_and_an_unswept_merging_replica_agree_once_an_entry_expired() {
+    let clock = manual_clock();
+    let swept = merging_shard_with_an_expiring_entry(&clock).await;
+    let unswept = merging_shard_with_an_expiring_entry(&clock).await;
+    clock.store(EXPIRES_AT_MS + 100, Ordering::SeqCst);
+    ShardOps::run_pending_tasks(&swept).await;
+
+    assert_eq!(
+        ShardOps::digests(&swept).await,
+        ShardOps::digests(&unswept).await
+    );
+    let peer = NodeId::from(2);
+    assert_eq!(
+        ShardOps::ae_digests_for(&swept, peer).await,
+        ShardOps::ae_digests_for(&unswept, peer).await
+    );
+    let buckets: Vec<u16> = (0..u16::try_from(BUCKET_COUNT).expect("fits")).collect();
+    assert_eq!(
+        ShardOps::part_digests(&swept, buckets.clone()).await,
+        ShardOps::part_digests(&unswept, buckets).await
+    );
+}

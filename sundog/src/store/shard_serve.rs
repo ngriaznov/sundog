@@ -415,12 +415,23 @@ where
         scope
     }
 
+    /// Sweeps the stripes whose entries have lapsed, so the digest read
+    /// that follows never counts an entry this shard's listings omit at
+    /// the same instant. A sweep of a merging resolver's expired entry
+    /// folds its fingerprint out of the digest, and without this a replica
+    /// that has swept disagrees with one that has not, with the same live
+    /// data. Stripes with nothing due are skipped.
+    fn sweep_before_digest_read(&self) {
+        self.engine.sweep(self.now_ms(), self.expiry_tombstones());
+    }
+
     /// The bucket digest of every bucket [`Shard::peer_scope`] touches.
     fn bucket_digests_for(
         &self,
         residency: &(Arc<OwnershipView>, Arc<ResidencySet>),
         peer: NodeId,
     ) -> Vec<BucketDigest> {
+        self.sweep_before_digest_read();
         let scope: HashSet<u16> = Self::peer_scope(residency, peer)
             .into_iter()
             .map(PartId::bucket)
@@ -436,6 +447,7 @@ where
     /// `parts` gathered by bucket, ascending, each bucket's parts as a mask
     /// and their digests folded: one engine read per bucket.
     fn masked_digests(&self, parts: &[PartId]) -> Vec<MaskedDigest> {
+        self.sweep_before_digest_read();
         let mut masks: BTreeMap<u16, PartMask> = BTreeMap::new();
         for part in parts {
             masks.entry(part.bucket()).or_default().insert(part.part());
@@ -735,6 +747,7 @@ where
     }
 
     fn digests(&self) -> BoxFuture<'_, Vec<BucketDigest>> {
+        self.sweep_before_digest_read();
         let digests = self.engine.digests();
         // The outbound-serving guard: a `Mode::Distributed` shard never
         // reports a bucket it neither owns nor is releasing.
@@ -834,6 +847,7 @@ where
     }
 
     fn part_digests(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<BucketPartDigests>> {
+        self.sweep_before_digest_read();
         let out = self.gated_map(buckets, |b| self.engine.part_digests(b), Vec::new());
         let out = out
             .into_iter()
