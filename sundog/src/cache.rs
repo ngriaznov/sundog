@@ -1327,11 +1327,14 @@ where
     }
 
     /// [`Cache::remove`] for many keys at once, the tombstone counterpart of
-    /// [`Cache::insert_many`].
+    /// [`Cache::insert_many`]. **Not a transaction**: if a key partway through
+    /// fails to encode, the keys before it are still tombstoned and the call
+    /// returns that key's error.
     ///
     /// # Errors
     ///
-    /// Returns a [`CacheError`] if any key fails to encode for the wire.
+    /// Returns a [`CacheError`] if any key fails to encode for the wire, after
+    /// tombstoning the keys before it.
     pub async fn remove_many(&self, keys: impl IntoIterator<Item = K>) -> Result<(), CacheError> {
         self.shard.remove_many(keys).await
     }

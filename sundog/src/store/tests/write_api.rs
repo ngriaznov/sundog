@@ -437,3 +437,97 @@ fn a_closed_fan_out_queue_drops_its_backlog_and_accepts_nothing() {
     assert!(drained.is_empty(), "{drained:?}");
     assert_eq!(s.get_sync(&2), Some("b".to_string()), "writes still land");
 }
+
+/// A key that fails to encode when it holds 99.
+#[derive(Clone, Hash, PartialEq, Eq, serde::Deserialize)]
+struct FallibleKey(u32);
+
+impl Serialize for FallibleKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.0 == 99 {
+            return Err(serde::ser::Error::custom("99 never encodes"));
+        }
+        serializer.serialize_u32(self.0)
+    }
+}
+
+#[tokio::test]
+async fn remove_many_tombstones_the_keys_before_one_that_fails_to_encode() {
+    let s = shard::<FallibleKey, String>(1);
+    s.insert(FallibleKey(1), "a".into()).await.expect("insert");
+    s.insert(FallibleKey(2), "b".into()).await.expect("insert");
+    s.insert(FallibleKey(3), "c".into()).await.expect("insert");
+
+    let result = s
+        .remove_many([
+            FallibleKey(1),
+            FallibleKey(2),
+            FallibleKey(99),
+            FallibleKey(3),
+        ])
+        .await;
+    assert!(
+        matches!(result, Err(crate::error::CacheError::Codec(_))),
+        "{:?}",
+        result.err()
+    );
+    assert_eq!(s.get(&FallibleKey(1)).await, None, "before the failure");
+    assert_eq!(s.get(&FallibleKey(2)).await, None, "before the failure");
+    assert_eq!(
+        s.get(&FallibleKey(3)).await.as_deref(),
+        Some("c"),
+        "after the failure"
+    );
+}
+
+#[tokio::test]
+async fn remove_many_keeps_the_pending_fold_of_a_key_after_the_failing_one() {
+    use super::merging::SumResolver;
+    let s = shard::<FallibleKey, u32>(1)
+        .with_resolver(Arc::new(SumResolver))
+        .with_merge_coalesce_window(Duration::from_mins(1));
+    s.merge(FallibleKey(1), 5).await.expect("merge");
+    s.merge(FallibleKey(3), 7).await.expect("merge");
+
+    let result = s
+        .remove_many([FallibleKey(1), FallibleKey(99), FallibleKey(3)])
+        .await;
+    assert!(result.is_err());
+    assert_eq!(
+        s.pending_merge_count(),
+        1,
+        "the fold of the key before the failure went with its tombstone; the one after stays"
+    );
+    s.flush_all_pending_merges();
+    assert_eq!(
+        s.get(&FallibleKey(1)).await,
+        None,
+        "tombstoned, not resurrected by a fold"
+    );
+    assert_eq!(s.get(&FallibleKey(3)).await, Some(7));
+}
+
+#[tokio::test]
+async fn remove_many_forwards_the_tombstones_before_a_failing_key() {
+    let self_node = NodeId::from(1);
+    let eligible = (1..=5u64).map(NodeId::from).collect::<Vec<_>>();
+    let (s, view, _tx) = distributed_shard::<FallibleKey, String>(
+        self_node,
+        eligible,
+        2,
+        Arc::new(ResidencySet::new()),
+    );
+    let unowned = (0..1_000_000u32)
+        .find(|k| !view.owns(PartId::of_key(&key_bytes(&FallibleKey(*k)))) && *k != 99)
+        .expect("an unowned key");
+
+    let result = s.remove_many([FallibleKey(unowned), FallibleKey(99)]).await;
+    assert!(result.is_err());
+    let queued = s.fan_out_queue().drain();
+    assert_eq!(
+        queued.len(),
+        1,
+        "the tombstone before the failure is forwarded"
+    );
+    assert!(matches!(queued[0], FanOutItem::Forward(_)));
+}

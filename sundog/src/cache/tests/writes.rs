@@ -591,3 +591,53 @@ async fn a_windowed_merge_on_a_clone_after_close_applies_locally() {
 
     cluster.shutdown().await;
 }
+
+/// A key that fails to encode when it holds 99.
+#[derive(Clone, Hash, PartialEq, Eq, serde::Deserialize)]
+struct FallibleKey(u32);
+
+impl serde::Serialize for FallibleKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.0 == 99 {
+            return Err(serde::ser::Error::custom("99 never encodes"));
+        }
+        serializer.serialize_u32(self.0)
+    }
+}
+
+#[tokio::test]
+async fn remove_many_tombstones_the_keys_before_one_that_fails_to_encode() {
+    let cluster = Cluster::builder("cache-it-remove-many-encode")
+        .seeds(std::iter::empty())
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("build succeeds");
+    let cache = cluster
+        .cache::<FallibleKey, String>("keys")
+        .mode(Mode::Local)
+        .open()
+        .await
+        .expect("open succeeds");
+    cache
+        .insert(FallibleKey(1), "a".into())
+        .await
+        .expect("insert");
+    cache
+        .insert(FallibleKey(2), "b".into())
+        .await
+        .expect("insert");
+
+    let result = cache
+        .remove_many([FallibleKey(1), FallibleKey(99), FallibleKey(2)])
+        .await;
+    assert!(
+        matches!(result, Err(CacheError::Codec(_))),
+        "{:?}",
+        result.err()
+    );
+    assert_eq!(cache.get(&FallibleKey(1)).await, None);
+    assert_eq!(cache.get(&FallibleKey(2)).await.as_deref(), Some("b"));
+
+    cluster.shutdown().await;
+}

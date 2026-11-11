@@ -841,15 +841,28 @@ where
 
     /// [`Shard::remove`] for many keys at once, the tombstone counterpart of
     /// [`Shard::insert_many`]. **Not a transaction**: if a key partway through
-    /// fails to encode, the keys before it are still tombstoned.
+    /// fails to encode, the keys before it are still tombstoned, and the call
+    /// returns that key's error. A key after the failing one is not touched,
+    /// and a [`Shard::merge`] fold pending for it stays.
     ///
     /// # Errors
     ///
-    /// Returns a [`CacheError`] if any key fails to encode for the wire.
+    /// Returns a [`CacheError`] if any key fails to encode for the wire, after
+    /// tombstoning the keys before it.
     pub async fn remove_many(&self, keys: impl IntoIterator<Item = K>) -> Result<(), CacheError> {
         let mut prepared = Vec::new();
+        // Stops preparing at the first key that fails to encode but keeps
+        // everything prepared before it, which the apply below still
+        // tombstones, as `insert_many_expiring` does.
+        let mut failure: Option<CacheError> = None;
         for key in keys {
-            let key_bytes = encode_key(&key)?;
+            let key_bytes = match encode_key(&key) {
+                Ok(key_bytes) => key_bytes,
+                Err(err) => {
+                    failure = Some(err.into());
+                    break;
+                }
+            };
             // Before the stamp, as in `Shard::remove_sync`.
             self.discard_pending_merge(&key, key_bytes.as_ref());
             let ver = self.stamp_local();
@@ -867,10 +880,15 @@ where
             return Err(self.closed());
         }
 
-        self.apply_grouped(owned_prepared, |(hash, key, key_bytes, ver)| {
-            (hash, key, key_bytes, ver, Incoming::DELETE)
-        })
-        .await
+        let applied = self
+            .apply_grouped(owned_prepared, |(hash, key, key_bytes, ver)| {
+                (hash, key, key_bytes, ver, Incoming::DELETE)
+            })
+            .await;
+        match failure {
+            Some(err) => Err(err),
+            None => applied,
+        }
     }
 
     /// Hands a bulk write's landed keys to the fan-out queue one full
