@@ -1158,6 +1158,7 @@ async fn anti_entropy_repairs_a_sketch_fallback_listing_larger_than_one_frame() 
         // 2 cells per partition, too small to peel the 24-key difference.
         ae_sketch_cells: 6,
         ae_interval: Duration::from_hours(1),
+        tombstone_ttl: Duration::from_hours(4),
         // Hashing and moving 4.7 MB per round starves gossip on a busy test
         // runner, and a failure detector that drops the peer for a moment
         // fails the round with "not a known mesh member".
@@ -1250,6 +1251,7 @@ const LONG_KEY_LEN: usize = 8 * 1024;
 async fn long_key_round(cluster_name: &str, a_lacks: impl Fn(usize) -> bool) -> (usize, usize) {
     let config = ClusterConfig {
         ae_interval: Duration::from_hours(1),
+        tombstone_ttl: Duration::from_hours(4),
         // Hashing and moving megabytes per round starves gossip on a busy
         // test runner, and a failure detector that drops the peer for a
         // moment fails the round with "not a known mesh member".

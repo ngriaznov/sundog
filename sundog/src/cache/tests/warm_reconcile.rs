@@ -78,6 +78,7 @@ async fn a_joiner_whose_only_donor_stays_cold_converges_with_it_before_serving()
     let config = ClusterConfig {
         ae_interval: Duration::from_hours(1),
         tombstone_ttl: Duration::from_hours(720),
+        tombstone_max_ttl: Duration::from_hours(720),
         ..loopback_config()
     };
 

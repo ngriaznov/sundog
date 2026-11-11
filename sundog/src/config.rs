@@ -49,9 +49,10 @@ pub struct ClusterConfig {
     /// Base interval between a node's anti-entropy rounds. The actual delay
     /// is jittered around this value to avoid thundering-herd rounds.
     pub ae_interval: Duration,
-    /// How long a tombstone is retained before garbage collection. Must be
-    /// at least `3 * ae_interval` so a lagging peer gets a few anti-entropy
-    /// rounds to observe the deletion first, and at least
+    /// How long a tombstone is retained before garbage collection.
+    /// At least `3 * ae_interval` so a lagging peer gets a few anti-entropy
+    /// rounds to observe the deletion first
+    /// ([`tombstone_ttl_is_safe`](Self::tombstone_ttl_is_safe)); and at least
     /// `ae_interval * (2 * distributed_disown_grace_rounds + 2)`, the bucket
     /// release window: a `Mode::Distributed` node that lost a bucket keeps a
     /// copy that no removal reaches until its hand-off round, up to twice
@@ -59,6 +60,8 @@ pub struct ClusterConfig {
     /// the tombstone still there the stale copy loses; without it a removed
     /// key comes back. Opening a `Mode::Distributed` cache rejects a shorter
     /// retention with `CacheError::TombstoneTtlInsideReleaseWindow`.
+    /// `ClusterBuilder::build` rejects a value under `3 * ae_interval` with
+    /// `JoinError::InvalidConfig`.
     ///
     /// While a member is absent, a cache defers collection past this point,
     /// up to [`tombstone_max_ttl`](Self::tombstone_max_ttl), and for another
@@ -93,6 +96,8 @@ pub struct ClusterConfig {
     /// tombstones a node holds.
     pub tombstone_ttl: Duration,
     /// Hard cap on tombstone retention regardless of any member's absence.
+    /// `ClusterBuilder::build` rejects a cap under
+    /// [`tombstone_ttl`](Self::tombstone_ttl).
     /// Bounds [`tombstone_ttl`](Self::tombstone_ttl)'s deferral against a
     /// member that never comes back. A node that defers, for an absent
     /// member, after opening or after a pause, counts this cap from a

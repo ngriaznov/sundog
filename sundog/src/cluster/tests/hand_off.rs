@@ -1043,6 +1043,7 @@ async fn a_leave_stops_retrying_a_co_owner_that_crashed_once_the_failure_detecto
     // A budget the failure detector's verdict beats by a wide margin.
     let config = ClusterConfig {
         ae_interval: Duration::from_secs(3600),
+        tombstone_ttl: Duration::from_hours(4),
         state_transfer_budget: Duration::from_secs(120),
         ..loopback_config()
     };

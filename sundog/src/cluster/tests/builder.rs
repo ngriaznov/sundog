@@ -512,3 +512,76 @@ async fn a_cluster_built_with_tls_before_config_runs_tls() {
 
     cluster.shutdown().await;
 }
+
+
+/// Every timing and detector setting that cannot drive a working cluster
+/// fails `build()` with an `InvalidConfig` that names the setting.
+#[tokio::test]
+async fn build_rejects_timing_and_detector_values_that_cannot_work() {
+    type Breaking = (&'static str, fn(&mut ClusterConfig));
+    let broken: [Breaking; 9] = [
+        ("gossip_interval", |c| c.gossip_interval = Duration::ZERO),
+        ("phi_sampling_window_size", |c| {
+            c.phi_sampling_window_size = 0;
+        }),
+        ("phi_threshold", |c| c.phi_threshold = f64::NAN),
+        ("phi_threshold", |c| c.phi_threshold = 0.0),
+        ("phi_threshold", |c| c.phi_threshold = -8.0),
+        ("phi_threshold", |c| c.phi_threshold = f64::INFINITY),
+        ("crdt_sweep_interval", |c| {
+            c.crdt_sweep_interval = Some(Duration::ZERO);
+        }),
+        ("fetch_timeout", |c| c.fetch_timeout = Duration::ZERO),
+        ("tombstone_ttl", |c| {
+            c.ae_interval = Duration::from_secs(30);
+            c.tombstone_ttl = Duration::from_secs(5);
+        }),
+    ];
+    for (setting, break_it) in broken {
+        let mut config = loopback_config();
+        break_it(&mut config);
+        let err = Cluster::builder("cluster-it-timing-guard")
+            .seeds(std::iter::empty())
+            .config(config)
+            .build()
+            .await
+            .expect_err(setting);
+        assert!(
+            matches!(&err, JoinError::InvalidConfig(msg) if msg.contains(setting)),
+            "{setting}: {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn build_rejects_a_tombstone_max_ttl_below_the_tombstone_ttl() {
+    let mut config = loopback_config();
+    config.tombstone_ttl = Duration::from_secs(10);
+    config.tombstone_max_ttl = Duration::from_secs(5);
+    let err = Cluster::builder("cluster-it-max-ttl-below-ttl")
+        .seeds(std::iter::empty())
+        .config(config)
+        .build()
+        .await
+        .expect_err("a cap below the retention defers nothing");
+    assert!(
+        matches!(&err, JoinError::InvalidConfig(msg) if msg.contains("tombstone_max_ttl")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn build_accepts_the_boundary_values_of_the_timing_rules() {
+    let mut config = loopback_config();
+    config.tombstone_ttl = config.ae_interval.saturating_mul(3);
+    config.tombstone_max_ttl = config.tombstone_ttl;
+    config.crdt_sweep_interval = Some(Duration::from_millis(1));
+    config.phi_threshold = f64::MIN_POSITIVE;
+    let cluster = Cluster::builder("cluster-it-timing-boundaries")
+        .seeds(std::iter::empty())
+        .config(config)
+        .build()
+        .await
+        .expect("boundary values are valid");
+    cluster.shutdown().await;
+}

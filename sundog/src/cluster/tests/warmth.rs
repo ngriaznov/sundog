@@ -97,6 +97,7 @@ async fn a_joiner_reconciles_with_every_peer_after_its_snapshot() {
     // snapshot can close the gap within the test.
     let slow_ae = ClusterConfig {
         ae_interval: Duration::from_secs(60),
+        tombstone_ttl: Duration::from_mins(4),
         ..loopback_config()
     };
     let (cluster_a, cluster_b) =

@@ -216,7 +216,12 @@ fn peer_record(key: u32) -> WireRecord {
 async fn the_node_holding_the_unshippable_record_pushes_every_other_key_in_its_own_round() {
     let name = SmolStr::new("big");
     // A background round would push the keys before the one under test does.
-    let quiet = || loopback_config().with(|c| c.ae_interval = Duration::from_secs(3_600));
+    let quiet = || {
+        loopback_config().with(|c| {
+            c.ae_interval = Duration::from_secs(3_600);
+            c.tombstone_ttl = Duration::from_hours(4);
+        })
+    };
     let cluster_a = Cluster::builder("cluster-it-oversize-push")
         .seeds(std::iter::empty())
         .config(quiet())

@@ -73,6 +73,18 @@ the defaults. `open` refuses a `Distributed` cache otherwise, with
 `CacheError::TombstoneTtlInsideReleaseWindow`, since a shorter retention
 would let a released bucket's stale copy bring a removed key back.
 
+## Rejected values
+
+`ClusterBuilder::build` fails with `JoinError::InvalidConfig` for these
+values:
+
+- `gossip_interval`, `fetch_timeout` and `fan_out_stall_timeout` of zero
+- `phi_sampling_window_size` of zero
+- `phi_threshold` that is NaN, infinite, zero or negative
+- `crdt_sweep_interval` of `Some(Duration::ZERO)`
+- `tombstone_ttl` under `3 × ae_interval`
+- `tombstone_max_ttl` under `tombstone_ttl`
+
 ## Merge resolvers
 
 | Field | Default | Change it when |

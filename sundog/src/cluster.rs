@@ -1306,6 +1306,60 @@ pub(crate) fn resolve_discovery(
             DiscoveryKind::Static(Static::from_env())
         } else {
             DiscoveryKind::Mdns(Mdns::new(name.clone(), node_name.to_string()))
+    validate_timings(config)?;
+    validate_tombstones(config)
+}
+
+/// Rejects the zero, non-finite and non-positive timing and detector
+/// settings that cannot drive a working cluster.
+fn validate_timings(config: &ClusterConfig) -> Result<(), JoinError> {
+    if config.gossip_interval.is_zero() {
+        return Err(JoinError::InvalidConfig(
+            "ClusterConfig::gossip_interval must be nonzero".to_string(),
+        ));
+    }
+    if config.phi_sampling_window_size == 0 {
+        return Err(JoinError::InvalidConfig(
+            "ClusterConfig::phi_sampling_window_size must be nonzero".to_string(),
+        ));
+    }
+    if !(config.phi_threshold.is_finite() && config.phi_threshold > 0.0) {
+        return Err(JoinError::InvalidConfig(format!(
+            "ClusterConfig::phi_threshold ({}) must be finite and greater than zero",
+            config.phi_threshold
+        )));
+    }
+    if config.crdt_sweep_interval.is_some_and(|d| d.is_zero()) {
+        return Err(JoinError::InvalidConfig(
+            "ClusterConfig::crdt_sweep_interval must be nonzero when set".to_string(),
+        ));
+    }
+    if config.fetch_timeout.is_zero() {
+        return Err(JoinError::InvalidConfig(
+            "ClusterConfig::fetch_timeout must be nonzero".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects a tombstone retention shorter than `3 * ae_interval` and a
+/// `tombstone_max_ttl` below `tombstone_ttl`: the first lets a peer that
+/// misses a delete frame see the key return through anti-entropy, and the
+/// second makes the cap collect before the retention it defers.
+fn validate_tombstones(config: &ClusterConfig) -> Result<(), JoinError> {
+    if !config.tombstone_ttl_is_safe() {
+        return Err(JoinError::InvalidConfig(format!(
+            "ClusterConfig::tombstone_ttl ({:?}) must be at least 3 * ae_interval ({:?})",
+            config.tombstone_ttl,
+            config.ae_interval.saturating_mul(3)
+        )));
+    }
+    if config.tombstone_max_ttl < config.tombstone_ttl {
+        return Err(JoinError::InvalidConfig(format!(
+            "ClusterConfig::tombstone_max_ttl ({:?}) must be at least tombstone_ttl ({:?})",
+            config.tombstone_max_ttl, config.tombstone_ttl
+        )));
+    }
         }
     })
 }
