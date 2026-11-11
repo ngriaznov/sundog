@@ -1556,9 +1556,84 @@ async fn bucket_stream_yields_bucket_done_between_and_after_chunks_when_the_peer
     }
     assert_eq!(got.len(), 4, "two chunks and two bucket-done signals");
     assert!(matches!(&got[0], BucketStreamItem::Chunk(chunk) if chunk == &vec![rec1]));
-    assert!(matches!(got[1], BucketStreamItem::BucketDone(0)));
+    assert!(matches!(
+        got[1],
+        BucketStreamItem::BucketDone { bucket: 0, .. }
+    ));
     assert!(matches!(&got[2], BucketStreamItem::Chunk(chunk) if chunk == &vec![rec2]));
-    assert!(matches!(got[3], BucketStreamItem::BucketDone(1)));
+    assert!(matches!(
+        got[3],
+        BucketStreamItem::BucketDone { bucket: 1, .. }
+    ));
+}
+
+/// The acks a donor that streamed two buckets sees back from a receiver
+/// that withholds the first.
+#[cfg(not(feature = "sim"))]
+#[tokio::test]
+async fn bucket_stream_sends_no_ack_for_a_bucket_the_caller_withheld() {
+    let cache = SmolStr::new("users");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("listener has a local addr");
+    let prelude = vec![
+        Msg::StBucketDone {
+            cache: cache.clone(),
+            bucket: 0,
+        },
+        Msg::StBucketDone {
+            cache: cache.clone(),
+            bucket: 1,
+        },
+        Msg::StBucketChunk {
+            cache: cache.clone(),
+            recs: Vec::new(),
+            done: true,
+        },
+    ];
+    let donor = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut framed = LengthDelimitedCodec::builder()
+            .max_frame_length(MAX_FRAME)
+            .new_framed(stream);
+        for msg in prelude {
+            framed
+                .send(wire::encode(&msg).expect("encodes"))
+                .await
+                .expect("send");
+        }
+        let mut acked = Vec::new();
+        while let Ok(Some(Ok(frame))) =
+            tokio::time::timeout(Duration::from_millis(500), framed.next()).await
+        {
+            if let Ok(Msg::StBucketAck { bucket, .. }) = wire::decode(&frame.freeze()) {
+                acked.push(bucket);
+            }
+        }
+        acked
+    });
+    let client = TcpStream::connect(addr).await.expect("connect");
+    let mut stream = super::reply::bucket_stream(
+        super::framing::new_framed(as_mesh_stream(client)),
+        Arc::new(ReqPool::new()),
+        None,
+        cache,
+        wire::PROTOCOL_VERSION,
+        42,
+    );
+    while let Some(item) = stream.next().await {
+        if let BucketStreamItem::BucketDone { bucket, veto } = item.expect("item decodes")
+            && bucket == 0
+        {
+            veto.withhold();
+        }
+    }
+    assert_eq!(
+        donor.await.expect("donor task"),
+        vec![1],
+        "only the vouched-for bucket is acked"
+    );
 }
 
 #[cfg(not(feature = "sim"))]

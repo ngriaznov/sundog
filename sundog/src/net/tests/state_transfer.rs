@@ -157,7 +157,7 @@ async fn request_buckets_yields_bucket_done_once_per_bucket_before_the_stream_en
     };
     let mut dones = Vec::new();
     while let Some(item) = stream.next().await {
-        if let BucketStreamItem::BucketDone(bucket) = item.expect("item decodes") {
+        if let BucketStreamItem::BucketDone { bucket, .. } = item.expect("item decodes") {
             dones.push(bucket);
         }
     }

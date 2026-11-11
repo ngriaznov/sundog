@@ -91,8 +91,14 @@ where
     /// applies `recs`, which arrived as `inbound` says. A held record the
     /// stamp refuses ([`Inbound::Forwarded`]) goes to the skew hold; every
     /// other refusal drops the record, because its sender or its writer still
-    /// holds it.
-    pub(super) async fn apply_inbound(&self, recs: Vec<WireRecord>, inbound: Inbound) {
+    /// holds it. Answers how many records the stamp check refused and this
+    /// call dropped, which the receiver of a state-transfer chunk needs
+    /// before it vouches for the bucket.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one inbound path's guard, decode, reserve and apply steps read best kept together"
+    )]
+    pub(super) async fn apply_inbound(&self, recs: Vec<WireRecord>, inbound: Inbound) -> usize {
         #[cfg(feature = "spill")]
         if self.inbound_held() {
             tracing::trace!(
@@ -100,7 +106,7 @@ where
                 records = recs.len(),
                 "inbound batch for a cache still attaching its spill tier; dropped"
             );
-            return;
+            return 0;
         }
         // The inbound-apply guard: a `Mode::Distributed` shard never
         // applies a record for a bucket its own *current* view does not
@@ -131,10 +137,13 @@ where
             self.invalidate_key(rec.key.as_ref(), rec.ver, true);
         }
         let mut decoded: Vec<RemoteEntry<K, V>> = Vec::with_capacity(recs.len());
+        let mut refused = 0;
         for (i, rec) in recs.into_iter().enumerate() {
             if !self.observe_remote(rec.ver) {
                 if i < held {
                     self.hold_skewed(&rec);
+                } else {
+                    refused += 1;
                 }
                 continue;
             }
@@ -216,6 +225,7 @@ where
         self.note_ignored_tombstones(written.ignored_tombstones(), inbound);
         self.retry_reservation_deficit(0, deficit, wait_left, &mut written)
             .await;
+        refused
     }
 
     /// The write a wire record stands for: a put of its decoded value, or the
@@ -714,12 +724,20 @@ where
     }
 
     fn apply_remote_batch(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            self.apply_inbound(recs, Inbound::Replicated).await;
+        })
+    }
+
+    fn apply_remote_batch_counted(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, usize> {
         Box::pin(self.apply_inbound(recs, Inbound::Replicated))
     }
 
     fn apply_forwarded_batch(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, ()> {
         let held = recs.len();
-        Box::pin(self.apply_inbound(recs, Inbound::Forwarded { held }))
+        Box::pin(async move {
+            self.apply_inbound(recs, Inbound::Forwarded { held }).await;
+        })
     }
 
     fn apply_forward_run(
@@ -729,7 +747,10 @@ where
     ) -> BoxFuture<'_, ()> {
         let count = held.len();
         held.extend(kept);
-        Box::pin(self.apply_inbound(held, Inbound::Forwarded { held: count }))
+        Box::pin(async move {
+            self.apply_inbound(held, Inbound::Forwarded { held: count })
+                .await;
+        })
     }
 
     fn invalidate(&self, key: Bytes, ver: Hlc) -> BoxFuture<'_, ()> {

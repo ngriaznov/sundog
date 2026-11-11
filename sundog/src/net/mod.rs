@@ -54,11 +54,11 @@ use frames::record_frame_sent; // consumed by conn::framing via crate::net::reco
 pub(crate) use frames::{OutFrame, batch_forward, batch_replicate};
 pub use frames::{bytes_sent_total, frames_sent_total};
 pub use handler::RequestHandler;
-pub use types::{AeMismatch, AePartReply, InboundMsg, MsgClass};
 pub(crate) use types::{
-    AeRoundOutcome, AeServeOutcome, BucketPull, BucketStreamItem, FetchOutcome, FetchServe,
-    LoadOutcome, StServe,
+    AckVeto, AeRoundOutcome, AeServeOutcome, BucketPull, BucketStreamItem, FetchOutcome,
+    FetchServe, LoadOutcome, StServe,
 };
+pub use types::{AeMismatch, AePartReply, InboundMsg, MsgClass};
 
 #[cfg(doc)]
 use crate::membership::Peer;

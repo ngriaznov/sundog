@@ -62,8 +62,12 @@ it again. Every other forward is held: one another node relays, such as a
 closing owner's hand-off, and one sent under a view the receiver does not
 hold, whose writer may have owned nothing of the part when it wrote. Rebalance
 and state transfer do not hold what they are refused: a record a receiver
-refuses for skew is not applied there, and a donor that finishes its round can
-release the part.
+refuses for skew is not applied there. The receiver sends no bucket ack for a
+bucket with a refused record, and a node that loses a part releases it only
+after a round against each new owner finds that part's digest equal to its own,
+so the former owner keeps the part and retries each anti-entropy interval. It
+gives the part up at the tombstone-retention cutoff, within the hold's
+horizon, with a warning that names the cache, the part count and the owners.
 
 A restart that replays a spill snapshot resumes the node's clock at or past
 the replayed stamps, so a clock that steps back across a restart does not

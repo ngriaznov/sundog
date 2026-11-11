@@ -940,12 +940,18 @@ pub(crate) fn hand_off_cutoff(tombstone_ttl: Duration, ae_interval: Duration) ->
 }
 
 /// Drops `parts` held past [`hand_off_cutoff`] at once, counted under
-/// `sundog_rebalance_parts_total{direction="out"}` like any release.
+/// `sundog_rebalance_parts_total{direction="out"}` like any release, and
+/// warns with the part count and the `owners` that never confirmed them. A
+/// part whose records an owner keeps refusing, for a clock behind them by
+/// more than `max_clock_skew`, never matches that owner's digest and stays
+/// resident until this cutoff, which lies within the skew hold's horizon,
+/// `min(tombstone_max_ttl, 24 h)`.
 async fn release_without_hand_off(
     shard: &dyn ShardOps,
     residency: &ResidencySet,
     cache: &SmolStr,
     parts: &[PartId],
+    owners: &[NodeId],
 ) {
     if parts.is_empty() {
         return;
@@ -958,7 +964,7 @@ async fn release_without_hand_off(
         "direction" => "out"
     )
     .increment(u64::try_from(parts.len()).unwrap_or(u64::MAX));
-    tracing::warn!(cache = %cache, parts = parts.len(), removed, "released parts held past the tombstone retention without a hand-off");
+    tracing::warn!(cache = %cache, parts = parts.len(), ?owners, removed, "released parts held past the tombstone retention without a hand-off");
 }
 
 /// Acks recorded against wire ids, re-keyed by the parts each id names at
@@ -1123,7 +1129,11 @@ fn owners_needing_confirmation(
 /// [`owners_needing_confirmation`] still runs a round unless every due part
 /// that owner co-owns was acked. `disown_grace` still gates which parts
 /// reach this hand-off, so an ack only accelerates confirmation, never the
-/// release timing floor.
+/// release timing floor. A part whose owners never agree, such as one whose
+/// records a receiver refuses for clock skew (which also sends no bucket
+/// ack for it), stays resident, and each tick runs its rounds again, until
+/// [`hand_off_cutoff`]; it is then released with a warning that names its
+/// owners.
 ///
 /// A pull that runs out `state_transfer_budget` leaves its parts cold, and the
 /// same tick pulls them again, after the release pass, until they land
@@ -1305,7 +1315,19 @@ pub(crate) async fn rebalance_task(
                     }
                 }
                 let past_cutoff = not_owned(&ownership.current(), residency.expired(cutoff));
-                release_without_hand_off(shard.as_ref(), &residency, &cache, &past_cutoff).await;
+                let past_cutoff_owners: Vec<NodeId> =
+                    push_targets(&ownership.current(), cluster.node_id(), &past_cutoff)
+                        .into_iter()
+                        .map(|(owner, _)| owner)
+                        .collect();
+                release_without_hand_off(
+                    shard.as_ref(),
+                    &residency,
+                    &cache,
+                    &past_cutoff,
+                    &past_cutoff_owners,
+                )
+                .await;
                 let past_cutoff: PartSet = past_cutoff.into_iter().collect();
                 let due: Vec<PartId> = residency
                     .expired(disown_grace)

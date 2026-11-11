@@ -12,7 +12,7 @@ use super::framing::{PeerFramed, feed_msg, recv_msg, wire_to_key_versions};
 use super::pool::ReqPool;
 use crate::error::CodecError;
 use crate::net::{
-    AeMismatch, AePartReply, AeRoundOutcome, BucketStreamItem, FetchOutcome, LoadOutcome,
+    AckVeto, AeMismatch, AePartReply, AeRoundOutcome, BucketStreamItem, FetchOutcome, LoadOutcome,
 };
 use crate::store::KeyVersion;
 use crate::wire::{self, Msg, WireRecord};
@@ -295,13 +295,19 @@ pub(in crate::net) fn bucket_stream(
 ) -> futures::stream::BoxStream<'static, Result<BucketStreamItem, CodecError>> {
     let ack_gated = wire::peer_supports(donor_protocol, wire::PROTOCOL_ST_BUCKET_DONE_ACK);
     Box::pin(futures::stream::unfold(
-        Some((framed, first, None::<u16>, 0usize)),
+        Some((framed, first, None::<(u16, AckVeto)>, 0usize)),
         move |state| {
             let pool = Arc::clone(&pool);
             let cache = cache.clone();
             async move {
                 let (mut framed, mut pending, pending_ack, mut unflushed) = state?;
-                if ack_gated && let Some(bucket) = pending_ack {
+                // A bucket the caller could not apply in full is not vouched
+                // for: the donor's ack table then lacks it and its release
+                // waits on an anti-entropy round that finds the digests equal.
+                if ack_gated
+                    && let Some((bucket, veto)) = pending_ack
+                    && !veto.is_withheld()
+                {
                     // Best-effort: a broken send surfaces on the read below.
                     // `view_hash` is this node's view when it requested the
                     // buckets; the donor drops the ack once its own view
@@ -350,9 +356,13 @@ pub(in crate::net) fn bucket_stream(
                             ));
                         }
                         Some(Ok(Msg::StBucketDone { bucket, .. })) => {
+                            let veto = AckVeto::default();
                             return Some((
-                                Ok(BucketStreamItem::BucketDone(bucket)),
-                                Some((framed, None, Some(bucket), unflushed)),
+                                Ok(BucketStreamItem::BucketDone {
+                                    bucket,
+                                    veto: veto.clone(),
+                                }),
+                                Some((framed, None, Some((bucket, veto)), unflushed)),
                             ));
                         }
                         Some(Ok(_)) => {} // unexpected message on this stream; keep reading

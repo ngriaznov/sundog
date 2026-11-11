@@ -5,6 +5,9 @@ use super::{Mesh, RequestHandler};
 #[cfg(doc)]
 use crate::wire;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use bytes::Bytes;
 use futures::stream::BoxStream;
 
@@ -153,8 +156,34 @@ pub(crate) enum BucketStreamItem {
     /// Records for the bucket currently streaming.
     Chunk(Vec<WireRecord>),
     /// The donor released this bucket; triggers the caller's
-    /// `on_bucket_done` ahead of the stream's own end.
-    BucketDone(u16),
+    /// `on_bucket_done` ahead of the stream's own end. The caller calls
+    /// [`AckVeto::withhold`] before its next poll when it could not apply
+    /// every record of the bucket, and the stream then sends no
+    /// `StBucketAck` for it.
+    BucketDone {
+        /// The bucket the donor released.
+        bucket: u16,
+        /// Whether the caller vouches for the bucket.
+        veto: AckVeto,
+    },
+}
+
+/// A caller's veto over one bucket's [`Msg::StBucketAck`]: shared between
+/// the [`BucketStreamItem::BucketDone`] it rides on and the stream that
+/// sends the ack on its next poll.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AckVeto(Arc<AtomicBool>);
+
+impl AckVeto {
+    /// Stops the stream sending the ack for this bucket.
+    pub(crate) fn withhold(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Whether the ack is withheld.
+    pub(crate) fn is_withheld(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 /// One reply to [`Mesh::ae_round_scoped`]: the scoped anti-entropy digest

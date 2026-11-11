@@ -481,6 +481,15 @@ where
     }
 }
 
+/// Whether a receiver acks a bucket whose chunks had `refused` records the
+/// shard dropped for a stamp further ahead of its clock than
+/// `max_clock_skew`: only a bucket every record of which was taken. The
+/// donor's release otherwise waits for an anti-entropy round that finds the
+/// digests equal. Pure; unit tested directly.
+pub(crate) const fn vouches_for_bucket(refused: usize) -> bool {
+    refused == 0
+}
+
 /// [`pull_from_donor`]'s bucket-scoped sibling: applies every
 /// [`BucketStreamItem::Chunk`] the same way, but also invokes
 /// `on_bucket_done` as each [`BucketStreamItem::BucketDone`] arrives, ahead
@@ -516,6 +525,9 @@ where
 
     let mut applied: u64 = 0;
     let mut chunks: u64 = 0;
+    // Records refused for clock skew since the last `BucketDone`: the donor's
+    // copy of them is the only one, so it must not be told the bucket landed.
+    let mut refused: usize = 0;
     loop {
         match stream.next().await {
             Some(Ok(BucketStreamItem::Chunk(chunk))) => {
@@ -524,9 +536,17 @@ where
                 // versioned-apply path live `Replicate` uses.
                 chunks += 1;
                 applied += chunk.len() as u64;
-                shard.apply_remote_batch(chunk).await;
+                refused += shard.apply_remote_batch_counted(chunk).await;
             }
-            Some(Ok(BucketStreamItem::BucketDone(bucket))) => {
+            Some(Ok(BucketStreamItem::BucketDone { bucket, veto })) => {
+                if !vouches_for_bucket(std::mem::take(&mut refused)) {
+                    veto.withhold();
+                    tracing::debug!(
+                        %donor,
+                        bucket,
+                        "records of the bucket were refused for clock skew; its ack is withheld"
+                    );
+                }
                 on_bucket_done(bucket);
             }
             Some(Err(error)) => {
@@ -746,7 +766,10 @@ mod tests {
         let rec = sample_wire_record(1);
         let items: Vec<Result<BucketStreamItem, CodecError>> = vec![
             Ok(BucketStreamItem::Chunk(vec![rec])),
-            Ok(BucketStreamItem::BucketDone(0)),
+            Ok(BucketStreamItem::BucketDone {
+                bucket: 0,
+                veto: crate::net::AckVeto::default(),
+            }),
             Err(CodecError::Io(std::io::Error::other(
                 "bucket 1 stream broke",
             ))),
@@ -772,6 +795,79 @@ mod tests {
             done_buckets,
             vec![0],
             "on_bucket_done fired for bucket 0 despite bucket 1's later failure"
+        );
+    }
+
+    #[test]
+    fn a_bucket_is_vouched_for_only_when_no_record_was_refused() {
+        assert!(vouches_for_bucket(0));
+        assert!(!vouches_for_bucket(1));
+        assert!(!vouches_for_bucket(usize::MAX));
+    }
+
+    #[tokio::test]
+    async fn pull_buckets_from_donor_withholds_the_ack_of_a_bucket_with_a_skew_refused_record() {
+        use crate::net::AckVeto;
+        let shard: Arc<dyn ShardOps> = Arc::new(
+            crate::store::Shard::<u32, u32>::new(
+                SmolStr::new("skew"),
+                crate::store::Mode::Replicated,
+                crate::node::NodeId::random(),
+                1024,
+                None,
+                None,
+            )
+            .with_max_clock_skew(Some(Duration::from_secs(60))),
+        );
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("invariant: the clock is past the epoch")
+                .as_millis(),
+        )
+        .expect("fits");
+        let skewed = |key: u32, lead_ms: u64| WireRecord {
+            key: bytes::Bytes::from(postcard::to_allocvec(&key).expect("encodes")),
+            value: Some(bytes::Bytes::from(
+                postcard::to_allocvec(&1u32).expect("encodes"),
+            )),
+            ver: crate::hlc::Hlc {
+                wall_ms: now_ms + lead_ms,
+                logical: 0,
+                node: NodeId::from(1),
+            },
+            expires_at_ms: None,
+        };
+        let (refused_done, taken_done) = (AckVeto::default(), AckVeto::default());
+        let items: Vec<Result<BucketStreamItem, CodecError>> = vec![
+            Ok(BucketStreamItem::Chunk(vec![skewed(1, 600_000)])),
+            Ok(BucketStreamItem::BucketDone {
+                bucket: 0,
+                veto: refused_done.clone(),
+            }),
+            Ok(BucketStreamItem::Chunk(vec![skewed(2, 0)])),
+            Ok(BucketStreamItem::BucketDone {
+                bucket: 1,
+                veto: taken_done.clone(),
+            }),
+        ];
+        let mut done_buckets = Vec::new();
+        let (result, _) = pull_buckets_from_donor(
+            &shard,
+            NodeId::from(9),
+            async { Ok(Some(futures::stream::iter(items))) },
+            |bucket| done_buckets.push(bucket),
+        )
+        .await;
+        assert_eq!(result, DonorResult::Done);
+        assert_eq!(done_buckets, vec![0, 1], "the receiver still serves both");
+        assert!(
+            refused_done.is_withheld(),
+            "the bucket whose record the receiver refused is not vouched for"
+        );
+        assert!(
+            !taken_done.is_withheld(),
+            "the refusal in bucket 0 does not spoil bucket 1's ack"
         );
     }
 

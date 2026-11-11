@@ -155,6 +155,36 @@ async fn a_record_replicated_past_the_bound_is_dropped_not_held() {
     assert_eq!(s.get(&key).await, None, "nothing was kept to apply");
 }
 
+/// The counted entry point reports the records it dropped for skew, so a
+/// state-transfer receiver can decline to vouch for them; a held forward is
+/// kept, not refused.
+#[tokio::test]
+async fn apply_remote_batch_counted_answers_how_many_records_the_stamp_check_dropped() {
+    let clock = TestClock::at(START_MS);
+    let (s, view, _tx, _residency) = skew_shard::<String>(&clock);
+    let key = owned_key(&view);
+    let batch = vec![
+        forward(key, "skewed", 10_000),
+        forward(key.wrapping_add(1), "late-but-fine", 0),
+    ];
+    assert_eq!(ShardOps::apply_remote_batch_counted(&s, batch).await, 1);
+    assert_eq!(s.skew_held(), (0, 0), "a replicated record is dropped");
+
+    let held = vec![forward(key, "skewed", 10_000)];
+    assert_eq!(
+        ShardOps::apply_remote_batch_counted(&s, held).await,
+        1,
+        "the same record through the counted entry point is refused again"
+    );
+    assert_eq!(
+        ShardOps::apply_remote_batch_counted(&s, Vec::new()).await,
+        0,
+        "an empty batch refuses nothing"
+    );
+    ShardOps::apply_forwarded_batch(&s, vec![forward(key, "skewed", 10_000)]).await;
+    assert_eq!(s.skew_held().0, 1, "a forward is held, which is no refusal");
+}
+
 /// A shard with no ownership view, or no bound, has nothing to hold with.
 #[tokio::test]
 async fn a_shard_without_an_ownership_view_or_a_bound_holds_nothing() {

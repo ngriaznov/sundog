@@ -149,7 +149,9 @@ ownership moves at the announcement; a crashed node keeps its parts until
 the failure detector drops it. A
 node that loses one keeps serving it for `distributed_disown_grace_rounds`
 anti-entropy intervals, hands it to each new owner, and drops it once every
-owner confirms. A lost part that no other previous owner still owns, as
+owner confirms. An owner confirms a part when a part-scoped round finds its
+digest equal to the donor's, or when it acks that part; a round that pushed
+records leaves the part resident until a later round matches. A lost part that no other previous owner still owns, as
 when a node opened the cache before its peers and owned every part alone,
 goes to its new owners as soon as the views agree, not at the end of the
 grace.

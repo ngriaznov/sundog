@@ -90,6 +90,19 @@ pub trait ShardOps: Send + Sync {
     /// any other key, and treats a tombstone record as [`ShardOps::invalidate`].
     fn apply_remote_batch(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, ()>;
 
+    /// [`ShardOps::apply_remote_batch`], answering how many records it
+    /// refused for a stamp further ahead of this shard's clock than
+    /// `max_clock_skew` and dropped. The receiver of a state-transfer
+    /// chunk withholds its bucket ack when this is not zero, since a
+    /// dropped record is one only the sender holds. Default: applies the
+    /// batch and answers `0`, for a shard that never refuses on a stamp.
+    fn apply_remote_batch_counted(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, usize> {
+        Box::pin(async move {
+            self.apply_remote_batch(recs).await;
+            0
+        })
+    }
+
     /// [`ShardOps::apply_remote_batch`] for the records of a
     /// [`crate::wire::Msg::ForwardBatch`] whose writer may have kept no copy:
     /// a `Mode::Distributed` writer keeps none of a write to a part it does
