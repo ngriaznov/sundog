@@ -72,6 +72,17 @@ jobs:
       - name: cargo check (fuzz crate)
         run: cargo check --manifest-path sundog/fuzz/Cargo.toml --all-targets
 
+      # Every fuzz target except the seed generator has a weekly-fuzz step.
+      - name: weekly-fuzz covers every fuzz target
+        run: |
+          bins=$(awk -F'"' '/^name = /{print $2}' sundog/fuzz/Cargo.toml | grep -vx -e gen_seeds -e sundog-fuzz | sort)
+          steps=$(sed -n 's/.*cargo +nightly fuzz run \([A-Za-z0-9_]*\) .*/\1/p' .github/workflows/weekly-fuzz.yml | sort)
+          if [ "$bins" != "$steps" ]; then
+            echo "fuzz targets in sundog/fuzz/Cargo.toml differ from weekly-fuzz.yml steps" >&2
+            diff <(echo "$bins") <(echo "$steps") >&2 || true
+            exit 1
+          fi
+
       - name: cargo doc
         run: cargo doc --workspace --no-deps
 
