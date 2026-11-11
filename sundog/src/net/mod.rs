@@ -16,8 +16,10 @@
 //! the node runs TLS, within `HELLO_TIMEOUT` (10 seconds) of the moment its
 //! handler first runs, or the node closes it. Until the `Hello` decodes, a
 //! frame is at most 1 KiB. At most 512 connections from addresses that are
-//! not a peer's wait for their `Hello` at once; the node closes any further
-//! one as it accepts it.
+//! not a peer's wait for their `Hello` at once, and at most 2048 are open at
+//! once; the node closes any further one as it accepts it. After its `Hello`,
+//! a connection from such an address that sends no frame for 60 seconds is
+//! closed, and any connection that stops inside a frame for 30 seconds is.
 //!
 //! A failed accept on the listener is retried after 5 milliseconds, doubling to
 //! one second while failures continue; a connection reset or aborted before
@@ -669,6 +671,23 @@ impl MeshInner {
             accept_cancel,
             conn::Admission::with_cap(cap),
             Duration::from_secs(60),
+        )
+    }
+
+    /// [`MeshInner::for_tests`] with `cap` connections from unknown sources
+    /// allowed to wait for their `Hello` and `open_cap` open at once.
+    #[cfg(all(test, not(feature = "sim")))]
+    pub(super) fn for_tests_with_caps(
+        tls: TlsCtx,
+        accept_cancel: CancellationToken,
+        cap: usize,
+        open_cap: usize,
+    ) -> Arc<Self> {
+        Self::for_tests_admitting(
+            tls,
+            accept_cancel,
+            conn::Admission::with_caps(cap, open_cap),
+            Duration::from_mins(1),
         )
     }
 

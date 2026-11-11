@@ -36,12 +36,22 @@ struct Node {
 }
 
 async fn node_with_cap(cap: usize) -> Node {
+    node_over(|cancel| MeshInner::for_tests_with_cap(no_tls(), cancel, cap)).await
+}
+
+/// [`node_with_cap`] with `open_cap` connections from unknown sources allowed
+/// open at once.
+async fn node_with_caps(cap: usize, open_cap: usize) -> Node {
+    node_over(|cancel| MeshInner::for_tests_with_caps(no_tls(), cancel, cap, open_cap)).await
+}
+
+async fn node_over(build: impl FnOnce(CancellationToken) -> Arc<MeshInner>) -> Node {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind loopback");
     let addr = listener.local_addr().expect("listener has a local addr");
     let cancel = CancellationToken::new();
-    let mesh = MeshInner::for_tests_with_cap(no_tls(), cancel.clone(), cap);
+    let mesh = build(cancel.clone());
     let (inbound_tx, inbound) = mpsc::channel(128);
     let accept = tokio::spawn(accept_loop(
         listener,
@@ -340,4 +350,51 @@ async fn the_cap_is_512_on_a_spawned_mesh() {
         crate::net::test_support::spawn_mesh(peer(), Arc::new(EmptyHandler)).await;
     assert_eq!(mesh.inner.admission.in_flight(), 0);
     assert_eq!(mesh.inner.admission.cap(), 512);
+}
+
+#[tokio::test]
+async fn an_unknown_source_over_the_open_cap_is_closed_and_a_peer_address_is_not_counted() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let dropped = Dropped::new(recorder.snapshotter());
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let mut node = node_with_caps(8, 2).await;
+
+    // Two established connections from unknown sources fill the open cap
+    // though neither waits for a hello any more.
+    let mut first = node.connect_and_greet(1).await;
+    let _second = node.connect_and_greet(2).await;
+    node.next().await;
+    node.next().await;
+    node.wait_in_flight(0).await;
+    assert_eq!(node.mesh.admission.open(), 2);
+    assert_eq!(dropped.total("open_cap"), None);
+
+    let mut over = node.connect().await;
+    assert_closed_at_once(&mut over).await;
+    assert_eq!(dropped.total("open_cap"), Some(1));
+    assert_eq!(dropped.total("over_cap"), None, "the hello gate has room");
+
+    // A source that is a peer's IP is outside both caps.
+    node.mesh.admission.set_known_sources([LOOPBACK]);
+    let mut peer = node.connect_and_greet(3).await;
+    assert_eq!(node.next().await.msg, invalidate(3));
+    assert_eq!(node.mesh.admission.open(), 2, "a peer holds no slot");
+    send_each(&mut peer, &[invalidate(4)]).await;
+    assert_eq!(node.next().await.msg, invalidate(4));
+    node.mesh.admission.set_known_sources([]);
+
+    // A closed connection frees its slot for the next one.
+    first.shutdown().await.expect("close");
+    tokio::time::timeout(AT_ONCE, async {
+        while node.mesh.admission.open() != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the closed connection frees its slot");
+    let _third = node.connect_and_greet(5).await;
+    assert_eq!(node.next().await.msg, invalidate(5));
+    assert_eq!(node.mesh.admission.open(), 2);
+
+    node.stop().await;
 }

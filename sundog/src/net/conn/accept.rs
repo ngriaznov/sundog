@@ -2,13 +2,17 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{OwnedSemaphorePermit, mpsc};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::admit::{Admit, HELLO_TIMEOUT, accept_backoff, accept_error_backs_off};
+use super::admit::{
+    Admit, FIRST_FRAME_TIMEOUT, FRAME_STALL_TIMEOUT, HELLO_TIMEOUT, Slots, accept_backoff,
+    accept_error_backs_off, note_read_timeout,
+};
 use super::framing::{
     PeerFramed, establish_accept, new_framed_pre_hello, recv_msg, send_batch_or_cancelled,
     tune_socket,
@@ -25,20 +29,110 @@ use crate::net::{InboundMsg, MeshInner, RequestHandler, TlsCtx};
 use crate::node::NodeId;
 use crate::wire::{self, MAX_FRAME, Msg};
 
-/// Reads the next message off `framed`, bounded by `idle_timeout` when set.
-/// Used only once a connection has served at least one request/response
-/// exchange; a persistent broadcast link never goes through this path.
-/// Timing out is treated like the peer closing the connection.
-async fn recv_msg_or_idle_timeout(
-    framed: &mut PeerFramed,
-    idle_timeout: Option<Duration>,
-) -> Option<Result<Msg, CodecError>> {
-    match idle_timeout {
-        Some(timeout) => tokio::time::timeout(timeout, recv_msg(framed))
-            .await
-            .unwrap_or(None),
-        None => recv_msg(framed).await,
+/// Why a read off an accepted connection gave up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReadTimeout {
+    /// The wait for a frame to start ran out.
+    Idle,
+    /// A frame had started and stopped arriving.
+    Stalled,
+}
+
+/// How long a read off an accepted connection waits for more bytes, given
+/// whether the codec stands inside a frame and the connection's idle wait
+/// for a frame to start (`idle`, `None` for no bound). Inside a frame the
+/// wait is [`FRAME_STALL_TIMEOUT`] whatever the connection is; outside one
+/// it is `idle`. Pure; unit tested directly.
+pub(super) fn read_wait(mid_frame: bool, idle: Option<Duration>) -> Option<Duration> {
+    if mid_frame {
+        Some(FRAME_STALL_TIMEOUT)
+    } else {
+        idle
     }
+}
+
+/// How long a connection waits for its next frame to start. A connection
+/// that has served a request is a pooling candidate and waits
+/// [`REQ_CONN_IDLE_TIMEOUT`]. One from an unknown source (`unknown_source`)
+/// that has received no frame since its `Hello` waits
+/// [`FIRST_FRAME_TIMEOUT`]. Every other connection waits without bound: a
+/// persistent broadcast link from a peer is idle for as long as the peer has
+/// nothing to send, before its first frame and between frames, and the
+/// acceptor cannot tell it from a connection that has served nothing.
+/// Pure; unit tested directly.
+pub(super) fn frame_idle_timeout(
+    served_requests: usize,
+    frames_received: usize,
+    unknown_source: bool,
+) -> Option<Duration> {
+    if served_requests > 0 {
+        Some(REQ_CONN_IDLE_TIMEOUT)
+    } else if unknown_source && frames_received == 0 {
+        Some(FIRST_FRAME_TIMEOUT)
+    } else {
+        None
+    }
+}
+
+/// The `sundog_accept_dropped_total` reason a read that gave up counts under:
+/// none for a pooled request connection that went idle, which closes as
+/// usual. Pure; unit tested directly.
+pub(super) const fn read_timeout_reason(
+    timeout: ReadTimeout,
+    served_requests: usize,
+) -> Option<&'static str> {
+    match timeout {
+        ReadTimeout::Idle if served_requests > 0 => None,
+        ReadTimeout::Idle => Some("first_frame_timeout"),
+        ReadTimeout::Stalled => Some("frame_stall"),
+    }
+}
+
+/// Reads the next message off `framed`. Waits `idle` for a frame to start
+/// (without bound for `None`) and [`FRAME_STALL_TIMEOUT`] for the rest of a
+/// frame whose length prefix has arrived; the stall wait restarts whenever
+/// more of the frame arrives. The outer `Err` says which wait ran out, and
+/// the caller closes the connection. Cancel safe: the codec keeps what it
+/// has read.
+async fn recv_msg_bounded(
+    framed: &mut PeerFramed,
+    idle: Option<Duration>,
+) -> Result<Option<Result<Msg, CodecError>>, ReadTimeout> {
+    use futures::StreamExt as _;
+    use std::task::Poll;
+
+    let mut timer: Option<(Pin<Box<tokio::time::Sleep>>, bool, usize)> = None;
+    let polled = std::future::poll_fn(|cx| {
+        if let Poll::Ready(item) = framed.poll_next_unpin(cx) {
+            return Poll::Ready(Ok(item));
+        }
+        let mid_frame = framed.codec().mid_frame();
+        let buffered = framed.read_buffer().len();
+        // A change of state, or more of the frame, starts the wait afresh.
+        if timer
+            .as_ref()
+            .is_none_or(|(_, mid, len)| *mid != mid_frame || *len != buffered)
+        {
+            timer = read_wait(mid_frame, idle)
+                .map(|wait| (Box::pin(tokio::time::sleep(wait)), mid_frame, buffered));
+        }
+        if let Some((sleep, ..)) = timer.as_mut()
+            && sleep.as_mut().poll(cx).is_ready()
+        {
+            return Poll::Ready(Err(if mid_frame {
+                ReadTimeout::Stalled
+            } else {
+                ReadTimeout::Idle
+            }));
+        }
+        Poll::Pending
+    })
+    .await?;
+    Ok(match polled {
+        Some(Ok(bytes)) => Some(wire::decode(&bytes.freeze())),
+        Some(Err(source)) => Some(Err(CodecError::Io(source))),
+        None => None,
+    })
 }
 
 /// Where the accept loop takes connections from: the listener, or a script
@@ -74,9 +168,9 @@ pub(in crate::net) async fn accept_loop(
 ///
 /// A connection from the IP of a current peer's data address is admitted
 /// without limit. At most `MAX_PRE_HELLO_CONNS` connections
-/// from any other source wait for their `Hello` at once, and one that arrives
-/// beyond that is closed as it is accepted, before a handshake or a task
-/// exists.
+/// from any other source wait for their `Hello` at once, and at most
+/// `MAX_UNKNOWN_SOURCE_CONNS` are open at once; one that arrives beyond
+/// either is closed as it is accepted, before a handshake or a task exists.
 pub(super) async fn accept_loop_over<S: ConnSource>(
     mut source: S,
     inbound_tx: mpsc::Sender<InboundMsg>,
@@ -118,10 +212,14 @@ pub(super) async fn accept_loop_over<S: ConnSource>(
         };
         let pre_hello = match mesh.admission.admit(peer_addr.ip()) {
             Admit::Known => None,
-            Admit::Waiting(permit) => Some(permit),
+            Admit::Waiting(slots) => Some(slots),
             Admit::OverCap => {
                 mesh.admission.note_over_cap(peer_addr);
                 // `stream` drops: closed before a handshake or a task exists.
+                continue;
+            }
+            Admit::OverOpenCap => {
+                mesh.admission.note_open_cap(peer_addr);
                 continue;
             }
         };
@@ -196,10 +294,16 @@ async fn open_link(stream: TcpStream, tls: &TlsCtx) -> Option<OpenedLink> {
 /// the `Hello` decodes a frame is at most `HELLO_MAX_FRAME` bytes (1 KiB);
 /// afterwards it is at most [`MAX_FRAME`].
 ///
-/// `pre_hello` is the slot a connection from an unknown source holds in the
-/// cap on connections waiting for their `Hello`; it is released when the
-/// `Hello` decodes or the handler returns, whichever comes first. A known
-/// source holds none.
+/// `slots` is what a connection from an unknown source holds against the
+/// caps: a slot among the open connections until the handler returns, and a
+/// slot among those waiting for their `Hello` until the `Hello` decodes. A
+/// known source holds none. After its `Hello` a connection from an unknown
+/// source that sends no frame for [`FIRST_FRAME_TIMEOUT`] is closed and
+/// counted in `sundog_accept_dropped_total{reason="first_frame_timeout"}`;
+/// every connection that stops inside a frame for [`FRAME_STALL_TIMEOUT`] is
+/// closed and counted under `reason="frame_stall"`. A connection from a
+/// peer's IP that is between frames waits without bound, as a broadcast link
+/// does.
 ///
 /// Every read and write below races against `mesh`'s accept token, tearing
 /// a slow snapshot or AE reply down promptly on [`crate::net::Mesh::shutdown`].
@@ -212,7 +316,7 @@ pub(super) async fn handle_accepted(
     inbound_tx: mpsc::Sender<InboundMsg>,
     handler: Arc<dyn RequestHandler>,
     mesh: Arc<MeshInner>,
-    pre_hello: Option<OwnedSemaphorePermit>,
+    mut slots: Option<Slots>,
 ) {
     let cancel = mesh.accept_cancel.clone();
     let peer_addr = stream.peer_addr().ok();
@@ -234,8 +338,12 @@ pub(super) async fn handle_accepted(
             return;
         }
     };
-    // No longer waiting for its hello: the cap does not count it again.
-    drop(pre_hello);
+    // No longer waiting for its hello: the cap on those does not count it
+    // again. It keeps its slot among the open connections until it returns.
+    let unknown_source = slots.is_some();
+    if let Some(slots) = slots.as_mut() {
+        slots.release_pre_hello();
+    }
     // Frames buffered behind the `Hello` decode under the full limit.
     framed.codec_mut().set_max_frame_length(MAX_FRAME);
     // A peer of another cluster dialed an address this node now holds,
@@ -257,18 +365,28 @@ pub(super) async fn handle_accepted(
     }
 
     let mut served_requests: usize = 0;
+    let mut frames_received: usize = 0;
     loop {
-        // Only a connection that has served a request/response exchange is
-        // a pooling candidate; a persistent broadcast link waits indefinitely.
-        let idle_timeout = (served_requests > 0).then_some(REQ_CONN_IDLE_TIMEOUT);
+        // See `frame_idle_timeout` for which connections wait without bound.
+        let idle_timeout = frame_idle_timeout(served_requests, frames_received, unknown_source);
         let received = tokio::select! {
             biased;
             () = cancel.cancelled() => return,
-            received = recv_msg_or_idle_timeout(&mut framed, idle_timeout) => received,
+            received = recv_msg_bounded(&mut framed, idle_timeout) => received,
+        };
+        let received = match received {
+            Ok(received) => received,
+            Err(timeout) => {
+                if let Some(reason) = read_timeout_reason(timeout, served_requests) {
+                    note_read_timeout(reason, peer_addr);
+                }
+                return;
+            }
         };
         let Some(Ok(msg)) = received else {
             return;
         };
+        frames_received += 1;
         let is_request = matches!(
             msg,
             Msg::StRequest { .. }

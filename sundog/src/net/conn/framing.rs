@@ -4,8 +4,9 @@
 use crate::net::OutFrame;
 
 use bytes::Bytes;
+use bytes::BytesMut;
 use futures::{Sink, SinkExt as _, StreamExt as _};
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio_util::codec::{Decoder, Encoder, Framed, LengthDelimitedCodec};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(not(feature = "sim"))]
@@ -17,7 +18,78 @@ use crate::net::{MeshStream, TlsCtx};
 use crate::store::KeyVersion;
 use crate::wire::{self, MAX_FRAME, Msg};
 
-pub(in crate::net) type PeerFramed = Framed<MeshStream, LengthDelimitedCodec>;
+pub(in crate::net) type PeerFramed = Framed<MeshStream, PeerCodec>;
+
+/// The codec of every mesh connection: a [`LengthDelimitedCodec`] that also
+/// reports whether it stands inside a frame, so a reader can bound a
+/// connection that sent a frame's length prefix and then stopped. The wire
+/// format is the length-delimited codec's.
+pub(in crate::net) struct PeerCodec {
+    inner: LengthDelimitedCodec,
+    /// Whether the last decode left a frame started and not complete.
+    mid_frame: bool,
+}
+
+impl PeerCodec {
+    fn new(max_frame: usize) -> Self {
+        Self {
+            inner: LengthDelimitedCodec::builder()
+                .max_frame_length(max_frame)
+                .new_codec(),
+            mid_frame: false,
+        }
+    }
+
+    /// Sets the largest frame the codec accepts.
+    pub(in crate::net) fn set_max_frame_length(&mut self, max_frame: usize) {
+        self.inner.set_max_frame_length(max_frame);
+    }
+
+    /// Whether the codec has taken the start of a frame, its length prefix
+    /// or more, and waits for the rest. The prefix leaves the read buffer
+    /// when it is taken, so the buffer alone cannot say.
+    pub(in crate::net) fn mid_frame(&self) -> bool {
+        self.mid_frame
+    }
+}
+
+impl Decoder for PeerCodec {
+    type Item = BytesMut;
+    type Error = std::io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<BytesMut>, Self::Error> {
+        let before = src.len();
+        let decoded = self.inner.decode(src)?;
+        self.mid_frame = frame_started(self.mid_frame, decoded.is_some(), before, src.len());
+        Ok(decoded)
+    }
+}
+
+impl Encoder<Bytes> for PeerCodec {
+    type Error = std::io::Error;
+
+    fn encode(&mut self, frame: Bytes, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        self.inner.encode(frame, dst)
+    }
+}
+
+/// Whether a codec stands inside a frame after one decode call, given
+/// whether it stood in one before (`was_mid_frame`), whether the call
+/// returned a frame, and the read buffer's length before and after. A
+/// returned frame ends the frame; an unfinished decode is inside one when it
+/// consumed bytes (the length prefix) or leaves some buffered, and a decode
+/// that touched nothing keeps the state it had. Pure; unit tested directly.
+pub(super) const fn frame_started(
+    was_mid_frame: bool,
+    returned_frame: bool,
+    len_before: usize,
+    len_after: usize,
+) -> bool {
+    if returned_frame {
+        return false;
+    }
+    was_mid_frame || len_after != len_before || len_after > 0
+}
 
 /// When the kernel probes a silent connection and how often it gives up:
 /// [`keepalive_timing`]'s result for one `ClusterConfig::mesh_keepalive`.
@@ -106,9 +178,7 @@ fn enable_keepalive(stream: &TcpStream, timing: KeepaliveTiming) -> std::io::Res
 }
 
 pub(super) fn new_framed(stream: MeshStream) -> PeerFramed {
-    LengthDelimitedCodec::builder()
-        .max_frame_length(MAX_FRAME)
-        .new_framed(stream)
+    Framed::new(stream, PeerCodec::new(MAX_FRAME))
 }
 
 /// The largest frame an accepted connection may send before its `Hello`
@@ -122,9 +192,7 @@ pub(super) const HELLO_MAX_FRAME: usize = 1024;
 /// frames are capped at [`HELLO_MAX_FRAME`] until the caller lifts the cap
 /// with `set_max_frame_length(MAX_FRAME)` on the codec.
 pub(super) fn new_framed_pre_hello(stream: MeshStream) -> PeerFramed {
-    LengthDelimitedCodec::builder()
-        .max_frame_length(HELLO_MAX_FRAME)
-        .new_framed(stream)
+    Framed::new(stream, PeerCodec::new(HELLO_MAX_FRAME))
 }
 
 /// Layers TLS onto a freshly dialed `stream` per `tls`, a no-op passthrough

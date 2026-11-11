@@ -69,7 +69,7 @@ addresses once it forms, under `cluster formed`.
 | `sundog_open_caches` | caches open on this node; 0 once the node has shut down |
 | `sundog_frames_sent_total` | data-plane frames sent |
 | `sundog_bytes_sent_total` | data-plane bytes sent |
-| `sundog_accept_dropped_total{reason}` | data-plane connections this node closed before they sent a hello: `hello_timeout` (no complete hello within 10 seconds of the connection's handler first running, TLS handshake included) or `over_cap` (512 connections from addresses that are not a peer's already waited for their hello) |
+| `sundog_accept_dropped_total{reason}` | data-plane connections this node closed: before a hello, `hello_timeout` (no complete hello within 10 seconds of the connection's handler first running, TLS handshake included) or `over_cap` (512 connections from addresses that are not a peer's already waited for their hello); at accept, `open_cap` (2048 connections from such addresses were already open); after a hello, `first_frame_timeout` (a connection from such an address sent no frame for 60 seconds) or `frame_stall` (a frame's length prefix arrived and the rest did not for 30 seconds) |
 | `sundog_fan_out_wait_seconds_total{peer}` | whole seconds writers spent waiting for a live peer's full outbox |
 | `sundog_fan_out_stalls_total` | live peers whose outbox took no fan-out frame for `fan_out_stall_timeout`: the rest of their frames were dropped, and fan-out sends to each took only free room until the peer read a frame again |
 | `sundog_backlog_dropped_total{peer}` | frames dropped before reaching the peer's connection: an outbox that stayed full, in frames (`outbox_capacity`) or in bytes (`outbox_bytes`), the oldest invalidations displaced by a newer one, in frames or bytes alike, a message that failed to encode, a re-forward lane that already held 64 MiB, encoded and decoded, for a live peer, or the peer leaving the mesh. Each drop marks the peer for the next anti-entropy round, which repairs a record the dropping node owns but not one it only passed on. A broken connection drops a frame only if the writer cannot send it again: the writer resends the burst whose send failed and the frames it wrote in the last second, up to 1 MiB |
@@ -163,6 +163,16 @@ addresses once it forms, under `cluster formed`.
   from such addresses, as a restart of a large fleet can cause, closes the
   excess. A broadcast link redials after 500 milliseconds. A request that
   meets a closed connection fails.
+- `open_cap` means 2048 connections from addresses that are not a peer's
+  were already open. A peer behind NAT or an `advertise_ip` override holds a
+  few, so the cap admits hundreds of them; a larger count is a client that
+  opens connections and keeps them.
+- `first_frame_timeout` closes a connection from an address that is not a
+  peer's that sent no frame for 60 seconds after its hello. A peer behind
+  NAT with nothing to replicate sees its broadcast link close at that rate
+  and redial it.
+- `frame_stall` closes a connection, from any address, that stopped inside a
+  frame for 30 seconds.
 
 ### Opening a cache fails with `ModeMismatch`
 

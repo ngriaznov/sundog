@@ -26,6 +26,35 @@ pub(crate) const HELLO_TIMEOUT: Duration = crate::net::request::REQUEST_TIMEOUT;
 /// many already waiting is closed as it is accepted.
 pub(super) const MAX_PRE_HELLO_CONNS: usize = 512;
 
+/// How many connections from sources that are not mesh peers are open at
+/// once, a connection counting from its accept until it closes. A connection
+/// from such a source that arrives with this many already open is closed as
+/// it is accepted. Four times [`MAX_PRE_HELLO_CONNS`]: a source that is not
+/// a peer's IP is an outsider or a peer whose dialing address differs from
+/// its advertised one, and such a peer holds a handful of connections (its
+/// broadcast link and a few pooled request connections), so this admits
+/// hundreds of them while bounding what an outsider that sends a valid
+/// `Hello` and then stalls can hold.
+pub(super) const MAX_UNKNOWN_SOURCE_CONNS: usize = 2048;
+
+/// How long a connection from a source that is not a mesh peer may wait,
+/// after its `Hello`, for its first frame. A request connection sends its
+/// first frame in the same flush as its `Hello`, and a broadcast link from
+/// a peer waits for its first frame as long as the peer has none to send,
+/// and the acceptor cannot tell the two apart before that frame arrives.
+/// A connection from a peer's IP therefore waits without bound, and one
+/// from any other source is closed after this long: a peer behind a
+/// translated address redials its broadcast link at that rate while it has
+/// nothing to send.
+pub(super) const FIRST_FRAME_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// How long a connection may sit inside a frame, its length prefix received
+/// and the rest of the frame not arriving, before it is closed. The wait
+/// restarts whenever more of the frame arrives, so a slow link that keeps
+/// delivering is never cut. A peer that writes a frame writes it whole, so
+/// a pause this long inside one is a peer that died or stalled on purpose.
+pub(super) const FRAME_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The wait after the first failed accept in a row.
 const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(5);
 
@@ -101,14 +130,46 @@ impl WarnLimiter {
 
 /// What the accept loop does with one accepted connection.
 pub(super) enum Admit {
-    /// The source is a mesh peer's address: no slot, and the cap never
-    /// refuses it. The `Hello` deadline and frame limit still apply.
+    /// The source is a mesh peer's address: no slot, and the caps never
+    /// refuse it. The `Hello` deadline and frame limit still apply.
     Known,
-    /// Any other source with room under the cap: the connection holds
-    /// `permit` until its `Hello` decodes or it closes.
-    Waiting(OwnedSemaphorePermit),
-    /// Any other source with the cap full: closed at once.
+    /// Any other source with room under both caps: the connection holds
+    /// `slots` until it closes, and its pre-`Hello` slot until its `Hello`
+    /// decodes.
+    Waiting(Slots),
+    /// Any other source with the pre-`Hello` cap full: closed at once.
     OverCap,
+    /// Any other source with the cap on open connections full: closed at
+    /// once.
+    OverOpenCap,
+}
+
+/// What a connection from an unknown source holds against the caps: a slot
+/// among the open connections for as long as it lives, and a slot among the
+/// connections waiting for their `Hello` until the `Hello` decodes.
+pub(super) struct Slots {
+    pre_hello: Option<OwnedSemaphorePermit>,
+    _open: OwnedSemaphorePermit,
+}
+
+impl Slots {
+    /// Frees the pre-`Hello` slot: the connection no longer waits for its
+    /// `Hello`. It keeps its slot among the open connections.
+    pub(super) fn release_pre_hello(&mut self) {
+        self.pre_hello = None;
+    }
+}
+
+/// Counts a connection closed for the wait `reason` names, one of
+/// `"first_frame_timeout"` and `"frame_stall"`, in
+/// `sundog_accept_dropped_total{reason}` and logs it at debug.
+pub(super) fn note_read_timeout(reason: &'static str, peer: Option<SocketAddr>) {
+    metrics::counter!("sundog_accept_dropped_total", "reason" => reason).increment(1);
+    tracing::debug!(
+        peer = peer.map(|addr| addr.to_string()),
+        reason,
+        "closed a data-plane connection that stopped sending"
+    );
 }
 
 /// What a mesh keeps to admit the connections its listener accepts.
@@ -117,6 +178,9 @@ pub(in crate::net) struct Admission {
     /// `Hello`.
     gate: Arc<Semaphore>,
     cap: usize,
+    /// One permit per open connection from an unknown source.
+    open_gate: Arc<Semaphore>,
+    open_cap: usize,
     /// The IPs of the data addresses of the mesh's current peers, kept by
     /// `Mesh::update_peers`. A peer behind NAT, or whose advertised address
     /// differs from the one it dials from, is not in it and takes the gate
@@ -124,21 +188,32 @@ pub(in crate::net) struct Admission {
     /// table.
     known_sources: RwLock<HashSet<IpAddr>>,
     warn_over_cap: WarnLimiter,
+    warn_open_cap: WarnLimiter,
     warn_hello_timeout: WarnLimiter,
     warn_accept_error: WarnLimiter,
 }
 
 impl Admission {
     pub(in crate::net) fn new() -> Self {
-        Self::with_cap(MAX_PRE_HELLO_CONNS)
+        Self::with_caps(MAX_PRE_HELLO_CONNS, MAX_UNKNOWN_SOURCE_CONNS)
     }
 
+    #[cfg(test)]
+    /// An admission whose cap on connections waiting for their `Hello` is
+    /// `cap` and whose cap on open connections never refuses.
     pub(in crate::net) fn with_cap(cap: usize) -> Self {
+        Self::with_caps(cap, Semaphore::MAX_PERMITS)
+    }
+
+    pub(in crate::net) fn with_caps(cap: usize, open_cap: usize) -> Self {
         Self {
             gate: Arc::new(Semaphore::new(cap)),
             cap,
+            open_gate: Arc::new(Semaphore::new(open_cap)),
+            open_cap,
             known_sources: RwLock::new(HashSet::new()),
             warn_over_cap: WarnLimiter::new(),
+            warn_open_cap: WarnLimiter::new(),
             warn_hello_timeout: WarnLimiter::new(),
             warn_accept_error: WarnLimiter::new(),
         }
@@ -168,9 +243,15 @@ impl Admission {
         if self.is_known_source(source) {
             return Admit::Known;
         }
-        match Arc::clone(&self.gate).try_acquire_owned() {
-            Ok(permit) => Admit::Waiting(permit),
-            Err(_no_permits) => Admit::OverCap,
+        let Ok(pre_hello) = Arc::clone(&self.gate).try_acquire_owned() else {
+            return Admit::OverCap;
+        };
+        match Arc::clone(&self.open_gate).try_acquire_owned() {
+            Ok(open) => Admit::Waiting(Slots {
+                pre_hello: Some(pre_hello),
+                _open: open,
+            }),
+            Err(_no_permits) => Admit::OverOpenCap,
         }
     }
 
@@ -180,9 +261,20 @@ impl Admission {
         self.cap - self.gate.available_permits()
     }
 
+    /// The open connections from unknown sources.
+    #[cfg(test)]
+    pub(in crate::net) fn open(&self) -> usize {
+        self.open_cap - self.open_gate.available_permits()
+    }
+
     #[cfg(test)]
     pub(in crate::net) const fn cap(&self) -> usize {
         self.cap
+    }
+
+    #[cfg(test)]
+    pub(in crate::net) const fn open_cap(&self) -> usize {
+        self.open_cap
     }
 
     /// Counts a connection closed because the cap was full in
@@ -198,6 +290,22 @@ impl Admission {
                  that wait for their hello is full; the data-plane port is for cluster \
                  members only, and sundog_accept_dropped_total{{reason=\"over_cap\"}} counts \
                  every such close"
+            );
+        }
+    }
+
+    /// Counts a connection closed because the cap on open connections from
+    /// unknown sources was full in `sundog_accept_dropped_total{reason="open_cap"}`
+    /// and warns about it at most once a minute.
+    pub(super) fn note_open_cap(&self, peer: SocketAddr) {
+        metrics::counter!("sundog_accept_dropped_total", "reason" => "open_cap").increment(1);
+        if self.warn_open_cap.claim(crate::net::mono_ms()) {
+            tracing::warn!(
+                %peer,
+                cap = self.open_cap,
+                "closed a data-plane connection: the cap on open connections from unknown \
+                 sources is full; the data-plane port is for cluster members only, and \
+                 sundog_accept_dropped_total{{reason=\"open_cap\"}} counts every such close"
             );
         }
     }
@@ -288,11 +396,11 @@ mod tests {
     }
 
     /// The permit of an admission that must wait under the cap.
-    fn waiting(admission: &Admission, source: IpAddr) -> OwnedSemaphorePermit {
+    fn waiting(admission: &Admission, source: IpAddr) -> Slots {
         match admission.admit(source) {
-            Admit::Waiting(permit) => permit,
+            Admit::Waiting(slots) => slots,
             Admit::Known => panic!("{source} is not a known source"),
-            Admit::OverCap => panic!("{source} is refused under the cap"),
+            Admit::OverCap | Admit::OverOpenCap => panic!("{source} is refused under the cap"),
         }
     }
 
@@ -314,6 +422,50 @@ mod tests {
         assert_eq!(admission.in_flight(), 3, "a refusal takes no slot");
         drop(permits);
         assert_eq!(admission.in_flight(), 0);
+    }
+
+    #[test]
+    fn the_open_cap_is_2048_and_four_times_the_hello_cap() {
+        assert_eq!(MAX_UNKNOWN_SOURCE_CONNS, 2048);
+        assert_eq!(MAX_UNKNOWN_SOURCE_CONNS, 4 * MAX_PRE_HELLO_CONNS);
+        let admission = Admission::new();
+        assert_eq!(admission.open_cap(), 2048);
+        assert_eq!(admission.open(), 0);
+    }
+
+    #[test]
+    fn an_unknown_source_holds_an_open_slot_after_its_hello_until_it_drops() {
+        let admission = Admission::with_caps(2, 2);
+        let mut first = waiting(&admission, ip(1));
+        let second = waiting(&admission, ip(2));
+        assert_eq!((admission.in_flight(), admission.open()), (2, 2));
+        assert!(matches!(admission.admit(ip(3)), Admit::OverCap));
+
+        first.release_pre_hello();
+        assert_eq!((admission.in_flight(), admission.open()), (1, 2));
+        assert!(
+            matches!(admission.admit(ip(3)), Admit::OverOpenCap),
+            "the open cap is full though a hello slot is free"
+        );
+        assert_eq!(admission.in_flight(), 1, "a refusal takes no hello slot");
+
+        drop(second);
+        assert_eq!((admission.in_flight(), admission.open()), (0, 1));
+        let _third = waiting(&admission, ip(3));
+        assert_eq!(admission.open(), 2);
+        drop(first);
+        assert_eq!(admission.open(), 1);
+    }
+
+    #[test]
+    fn a_known_source_holds_no_open_slot() {
+        let admission = Admission::with_caps(1, 1);
+        admission.set_known_sources([ip(7)]);
+        let _held = waiting(&admission, ip(1));
+        for _ in 0..5 {
+            assert!(matches!(admission.admit(ip(7)), Admit::Known));
+        }
+        assert_eq!(admission.open(), 1);
     }
 
     #[test]
@@ -386,7 +538,7 @@ mod tests {
     #[test]
     fn racing_connections_never_exceed_the_cap() {
         let admission = Arc::new(Admission::with_cap(64));
-        let permits: Vec<OwnedSemaphorePermit> = (0..8)
+        let permits: Vec<Slots> = (0..8)
             .map(|_| {
                 let admission = Arc::clone(&admission);
                 std::thread::spawn(move || {
@@ -394,7 +546,7 @@ mod tests {
                         .filter_map(|n| {
                             match admission.admit(ip(u8::try_from(n % 200).expect("under 200"))) {
                                 Admit::Waiting(permit) => Some(permit),
-                                Admit::Known | Admit::OverCap => None,
+                                Admit::Known | Admit::OverCap | Admit::OverOpenCap => None,
                             }
                         })
                         .collect::<Vec<_>>()
@@ -441,6 +593,12 @@ mod tests {
             metrics_util::debugging::DebugValue::Counter(1)
         );
         assert_eq!(counted.len(), 2, "no other reason: {:?}", counted.keys());
+    }
+
+    #[test]
+    fn the_read_bounds_are_a_minute_for_a_first_frame_and_half_a_minute_inside_a_frame() {
+        assert_eq!(FIRST_FRAME_TIMEOUT, Duration::from_mins(1));
+        assert_eq!(FRAME_STALL_TIMEOUT, Duration::from_secs(30));
     }
 
     #[test]

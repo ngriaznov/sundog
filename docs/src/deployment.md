@@ -220,7 +220,17 @@ their hello at once, and the node closes any further one as it accepts it. A
 known peer's connections are not capped. A node whose peer table is empty, as
 a node that has just started is, and a peer behind NAT or an `advertise_ip`
 override that dials from an address other than the one it advertises, meet the
-cap like any other source. The limits are fixed.
+cap like any other source.
+
+A connection from an address that is not a peer's holds a slot among at most
+2048 such open connections for as long as it lives, and the node closes any
+further one as it accepts it. Such a connection that sends no frame for 60
+seconds after its hello is closed, and a peer behind NAT redials its idle
+broadcast link at that rate. A connection from a peer's address waits for a
+frame without limit, as an idle broadcast link does. Every connection that
+stops inside a frame, its length prefix received and the rest not arriving,
+for 30 seconds is closed; the 30 seconds restart whenever more of the frame
+arrives. The limits are fixed.
 `sundog_accept_dropped_total` counts the closes; see
 [Operations](operations.md#data-plane-connections-close-before-the-hello).
 

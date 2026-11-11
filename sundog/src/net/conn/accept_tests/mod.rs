@@ -15,6 +15,7 @@
 mod backoff;
 mod cap;
 mod hello;
+mod read_bounds;
 #[cfg(feature = "tls")]
 mod tls;
 
@@ -81,8 +82,8 @@ fn spawn_handler(pair: (TcpStream, TcpStream, SocketAddr), mesh: &Arc<MeshInner>
     let (inbound_tx, inbound) = mpsc::channel(8);
     let pre_hello = match mesh.admission.admit(client_addr.ip()) {
         Admit::Known => None,
-        Admit::Waiting(permit) => Some(permit),
-        Admit::OverCap => panic!("the test mesh is under its cap"),
+        Admit::Waiting(slots) => Some(slots),
+        Admit::OverCap | Admit::OverOpenCap => panic!("the test mesh is under its caps"),
     };
     let task = tokio::spawn(handle_accepted(
         server,
