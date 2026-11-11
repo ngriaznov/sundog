@@ -102,7 +102,7 @@ fn builder() -> PrometheusBuilder {
         })
 }
 
-/// What `install_listener`'s `GET /readyz` route reports.
+/// What the listener's `GET /readyz` route reports.
 pub(crate) trait ReadinessSource: Send + Sync + 'static {
     /// Mirrors [`crate::cluster::Cluster::is_ready`].
     fn is_ready(&self) -> bool;
@@ -130,7 +130,7 @@ pub(crate) const MAX_CONNECTIONS: usize = 64;
 /// The methods a known path answers, as the `Allow` header of a `405`.
 const ALLOWED_METHODS: &str = "GET, HEAD";
 
-/// The bounds `serve` enforces. `install_listener` passes `Limits::SERVED`;
+/// The bounds `serve` enforces. `BoundListener::serve` passes `Limits::SERVED`;
 /// the tests pass smaller ones.
 #[derive(Clone, Copy, Debug)]
 struct Limits {
@@ -155,21 +155,21 @@ impl Limits {
     };
 }
 
-/// Installs a Prometheus recorder and serves `GET` and `HEAD` for
-/// `/metrics`, `/readyz` (200 once `readiness` reports ready, 503 otherwise),
-/// and `/healthz` on `addr`. Each request is bounded by `REQUEST_TIMEOUT`,
-/// `RESPONSE_TIMEOUT`, `MAX_REQUEST_HEAD` and `MAX_CONNECTIONS`; see the module
-/// docs.
+/// A bound, not yet serving metrics listener: the fallible bind of
+/// [`bind_listener`] done, the process-global recorder not yet installed.
+pub(crate) struct BoundListener {
+    listener: TcpListener,
+}
+
+/// Binds `addr` for the metrics listener without installing the
+/// process-global recorder, so a caller can fail on the address early and
+/// leave no global state behind. [`BoundListener::serve`] installs the
+/// recorder and starts serving.
 ///
 /// # Errors
 ///
-/// Returns [`BuildError`] if `addr` cannot be bound, or a `metrics`
-/// recorder is already installed.
-pub(crate) fn install_listener(
-    addr: SocketAddr,
-    readiness: Arc<dyn ReadinessSource>,
-) -> Result<(), BuildError> {
-    let handle = builder().install_recorder()?;
+/// Returns [`BuildError`] if `addr` cannot be bound.
+pub(crate) fn bind_listener(addr: SocketAddr) -> Result<BoundListener, BuildError> {
     let std_listener = std::net::TcpListener::bind(addr)
         .and_then(|listener| {
             listener.set_nonblocking(true)?;
@@ -178,9 +178,25 @@ pub(crate) fn install_listener(
         .map_err(|error| BuildError::FailedToCreateHTTPListener(error.to_string()))?;
     let listener = TcpListener::from_std(std_listener)
         .map_err(|error| BuildError::FailedToCreateHTTPListener(error.to_string()))?;
-    tokio::spawn(upkeep(handle.clone()));
-    tokio::spawn(serve(listener, handle, readiness, Limits::SERVED));
-    Ok(())
+    Ok(BoundListener { listener })
+}
+
+impl BoundListener {
+    /// Installs a Prometheus recorder and serves `GET` and `HEAD` for
+    /// `/metrics`, `/readyz` (200 once `readiness` reports ready, 503
+    /// otherwise), and `/healthz` on the bound address. Each request is
+    /// bounded by `REQUEST_TIMEOUT`, `RESPONSE_TIMEOUT`, `MAX_REQUEST_HEAD`
+    /// and `MAX_CONNECTIONS`; see the module docs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError`] if a `metrics` recorder is already installed.
+    pub(crate) fn serve(self, readiness: Arc<dyn ReadinessSource>) -> Result<(), BuildError> {
+        let handle = builder().install_recorder()?;
+        tokio::spawn(upkeep(handle.clone()));
+        tokio::spawn(serve(self.listener, handle, readiness, Limits::SERVED));
+        Ok(())
+    }
 }
 
 /// Drains histogram buckets on the exporter's default cadence, the task its

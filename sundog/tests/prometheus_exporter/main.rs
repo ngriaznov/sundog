@@ -40,8 +40,40 @@ use crate::support::{
     scraped_metric_value, scraped_unlabelled_value,
 };
 use std::net::{Ipv4Addr, SocketAddr};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use sundog::{Cluster, Mode};
+
+/// Set when the listener test below begins, so the handle test knows to
+/// leave it the process-global recorder.
+static LISTENER_TEST_STARTED: AtomicBool = AtomicBool::new(false);
+/// Set once the listener test's `build()` has returned, whether it installed
+/// the recorder or not.
+static LISTENER_BUILD_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Sets [`LISTENER_BUILD_DONE`] when dropped, so a failed build releases the
+/// handle test too.
+struct BuildDone;
+
+impl Drop for BuildDone {
+    fn drop(&mut self) {
+        LISTENER_BUILD_DONE.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Waits until the listener test's `build()` has returned, when that test
+/// runs: `build()` installs the recorder late, after its binds, so the
+/// handle test must not race it for the slot. Returns after two seconds when
+/// the listener test never starts, as when this one is run alone.
+async fn wait_for_listener_build() {
+    let begun = Instant::now();
+    while !LISTENER_BUILD_DONE.load(Ordering::SeqCst)
+        && (LISTENER_TEST_STARTED.load(Ordering::SeqCst)
+            || begun.elapsed() < Duration::from_secs(2))
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
 
 #[allow(
     clippy::too_many_lines,
@@ -54,15 +86,17 @@ use sundog::{Cluster, Mode};
 // parallelism, or the flusher tends to keep `admit` refilled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
+    LISTENER_TEST_STARTED.store(true, Ordering::SeqCst);
     let metrics_addr = reserve_tcp_addr().await;
 
-    let cluster = Cluster::builder("it-prometheus-exporter")
+    let built = Cluster::builder("it-prometheus-exporter")
         .seeds(std::iter::empty())
         .config(node_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))))
         .prometheus_listen(metrics_addr)
         .build()
-        .await
-        .expect("cluster builds with a prometheus listener");
+        .await;
+    drop(BuildDone);
+    let cluster = built.expect("cluster builds with a prometheus listener");
     // A peer for `users` to replicate to and reconcile against; only the
     // first node serves metrics, since the recorder is process-global.
     let peer = Cluster::builder("it-prometheus-exporter")
@@ -981,6 +1015,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
 /// race.
 #[tokio::test]
 async fn prometheus_handle_exposes_cache_hits_without_a_listener() {
+    wait_for_listener_build().await;
     let cluster = Cluster::builder("it-prometheus-handle")
         .seeds(std::iter::empty())
         .config(common::fast_config())

@@ -1107,10 +1107,11 @@ impl ClusterBuilder {
             Arc::new(RwLock::new(HashMap::new()));
         let warmth = Arc::new(Warmth::default());
 
+        // Binds the address now, so a port conflict fails before anything
+        // spawns; the process-global recorder installs after every other
+        // fallible step, so a failed `build()` leaves none behind.
         #[cfg(feature = "prometheus")]
-        if let Some(addr) = prometheus_listen {
-            install_readiness_listener(addr, &local_modes, &warmth)?;
-        }
+        let metrics_listener = prometheus_listen.map(bind_readiness_listener).transpose()?;
 
         let node = node_id.unwrap_or_else(NodeId::random);
         let hostname = local_hostname();
@@ -1160,6 +1161,9 @@ impl ClusterBuilder {
             cluster: wire::cluster_id(&name),
         };
         let (mesh, inbound_rx) = Mesh::spawn_on(data_listener, greeting, &config, handler)?;
+
+        #[cfg(feature = "prometheus")]
+        serve_readiness_listener(metrics_listener, &local_modes, &warmth)?;
 
         let cluster = Cluster {
             inner: Arc::new(ClusterInner {
@@ -1302,24 +1306,6 @@ fn validate_config(config: &ClusterConfig) -> Result<(), JoinError> {
             "ClusterConfig::fan_out_stall_timeout must be nonzero".to_string(),
         ));
     }
-    Ok(())
-}
-
-/// Resolves the discovery mechanism `build()` uses: the caller's explicit
-/// choice, else [`use_static_from_env`]'s pick between `Static::from_env()`
-/// and the zeroconf `Mdns` default.
-pub(crate) fn resolve_discovery(
-    discovery: Option<DiscoveryKind>,
-    name: &SmolStr,
-    node_name: &NodeName,
-) -> DiscoveryKind {
-    let discovery_set = discovery.is_some();
-    let seeds_env = std::env::var(crate::discovery::statics::SUNDOG_SEEDS_ENV).ok();
-    discovery.unwrap_or_else(|| {
-        if use_static_from_env(discovery_set, seeds_env.as_deref()) {
-            DiscoveryKind::Static(Static::from_env())
-        } else {
-            DiscoveryKind::Mdns(Mdns::new(name.clone(), node_name.to_string()))
     validate_timings(config)?;
     validate_tombstones(config)
 }
@@ -1417,18 +1403,36 @@ fn seeds_env_names_no_seed(seeds_env: Option<&str>) -> bool {
     })
 }
 
-/// Installs the `/metrics`, `/readyz`, `/healthz` listener on `addr`.
+/// Binds `addr` for the `/metrics`, `/readyz`, `/healthz` listener,
+/// installing no recorder.
 #[cfg(feature = "prometheus")]
-fn install_readiness_listener(
+fn bind_readiness_listener(
     addr: SocketAddr,
+) -> Result<(SocketAddr, crate::telemetry::BoundListener), JoinError> {
+    crate::telemetry::bind_listener(addr)
+        .map(|listener| (addr, listener))
+        .map_err(|source| JoinError::Bind {
+            addr,
+            source: std::io::Error::other(source),
+        })
+}
+
+/// Installs the metrics recorder and serves the `bound` listener, if any, over the
+/// maps the eventual [`Cluster`] shares.
+#[cfg(feature = "prometheus")]
+fn serve_readiness_listener(
+    bound: Option<(SocketAddr, crate::telemetry::BoundListener)>,
     local_modes: &Arc<RwLock<HashMap<SmolStr, Mode>>>,
     warmth: &Arc<Warmth>,
 ) -> Result<(), JoinError> {
+    let Some((addr, listener)) = bound else {
+        return Ok(());
+    };
     let readiness: Arc<dyn crate::telemetry::ReadinessSource> = Arc::new(ClusterReadiness {
         local_modes: Arc::clone(local_modes),
         warmth: Arc::clone(warmth),
     });
-    crate::telemetry::install_listener(addr, readiness).map_err(|source| JoinError::Bind {
+    listener.serve(readiness).map_err(|source| JoinError::Bind {
         addr,
         source: std::io::Error::other(source),
     })
