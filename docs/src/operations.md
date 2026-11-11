@@ -65,7 +65,7 @@ addresses once it forms, under `cluster formed`.
 
 | Metric | Meaning |
 |---|---|
-| `sundog_live_peers` | peers this node sees alive |
+| `sundog_live_peers` | peers this node sees alive: one for each remote node id, at its newest incarnation, so a node that restarted under a persisted id before its old incarnation was reaped counts once. A live process that carries this node's own id is not a peer; see [Two nodes share a node id](#two-nodes-share-a-node-id) |
 | `sundog_open_caches` | caches open on this node |
 | `sundog_frames_sent_total` | data-plane frames sent |
 | `sundog_bytes_sent_total` | data-plane bytes sent |
@@ -169,6 +169,17 @@ addresses once it forms, under `cluster formed`.
 A live peer has the same cache name open under another mode, or with
 another `owners` count. Deploy the same cache configuration everywhere, or
 give the new configuration a new cache name.
+
+### Two nodes share a node id
+
+`Health::twin_nodes` is above zero and the log carries an `error` saying
+another live process uses this node's id. Two processes configured with the
+same `node_id`, from an id baked into an image or a ConfigMap, gossip
+together but never open a data connection between them, so no write
+replicates from one to the other. A twin is not counted in `Cluster::peers`
+or `sundog_live_peers`. A process started later than the twin it matches by
+hostname sees the earlier one as its own previous incarnation and reports
+nothing. Give each node its own id, or leave `node_id` unset.
 
 ### Readiness stays at 503
 

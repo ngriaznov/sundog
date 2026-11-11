@@ -274,6 +274,11 @@ pub struct Health {
     pub ready: bool,
     /// The current live peer count.
     pub live_peers: usize,
+    /// How many other live processes report this node's own id: nodes
+    /// configured with the same persisted [`ClusterBuilder::node_id`]. A twin
+    /// is not counted in `live_peers`, and the mesh never dials it. Zero in a
+    /// correctly configured cluster; membership logs an error once per twin.
+    pub twin_nodes: usize,
     /// Every open cache's mode and warmth.
     pub caches: Vec<CacheHealth>,
 }
@@ -442,6 +447,7 @@ impl Cluster {
         Health {
             ready: is_ready_from(&caches),
             live_peers: self.peers().len(),
+            twin_nodes: self.inner.membership.twin_count(),
             caches,
         }
     }

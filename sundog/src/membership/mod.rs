@@ -7,6 +7,8 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chitchat::transport::UdpTransport;
@@ -125,6 +127,9 @@ pub struct Membership {
     cache_loaders: watch::Receiver<CacheLoaders>,
     local: Peer,
     commands: mpsc::UnboundedSender<Command>,
+    /// How many live entries currently report this node's id under another
+    /// chitchat id; see [`Membership::twin_count`].
+    twins: Arc<AtomicUsize>,
 }
 
 impl Membership {
@@ -218,17 +223,24 @@ impl Membership {
         // rounds is generous headroom against a dropped packet or two.
         let departure_notice = config.gossip_interval.saturating_mul(3);
 
+        let twins = Arc::new(AtomicUsize::new(0));
         let publishers = Publishers {
             peers: peers_tx,
             cache_modes: cache_modes_tx,
             cache_loaders: cache_loaders_tx,
             observer,
+            twins: Arc::clone(&twins),
         };
         tokio::spawn(run(
             handle,
             seeds,
             publishers,
-            chitchat_id,
+            LocalIdentity {
+                chitchat_id,
+                node: local.node,
+                name: local.name.clone(),
+                incarnation,
+            },
             commands_rx,
             departure_notice,
         ));
@@ -239,6 +251,7 @@ impl Membership {
             cache_loaders: cache_loaders_rx,
             local,
             commands: commands_tx,
+            twins,
         })
     }
 
@@ -246,6 +259,15 @@ impl Membership {
     #[must_use]
     pub fn local_peer(&self) -> &Peer {
         &self.local
+    }
+
+    /// How many live entries report this node's [`NodeId`] under another
+    /// chitchat id: other processes configured with the same persisted id.
+    /// A twin is left out of [`Membership::peers`] because the mesh never
+    /// dials a node that carries the local id.
+    #[must_use]
+    pub fn twin_count(&self) -> usize {
+        self.twins.load(Ordering::Relaxed)
     }
 
     /// A live-updating view of the current member set. Downstream
@@ -747,13 +769,123 @@ struct Publishers {
     cache_modes: watch::Sender<CacheModes>,
     cache_loaders: watch::Sender<CacheLoaders>,
     observer: Option<LiveObserver>,
+    twins: Arc<AtomicUsize>,
+}
+
+/// This node's identity as [`run`] tells it apart from the other live
+/// entries.
+struct LocalIdentity {
+    chitchat_id: ChitchatId,
+    node: NodeId,
+    name: NodeName,
+    incarnation: u64,
+}
+
+/// One membership view split by [`split_live`].
+#[derive(Debug, PartialEq, Eq)]
+struct LiveSplit<T> {
+    /// One entry per remote node: the highest incarnation.
+    live: Vec<T>,
+    /// The entries carrying the local node id that are not this node's own
+    /// earlier incarnation.
+    twins: Vec<T>,
+}
+
+/// Splits the live entries other than this node's own chitchat id into the
+/// peers handed to consumers and the twins of this node.
+///
+/// An entry with the local node id and the local name (`{hostname}-{id}`)
+/// but a lower incarnation is this node's own previous generation, still
+/// live because the failure detector has not reaped it; it is dropped. Any
+/// other entry with the local node id is a twin: another process configured
+/// with the same persisted id. Of several entries for one remote node, a
+/// restart that outran the failure detector, only the highest incarnation
+/// stays, so consumers dial the generation that is running; a tie on
+/// incarnation goes to the greater gossip address, so the pick does not
+/// depend on iteration order. The order of the first appearance of each node
+/// is kept.
+fn split_live<T>(
+    entries: Vec<T>,
+    peer_of: impl Fn(&T) -> &Peer,
+    local: &LocalIdentity,
+) -> LiveSplit<T> {
+    let mut twins = Vec::new();
+    let mut live: Vec<T> = Vec::new();
+    for entry in entries {
+        let peer = peer_of(&entry);
+        if peer.node == local.node {
+            if !(peer.name == local.name && peer.incarnation < local.incarnation) {
+                twins.push(entry);
+            }
+        } else if let Some(kept) = live.iter_mut().find(|kept| peer_of(kept).node == peer.node) {
+            let (old, new) = (peer_of(kept), peer);
+            if (new.incarnation, new.gossip_addr) > (old.incarnation, old.gossip_addr) {
+                *kept = entry;
+            }
+        } else {
+            live.push(entry);
+        }
+    }
+    LiveSplit { live, twins }
+}
+
+/// The identity of one twin entry, so a twin is logged once while it stays
+/// live.
+type TwinKey = (NodeName, u64, SocketAddr);
+
+/// The keys of `twins` not in `noticed`, which then holds exactly the keys of
+/// `twins`: a twin that leaves the view is forgotten and logged again if it
+/// returns.
+fn fresh_twins(noticed: &mut HashSet<TwinKey>, twins: &[Peer]) -> Vec<Peer> {
+    let current: HashSet<TwinKey> = twins.iter().map(twin_key).collect();
+    noticed.retain(|key| current.contains(key));
+    twins
+        .iter()
+        .filter(|twin| noticed.insert(twin_key(twin)))
+        .cloned()
+        .collect()
+}
+
+fn twin_key(twin: &Peer) -> TwinKey {
+    (twin.name.clone(), twin.incarnation, twin.gossip_addr)
+}
+
+/// The remote live entries of one membership view, one per node, parsed with
+/// their gossip state. Reports each new twin of this node once at `error` and
+/// stores the number of twins in `twin_count`.
+fn view_entries<'a>(
+    live: impl IntoIterator<Item = (&'a ChitchatId, &'a NodeState)>,
+    local: &LocalIdentity,
+    twins_noticed: &mut HashSet<TwinKey>,
+    twin_count: &AtomicUsize,
+) -> Vec<(Peer, &'a NodeState)> {
+    let entries: Vec<(Peer, &NodeState)> = live
+        .into_iter()
+        .filter(|(id, _)| *id != &local.chitchat_id)
+        .filter_map(|(id, state)| Some((parse_peer(id, state)?, state)))
+        .collect();
+    let LiveSplit {
+        live: entries,
+        twins,
+    } = split_live(entries, |(peer, _)| peer, local);
+    let twins: Vec<Peer> = twins.into_iter().map(|(peer, _)| peer).collect();
+    for twin in fresh_twins(twins_noticed, &twins) {
+        tracing::error!(
+            node = %local.node,
+            twin_name = %twin.name,
+            twin_gossip_addr = %twin.gossip_addr,
+            "another live process uses this node's id; it is never dialed and no data flows to it, give each node its own id",
+        );
+    }
+    twin_count.store(twins.len(), Ordering::Relaxed);
+    entries
 }
 
 async fn run(
     handle: ChitchatHandle,
     seeds: BoxStream<'static, SocketAddr>,
     publishers: Publishers,
-    self_chitchat_id: ChitchatId,
+    local: LocalIdentity,
     mut commands_rx: mpsc::UnboundedReceiver<Command>,
     departure_notice: Duration,
 ) {
@@ -762,6 +894,7 @@ async fn run(
         cache_modes: cache_modes_tx,
         cache_loaders: cache_loaders_tx,
         observer,
+        twins: twin_count,
     } = publishers;
     let mut seeds = seeds.fuse();
     let chitchat = handle.chitchat();
@@ -770,6 +903,8 @@ async fn run(
     // does not repeat the notice; a peer that leaves the view is dropped and
     // noticed again when it returns.
     let mut protocol_noticed: HashSet<NodeId> = HashSet::new();
+    // Twins already reported, so each is logged once while it stays live.
+    let mut twins_noticed: HashSet<TwinKey> = HashSet::new();
 
     loop {
         tokio::select! {
@@ -786,8 +921,8 @@ async fn run(
                 let mut cache_modes: CacheModes = HashMap::new();
                 let mut cache_loaders: CacheLoaders = HashMap::new();
                 let mut live_flags: HashMap<NodeId, LiveFlags> = HashMap::new();
-                for (id, state) in live.iter().filter(|(id, _)| *id != &self_chitchat_id) {
-                    let Some(peer) = parse_peer(id, state) else { continue };
+                let entries = view_entries(&live, &local, &mut twins_noticed, &twin_count);
+                for (peer, state) in entries {
                     if let Some(notice) = protocol_notice(peer.protocol)
                         && protocol_noticed.insert(peer.node)
                     {
@@ -933,6 +1068,111 @@ mod tests {
         assert!(protocol_notice(crate::wire::MIN_PROTOCOL_VERSION).is_none());
         assert!(protocol_notice(crate::wire::PROTOCOL_VERSION + 1).is_some());
         assert!(protocol_notice(0).is_some());
+    }
+
+    fn live_peer(node: u64, host: &str, incarnation: u64, port: u16) -> Peer {
+        let node = NodeId::from(node);
+        Peer {
+            node,
+            name: NodeName::new(host, node),
+            gossip_addr: addr(port),
+            data_addr: addr(port + 1000),
+            incarnation,
+            protocol: crate::wire::PROTOCOL_VERSION,
+        }
+    }
+
+    fn local_identity(node: u64, host: &str, incarnation: u64) -> LocalIdentity {
+        let node = NodeId::from(node);
+        let name = NodeName::new(host, node);
+        LocalIdentity {
+            chitchat_id: ChitchatId::new(name.to_string(), incarnation, addr(1)),
+            node,
+            name,
+            incarnation,
+        }
+    }
+
+    #[test]
+    fn split_live_keeps_the_highest_incarnation_of_a_node() {
+        let local = local_identity(1, "me", 50);
+        let old = live_peer(2, "host-b", 10, 7002);
+        let new = live_peer(2, "host-b", 20, 7003);
+        let other = live_peer(3, "host-c", 5, 7004);
+        for entries in [
+            vec![old.clone(), new.clone(), other.clone()],
+            vec![new.clone(), other.clone(), old.clone()],
+        ] {
+            let split = split_live(entries, |peer| peer, &local);
+            assert_eq!(split.live.len(), 2);
+            assert!(split.live.contains(&new), "the newer generation stays");
+            assert!(split.live.contains(&other));
+            assert!(split.twins.is_empty());
+        }
+    }
+
+    #[test]
+    fn split_live_breaks_an_incarnation_tie_by_gossip_address() {
+        let local = local_identity(1, "me", 50);
+        let low = live_peer(2, "host-b", 10, 7002);
+        let high = live_peer(2, "host-b", 10, 7003);
+        let forward = split_live(vec![low.clone(), high.clone()], |peer| peer, &local);
+        let backward = split_live(vec![high.clone(), low], |peer| peer, &local);
+        assert_eq!(forward.live, vec![high.clone()]);
+        assert_eq!(backward.live, vec![high]);
+    }
+
+    #[test]
+    fn split_live_reports_a_second_holder_of_the_local_id_as_a_twin() {
+        let local = local_identity(1, "me", 50);
+        let twin_elsewhere = live_peer(1, "other-host", 10, 7005);
+        let remote = live_peer(2, "host-b", 10, 7002);
+        let split = split_live(
+            vec![twin_elsewhere.clone(), remote.clone()],
+            |peer| peer,
+            &local,
+        );
+        assert_eq!(split.live, vec![remote]);
+        assert_eq!(split.twins, vec![twin_elsewhere]);
+    }
+
+    #[test]
+    fn split_live_drops_the_own_previous_incarnation_without_calling_it_a_twin() {
+        let local = local_identity(1, "me", 50);
+        let previous = live_peer(1, "me", 40, 7006);
+        let split = split_live(vec![previous], |peer| peer, &local);
+        assert!(split.live.is_empty(), "the old generation is not a peer");
+        assert!(split.twins.is_empty(), "a fast restart is not a twin");
+    }
+
+    #[test]
+    fn split_live_calls_a_same_host_entry_that_is_not_older_a_twin() {
+        let local = local_identity(1, "me", 50);
+        let same_stamp = live_peer(1, "me", 50, 7006);
+        let newer = live_peer(1, "me", 60, 7007);
+        let split = split_live(vec![same_stamp.clone(), newer.clone()], |peer| peer, &local);
+        assert_eq!(split.twins, vec![same_stamp, newer]);
+    }
+
+    #[test]
+    fn fresh_twins_reports_each_twin_once_while_it_stays_live() {
+        let mut noticed = HashSet::new();
+        let twin = live_peer(1, "other", 10, 7005);
+        assert_eq!(
+            fresh_twins(&mut noticed, std::slice::from_ref(&twin)),
+            vec![twin.clone()]
+        );
+        assert!(
+            fresh_twins(&mut noticed, std::slice::from_ref(&twin)).is_empty(),
+            "a later view with the same twin stays quiet"
+        );
+        assert!(fresh_twins(&mut noticed, &[]).is_empty());
+        assert!(noticed.is_empty(), "a twin that left is forgotten");
+        assert_eq!(
+            fresh_twins(&mut noticed, std::slice::from_ref(&twin)),
+            vec![twin],
+            "a twin that returns is reported again"
+        );
     }
 
     #[test]

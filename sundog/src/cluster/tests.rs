@@ -15,6 +15,7 @@ mod gc_task;
 mod hand_off;
 mod inbound;
 mod invalidation_fold;
+mod membership_view;
 mod merge_seq;
 mod modes;
 mod oversize_sync;
