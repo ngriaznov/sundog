@@ -1090,7 +1090,7 @@ fn residency_set_cold_marks_clear_per_part_or_all_at_once() {
     );
     set.clear_cold(&[p(2)]);
     assert!(set.is_cold(p(1)) && !set.is_cold(p(2)) && set.is_cold(p(3)));
-    set.mark_all_serving();
+    set.mark_planned_serving(&every_part());
     assert!(!set.is_cold(p(1)) && !set.is_cold(p(3)));
 }
 
@@ -1126,7 +1126,7 @@ fn residency_set_stale_marks_distrust_a_hit_without_holding_the_part_back() {
     set.mark_serving(&[p(2)]);
     assert!(!set.is_unverified(p(2)));
     set.mark_stale(&[p(3)]);
-    set.mark_all_serving();
+    set.mark_planned_serving(&every_part());
     assert!(!set.is_unverified(p(3)));
 }
 
@@ -1196,7 +1196,7 @@ fn residency_set_a_part_the_settled_view_misses_stays_unsettled_until_it_serves(
         set.is_unsettled(gained),
         "settling again forgets what served under the previous settled view"
     );
-    set.mark_all_serving();
+    set.mark_planned_serving(&every_part());
     assert!(
         !set.is_unsettled(gained),
         "giving up the warm-up settles every part"
@@ -1341,8 +1341,27 @@ fn a_pull_ticket_never_vouches_for_a_part_dropped_and_owned_again_while_it_ran()
     );
 }
 
+/// Every part, for a `mark_planned_serving` that plans the whole space.
+fn every_part() -> PartSet {
+    PartId::all().collect()
+}
+
 #[test]
-fn residency_set_mark_all_serving_leaves_a_part_the_published_view_does_not_own() {
+fn residency_set_mark_planned_serving_leaves_a_part_the_warm_up_did_not_plan() {
+    let set = ResidencySet::new();
+    set.mark_cold(&[p(1), p(2)]);
+
+    set.mark_planned_serving(&PartSet::from_iter([p(1)]));
+
+    assert!(!set.is_cold(p(1)));
+    assert!(
+        set.is_cold(p(2)),
+        "a part gained after the warm-up began stays with its pull"
+    );
+}
+
+#[test]
+fn residency_set_mark_planned_serving_leaves_a_part_the_published_view_does_not_own() {
     let set = ResidencySet::new();
     let alone = NonZeroU8::new(1).expect("nonzero");
     let (me, other) = (NodeId::from(1), NodeId::from(2));
@@ -1358,7 +1377,7 @@ fn residency_set_mark_all_serving_leaves_a_part_the_published_view_does_not_own(
     set.settle(&whole);
     set.mark_cold(&[dropped, kept]);
     set.record_published(&whole, &split);
-    set.mark_all_serving();
+    set.mark_planned_serving(&every_part());
     assert!(set.is_cold(dropped) && !set.is_cold(kept));
 
     set.record_published(&split, &whole);
@@ -1367,19 +1386,19 @@ fn residency_set_mark_all_serving_leaves_a_part_the_published_view_does_not_own(
 
 #[cfg(feature = "spill")]
 #[test]
-fn residency_set_mark_all_serving_clears_every_cold_and_unverified_mark() {
+fn residency_set_mark_planned_serving_clears_every_cold_and_unverified_mark() {
     let set = ResidencySet::new();
     set.mark_cold(&[p(1), p(2), p(3)]);
     set.mark_unverified(&[p(2), p(3)]);
     set.mark_releasing(&[p(9)]);
 
-    set.mark_all_serving();
+    set.mark_planned_serving(&every_part());
 
     assert!(!set.is_cold(p(1)) && !set.is_cold(p(2)) && !set.is_cold(p(3)));
     assert!(!set.is_unverified(p(2)) && !set.is_unverified(p(3)));
     assert!(
         set.is_releasing(p(9)),
-        "mark_all_serving touches only the cold and unverified marks"
+        "mark_planned_serving touches only the cold and unverified marks"
     );
 }
 

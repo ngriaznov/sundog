@@ -454,8 +454,10 @@ impl PullRequest<'_> {
         // A part this node owns alone has nobody to pull from or verify a
         // warm-reloaded record against, so it is neither cold nor
         // unverified, but only when `trust_sole_owner` says this view's
-        // "alone" answer is real. Left untrusted, it falls to
-        // warm_up_task's ordinary retries via Outcome::NoPeers.
+        // "alone" answer is real. Left untrusted, it keeps its cold and
+        // unverified marks, and the pull answers Outcome::NoPeers when no
+        // part has a donor; `warm_up_task` then pulls again, trusting the
+        // view once it observes a view change or one retry interval passes.
         let alone: Vec<PartId> = no_donor.into_iter().flat_map(|(_, p)| p).collect();
         if !alone.is_empty() && trust_sole_owner {
             let absent = cluster.away_within(budget);
@@ -618,13 +620,44 @@ async fn run_retry(
     }
 }
 
+/// Whether `warm_up_task`'s pull trusts a part owned alone as sole-owned:
+/// when `open_trusted` (the open's own decision, see
+/// `crate::cache::open::trust_sole_owner_at_open`) says so, or once the
+/// warm-up has seen a view change (`view_changed`) or run for a retry
+/// interval (`retry_elapsed`), by which time an "alone" view is the live
+/// membership and no longer the transient one a node computes before gossip
+/// shows it a peer. Pure; unit tested directly.
+pub(crate) const fn warm_up_trusts_sole_owner(
+    open_trusted: bool,
+    view_changed: bool,
+    retry_elapsed: bool,
+) -> bool {
+    open_trusted || view_changed || retry_elapsed
+}
+
+/// The parts `warm_up_task` plans to warm: those of `owned` still marked
+/// cold or unverified (`marked`) when it starts. A part a later view change
+/// gains is marked afterwards and pulled by `rebalance_task`, so the
+/// warm-up's give-up leaves it alone. Pure; unit tested directly.
+pub(crate) fn warm_up_plan(
+    owned: impl IntoIterator<Item = PartId>,
+    marked: impl Fn(PartId) -> bool,
+) -> PartSet {
+    owned.into_iter().filter(|&part| marked(part)).collect()
+}
+
 /// Retries [`PullRequest::run`] for whatever this node's [`OwnershipTracker`]
 /// owns, after an initial `open()`-time pull that
 /// [`state_transfer::Outcome::needs_warm_up`] left cold: waits for a
 /// co-owner when there is none, then retries every `retry_interval` until a
 /// pass lands or repeated timeouts mark the cache warm with whatever
 /// landed, counted under `sundog_rebalance_pull_timeouts_total{cache}`
-/// ([`count_pull_timeout`]). Shares [`state_transfer::next_warm_up_step`]'s decision and
+/// ([`count_pull_timeout`]). `trust_sole_owner` is the open's decision
+/// ([`warm_up_trusts_sole_owner`]): a part owned alone is trusted as
+/// sole-owned only once the warm-up observes a view change or a retry
+/// interval passes, so a warm reopen's untrusted wait does not end on the
+/// first pass. The give-up declares servable only the parts the warm-up
+/// planned ([`warm_up_plan`]), never one `rebalance_task` is pulling. Shares [`state_transfer::next_warm_up_step`]'s decision and
 /// [`state_transfer::MAX_WARM_UP_ATTEMPTS`] cap with the whole-cache
 /// analogue, [`state_transfer::warm_up_task`].
 #[expect(
@@ -639,13 +672,24 @@ pub(crate) async fn warm_up_task(
     cache: SmolStr,
     budget: Duration,
     concurrency: usize,
+    trust_sole_owner: bool,
     cancel: CancellationToken,
 ) {
     let retry_interval = cluster.config().ae_interval;
+    let started = tokio::time::Instant::now();
     let mut attempt: u32 = 0;
+    let mut view_changed = false;
     let mut view_rx = ownership.subscribe();
+    let planned = warm_up_plan(view_rx.borrow().owned_parts(), |part| {
+        residency.is_cold(part) || residency.is_unverified(part)
+    });
     loop {
         let parts: Vec<PartId> = view_rx.borrow_and_update().owned_parts().collect();
+        let trusting = warm_up_trusts_sole_owner(
+            trust_sole_owner,
+            view_changed,
+            started.elapsed() >= retry_interval,
+        );
         let pull = PullRequest {
             cluster: &cluster,
             shard: &shard,
@@ -655,8 +699,7 @@ pub(crate) async fn warm_up_task(
             parts,
             budget,
             concurrency,
-            // The library's normal, live-updating view by the time this retry loop runs.
-            trust_sole_owner: true,
+            trust_sole_owner: trusting,
         };
         let outcome = tokio::select! {
             biased;
@@ -679,6 +722,15 @@ pub(crate) async fn warm_up_task(
             }
             state_transfer::WarmUpStep::WaitForPeer => {
                 tracing::debug!(cache = %cache, "no co-owner for any owned part yet; waiting for the ownership view to change");
+                // An untrusting pass also wakes after a retry interval: the
+                // next pass then trusts the view even when it never changes.
+                let wake = async {
+                    if trusting {
+                        std::future::pending::<()>().await;
+                    } else {
+                        tokio::time::sleep(retry_interval).await;
+                    }
+                };
                 tokio::select! {
                     biased;
                     () = cancel.cancelled() => return,
@@ -686,7 +738,9 @@ pub(crate) async fn warm_up_task(
                         if changed.is_err() {
                             return;
                         }
+                        view_changed = true;
                     }
+                    () = wake => {}
                 }
             }
             state_transfer::WarmUpStep::RetryNow => {}
@@ -705,8 +759,9 @@ pub(crate) async fn warm_up_task(
                 );
                 count_pull_timeout(&cache);
                 // No donor left to try: whatever landed, warm-reloaded or
-                // not, is declared servable.
-                residency.mark_all_serving();
+                // not, is declared servable, for the parts this warm-up
+                // planned only; a part gained since is `rebalance_task`'s.
+                residency.mark_planned_serving(&planned);
                 cluster.mark_warm(&cache);
                 return;
             }

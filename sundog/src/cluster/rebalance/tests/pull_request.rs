@@ -132,6 +132,7 @@ async fn warm_up_task_waits_for_a_co_owner_and_warms_once_its_pulls_give_up() {
         name.clone(),
         Duration::from_millis(150),
         4,
+        true,
         cancel.clone(),
     ));
 
@@ -326,6 +327,7 @@ async fn warm_up_task_marks_a_warm_reloaded_bucket_servable_once_its_pulls_give_
         name.clone(),
         Duration::from_millis(150),
         4,
+        true,
         cancel.clone(),
     ));
 
@@ -452,5 +454,179 @@ async fn rebalance_task_stops_mid_pull_when_cancelled() {
         .expect("the task does not panic");
 
     donor.shutdown().await;
+    cluster.shutdown().await;
+}
+
+#[test]
+fn warm_up_trusts_a_sole_owner_once_the_open_the_view_or_a_retry_interval_says_so() {
+    assert!(
+        warm_up_trusts_sole_owner(true, false, false),
+        "the open trusted it"
+    );
+    assert!(
+        !warm_up_trusts_sole_owner(false, false, false),
+        "an untrusted open stays untrusted on the first pass"
+    );
+    assert!(
+        warm_up_trusts_sole_owner(false, true, false),
+        "a view change ends the distrust"
+    );
+    assert!(
+        warm_up_trusts_sole_owner(false, false, true),
+        "a retry interval ends the distrust"
+    );
+}
+
+#[test]
+fn warm_up_plan_keeps_only_the_owned_parts_still_marked_when_the_warm_up_starts() {
+    let owned = [
+        PartId::from_raw(1),
+        PartId::from_raw(2),
+        PartId::from_raw(3),
+    ];
+    let marked: PartSet = [PartId::from_raw(1), PartId::from_raw(3)]
+        .into_iter()
+        .collect();
+    let plan = warm_up_plan(owned, |part| marked.contains(part));
+    assert_eq!(
+        plan.iter().collect::<Vec<_>>(),
+        vec![PartId::from_raw(1), PartId::from_raw(3)]
+    );
+    assert!(warm_up_plan(owned, |_| false).is_empty());
+}
+
+/// A warm reopen whose first-peer wait timed out does not vouch for a part
+/// it owns alone on the warm-up's first pass: the part stays cold until a
+/// retry interval passes.
+#[tokio::test]
+async fn warm_up_task_keeps_an_untrusted_sole_owned_part_cold_for_a_retry_interval() {
+    let cluster = crate::cluster::Cluster::builder("rebalance-unit-test-warm-up-untrusted")
+        .seeds(std::iter::empty())
+        .config(crate::config::ClusterConfig {
+            gossip_bind_addr: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+            data_bind_addr: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+            ae_interval: Duration::from_millis(600),
+            ..crate::config::ClusterConfig::default()
+        })
+        .build()
+        .await
+        .expect("solo cluster builds");
+    let name = SmolStr::new("prices");
+    let k = NonZeroU8::new(2).expect("nonzero");
+    let (tracker, _tx) = OwnershipTracker::seed(
+        cluster.node_id(),
+        &cluster.peers(),
+        &cluster.advertised_cache_modes(),
+        &name,
+        k,
+    );
+    let part = tracker
+        .current()
+        .owned_parts()
+        .next()
+        .expect("a lone node owns every part");
+    let residency = Arc::new(ResidencySet::new());
+    residency.mark_cold(&[part]);
+
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn(warm_up_task(
+        cluster.clone(),
+        empty_shard(),
+        tracker,
+        Arc::clone(&residency),
+        name.clone(),
+        Duration::from_millis(150),
+        4,
+        false,
+        cancel.clone(),
+    ));
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        residency.is_cold(part),
+        "the first pass does not trust an untrusted view"
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while residency.is_cold(part) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a retry interval later the view is trusted and the part serves");
+
+    cancel.cancel();
+    task.await.expect("the task does not panic");
+    cluster.shutdown().await;
+}
+
+/// The warm-up's give-up declares servable the parts it planned, never one
+/// a view change gained after it began and `rebalance_task` is pulling.
+#[tokio::test]
+async fn warm_up_task_give_up_leaves_a_part_a_rebalance_pull_marked_afterwards_cold() {
+    let cluster = crate::cluster::Cluster::builder("rebalance-unit-test-warm-up-planned")
+        .seeds(std::iter::empty())
+        .config(crate::config::ClusterConfig {
+            gossip_bind_addr: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+            data_bind_addr: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+            ae_interval: Duration::from_millis(50),
+            ..crate::config::ClusterConfig::default()
+        })
+        .build()
+        .await
+        .expect("solo cluster builds");
+    let name = SmolStr::new("prices");
+    let k = NonZeroU8::new(2).expect("nonzero");
+    let (tracker, tx) = OwnershipTracker::seed(
+        cluster.node_id(),
+        &cluster.peers(),
+        &cluster.advertised_cache_modes(),
+        &name,
+        k,
+    );
+    let phantom = NodeId::from(u64::MAX);
+    let phantom_view = Arc::new(view(cluster.node_id(), vec![cluster.node_id(), phantom], 2));
+    tx.send(Arc::clone(&phantom_view))
+        .expect("receiver still alive");
+    let mut owned = phantom_view.owned_parts();
+    let (planned, gained) = (
+        owned.next().expect("self owns parts"),
+        owned.next().expect("self owns two parts"),
+    );
+    let residency = Arc::new(ResidencySet::new());
+    residency.mark_cold(&[planned]);
+
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn(warm_up_task(
+        cluster.clone(),
+        empty_shard(),
+        tracker,
+        Arc::clone(&residency),
+        name.clone(),
+        Duration::from_millis(150),
+        4,
+        true,
+        cancel.clone(),
+    ));
+    // The warm-up has read its plan; `rebalance_task` now marks a part it
+    // gained and starts pulling it.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    residency.mark_cold(&[gained]);
+
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the task ends within the bound")
+        .expect("the task does not panic");
+
+    assert!(cluster.is_warm(&name));
+    assert!(
+        !residency.is_cold(planned),
+        "the planned part is given up on"
+    );
+    assert!(
+        residency.is_cold(gained),
+        "a part a rebalance pull marked after the warm-up began stays cold"
+    );
+
+    cancel.cancel();
     cluster.shutdown().await;
 }

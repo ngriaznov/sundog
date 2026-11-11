@@ -311,6 +311,7 @@ pub(super) async fn distributed_warm_and_rebalance(
         .into_iter()
         .filter(|part| !reconciled.contains(part))
         .collect();
+    let trust_sole_owner = trust_sole_owner_at_open(membership_settled, warm_reloaded_parts.len());
     let outcome = crate::cluster::rebalance::PullRequest {
         cluster,
         shard: &shard_ops,
@@ -322,8 +323,9 @@ pub(super) async fn distributed_warm_and_rebalance(
         concurrency,
         // See `trust_sole_owner_at_open`: a cold open trusts sole ownership
         // outright; a warm reopen trusts it only once membership_settled too,
-        // else the part stays cold for `warm_up_task`'s ordinary retries.
-        trust_sole_owner: trust_sole_owner_at_open(membership_settled, warm_reloaded_parts.len()),
+        // else the part stays cold until `warm_up_task` observes a view change
+        // or one retry interval passes.
+        trust_sole_owner,
     }
     .run()
     .await;
@@ -338,6 +340,7 @@ pub(super) async fn distributed_warm_and_rebalance(
                 name.clone(),
                 budget,
                 concurrency,
+                trust_sole_owner,
                 cancel.clone(),
             ),
         );

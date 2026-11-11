@@ -920,13 +920,15 @@ impl ResidencySet {
         settlement.served.extend(owned);
     }
 
-    /// Wholesale analogue of [`ResidencySet::mark_serving`]: after
-    /// `warm_up_task`'s `WarmAnyway` give-up, every part the latest
-    /// published view owns and still marks cold or unverified is declared
-    /// servable at once.
-    pub(crate) fn mark_all_serving(&self) {
+    /// [`ResidencySet::mark_serving`] for the give-up of `warm_up_task`
+    /// (`WarmAnyway`): every part of `planned` that the latest published view
+    /// owns and still marks cold or unverified is declared servable at once.
+    /// A part outside `planned`, one a view change gained after the warm-up
+    /// began and `rebalance_task` is pulling, keeps its marks.
+    pub(crate) fn mark_planned_serving(&self, planned: &PartSet) {
         let mut settlement = self.settlement.write();
-        let owned: Vec<PartId> = PartId::all()
+        let owned: Vec<PartId> = planned
+            .iter()
             .filter(|&part| settlement.owns(part))
             .collect();
         self.clear_cold(&owned);
