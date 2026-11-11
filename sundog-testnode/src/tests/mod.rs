@@ -9,6 +9,8 @@ use sundog::observe::Member;
 
 use super::*;
 
+mod forward_command;
+
 #[test]
 fn parse_usize_override_reads_a_valid_number() {
     assert_eq!(parse_usize_override(Some("512")), Some(512));

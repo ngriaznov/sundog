@@ -529,3 +529,71 @@ async fn a_delete_the_previous_release_makes_drains_from_this_node_and_stays_gon
     new.stop().await.expect("new node stops");
     net.close().await.expect("network closes");
 }
+
+/// A write forwarded to a previous-release owner with a stamp past
+/// `max_clock_skew` is held there, not dropped, and applies once the owner's
+/// clock is within the bound. The forward comes from a writer that is in no
+/// member's view, as a non-owner's does, sent by the current node's
+/// `fwdskew` command, since a cache has no clock to set. The old owner keeps
+/// the only copy until then, and the current owner takes the record from it
+/// by anti-entropy afterwards.
+///
+/// Releases before the hold, 0.6.7 and earlier, drop such a forward, and a
+/// release before 0.6.10 drops one relayed by a node it lists as an owner of
+/// the part; the rolling-upgrade section of `docs/src/deployment.md` states
+/// both windows. The previous release this harness builds has the hold, so
+/// the test pins what the documentation promises for it.
+#[tokio::test]
+async fn a_skewed_forward_to_the_previous_release_owner_is_held_and_applied_within_the_bound() {
+    const KEY: &str = "ahead";
+    const VALUE: &str = "from-a-fast-clock";
+    // The test node's `max_clock_skew` is the library default, one minute.
+    const SKEW_BOUND: Duration = Duration::from_secs(60);
+    const WAIT_PAST_BOUND: Duration = Duration::from_secs(15);
+
+    require_containers!();
+
+    let previous = build_previous_testnode();
+    let net = Arc::new(Network::new_network());
+    let old = Node::spawn_binary(
+        &net,
+        "mixed-skew-cluster",
+        "n1",
+        &[],
+        &[("SUNDOG_TESTNODE_MODE", "distributed")],
+        previous,
+    )
+    .await;
+    let new = Node::spawn_distributed(&net, "mixed-skew-cluster", "n2", &[&seed("n1")], None).await;
+    wait_for_peers(&[&old, &new], 1).await;
+
+    let sent = new
+        .forward_skewed(SKEW_BOUND + WAIT_PAST_BOUND, KEY, VALUE)
+        .await
+        .expect("the current node sends the forward");
+    assert_eq!(sent, 1, "the old owner takes the connection");
+
+    // Held, not applied: the stamp is past the old owner's bound for the
+    // next fifteen seconds or so.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        old.get(KEY).await,
+        Ok(None),
+        "the old owner has not applied a write stamped past its bound"
+    );
+
+    // Applied once its clock is within the bound, which is not a drop.
+    eventually(WAIT_PAST_BOUND + CONVERGE_WAIT * 2, || async {
+        old.get(KEY).await == Ok(Some(VALUE.to_string()))
+    })
+    .await;
+    // And the current owner takes it from the old one by anti-entropy.
+    eventually(CONVERGE_WAIT * 2, || async {
+        new.get(KEY).await == Ok(Some(VALUE.to_string()))
+    })
+    .await;
+
+    old.stop().await.expect("old node stops");
+    new.stop().await.expect("new node stops");
+    net.close().await.expect("network closes");
+}

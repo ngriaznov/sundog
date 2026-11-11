@@ -262,6 +262,28 @@ last step of that upgrade runs one large rebalance: every lost part is
 served through its disown grace and handed to its new owners before it is
 dropped. Take that step outside peak load.
 
+A `Distributed` cache holds a forwarded write that an owner refuses for
+clock skew, and applies it once the owner's clock is within `max_clock_skew`
+of its stamp (see [guarantees](guarantees.md)). An owner on a release without
+that hold drops such a write: the caller saw `Ok`, an insert is never stored,
+a remove leaves the key live and a merge contribution is gone, and the old
+owner's `sundog_clock_skew_rejected_total` is the only sign. The hold exists
+from 0.6.8. A release before 0.6.10 holds a refused forward only when its
+writer owns none of the part in the owner's view, and drops one that a node
+relays, such as a closing owner's hand-off of the forwards it held, when the
+owner's view lists the relaying node as an owner of the part. The sender does
+not check the owner's release, so a mixed cluster keeps the older behaviour for
+these writes. A co-owner on the current release holds its own copy of each
+forward and offers it to the old owner by anti-entropy once the old owner's
+clock is within the bound; a write is lost only when every owner of its part
+is on an older release, or the current one that holds it stops before it
+applies. Keep node clocks within `max_clock_skew` of each other from the first
+node's upgrade to the last, and wait for `sundog_clock_skew_held` to read 0
+before stopping a node for an upgrade or a rollback: the hand-off of its held
+forwards goes to owners that may be older and drop it.
+No other write is affected: `Replicated` writes, anti-entropy pushes and
+transfers to an older node keep the sender's copy.
+
 Roll one node at a time. For a `Distributed` cache, wait until
 `Cluster::health()` on the restarted node reports the cache warm, meaning
 its owned parts have landed, before stopping the next node, so no part

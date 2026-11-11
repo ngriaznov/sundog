@@ -861,6 +861,27 @@ impl Node {
         Ok(Some(reply.split_whitespace().map(str::to_string).collect()))
     }
 
+    /// `fwdskew <ahead-ms> k v`: sends every other member a `Mode::Distributed`
+    /// forward of `k = v` stamped `ahead` past this node's clock, from a writer
+    /// in no member's view, and returns how many members took the connection.
+    /// # Errors
+    ///
+    /// Returns `Err` if the connection fails or the reply is not `sent=<n>`.
+    pub async fn forward_skewed(
+        &self,
+        ahead: Duration,
+        key: &str,
+        value: &str,
+    ) -> Result<usize, String> {
+        let reply = self
+            .command(&format!("fwdskew {} {key} {value}", ahead.as_millis()))
+            .await?;
+        reply
+            .strip_prefix("sent=")
+            .and_then(|sent| sent.parse().ok())
+            .ok_or_else(|| format!("unexpected reply to fwdskew: {reply}"))
+    }
+
     /// `drop k`, dropping `k`'s local copy with no tombstone and no fan-out,
     /// as if a `Replicate` for it never arrived.
     /// # Errors

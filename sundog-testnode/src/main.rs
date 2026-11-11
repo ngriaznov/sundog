@@ -73,6 +73,7 @@ use tokio::net::{TcpListener, TcpStream};
 use xxhash_rust::xxh3::xxh3_64;
 
 mod explain_reply;
+mod forward;
 
 const GOSSIP_PORT: u16 = 7946;
 const CONTROL_PORT: u16 = 8080;
@@ -1029,6 +1030,29 @@ impl TestNode {
             }
             "bigfill" | "bigcheck" | "bigput" | "bigverify" => {
                 big_command(&self.cache, command, &mut parts).await
+            }
+            // fwdskew <ahead-ms> <k> <v> -> sent=<n>, sending "it" a forward of k=v stamped
+            // <ahead-ms> past this node's clock to each other member, as a writer in no
+            // member's view would | err <e>. See `forward`.
+            "fwdskew" => {
+                let Some((ahead, key, value)) = forward::parse_fwdskew(parts.next(), parts.next())
+                else {
+                    return Reply::Line(
+                        "err fwdskew needs a millisecond lead, a key and a value".to_string(),
+                    );
+                };
+                let targets: Vec<SocketAddr> = self
+                    .cluster
+                    .peers()
+                    .iter()
+                    .map(|peer| peer.data_addr)
+                    .collect();
+                Reply::Line(
+                    match forward::send_forwards(&targets, CACHE_NAME, key, value, ahead).await {
+                        Ok(sent) => format!("sent={sent}"),
+                        Err(error) => format!("err {error}"),
+                    },
+                )
             }
             // drop k -> ok, dropping k's local copy with no tombstone.
             "drop" => {
