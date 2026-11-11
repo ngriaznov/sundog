@@ -1176,7 +1176,7 @@ mod tests {
             assert_eq!(split.live.len(), 2);
             assert!(split.live.contains(&new), "the newer generation stays");
             assert!(split.live.contains(&other));
-            assert!(split.twins.is_empty());
+            assert_eq!(split.twins, Vec::<Peer>::new());
         }
     }
 
@@ -1235,7 +1235,7 @@ mod tests {
             fresh_twins(&mut noticed, std::slice::from_ref(&twin)).is_empty(),
             "a later view with the same twin stays quiet"
         );
-        assert!(fresh_twins(&mut noticed, &[]).is_empty());
+        assert_eq!(fresh_twins(&mut noticed, &[]), Vec::<Peer>::new());
         assert!(noticed.is_empty(), "a twin that left is forgotten");
         assert_eq!(
             fresh_twins(&mut noticed, std::slice::from_ref(&twin)),

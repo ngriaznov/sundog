@@ -360,7 +360,7 @@ fn frame_records_lists_the_records_of_a_replicate_frame_only() {
         recs: vec![rec(1), rec(2), rec(3)],
     };
     assert_eq!(frame_records(&batch).len(), 3);
-    assert!(frame_records(&wire::Msg::ReqDone).is_empty());
+    assert_eq!(frame_records(&wire::Msg::ReqDone), []);
 }
 
 #[test]

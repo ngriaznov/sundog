@@ -621,9 +621,13 @@ fn a_part_a_round_only_repaired_stays_unconfirmed_until_a_later_round_matches_it
 
     // The follow-up round matches it.
     let after_follow_up = confirmed_by(&HashSet::from([other]), &due, &view);
-    assert!(unconfirmed_parts(&view, other, &due, &after_follow_up, &no_acked).is_empty());
-    assert!(
-        owners_needing_confirmation(&view, &[other], &due, &after_follow_up, &no_acked).is_empty()
+    assert_eq!(
+        unconfirmed_parts(&view, other, &due, &after_follow_up, &no_acked),
+        Vec::<PartId>::new()
+    );
+    assert_eq!(
+        owners_needing_confirmation(&view, &[other], &due, &after_follow_up, &no_acked),
+        Vec::<NodeId>::new()
     );
 }
 

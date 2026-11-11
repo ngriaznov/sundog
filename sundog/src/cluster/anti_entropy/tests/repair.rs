@@ -472,7 +472,7 @@ async fn a_dirty_peer_is_targeted_first_by_every_cache_not_only_the_first_to_pic
 
     let config = crate::config::ClusterConfig {
         ae_interval: Duration::from_secs(3600),
-        tombstone_ttl: Duration::from_secs(3600 * 4),
+        tombstone_ttl: Duration::from_hours(4),
         ..loopback_config()
     };
     let cluster_a = Cluster::builder("cluster-it-dirty-hint")

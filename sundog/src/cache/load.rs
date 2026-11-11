@@ -414,7 +414,7 @@ where
     }
 
     /// [`refresh_peers`] for this cache.
-    #[cfg(test)]
+    #[cfg(all(test, not(feature = "sim")))]
     pub(super) fn refresh_peers(&self) -> HashSet<NodeId> {
         refresh_peers(&self.cluster, self.shard.name(), self.shard.mode())
     }

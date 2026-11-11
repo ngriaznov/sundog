@@ -146,7 +146,7 @@ async fn open_accepts_an_oversized_capacity_hint() {
 #[tokio::test]
 async fn open_accepts_a_tti_above_the_cap() {
     let (cluster, result) = open_local("cache-it-tti-over-cap", |b| {
-        b.tti(Duration::from_secs(90 * 24 * 3600))
+        b.tti(Duration::from_hours(90 * 24))
     })
     .await;
     let cache = result.expect("opens with the capped tti");

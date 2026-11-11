@@ -1296,7 +1296,7 @@ async fn a_peer_removed_with_nothing_queued_leaves_no_count_and_no_mark() {
     mesh.update_peers(vec![peer_at(NodeId::from(2), dead_peer)]);
 
     assert_eq!(backlog_dropped(&snapshotter, NodeId::from(2)), 0);
-    assert!(mesh.take_dirty_peers().is_empty());
+    assert_eq!(mesh.take_dirty_peers(), Vec::<NodeId>::new());
     assert!(mesh.inner.departed_dirty.lock().expect("lock").is_empty());
 }
 
@@ -1338,7 +1338,7 @@ async fn a_departure_is_forgotten_once_it_outlives_the_window_and_the_map_stays_
         "past the window it is dropped"
     );
     mesh.update_peers(vec![peer_at(NodeId::from(2), dead_peer)]);
-    assert!(mesh.take_dirty_peers().is_empty());
+    assert_eq!(mesh.take_dirty_peers(), Vec::<NodeId>::new());
 }
 
 #[test]
@@ -1395,7 +1395,7 @@ async fn a_cache_nobody_watches_gets_no_mark_and_leaves_the_marks_in_place() {
     let (mesh, _watches) = mesh_with_watches(&["a"]).await;
     mesh.mark_dirty(NodeId::from(2));
 
-    assert!(mesh.take_dirty_peers_for("stranger").is_empty());
+    assert_eq!(mesh.take_dirty_peers_for("stranger"), Vec::<NodeId>::new());
     assert_eq!(
         mesh.take_dirty_peers_for("a"),
         vec![NodeId::from(2)],
@@ -1436,7 +1436,7 @@ async fn a_watch_that_drops_forgets_its_caches_marks() {
         1,
         "the closed cache's set is gone"
     );
-    assert!(mesh.take_dirty_peers_for("a").is_empty());
+    assert_eq!(mesh.take_dirty_peers_for("a"), Vec::<NodeId>::new());
     mesh.mark_dirty(NodeId::from(2));
     assert_eq!(mesh.take_dirty_peers_for("b"), vec![NodeId::from(2)]);
     drop(watches);
