@@ -1090,3 +1090,54 @@ async fn a_failed_loader_run_through_the_cache_counts_misses() {
     assert_eq!(misses, 4, "one per failed run of a key: 1 + 2 + 1");
     cluster.shutdown().await;
 }
+
+/// A value whose encoding fails when it holds `true`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+struct Flaky(bool);
+
+impl serde::Serialize for Flaky {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.0 {
+            Err(serde::ser::Error::custom("refuses to encode"))
+        } else {
+            serializer.serialize_bool(false)
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_loaded_value_that_fails_to_encode_fails_the_cache_read_with_codec() {
+    let cluster = Cluster::builder("cache-it-load-codec")
+        .seeds(std::iter::empty())
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("node builds");
+    let cache = cluster
+        .cache::<u32, Flaky>("flaky")
+        .mode(Mode::Local)
+        .batch_loader(|keys: Vec<u32>| async move {
+            Ok::<_, SourceDown>(
+                keys.into_iter()
+                    .map(|key| (key, Flaky(key == 2)))
+                    .collect::<HashMap<_, _>>(),
+            )
+        })
+        .open()
+        .await
+        .expect("opens");
+    let err = cache.load(&2).await.expect_err("does not encode");
+    assert!(matches!(err, CacheError::Codec(_)), "load: {err:?}");
+    let err = cache.load_many([1, 2]).await.expect_err("does not encode");
+    assert!(matches!(err, CacheError::Codec(_)), "load_many: {err:?}");
+    let err = cache
+        .get_or_load(&3, async |_key| Ok::<_, SourceDown>(Flaky(true)))
+        .await
+        .expect_err("does not encode");
+    assert!(matches!(err, CacheError::Codec(_)), "get_or_load: {err:?}");
+    assert_eq!(
+        cache.load(&1).await.expect("a good key still loads"),
+        Some(Flaky(false))
+    );
+    cluster.shutdown().await;
+}

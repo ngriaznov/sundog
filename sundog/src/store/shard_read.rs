@@ -10,9 +10,10 @@ use serde::de::DeserializeOwned;
 
 use super::engine::JoinOutcome;
 use super::fan_out::{FillRoute, ReadThroughRoute, fill_fans_out, fill_route, read_through_route};
-use super::load::{Fill, FillDeadline, fill_deadline};
+use super::load::{Fill, FillDeadline, FillPlan, fill_deadline};
 use super::{
-    Event, FanOutItem, Origin, PartId, Shard, SharedLoaderFailure, encode_key, engine, read_timing,
+    EncodeFailure, Event, FanOutItem, Origin, PartId, Shard, SharedLoaderFailure, encode_key,
+    engine, read_timing, shared_failure,
 };
 use crate::error::CacheError;
 use crate::explain::{LocalRecord, Residency};
@@ -36,9 +37,14 @@ where
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
     /// Ends a loader run that returned `fill` for `key`, the load stamped
-    /// `ver` before it started, through [`Shard::store_loaded`], which
-    /// stores the value only where this shard stores a fill, and counts the
-    /// run as a miss.
+    /// `ver` before it started, through [`Shard::plan_fill`] and
+    /// [`Shard::commit_fill`], and counts the run as a miss.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::Codec`] if the value fails to postcard-encode.
+    /// The in-flight load then fails with that error, so every joined
+    /// waiter returns it too, and nothing is stored.
     pub(super) fn finish_fill(
         &self,
         key: &K,
@@ -47,28 +53,24 @@ where
         ver: Hlc,
         inflight: &engine::Inflight<V>,
         fill: Fill<V>,
-    ) {
-        self.store_loaded(key, key_bytes, hash, ver, inflight, fill);
+    ) -> Result<(), CacheError> {
         self.misses.increment(1);
+        match self.plan_fill(key_bytes, ver, fill) {
+            Ok(plan) => {
+                self.commit_fill(key, key_bytes, hash, ver, inflight, plan);
+                Ok(())
+            }
+            Err(failure) => {
+                self.engine
+                    .fail_inflight(key_bytes, hash, inflight, Arc::new(failure.clone()));
+                Err(failure.into())
+            }
+        }
     }
 
-    /// Stores a loaded `fill` for `key` through
-    /// [`engine::Engine::complete_fresh_load`], the load stamped `ver`
-    /// before it started, or hands it to the caller and joined waiters
-    /// without storing it ([`fill_route`]): a node that owns nothing of
-    /// the key's part in `Mode::Distributed` keeps no copy, judged on the
-    /// shard's view when the fill completes, and a shard at the ceiling
-    /// takes no more. The value expires at the instant [`fill_deadline`]
-    /// gives: a value this node's loader produced takes the default TTL from
-    /// `ver`, and a copy of another node's record keeps that record's
-    /// expiry, so one already past it is handed out like a value stored
-    /// nowhere. A stored value fans out per [`fill_fans_out`] and
-    /// emits [`Event::Created`], or [`Event::Updated`] over an entry a read
-    /// could return, so a fill over an expired entry no sweep has removed
-    /// is a creation; one
-    /// a write, removal or invalidation overtook stores and sends nothing,
-    /// and a value stored nowhere sends nothing and emits no event. Returns
-    /// whether the value was stored.
+    /// [`Shard::finish_fill`] for a caller with no error to return, such as
+    /// refresh-ahead: a value that fails to encode fails the load and is
+    /// stored nowhere. Returns whether the value was stored.
     pub(super) fn store_loaded(
         &self,
         key: &K,
@@ -78,30 +80,101 @@ where
         inflight: &engine::Inflight<V>,
         fill: Fill<V>,
     ) -> bool {
+        match self.plan_fill(key_bytes, ver, fill) {
+            Ok(plan) => self.commit_fill(key, key_bytes, hash, ver, inflight, plan),
+            Err(failure) => {
+                self.engine
+                    .fail_inflight(key_bytes, hash, inflight, Arc::new(failure));
+                false
+            }
+        }
+    }
+
+    /// Decides where a loaded `fill` goes: the deadline [`fill_deadline`]
+    /// gives, the route [`fill_route`] gives, and the value's encoding when
+    /// it is stored. Touches no state, so a caller can record the outcome
+    /// before [`Shard::commit_fill`] ends the load.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EncodeFailure`] if a value to store fails to
+    /// postcard-encode.
+    pub(super) fn plan_fill(
+        &self,
+        key_bytes: &Bytes,
+        ver: Hlc,
+        fill: Fill<V>,
+    ) -> Result<FillPlan<V>, EncodeFailure> {
         let Fill { value, expiry } = fill;
         let now_ms = self.now_ms();
         let expires_at_ms = match fill_deadline(expiry, self.expiry_for(ver.wall_ms, None), now_ms)
         {
             FillDeadline::Store(at) => at,
             FillDeadline::Lapsed => {
-                self.engine
-                    .finish_uncached(key_bytes, hash, inflight, value);
-                return false;
+                return Ok(FillPlan::Uncached {
+                    value,
+                    counts_refusal: false,
+                });
             }
         };
         let route = fill_route(self.owns_key(key_bytes), self.at_ceiling().is_some());
         if let FillRoute::Uncached { counts_refusal } = route {
-            self.engine
-                .finish_uncached(key_bytes, hash, inflight, value);
-            if counts_refusal && let Some(refusals) = &self.ceiling_refusals {
-                refusals.fills.increment(1);
-            }
-            return false;
+            return Ok(FillPlan::Uncached {
+                value,
+                counts_refusal,
+            });
         }
-        let encoded = Bytes::from(
-            postcard::to_stdvec(&value)
-                .expect("invariant: a value returned by the loader postcard-encodes"),
-        );
+        let encoded = Bytes::from(postcard::to_stdvec(&value).map_err(EncodeFailure)?);
+        Ok(FillPlan::Store {
+            value,
+            encoded,
+            expires_at_ms,
+            now_ms,
+        })
+    }
+
+    /// Ends the load of `key`, stamped `ver` before it started, with a
+    /// `plan` from [`Shard::plan_fill`]: stores the value through
+    /// [`engine::Engine::complete_fresh_load`], or hands it to the caller and
+    /// joined waiters without storing it: a node that owns nothing of the
+    /// key's part in `Mode::Distributed` keeps no copy, judged on the
+    /// shard's view when the fill completes, and a shard at the ceiling
+    /// takes no more. A copy of another node's record keeps that record's
+    /// expiry, so one already past it is handed out like a value stored
+    /// nowhere. A stored value fans out per [`fill_fans_out`] and emits
+    /// [`Event::Created`], or [`Event::Updated`] over an entry a read
+    /// could return, so a fill over an expired entry no sweep has removed
+    /// is a creation; one a write, removal or invalidation overtook stores
+    /// and sends nothing, and a value stored nowhere sends nothing and
+    /// emits no event. Returns whether the value was stored.
+    pub(super) fn commit_fill(
+        &self,
+        key: &K,
+        key_bytes: &Bytes,
+        hash: u64,
+        ver: Hlc,
+        inflight: &engine::Inflight<V>,
+        plan: FillPlan<V>,
+    ) -> bool {
+        let (value, encoded, expires_at_ms, now_ms) = match plan {
+            FillPlan::Uncached {
+                value,
+                counts_refusal,
+            } => {
+                self.engine
+                    .finish_uncached(key_bytes, hash, inflight, value);
+                if counts_refusal && let Some(refusals) = &self.ceiling_refusals {
+                    refusals.fills.increment(1);
+                }
+                return false;
+            }
+            FillPlan::Store {
+                value,
+                encoded,
+                expires_at_ms,
+                now_ms,
+            } => (value, encoded, expires_at_ms, now_ms),
+        };
         let outcome = self.engine.complete_fresh_load(
             engine::FreshLoad {
                 key,
@@ -324,12 +397,9 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`CacheError::Loader`] if `loader` fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a value the loader returned fails to postcard-encode, since
-    /// `Shard::insert` relies on the same bound to encode any `V`.
+    /// Returns [`CacheError::Loader`] if `loader` fails, and
+    /// [`CacheError::Codec`] if `key` or the value the loader returned fails
+    /// to postcard-encode, which the callers joined to the load receive too.
     pub async fn get_or_load<F, E>(&self, key: &K, loader: F) -> Result<V, CacheError>
     where
         F: AsyncFnOnce(&K) -> Result<V, E>,
@@ -365,13 +435,9 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`CacheError::Loader`] if `loader` fails and `ask_first`'s
-    /// error if it fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a value `ask_first` or `loader` returned fails to
-    /// postcard-encode.
+    /// Returns [`CacheError::Loader`] if `loader` fails, `ask_first`'s
+    /// error if it fails, and [`CacheError::Codec`] if `key` or a value
+    /// `ask_first` or `loader` returned fails to postcard-encode.
     pub(crate) async fn get_or_load_via<P, F, E>(
         &self,
         key: &K,
@@ -404,9 +470,7 @@ where
                     // over the load.
                     let _ = done.changed().await;
                     if let Some(err) = inflight.error.get() {
-                        return Err(CacheError::Loader(Box::new(SharedLoaderFailure(
-                            Arc::clone(err),
-                        ))));
+                        return Err(shared_failure(Arc::clone(err)));
                     }
                     if let Some(value) = inflight.value.get() {
                         self.hits.increment(1);
@@ -450,7 +514,7 @@ where
                     // An error drops `guard` uncompleted, which frees the
                     // fill for a joined call to take over.
                     if let Some(value) = ask_first(key).await? {
-                        self.finish_fill(
+                        let filled = self.finish_fill(
                             key,
                             &key_bytes,
                             hash,
@@ -459,11 +523,12 @@ where
                             Fill::loaded(value.clone()),
                         );
                         guard.complete();
+                        filled?;
                         return Ok(value);
                     }
                     return match loader(key).await {
                         Ok(value) => {
-                            self.finish_fill(
+                            let filled = self.finish_fill(
                                 key,
                                 &key_bytes,
                                 hash,
@@ -472,7 +537,7 @@ where
                                 Fill::loaded(value.clone()),
                             );
                             guard.complete();
-                            Ok(value)
+                            filled.map(|()| value)
                         }
                         Err(err) => {
                             // The run found no entry here and could not fill

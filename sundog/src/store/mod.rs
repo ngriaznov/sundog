@@ -22,9 +22,7 @@ use xxhash_rust::xxh3::xxh3_64;
 
 #[cfg(doc)]
 use crate::config::ClusterConfig;
-#[cfg(doc)]
-use crate::error::CacheError;
-use crate::error::CodecError;
+use crate::error::{CacheError, CodecError};
 use crate::hlc::{Hlc, HlcClock};
 use crate::node::NodeId;
 use crate::ownership::{OwnershipTracker, ResidencySet};
@@ -324,6 +322,40 @@ impl std::fmt::Display for SharedLoaderFailure {
 impl std::error::Error for SharedLoaderFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.0.as_ref())
+    }
+}
+
+/// A value a loader returned that failed to postcard-encode. The in-flight
+/// load fails with it, and every call that shares the load returns it as
+/// [`CacheError::Codec`] through [`shared_failure`].
+#[derive(Debug, Clone)]
+pub(crate) struct EncodeFailure(pub(crate) postcard::Error);
+
+impl std::fmt::Display for EncodeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "a loaded value failed to encode: {}", self.0)
+    }
+}
+
+impl std::error::Error for EncodeFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+impl From<EncodeFailure> for CacheError {
+    fn from(failure: EncodeFailure) -> Self {
+        Self::Codec(CodecError::Postcard(failure.0))
+    }
+}
+
+/// The error a call returns for the failure a load it shared recorded: the
+/// [`CacheError::Codec`] of an [`EncodeFailure`], otherwise the loader's
+/// error as a [`CacheError::Loader`].
+pub(crate) fn shared_failure(err: Arc<dyn std::error::Error + Send + Sync>) -> CacheError {
+    match err.downcast_ref::<EncodeFailure>() {
+        Some(failure) => failure.clone().into(),
+        None => CacheError::Loader(Box::new(SharedLoaderFailure(err))),
     }
 }
 

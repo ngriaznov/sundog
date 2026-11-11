@@ -572,3 +572,119 @@ async fn a_successful_run_counts_one_miss() {
     .expect("ok");
     assert_eq!(counted_misses(&snapshotter), 1);
 }
+
+/// A value whose encoding fails when it holds `true`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+struct Flaky(bool);
+
+impl Serialize for Flaky {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.0 {
+            Err(serde::ser::Error::custom("refuses to encode"))
+        } else {
+            serializer.serialize_bool(false)
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_loaded_value_that_fails_to_encode_fails_get_or_load_with_codec_and_frees_the_load() {
+    let s = shard::<u32, Flaky>(1);
+    let err = s
+        .get_or_load(&1, async |_key: &u32| Ok::<_, BoomError>(Flaky(true)))
+        .await
+        .expect_err("the value does not encode");
+    assert!(matches!(err, CacheError::Codec(_)), "got {err:?}");
+    assert_eq!(s.get(&1).await, None, "nothing is stored");
+    let again = s
+        .get_or_load(&1, async |_key: &u32| Ok::<_, BoomError>(Flaky(false)))
+        .await
+        .expect("the in-flight entry was released");
+    assert_eq!(again, Flaky(false));
+}
+
+#[tokio::test]
+async fn joined_waiters_get_the_codec_error_of_a_value_that_fails_to_encode() {
+    let s = Arc::new(shard::<u32, Flaky>(1));
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let started = Arc::new(tokio::sync::Notify::new());
+    let owner = tokio::spawn({
+        let s = Arc::clone(&s);
+        let gate = Arc::clone(&gate);
+        let started = Arc::clone(&started);
+        async move {
+            s.get_or_load(&1, async move |_key: &u32| {
+                started.notify_one();
+                gate.notified().await;
+                Ok::<_, BoomError>(Flaky(true))
+            })
+            .await
+        }
+    });
+    started.notified().await;
+    let joiners: Vec<_> = (0..3)
+        .map(|_| {
+            let s = Arc::clone(&s);
+            tokio::spawn(async move {
+                s.get_or_load(&1, async |_key: &u32| Ok::<_, BoomError>(Flaky(false)))
+                    .await
+            })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    gate.notify_one();
+    let err = owner.await.expect("owner").expect_err("does not encode");
+    assert!(matches!(err, CacheError::Codec(_)), "owner got {err:?}");
+    for joiner in joiners {
+        let err = joiner.await.expect("joiner").expect_err("shares the error");
+        assert!(matches!(err, CacheError::Codec(_)), "joiner got {err:?}");
+    }
+}
+
+#[tokio::test]
+async fn load_and_load_many_fail_with_codec_for_a_value_that_fails_to_encode() {
+    let s = shard::<u32, Flaky>(1).with_loader(Loader::batch(|keys: Vec<u32>| async move {
+        Ok::<_, BoomError>(
+            keys.into_iter()
+                .map(|key| (key, Flaky(key == 2)))
+                .collect::<HashMap<_, _>>(),
+        )
+    }));
+    let err = s.load(&2).await.expect_err("does not encode");
+    assert!(matches!(err, CacheError::Codec(_)), "got {err:?}");
+    let err = s.load_many([1, 2, 3]).await.expect_err("does not encode");
+    assert!(matches!(err, CacheError::Codec(_)), "got {err:?}");
+    // The in-flight entries are free: the good keys load, the bad one fails
+    // again rather than hanging.
+    assert_eq!(s.load(&1).await.expect("loads"), Some(Flaky(false)));
+    let err = s.load(&2).await.expect_err("does not encode");
+    assert!(matches!(err, CacheError::Codec(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn serving_a_load_whose_value_fails_to_encode_replies_failed() {
+    let loader = || {
+        Loader::batch(|keys: Vec<u32>| async move {
+            Ok::<_, BoomError>(
+                keys.into_iter()
+                    .map(|key| (key, Flaky(true)))
+                    .collect::<HashMap<_, _>>(),
+            )
+        })
+    };
+    // A stored fill fails at the fill.
+    let s = shard::<u32, Flaky>(1).with_loader(loader());
+    assert!(matches!(
+        s.serve_load_encoded(vec![key_bytes(&1u32)]).await,
+        LoadServe::Failed(_)
+    ));
+    // A value answered without being stored fails at the reply's encoding.
+    let ceiling = shard::<u32, Flaky>(1)
+        .with_loader(loader())
+        .with_max_resident_bytes(1);
+    ceiling.insert(9, Flaky(false)).await.expect("insert");
+    assert!(matches!(
+        ceiling.serve_load_encoded(vec![key_bytes(&1u32)]).await,
+        LoadServe::Failed(_)
+    ));
+}

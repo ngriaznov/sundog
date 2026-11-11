@@ -23,8 +23,8 @@ use serde::de::DeserializeOwned;
 use tokio::sync::{Notify, watch};
 
 use super::engine::{self, Inflight, JoinOutcome};
-use super::{PartId, Shard, ShardOps, SharedLoaderFailure, encode_key};
-use crate::error::CacheError;
+use super::{PartId, Shard, ShardOps, encode_key, shared_failure};
+use crate::error::{CacheError, CodecError};
 use crate::hlc::Hlc;
 use crate::wire::WireRecord;
 
@@ -183,6 +183,31 @@ impl<V> Fill<V> {
         Self {
             value,
             expiry: FillExpiry::Loaded,
+        }
+    }
+}
+
+/// Where a loaded fill goes, decided by [`Shard::plan_fill`] before the load
+/// ends.
+pub(super) enum FillPlan<V> {
+    /// The value answers the caller and every joined waiter and is stored
+    /// nowhere. `counts_refusal` says a shard at its ceiling refused it.
+    Uncached { value: V, counts_refusal: bool },
+    /// The value is stored, encoded, expiring at `expires_at_ms`, as of
+    /// `now_ms`.
+    Store {
+        value: V,
+        encoded: Bytes,
+        expires_at_ms: Option<u64>,
+        now_ms: u64,
+    },
+}
+
+impl<V> FillPlan<V> {
+    /// The value the plan hands out.
+    fn value(&self) -> &V {
+        match self {
+            Self::Uncached { value, .. } | Self::Store { value, .. } => value,
         }
     }
 }
@@ -542,7 +567,7 @@ where
                     }
                     Resolved::Absent => {}
                     Resolved::Failed(err) => {
-                        return Err(CacheError::Loader(Box::new(SharedLoaderFailure(err))));
+                        return Err(shared_failure(err));
                     }
                     Resolved::Retry => {
                         let key_bytes = encode_key(&key)?;
@@ -562,7 +587,9 @@ where
     /// requested key's part is cold or unverified here, as a fetch does. A
     /// key whose part this shard's view does not own, a requester's view
     /// being stale, is loaded and reported `uncached`, not stored. An
-    /// undecodable key counts as one the source lacks.
+    /// undecodable key counts as one the source lacks. A value that fails to
+    /// encode fails the load, and the reply is [`LoadServe::Failed`] as for
+    /// a loader error.
     pub(crate) async fn serve_load_encoded(&self, keys: Vec<Bytes>) -> LoadServe {
         if self.loader.is_none() {
             return LoadServe::Unavailable;
@@ -599,13 +626,16 @@ where
             if let Some(rec) = stored.remove(&key_bytes) {
                 found.push(rec);
             } else {
-                uncached.push((
-                    key_bytes,
-                    Bytes::from(
-                        postcard::to_stdvec(&value)
-                            .expect("invariant: a value the shard holds postcard-encodes"),
-                    ),
-                ));
+                // A value handed out without being stored never met the
+                // encoder, so it can fail here.
+                match postcard::to_stdvec(&value) {
+                    Ok(encoded) => uncached.push((key_bytes, Bytes::from(encoded))),
+                    Err(err) => {
+                        return LoadServe::Failed(
+                            CacheError::from(CodecError::from(err)).to_string(),
+                        );
+                    }
+                }
             }
         }
         LoadServe::Loaded { found, uncached }
@@ -790,15 +820,30 @@ where
             }) => {
                 for (item, guard) in chunk.into_iter().zip(guards) {
                     if let Some(fill) = store.remove(&item.key) {
-                        let _ = item.slot.set(Ok(Some(fill.value.clone())));
-                        self.finish_fill(
-                            &item.key,
-                            &item.key_bytes,
-                            item.hash,
-                            item.ver,
-                            &item.inflight,
-                            fill,
-                        );
+                        self.misses.increment(1);
+                        match self.plan_fill(&item.key_bytes, item.ver, fill) {
+                            Ok(plan) => {
+                                let _ = item.slot.set(Ok(Some(plan.value().clone())));
+                                self.commit_fill(
+                                    &item.key,
+                                    &item.key_bytes,
+                                    item.hash,
+                                    item.ver,
+                                    &item.inflight,
+                                    plan,
+                                );
+                            }
+                            Err(failure) => {
+                                let failure = Arc::new(failure);
+                                let _ = item.slot.set(Err(Arc::clone(&failure) as _));
+                                self.engine.fail_inflight(
+                                    &item.key_bytes,
+                                    item.hash,
+                                    &item.inflight,
+                                    failure,
+                                );
+                            }
+                        }
                     } else if let Some(value) = answer.remove(&item.key) {
                         let _ = item.slot.set(Ok(Some(value.clone())));
                         self.engine.finish_uncached(
