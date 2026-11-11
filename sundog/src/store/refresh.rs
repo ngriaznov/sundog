@@ -1,6 +1,6 @@
-//! Refresh-ahead: a read that finds an entry past its refresh point, a set
-//! fraction of its lifetime, asks for the key to be reloaded before it
-//! expires. The cache layer's refresh task decides which node reloads a
+//! Refresh-ahead: a read that finds an entry past its refresh point, the
+//! last stretch of the default TTL before its expiry, asks for the key to
+//! be reloaded before it expires. The cache layer's refresh task decides which node reloads a
 //! key; the reload itself runs here, in [`Shard::refresh`], and stores its
 //! value like any other load, which replicates it per the cache's mode.
 //!
@@ -24,6 +24,12 @@ use crate::hlc::Hlc;
 
 /// How long after a failed reload a read asks for the key again.
 pub(crate) const REFRESH_RETRY_MS: u64 = 1_000;
+
+/// How long after a refresh hint is sent the hinter's read may ask about the
+/// same version again, covering a hint lost in flight or skipped by its
+/// target. The reload of a delivered hint changes the version, so the retry
+/// fires only when nothing did.
+pub(crate) const REFRESH_HINT_RETRY_MS: u64 = 1_000;
 
 /// How many refresh requests wait for the refresh task before a read stops
 /// asking; a read that finds the queue full asks again on its next read.
@@ -53,6 +59,10 @@ pub(crate) struct RefreshRequest<K> {
 pub(crate) struct RefreshTally {
     /// Reloaded and stored.
     pub(crate) loaded: u64,
+    /// Reloaded, and the value not stored: a write, removal, re-arm or
+    /// invalidation overtook the reload, the memory ceiling refused it, or
+    /// this node no longer owns the key's part.
+    pub(crate) discarded: u64,
     /// The source no longer holds the key; the entry is left to expire.
     pub(crate) absent: u64,
     /// The loader failed; the entry keeps its value until it expires.
@@ -65,7 +75,7 @@ type SeenStripe = StdMutex<HashMap<Bytes, (Hlc, u64)>>;
 
 /// A shard's refresh-ahead configuration and state.
 pub(crate) struct Refresh<K> {
-    /// The refresh point, in thousandths of an entry's lifetime.
+    /// The refresh point, in thousandths of the default TTL.
     permille: u64,
     requests: OnceLock<mpsc::Sender<RefreshRequest<K>>>,
     /// Per key, the version last asked about and when a read may ask
@@ -137,23 +147,34 @@ pub(crate) fn refresh_permille(fraction: f64) -> Option<u64> {
     Some(permille as u64)
 }
 
-/// Whether an entry written at `written_ms` and expiring at `expires_at_ms`
-/// is due for a reload at `now_ms`: past `permille` thousandths of its
-/// lifetime and not yet expired. An entry that never expires never is.
-/// Pure; unit tested directly.
+/// Whether an entry expiring at `expires_at_ms` is due for a reload at
+/// `now_ms`: not yet expired, and with at most `1000 - permille`
+/// thousandths of the default TTL, `ttl_ms`, left before it expires. The
+/// window is measured back from the expiry alone, so an entry whose
+/// lifetime was restarted by a touch or re-arm, or stamped by a leading
+/// clock, is due at the same distance from its expiry as any other; an entry
+/// of a lifetime no longer than the window is due from the start. An entry
+/// that never expires never is. Pure; unit tested directly.
 #[must_use]
 pub(crate) fn refresh_due(
     now_ms: u64,
-    written_ms: u64,
     expires_at_ms: Option<u64>,
+    ttl_ms: u64,
     permille: u64,
 ) -> bool {
     let Some(expires_at_ms) = expires_at_ms else {
         return false;
     };
-    let lifetime = u128::from(expires_at_ms.saturating_sub(written_ms));
-    let elapsed = u128::from(now_ms.saturating_sub(written_ms));
-    now_ms < expires_at_ms && elapsed * 1000 >= lifetime * u128::from(permille)
+    let left = u128::from(expires_at_ms.saturating_sub(now_ms));
+    now_ms < expires_at_ms
+        && left * 1000 <= u128::from(ttl_ms) * u128::from(1000u64.saturating_sub(permille))
+}
+
+/// When a read may ask about a version again after its hint was sent at
+/// `now_ms`. Pure; unit tested directly.
+#[must_use]
+pub(crate) fn hint_retry_at(now_ms: u64) -> u64 {
+    now_ms.saturating_add(REFRESH_HINT_RETRY_MS)
 }
 
 impl<K, V> Shard<K, V>
@@ -195,6 +216,33 @@ where
         Some(value)
     }
 
+    /// [`refresh_due`] under this shard's default TTL and refresh point:
+    /// never without both.
+    fn refresh_is_due(
+        &self,
+        refresh: &Refresh<K>,
+        expires_at_ms: Option<u64>,
+        now_ms: u64,
+    ) -> bool {
+        let Some(ttl) = self.ttl else {
+            return false;
+        };
+        let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
+        refresh_due(now_ms, expires_at_ms, ttl_ms, refresh.permille)
+    }
+
+    /// Records that a hint for `key_bytes` was sent to the peer chosen to
+    /// reload it: the claim the read set stops holding the version for good
+    /// and lets a read ask again after [`hint_retry_at`], so a hint lost in
+    /// flight or skipped by its target does not leave the key unrefreshed.
+    pub(crate) fn note_hint_sent(&self, key_bytes: &Bytes) {
+        let Some(refresh) = &self.refresh else {
+            return;
+        };
+        let hash = engine::hash_key_bytes(key_bytes.as_ref());
+        refresh.release(key_bytes, hash, hint_retry_at(self.now_ms()));
+    }
+
     /// [`Shard::read_resident`] for a caller holding only the key.
     pub(super) fn read_resident_key(&self, key: &K, now_ms: u64) -> Option<V> {
         if self.refresh.is_none() {
@@ -221,7 +269,7 @@ where
         let Some(refresh) = &self.refresh else {
             return;
         };
-        if !refresh_due(now_ms, ver.wall_ms, expires_at_ms, refresh.permille) {
+        if !self.refresh_is_due(refresh, expires_at_ms, now_ms) {
             return;
         }
         let Some(requests) = refresh.requests.get() else {
@@ -245,6 +293,8 @@ where
     /// Takes a peer's hint that it read `key_bytes` at `ver` past its
     /// refresh point and picked this node to reload it: queues a reload
     /// unless this node's copy is newer, missing, or already asked about.
+    /// The hinter judged the entry due, so the reload is not judged again on
+    /// this node's clock.
     pub(crate) fn take_refresh_hint(&self, key_bytes: &Bytes, ver: Hlc) {
         let Some(refresh) = &self.refresh else {
             return;
@@ -275,15 +325,16 @@ where
     }
 
     /// Reloads the keys of `requests` whose entry here is still the version
-    /// asked about, or older, still due, and in a part this node owns, in
-    /// loader calls of at most
-    /// [`super::Loader::max_keys`] keys. A value
-    /// the loader returns replaces the entry like any load, stamped before
-    /// the call so a write that lands meanwhile wins. A key the source no
-    /// longer holds keeps its entry until it expires; a loader failure
-    /// keeps every entry and lets reads ask again after
-    /// [`REFRESH_RETRY_MS`]. Reads keep answering from the old entries
-    /// throughout.
+    /// asked about, or older, still due unless a peer `hinted` the request,
+    /// and in a part this node owns, in loader calls of at most
+    /// [`super::Loader::max_keys`] keys. A value the loader returns replaces
+    /// the entry only while it is still the version the refresh read: a
+    /// write, removal, touch, expire or persist that lands during the call
+    /// wins, and the value is discarded. A key the source no longer holds
+    /// keeps its entry until it expires; a loader failure, a discarded
+    /// reload and a request skipped as not due or already loading keep
+    /// every entry and let reads ask again after [`REFRESH_RETRY_MS`].
+    /// Reads keep answering from the old entries throughout.
     pub(crate) async fn refresh(&self, requests: Vec<RefreshRequest<K>>) -> RefreshTally {
         let max_keys = self
             .loader
@@ -295,6 +346,7 @@ where
             let chunk = requests.by_ref().take(max_keys).collect();
             let done = self.refresh_chunk(chunk).await;
             tally.loaded += done.loaded;
+            tally.discarded += done.discarded;
             tally.absent += done.absent;
             tally.failed += done.failed;
         }
@@ -308,6 +360,7 @@ where
             return tally;
         };
         let now_ms = self.now_ms();
+        let retry_at = now_ms.saturating_add(REFRESH_RETRY_MS);
         let mut items = Vec::with_capacity(requests.len());
         for request in requests {
             let hash = engine::hash_key_bytes(request.key_bytes.as_ref());
@@ -316,9 +369,13 @@ where
             else {
                 continue;
             };
-            if held > request.ver
-                || !refresh_due(now_ms, held.wall_ms, expires_at_ms, refresh.permille)
-            {
+            if held > request.ver {
+                continue;
+            }
+            // A hinted request was judged due by the node that read the
+            // entry; this node's clock may run behind.
+            if !request.hinted && !self.refresh_is_due(refresh, expires_at_ms, now_ms) {
+                refresh.release(&request.key_bytes, hash, retry_at);
                 continue;
             }
             // An entry held only through disown grace belongs to its new
@@ -331,6 +388,7 @@ where
                 continue;
             }
             let Some(inflight) = self.engine.begin_refresh(&request.key_bytes, hash) else {
+                refresh.release(&request.key_bytes, hash, retry_at);
                 continue;
             };
             let guard = self.engine.guard_inflight(
@@ -338,7 +396,7 @@ where
                 hash,
                 std::sync::Arc::clone(&inflight),
             );
-            items.push((request, hash, self.stamp_local(), inflight, guard));
+            items.push((request, hash, (self.stamp_local(), held), inflight, guard));
         }
         if items.is_empty() {
             return tally;
@@ -349,17 +407,24 @@ where
             .collect();
         match self.call_loader(keys).await {
             Ok(mut values) => {
-                for (request, hash, ver, inflight, guard) in items {
+                for (request, hash, versions, inflight, guard) in items {
                     if let Some(value) = values.remove(&request.key) {
-                        self.store_loaded(
+                        if self.store_reloaded(
                             &request.key,
                             &request.key_bytes,
                             hash,
-                            ver,
+                            versions,
                             &inflight,
                             Fill::loaded(value),
-                        );
-                        tally.loaded += 1;
+                        ) {
+                            tally.loaded += 1;
+                        } else {
+                            // The version is not asked about again unless a
+                            // read comes after the retry delay: a reload
+                            // the ceiling refused retries then.
+                            refresh.release(&request.key_bytes, hash, retry_at);
+                            tally.discarded += 1;
+                        }
                     } else {
                         self.engine
                             .abandon_inflight(&request.key_bytes, hash, &inflight);
@@ -370,7 +435,6 @@ where
             }
             Err(err) => {
                 tracing::debug!(cache = %self.name, %err, "refresh-ahead reload failed; entries keep their values");
-                let retry_at = now_ms.saturating_add(REFRESH_RETRY_MS);
                 for (request, hash, _, inflight, guard) in items {
                     self.engine
                         .abandon_inflight(&request.key_bytes, hash, &inflight);
@@ -557,6 +621,7 @@ mod tests {
             tally,
             RefreshTally {
                 loaded: 1,
+                discarded: 0,
                 absent: 0,
                 failed: 0
             }
@@ -693,21 +758,44 @@ mod tests {
 
     #[test]
     fn refresh_due_opens_at_the_refresh_point_and_closes_at_expiry() {
-        // Written at 1_000, expiring at 11_000: a 10s lifetime, due from 9_000.
-        let due = |now| refresh_due(now, 1_000, Some(11_000), 800);
+        // A 10s default TTL refreshed at 0.8: due in the last 2s before
+        // the expiry at 11_000, so from 9_000.
+        let due = |now| refresh_due(now, Some(11_000), 10_000, 800);
         assert!(!due(1_000));
         assert!(!due(8_999));
         assert!(due(9_000));
         assert!(due(10_999));
         assert!(!due(11_000), "an expired entry is not refreshed");
         assert!(
-            !refresh_due(50_000, 1_000, None, 800),
+            !refresh_due(50_000, None, 10_000, 800),
             "no expiry, no refresh"
         );
-        assert!(
-            !refresh_due(5_000, 9_000, Some(20_000), 800),
-            "a clock behind the write time is not past the point"
-        );
+    }
+
+    /// The window is judged from the expiry alone: where an entry was
+    /// stamped, written or re-armed does not enter, and an entry whose
+    /// lifetime differs from the default TTL is due in the same last stretch
+    /// of the default.
+    #[test]
+    fn refresh_due_depends_on_the_expiry_and_the_default_ttl_only() {
+        let ttl = 10_000;
+        // A touch at 9_000 restarts the lifetime: the expiry is 19_000,
+        // so 16_000 is 3s from it, outside the 2s window, and 17_000 is in.
+        assert!(!refresh_due(16_000, Some(19_000), ttl, 800));
+        assert!(refresh_due(17_000, Some(19_000), ttl, 800));
+        // An expiry an hour out is not due until its last 2s.
+        assert!(!refresh_due(1_000, Some(3_601_000), ttl, 800));
+        assert!(refresh_due(3_599_000, Some(3_601_000), ttl, 800));
+        // An entry whose whole lifetime fits the window is due at once.
+        assert!(refresh_due(1_000, Some(2_000), ttl, 800));
+        // A zero default TTL leaves no window beyond the expiry itself.
+        assert!(!refresh_due(1_000, Some(2_000), 0, 800));
+    }
+
+    #[test]
+    fn hint_retry_at_waits_the_hint_retry_delay() {
+        assert_eq!(hint_retry_at(100), 100 + REFRESH_HINT_RETRY_MS);
+        assert_eq!(hint_retry_at(u64::MAX), u64::MAX);
     }
 
     #[test]
@@ -731,5 +819,419 @@ mod tests {
             "not before the retry time"
         );
         assert!(refresh.claim(&key, 7, ver(2), 500));
+    }
+
+    /// A refreshing shard on `clock` whose loader parks until `release`
+    /// fires, after telling `entered` it runs, and then holds `v{key}`.
+    fn gated_shard(
+        clock: &Arc<AtomicU64>,
+        entered: &Arc<tokio::sync::Notify>,
+        release: &Arc<tokio::sync::Notify>,
+    ) -> Shard<u32, String> {
+        let now = Arc::clone(clock);
+        let (entered, release) = (Arc::clone(entered), Arc::clone(release));
+        Shard::new(
+            SmolStr::new("test"),
+            Mode::Local,
+            NodeId::from(1),
+            10_000,
+            Some(Duration::from_secs(10)),
+            None,
+        )
+        .with_clock(Arc::new(move || now.load(Ordering::SeqCst)))
+        .with_loader(Loader::batch(move |keys: Vec<u32>| {
+            let (entered, release) = (Arc::clone(&entered), Arc::clone(&release));
+            async move {
+                entered.notify_one();
+                release.notified().await;
+                Ok::<_, Down>(
+                    keys.into_iter()
+                        .map(|key| (key, format!("v{key}")))
+                        .collect::<HashMap<_, _>>(),
+                )
+            }
+        }))
+        .with_refresh_ahead(800)
+    }
+
+    /// Runs one reload of key 1, inserted at `T0` and read due at
+    /// `T0 + 9_000`, with `act` run on the shard while its loader call is
+    /// parked. Returns the shard, the tally, and the request queue.
+    async fn reload_during(
+        shard: impl FnOnce(Shard<u32, String>) -> Shard<u32, String>,
+        act: impl AsyncFnOnce(&Shard<u32, String>),
+    ) -> (
+        Arc<Shard<u32, String>>,
+        RefreshTally,
+        mpsc::Receiver<RefreshRequest<u32>>,
+    ) {
+        let clock = Arc::new(AtomicU64::new(T0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let s = Arc::new(shard(gated_shard(&clock, &entered, &release)));
+        let mut requests = s.take_refresh_requests().expect("refresh-ahead is on");
+        s.insert(1, "a".to_string()).await.expect("insert");
+        clock.store(T0 + 9_000, Ordering::SeqCst);
+        let _ = s.get(&1).await;
+        let request = requests.try_recv().expect("a due read asks");
+        let task = {
+            let s = Arc::clone(&s);
+            tokio::spawn(async move { s.refresh(vec![request]).await })
+        };
+        entered.notified().await;
+        act(&s).await;
+        release.notify_one();
+        let tally = task.await.expect("refresh task");
+        (s, tally, requests)
+    }
+
+    fn assert_remaining_over(s: &Shard<u32, String>, floor: Duration) {
+        match s.ttl_of(&1) {
+            Some(crate::store::Ttl::Remaining(left)) => {
+                assert!(left > floor, "kept the lifetime, got {left:?}");
+            }
+            other => panic!("a remaining lifetime, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_touch_does_not_move_the_refresh_point_inside_the_lifetime() {
+        let clock = Arc::new(AtomicU64::new(T0));
+        let calls = Arc::new(AtomicU64::new(0));
+        let s = refreshing_shard(&clock, &calls, Source::Holds);
+        let mut requests = s.take_refresh_requests().expect("refresh-ahead is on");
+        s.insert(1, "a".to_string()).await.expect("insert");
+        clock.store(T0 + 9_000, Ordering::SeqCst);
+        assert!(s.touch(&1).await.expect("touch"));
+        // The touch restarts the 10s lifetime: the entry expires at
+        // T0 + 19_000 and is due from T0 + 17_000.
+        clock.store(T0 + 16_000, Ordering::SeqCst);
+        assert_eq!(s.get(&1).await, Some("a".to_string()));
+        assert!(
+            requests.try_recv().is_err(),
+            "a read 7s into a lifetime a touch restarted is not due"
+        );
+        clock.store(T0 + 17_000, Ordering::SeqCst);
+        assert_eq!(s.get(&1).await, Some("a".to_string()));
+        assert!(requests.try_recv().is_ok(), "due in the last 2s");
+    }
+
+    #[tokio::test]
+    async fn an_expire_judges_the_window_by_the_new_expiry() {
+        let clock = Arc::new(AtomicU64::new(T0));
+        let calls = Arc::new(AtomicU64::new(0));
+        let s = refreshing_shard(&clock, &calls, Source::Holds);
+        let mut requests = s.take_refresh_requests().expect("refresh-ahead is on");
+        s.insert(1, "a".to_string()).await.expect("insert");
+        s.insert(2, "b".to_string()).await.expect("insert");
+        clock.store(T0 + 5_000, Ordering::SeqCst);
+        assert!(
+            s.expire(&1, Duration::from_secs(3_600))
+                .await
+                .expect("expire")
+        );
+        assert!(s.expire(&2, Duration::from_secs(1)).await.expect("expire"));
+        let _ = s.get(&1).await;
+        assert!(
+            requests.try_recv().is_err(),
+            "an hour left is outside the last 2s of the default TTL"
+        );
+        let _ = s.get(&2).await;
+        assert_eq!(
+            requests.try_recv().expect("a second left is inside it").key,
+            2,
+            "an entry whose lifetime is shorter than the window is due at once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_leading_clock_does_not_make_every_version_due() {
+        let clock = Arc::new(AtomicU64::new(T0));
+        let calls = Arc::new(AtomicU64::new(0));
+        let s = refreshing_shard(&clock, &calls, Source::Holds);
+        let mut requests = s.take_refresh_requests().expect("refresh-ahead is on");
+        s.observe_remote(crate::hlc::Hlc {
+            wall_ms: T0 + 30_000,
+            logical: 0,
+            node: NodeId::from(2),
+        });
+        s.insert(1, "a".to_string()).await.expect("insert");
+        assert_eq!(s.get(&1).await, Some("a".to_string()));
+        assert!(
+            requests.try_recv().is_err(),
+            "a read at the moment of the write is not due"
+        );
+        clock.store(T0 + 8_000, Ordering::SeqCst);
+        assert_eq!(s.get(&1).await, Some("a".to_string()));
+        assert!(requests.try_recv().is_ok(), "due 2s before the expiry");
+    }
+
+    #[tokio::test]
+    async fn a_get_or_load_hit_past_the_refresh_point_asks_once_per_version() {
+        let clock = Arc::new(AtomicU64::new(T0));
+        let calls = Arc::new(AtomicU64::new(0));
+        let s = refreshing_shard(&clock, &calls, Source::Holds);
+        let mut requests = s.take_refresh_requests().expect("refresh-ahead is on");
+        s.insert(1, "a".to_string()).await.expect("insert");
+        let own = async |_: &u32| Ok::<_, Down>("own".to_string());
+
+        clock.store(T0 + 7_999, Ordering::SeqCst);
+        assert_eq!(s.get_or_load(&1, own).await.expect("hit"), "a");
+        assert!(requests.try_recv().is_err(), "not due before 80% of 10s");
+
+        clock.store(T0 + 8_000, Ordering::SeqCst);
+        assert_eq!(s.get_or_load(&1, own).await.expect("hit"), "a");
+        let request = requests.try_recv().expect("a due hit asks");
+        assert_eq!(request.key, 1);
+        assert_eq!(
+            s.get_or_insert_with(&1, async |_| "own".to_string())
+                .await
+                .expect("hit"),
+            "a"
+        );
+        assert!(
+            requests.try_recv().is_err(),
+            "every later read of that version asks nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hinted_request_is_not_judged_again_on_the_targets_clock() {
+        let clock = Arc::new(AtomicU64::new(T0));
+        let calls = Arc::new(AtomicU64::new(0));
+        let s = refreshing_shard(&clock, &calls, Source::Holds);
+        let mut requests = s.take_refresh_requests().expect("refresh-ahead is on");
+        s.insert(1, "a".to_string()).await.expect("insert");
+        let key_bytes = encode_key(&1u32).expect("encodes");
+        let hash = engine::hash_key_bytes(key_bytes.as_ref());
+        let (held, _) = s
+            .engine
+            .lifetime_of(&key_bytes, hash, T0)
+            .expect("live entry");
+        // The hinter read the entry past its refresh point; this node's
+        // clock is still seconds short of it.
+        clock.store(T0 + 1_000, Ordering::SeqCst);
+        s.take_refresh_hint(&key_bytes, held);
+        let request = requests.try_recv().expect("the hint queues a reload");
+        assert!(request.hinted);
+
+        let tally = s.refresh(vec![request]).await;
+        assert_eq!(tally.loaded, 1, "{tally:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(s.get(&1).await, Some("v1.1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_request_skipped_as_not_due_lets_a_read_ask_again_after_the_retry_delay() {
+        let clock = Arc::new(AtomicU64::new(T0));
+        let calls = Arc::new(AtomicU64::new(0));
+        let s = refreshing_shard(&clock, &calls, Source::Holds);
+        let mut requests = s.take_refresh_requests().expect("refresh-ahead is on");
+        s.insert(1, "a".to_string()).await.expect("insert");
+        clock.store(T0 + 8_000, Ordering::SeqCst);
+        let _ = s.get(&1).await;
+        let request = requests.try_recv().expect("a due read asks");
+
+        // The pass runs on a clock behind the read's: not due there.
+        clock.store(T0 + 1_000, Ordering::SeqCst);
+        assert_eq!(s.refresh(vec![request]).await, RefreshTally::default());
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no loader call");
+        clock.store(T0 + 1_000 + REFRESH_RETRY_MS, Ordering::SeqCst);
+        // Not due yet at this clock, so a read asks nothing; once the
+        // clock reaches the window the released claim lets it ask.
+        let _ = s.get(&1).await;
+        assert!(requests.try_recv().is_err());
+        clock.store(T0 + 8_000, Ordering::SeqCst);
+        let _ = s.get(&1).await;
+        assert!(
+            requests.try_recv().is_ok(),
+            "the skip released the claim, so the next due read asks"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_skipped_for_a_load_in_flight_lets_a_read_ask_again_after_the_retry_delay() {
+        let clock = Arc::new(AtomicU64::new(T0));
+        let calls = Arc::new(AtomicU64::new(0));
+        let s = refreshing_shard(&clock, &calls, Source::Holds);
+        let mut requests = s.take_refresh_requests().expect("refresh-ahead is on");
+        s.insert(1, "a".to_string()).await.expect("insert");
+        clock.store(T0 + 8_000, Ordering::SeqCst);
+        let _ = s.get(&1).await;
+        let request = requests.try_recv().expect("a due read asks");
+        let key_bytes = encode_key(&1u32).expect("encodes");
+        let hash = engine::hash_key_bytes(key_bytes.as_ref());
+        let busy = s
+            .engine
+            .begin_refresh(&key_bytes, hash)
+            .expect("no load in flight yet");
+
+        assert_eq!(s.refresh(vec![request]).await, RefreshTally::default());
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no loader call");
+        let _ = s.get(&1).await;
+        assert!(requests.try_recv().is_err(), "no retry before the delay");
+        clock.store(T0 + 8_000 + REFRESH_RETRY_MS, Ordering::SeqCst);
+        let _ = s.get(&1).await;
+        assert!(requests.try_recv().is_ok(), "a read after the delay asks");
+        s.engine.abandon_inflight(&key_bytes, hash, &busy);
+    }
+
+    #[tokio::test]
+    async fn a_read_asks_again_after_a_hint_sent_for_its_version_goes_unanswered() {
+        let clock = Arc::new(AtomicU64::new(T0));
+        let calls = Arc::new(AtomicU64::new(0));
+        let s = refreshing_shard(&clock, &calls, Source::Holds);
+        let mut requests = s.take_refresh_requests().expect("refresh-ahead is on");
+        s.insert(1, "a".to_string()).await.expect("insert");
+        let key_bytes = encode_key(&1u32).expect("encodes");
+        clock.store(T0 + 8_000, Ordering::SeqCst);
+        let _ = s.get(&1).await;
+        let request = requests.try_recv().expect("a due read asks");
+        s.note_hint_sent(&request.key_bytes);
+
+        clock.store(T0 + 8_000 + REFRESH_HINT_RETRY_MS - 1, Ordering::SeqCst);
+        let _ = s.get(&1).await;
+        assert!(requests.try_recv().is_err(), "no retry before the deadline");
+        clock.store(T0 + 8_000 + REFRESH_HINT_RETRY_MS, Ordering::SeqCst);
+        let _ = s.get(&1).await;
+        let again = requests.try_recv().expect("a read at the deadline asks");
+        assert_eq!(again.key_bytes, key_bytes);
+    }
+
+    #[tokio::test]
+    async fn a_persist_during_a_reload_survives_it() {
+        let (s, tally, _) = reload_during(
+            |s| s,
+            async |s| {
+                assert!(s.persist(&1).await.expect("persist"));
+            },
+        )
+        .await;
+        assert_eq!(s.ttl_of(&1), Some(crate::store::Ttl::Never));
+        assert_eq!(s.get(&1).await, Some("a".to_string()));
+        assert_eq!((tally.loaded, tally.discarded), (0, 1), "{tally:?}");
+    }
+
+    #[tokio::test]
+    async fn an_expire_during_a_reload_survives_it() {
+        let (s, tally, _) = reload_during(
+            |s| s,
+            async |s| {
+                assert!(
+                    s.expire(&1, Duration::from_secs(3_600))
+                        .await
+                        .expect("expire")
+                );
+            },
+        )
+        .await;
+        assert_remaining_over(&s, Duration::from_secs(1_000));
+        assert_eq!((tally.loaded, tally.discarded), (0, 1), "{tally:?}");
+    }
+
+    #[tokio::test]
+    async fn a_touch_during_a_reload_survives_it() {
+        let (s, tally, _) = reload_during(
+            |s| s,
+            async |s| {
+                assert!(s.touch(&1).await.expect("touch"));
+            },
+        )
+        .await;
+        assert_eq!(s.get(&1).await, Some("a".to_string()));
+        assert_eq!((tally.loaded, tally.discarded), (0, 1), "{tally:?}");
+    }
+
+    #[tokio::test]
+    async fn a_removal_during_a_reload_is_not_resurrected_by_it() {
+        let (s, tally, _) = reload_during(
+            |s| s,
+            async |s| {
+                s.remove(&1).await.expect("remove");
+            },
+        )
+        .await;
+        assert_eq!(s.get(&1).await, None, "the removed key stays removed");
+        assert_eq!((tally.loaded, tally.discarded), (0, 1), "{tally:?}");
+    }
+
+    #[tokio::test]
+    async fn a_write_during_a_reload_wins_and_the_reload_counts_as_discarded() {
+        let (s, tally, _) = reload_during(
+            |s| s,
+            async |s| {
+                s.insert(1, "b".to_string()).await.expect("insert");
+            },
+        )
+        .await;
+        assert_eq!(s.get(&1).await, Some("b".to_string()), "the write wins");
+        assert_eq!((tally.loaded, tally.discarded), (0, 1), "{tally:?}");
+    }
+
+    #[tokio::test]
+    async fn a_reload_nothing_overtook_is_stored_and_counted_loaded() {
+        let (s, tally, _) = reload_during(|s| s, async |_| {}).await;
+        assert_eq!(s.get(&1).await, Some("v1".to_string()));
+        assert_eq!((tally.loaded, tally.discarded), (1, 0), "{tally:?}");
+    }
+
+    #[tokio::test]
+    async fn a_reload_the_ceiling_refused_is_discarded_and_asked_for_again_after_the_retry_delay() {
+        let clock = Arc::new(AtomicU64::new(T0));
+        let calls = Arc::new(AtomicU64::new(0));
+        let s = refreshing_shard(&clock, &calls, Source::Holds).with_max_resident_bytes(1);
+        let mut requests = s.take_refresh_requests().expect("refresh-ahead is on");
+        s.insert(1, "a".to_string()).await.expect("insert");
+        clock.store(T0 + 8_000, Ordering::SeqCst);
+        let _ = s.get(&1).await;
+        let request = requests.try_recv().expect("a due read asks");
+
+        let tally = s.refresh(vec![request]).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the loader ran");
+        assert_eq!(s.get(&1).await, Some("a".to_string()), "nothing was stored");
+        assert_eq!((tally.loaded, tally.discarded), (0, 1), "{tally:?}");
+        assert!(requests.try_recv().is_err(), "no retry before the delay");
+        clock.store(T0 + 8_000 + REFRESH_RETRY_MS, Ordering::SeqCst);
+        let _ = s.get(&1).await;
+        assert!(
+            requests.try_recv().is_ok(),
+            "the refused reload released its claim for a retry"
+        );
+    }
+
+    /// Dropping a pass that waits on a hung loader frees its in-flight
+    /// entries, so a later reload of the key is not turned away as already
+    /// loading.
+    #[tokio::test]
+    async fn dropping_a_refresh_pass_mid_loader_frees_its_in_flight_entries() {
+        let clock = Arc::new(AtomicU64::new(T0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let s = Arc::new(gated_shard(&clock, &entered, &release));
+        let mut requests = s.take_refresh_requests().expect("refresh-ahead is on");
+        s.insert(1, "a".to_string()).await.expect("insert");
+        clock.store(T0 + 9_000, Ordering::SeqCst);
+        let _ = s.get(&1).await;
+        let request = requests.try_recv().expect("a due read asks");
+        let key_bytes = request.key_bytes.clone();
+        let hash = engine::hash_key_bytes(key_bytes.as_ref());
+        let task = {
+            let s = Arc::clone(&s);
+            tokio::spawn(async move { s.refresh(vec![request]).await })
+        };
+        entered.notified().await;
+        assert!(
+            s.engine.begin_refresh(&key_bytes, hash).is_none(),
+            "the parked reload holds the key"
+        );
+
+        task.abort();
+        assert!(task.await.expect_err("aborted").is_cancelled());
+        let freed = s
+            .engine
+            .begin_refresh(&key_bytes, hash)
+            .expect("the dropped pass released the key");
+        s.engine.abandon_inflight(&key_bytes, hash, &freed);
+        assert_eq!(s.get(&1).await, Some("a".to_string()));
     }
 }

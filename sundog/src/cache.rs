@@ -298,13 +298,34 @@ where
         self
     }
 
-    /// Reloads an entry before it expires: a read that finds the entry past
-    /// `fraction` of its lifetime, `0.8` for the last fifth, answers with
-    /// it and asks for one reload through the loader. One node reloads each
-    /// key, the one its loads gather on, and its new value replaces the
-    /// entry like any write, so a hot key never expires and its source sees
-    /// one load per lifetime. A reload the source fails keeps the entry
-    /// until it expires; one that finds the key gone leaves it to expire.
+    /// Reloads an entry before it expires: a read that finds the entry in
+    /// its last `1 - fraction` of the cache's [`CacheBuilder::ttl`], `0.8`
+    /// for the last fifth, answers with it and asks for one reload through
+    /// the loader. Every read asks: `get`, `get_sync`, `load`, `load_many`,
+    /// `get_or_load` and `get_or_insert_with` alike, the last two reloading
+    /// through the cache's loader, not the one the call passes.
+    ///
+    /// The window is judged from the entry's expiry alone: an entry is due
+    /// once the time left before it expires is at most `1 - fraction` of
+    /// the default TTL. [`Cache::touch`], [`Cache::expire`] and a leading
+    /// clock move the expiry and nothing else, so they never shift the
+    /// point inside the lifetime. An entry written with a TTL other than
+    /// the default, by `insert_with_ttl` or `expire`, is due in the same
+    /// last stretch of the default TTL: one with a longer lifetime waits
+    /// for it, and one whose whole lifetime is no longer than it is due
+    /// from its first read. An entry that never expires is never due.
+    ///
+    /// One node reloads each key, the one its loads gather on, and its new
+    /// value replaces the entry like any write, so a hot key never expires
+    /// and its source sees one load per lifetime. In `Replicated` and
+    /// `Distributed` caches that node must itself have `refresh_ahead` on:
+    /// a peer picks among the nodes that advertise it, and reloads the key
+    /// itself when none does. A write, removal, [`Cache::touch`],
+    /// [`Cache::expire`] or [`Cache::persist`] that lands while the loader
+    /// runs wins, and the reloaded value is discarded. A reload the source
+    /// fails keeps the entry until it expires; one that finds the key gone
+    /// leaves it to expire. [`Cache::close`] and [`Cluster::shutdown`]
+    /// drop a reload still waiting on the loader.
     /// Needs a loader and a [`CacheBuilder::ttl`], and works in every
     /// [`Mode`] but [`Mode::Invalidation`]; `fraction` must lie strictly
     /// between 0 and 1.
@@ -576,6 +597,9 @@ where
         cluster.advertise_cache_mode(&name, mode);
         if has_loader {
             cluster.advertise_loader(&name);
+        }
+        if refresh_permille.is_some() {
+            cluster.advertise_refresh(&name);
         }
         // `Replicated` and `Distributed` both have something to receive
         // before they can donate; every other mode is warm the moment it

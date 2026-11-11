@@ -505,8 +505,8 @@ impl Cluster {
 
     /// The cluster-side half of [`crate::cache::Cache::close`]: drops `name`
     /// from the shard registry, this node's local mode map and warmth set,
-    /// and clears its gossiped mode and loader so live peers stop seeing
-    /// either advertised. Acts only when the registry holds `shard` under
+    /// and clears its gossiped mode, loader and refresh-ahead keys so live
+    /// peers stop seeing any of them advertised. Acts only when the registry holds `shard` under
     /// `name` ([`registry_holds`]) and answers whether it did, so a close
     /// that finds the name free, or reopened as another cache, changes
     /// nothing, gossip included: the close that freed the name already
@@ -523,6 +523,7 @@ impl Cluster {
         self.inner.warmth.forget(name);
         self.inner.membership.clear_cache_mode(name);
         self.inner.membership.clear_loader(name);
+        self.inner.membership.clear_refresh(name);
         true
     }
 
@@ -558,6 +559,18 @@ impl Cluster {
     /// it to load and refresh that cache's keys.
     pub(crate) fn advertise_loader(&self, name: &str) {
         self.inner.membership.set_loader(name);
+    }
+
+    /// Gossips that this node runs refresh-ahead for cache `name`, so peers
+    /// hint it to reload that cache's keys.
+    pub(crate) fn advertise_refresh(&self, name: &str) {
+        self.inner.membership.set_refresh(name);
+    }
+
+    /// Every live peer's advertised refresh-ahead caches, as membership
+    /// reports them.
+    pub(crate) fn advertised_refreshers(&self) -> crate::membership::CacheRefreshers {
+        self.inner.membership.cache_refreshers().borrow().clone()
     }
 
     /// Every live peer's advertised loaders, as membership reports them.

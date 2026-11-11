@@ -64,6 +64,17 @@ fn loader_key(name: &str) -> String {
     format!("{LOADER_KEY_PREFIX}{name}")
 }
 
+/// Prefix for the per-cache keys `Membership::set_refresh` sets: the full
+/// key is `refresh:<name>`, present while this node has `name` open with
+/// refresh-ahead on, so it takes a peer's refresh hints for it. A node
+/// from a release that predates the key never sets it.
+const REFRESH_KEY_PREFIX: &str = "refresh:";
+
+/// Builds the gossip key that advertises refresh-ahead for one cache.
+fn refresh_key(name: &str) -> String {
+    format!("{REFRESH_KEY_PREFIX}{name}")
+}
+
 /// One live cluster member as seen through gossip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Peer {
@@ -92,6 +103,10 @@ pub(crate) type CacheModes = HashMap<NodeId, HashMap<SmolStr, Mode>>;
 /// The caches each live peer advertises a loader for, keyed by peer. A peer
 /// with no loader for any cache is absent.
 pub(crate) type CacheLoaders = HashMap<NodeId, HashSet<SmolStr>>;
+
+/// The caches each live peer advertises refresh-ahead for, keyed by peer.
+/// A peer with refresh-ahead on no cache is absent.
+pub(crate) type CacheRefreshers = HashMap<NodeId, HashSet<SmolStr>>;
 
 /// A live peer's flags [`cluster::absence`](crate::cluster::absence) needs
 /// captured at the instant it drops out of the live set: whether it
@@ -125,6 +140,7 @@ pub struct Membership {
     peers: watch::Receiver<Vec<Peer>>,
     cache_modes: watch::Receiver<CacheModes>,
     cache_loaders: watch::Receiver<CacheLoaders>,
+    cache_refreshers: watch::Receiver<CacheRefreshers>,
     local: Peer,
     commands: mpsc::UnboundedSender<Command>,
     /// How many live entries currently report this node's id under another
@@ -216,6 +232,7 @@ impl Membership {
         let (peers_tx, peers_rx) = watch::channel(Vec::new());
         let (cache_modes_tx, cache_modes_rx) = watch::channel(HashMap::new());
         let (cache_loaders_tx, cache_loaders_rx) = watch::channel(HashMap::new());
+        let (cache_refreshers_tx, cache_refreshers_rx) = watch::channel(HashMap::new());
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
 
         // A departing node's `DEPARTING_KEY` write needs at least one full
@@ -228,6 +245,7 @@ impl Membership {
             peers: peers_tx,
             cache_modes: cache_modes_tx,
             cache_loaders: cache_loaders_tx,
+            cache_refreshers: cache_refreshers_tx,
             observer,
             twins: Arc::clone(&twins),
         };
@@ -249,6 +267,7 @@ impl Membership {
             peers: peers_rx,
             cache_modes: cache_modes_rx,
             cache_loaders: cache_loaders_rx,
+            cache_refreshers: cache_refreshers_rx,
             local,
             commands: commands_tx,
             twins,
@@ -312,6 +331,26 @@ impl Membership {
     /// advertised.
     pub(crate) fn clear_loader(&self, name: &str) {
         let _ = self.commands.send(Command::DeleteKey(loader_key(name)));
+    }
+
+    /// A live-updating view of every live peer's [`CacheRefreshers`],
+    /// published in lockstep with [`Membership::peers`].
+    pub(crate) fn cache_refreshers(&self) -> watch::Receiver<CacheRefreshers> {
+        self.cache_refreshers.clone()
+    }
+
+    /// Advertises refresh-ahead for cache `name` under the `refresh:<name>`
+    /// gossip key.
+    pub(crate) fn set_refresh(&self, name: &str) {
+        let _ = self
+            .commands
+            .send(Command::SetKey(refresh_key(name), "1".to_string()));
+    }
+
+    /// Deletes the `refresh:<name>` gossip key. Safe to call on a name never
+    /// advertised.
+    pub(crate) fn clear_refresh(&self, name: &str) {
+        let _ = self.commands.send(Command::DeleteKey(refresh_key(name)));
     }
 
     /// Deletes the `cache:<name>` gossip key, so live peers stop seeing this
@@ -627,6 +666,28 @@ fn advertised_loaders(node_state: &NodeState) -> HashSet<SmolStr> {
     parse_loaders(node_state)
 }
 
+/// The caches `node_state` advertises refresh-ahead for: none once it
+/// gossips a departure, like [`advertised_loaders`].
+fn advertised_refreshers(node_state: &NodeState) -> HashSet<SmolStr> {
+    if is_departing(node_state) {
+        return HashSet::new();
+    }
+    parse_refreshers(node_state)
+}
+
+/// Reads every `refresh:<name>` key off `node_state`.
+pub(crate) fn parse_refreshers(node_state: &NodeState) -> HashSet<SmolStr> {
+    node_state
+        .iter_prefix(REFRESH_KEY_PREFIX)
+        .map(|(key, _)| {
+            SmolStr::new(
+                key.strip_prefix(REFRESH_KEY_PREFIX)
+                    .expect("invariant: iter_prefix only yields keys starting with the prefix"),
+            )
+        })
+        .collect()
+}
+
 /// Reads every `loader:<name>` key off `node_state`.
 pub(crate) fn parse_loaders(node_state: &NodeState) -> HashSet<SmolStr> {
     node_state
@@ -768,6 +829,7 @@ struct Publishers {
     peers: watch::Sender<Vec<Peer>>,
     cache_modes: watch::Sender<CacheModes>,
     cache_loaders: watch::Sender<CacheLoaders>,
+    cache_refreshers: watch::Sender<CacheRefreshers>,
     observer: Option<LiveObserver>,
     twins: Arc<AtomicUsize>,
 }
@@ -893,6 +955,7 @@ async fn run(
         peers: peers_tx,
         cache_modes: cache_modes_tx,
         cache_loaders: cache_loaders_tx,
+        cache_refreshers: cache_refreshers_tx,
         observer,
         twins: twin_count,
     } = publishers;
@@ -920,6 +983,7 @@ async fn run(
                 let mut peers: Vec<Peer> = Vec::new();
                 let mut cache_modes: CacheModes = HashMap::new();
                 let mut cache_loaders: CacheLoaders = HashMap::new();
+                let mut cache_refreshers: CacheRefreshers = HashMap::new();
                 let mut live_flags: HashMap<NodeId, LiveFlags> = HashMap::new();
                 let entries = view_entries(&live, &local, &mut twins_noticed, &twin_count);
                 for (peer, state) in entries {
@@ -932,6 +996,10 @@ async fn run(
                     let loaders = advertised_loaders(state);
                     if !loaders.is_empty() {
                         cache_loaders.insert(peer.node, loaders);
+                    }
+                    let refreshers = advertised_refreshers(state);
+                    if !refreshers.is_empty() {
+                        cache_refreshers.insert(peer.node, refreshers);
                     }
                     live_flags.insert(
                         peer.node,
@@ -950,6 +1018,7 @@ async fn run(
                     observer(&live_flags);
                 }
                 let _ = cache_loaders_tx.send(cache_loaders);
+                let _ = cache_refreshers_tx.send(cache_refreshers);
                 let _ = cache_modes_tx.send(cache_modes);
                 let _ = peers_tx.send(peers);
             }
@@ -1315,6 +1384,37 @@ mod tests {
         assert!(
             advertised_loaders(&leaving).is_empty(),
             "a departing node loads for no one"
+        );
+    }
+
+    #[test]
+    fn parse_refreshers_reads_every_refresh_key_and_nothing_else() {
+        let mut state = state_with(&[
+            ("refresh:users", "1"),
+            ("refresh:orders", "1"),
+            ("loader:carts", "1"),
+            ("cache:users", "replicated"),
+        ]);
+        let expected: HashSet<SmolStr> =
+            ["users", "orders"].into_iter().map(SmolStr::new).collect();
+        assert_eq!(parse_refreshers(&state), expected);
+        assert!(
+            !parse_loaders(&state).contains("users"),
+            "a refresh key is no loader key"
+        );
+        state.delete(&refresh_key("users"));
+        assert_eq!(
+            parse_refreshers(&state),
+            [SmolStr::new("orders")].into_iter().collect()
+        );
+        let leaving = state_with(&[("refresh:users", "1"), (DEPARTING_KEY, "1")]);
+        assert!(
+            advertised_refreshers(&leaving).is_empty(),
+            "a departing node takes no refresh hints"
+        );
+        assert!(
+            parse_refreshers(&NodeState::for_test()).is_empty(),
+            "a node of a release without the key advertises none"
         );
     }
 

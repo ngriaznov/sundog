@@ -256,6 +256,31 @@ fn fill_supersedes_only_an_absent_or_older_entry() {
 }
 
 #[test]
+fn fill_replaces_only_the_version_a_reload_expected() {
+    assert!(
+        fill_replaces(Some(hlc(1, 1)), hlc(5, 1), Some(hlc(1, 1))),
+        "the entry the reload read is still there"
+    );
+    assert!(
+        !fill_replaces(Some(hlc(1, 2)), hlc(5, 1), Some(hlc(1, 1))),
+        "a re-arm older than the fill but newer than the read stays"
+    );
+    assert!(
+        !fill_replaces(None, hlc(5, 1), Some(hlc(1, 1))),
+        "a removed key is not resurrected"
+    );
+    assert!(
+        !fill_replaces(Some(hlc(9, 1)), hlc(5, 1), Some(hlc(9, 1))),
+        "a newer entry still wins when it is the expected one"
+    );
+    assert!(
+        fill_replaces(None, hlc(5, 1), None),
+        "no expectation is fill_supersedes alone"
+    );
+    assert!(!fill_replaces(Some(hlc(1, 2)), hlc(1, 1), None));
+}
+
+#[test]
 fn complete_fresh_load_keeps_a_newer_write_that_landed_during_the_load() {
     let engine = engine_u32_string(u64::MAX, None);
     let key = 22u32;

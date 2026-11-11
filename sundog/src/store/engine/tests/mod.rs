@@ -16,7 +16,7 @@ use super::expiry::{
     encode_expiry, idle_elapsed_ms, lapse_cause,
 };
 use super::housekeeping::{should_shrink_stripe, shrink_batch};
-use super::inflight::fill_supersedes;
+use super::inflight::{fill_replaces, fill_supersedes};
 use super::prefold::BatchEntry;
 #[cfg(feature = "spill")]
 use super::promote::{claimed_total, promotion_fits};

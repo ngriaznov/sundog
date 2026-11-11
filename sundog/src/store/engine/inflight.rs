@@ -46,6 +46,16 @@ pub(super) fn fill_supersedes(existing: Option<Hlc>, fill: Hlc) -> bool {
     existing.is_none_or(|current| current < fill)
 }
 
+/// Whether a fill stamped `fill` replaces what its key holds, `existing`,
+/// when it also expects the key to still hold `expected`: a reload that
+/// read an entry at `expected` stores only over that very version, so a
+/// re-arm, a write or a removal in between, which the fill's stamp alone
+/// would not rank above it, wins too. `None` for `expected` is
+/// [`fill_supersedes`] alone. Pure; unit tested directly.
+pub(super) fn fill_replaces(existing: Option<Hlc>, fill: Hlc, expected: Option<Hlc>) -> bool {
+    fill_supersedes(existing, fill) && expected.is_none_or(|held| existing == Some(held))
+}
+
 /// A successful [`super::super::Shard::get_or_load`] fill's write, for [`Engine::complete_fresh_load`].
 pub(crate) struct FreshLoad<'a, K, V> {
     pub(crate) key: &'a K,
@@ -203,6 +213,32 @@ where
         now_ms: u64,
         inflight: &Inflight<V>,
     ) -> FillOutcome {
+        self.complete_expecting(write, None, now_ms, inflight)
+    }
+
+    /// [`Engine::complete_fresh_load`] for a refresh-ahead reload of the
+    /// entry the refresh read at `expected`: the fill stores only while the
+    /// key still holds that version, per [`fill_replaces`], so a
+    /// `persist`, `expire`, `touch`, write or removal during the loader
+    /// call stays in place of the reloaded value, and a removed key is not
+    /// resurrected.
+    pub(crate) fn complete_reload(
+        &self,
+        write: FreshLoad<'_, K, V>,
+        expected: Hlc,
+        now_ms: u64,
+        inflight: &Inflight<V>,
+    ) -> FillOutcome {
+        self.complete_expecting(write, Some(expected), now_ms, inflight)
+    }
+
+    fn complete_expecting(
+        &self,
+        write: FreshLoad<'_, K, V>,
+        expected: Option<Hlc>,
+        now_ms: u64,
+        inflight: &Inflight<V>,
+    ) -> FillOutcome {
         let FreshLoad {
             key,
             key_bytes,
@@ -233,7 +269,7 @@ where
                         .find(hash, |l| record_key(&l.record) == key_bytes.as_ref())
                         .map(Live::ver)
                 });
-            if !fill_supersedes(existing, ver) {
+            if !fill_replaces(existing, ver, expected) {
                 drop(stripe);
                 inflight.finish();
                 return FillOutcome::Superseded;

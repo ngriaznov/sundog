@@ -314,6 +314,59 @@ pub(crate) async fn refresh_outcomes_pin_metrics(cluster: &Cluster) {
     }
 }
 
+/// Drives `sundog_refreshes_total{cache, outcome="discarded"}` on a
+/// `Mode::Local` cache with a 1s TTL and refresh-ahead at 0.5: a key loads,
+/// and once due a read asks for its reload; a write lands while the loader
+/// call is parked, so the reloaded value is not stored. The one reload is
+/// `discarded`, none `loaded`.
+pub(crate) async fn refresh_discarded_pin_metric(cluster: &Cluster) {
+    let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let cache = cluster
+        .cache::<u32, String>("refresh-discard-pin")
+        .mode(Mode::Local)
+        .ttl(Duration::from_secs(1))
+        .refresh_ahead(0.5)
+        .batch_loader({
+            let (calls, entered, release) = (
+                Arc::clone(&calls),
+                Arc::clone(&entered),
+                Arc::clone(&release),
+            );
+            move |keys: Vec<u32>| {
+                let first = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                let (entered, release) = (Arc::clone(&entered), Arc::clone(&release));
+                async move {
+                    if !first {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                    Ok::<_, SourceDown>(
+                        keys.into_iter()
+                            .map(|key| (key, "reloaded".to_string()))
+                            .collect::<std::collections::HashMap<_, _>>(),
+                    )
+                }
+            }
+        })
+        .open()
+        .await
+        .expect("cache opens");
+    assert_eq!(cache.load(&1).await.expect("load"), Some("reloaded".into()));
+    tokio::time::sleep(Duration::from_millis(550)).await;
+    assert!(cache.get(&1).await.is_some(), "the key is live and due");
+    tokio::time::timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .expect("the reload reaches the loader");
+    cache.insert(1, "written".into()).await.expect("insert");
+    release.notify_one();
+    // The scrape comes seconds later, after the pins below; this gives the
+    // refresh task time to count the discarded reload first.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(cache.get(&1).await, Some("written".to_string()));
+}
+
 /// Drives `sundog_refresh_hints_sent_total{cache}` across `cluster` and
 /// `peer`, both holding a `Mode::Replicated` cache with a 2s TTL and
 /// refresh-ahead at 0.5: 16 keys load on `cluster` and replicate, and once

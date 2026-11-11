@@ -56,7 +56,9 @@ pub const DEFAULT_MAX_BATCH_KEYS: usize = 1024;
 
 /// A cache's registered loader: given keys, returns the values the source
 /// holds for them. A key missing from the returned map is one the source
-/// does not hold.
+/// does not hold. A loader future still running when the caller drops its
+/// own future, or when the cache closes during a refresh-ahead reload, is
+/// dropped with it.
 pub struct Loader<K, V> {
     load: Arc<LoadFn<K, V>>,
     window: Duration,

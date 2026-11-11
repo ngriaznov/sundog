@@ -94,7 +94,7 @@ addresses once it forms, under `cluster formed`.
 | Metric | Meaning |
 |---|---|
 | `sundog_loader_calls_total{cache}` | calls to the cache's registered loader on this node |
-| `sundog_refreshes_total{cache, outcome}` | refresh-ahead reloads by outcome: `loaded`, `absent` or `failed` |
+| `sundog_refreshes_total{cache, outcome}` | refresh-ahead reloads by outcome: `loaded` (stored), `discarded` (the loader answered and the value was not stored: a write, removal, `touch`, `expire`, `persist` or invalidation landed meanwhile, the memory ceiling refused it, or this node no longer owns the key's part), `absent` or `failed` |
 | `sundog_refresh_hints_sent_total{cache}` | hints this node sent to the node that refreshes a key |
 
 ### Merge resolvers

@@ -55,13 +55,28 @@ read through it with `load` and `load_many`:
 - **`batch_window`** gathers the misses of every call within the window into
   one loader call of at most `max_keys` keys. Without it, the keys one call
   misses go to the loader together.
-- **`refresh_ahead(0.8)`** reloads a key that is read in the last fifth of its
-  lifetime. The read answers with the old value, and the new one replaces it
-  with a full lifetime, replicated or forwarded like any write. A hot key
-  reloads about once per lifetime across the cluster and never misses. A
-  reload the source fails keeps the entry until it expires, and one that finds
-  the key gone leaves it to expire. It needs a loader and a `ttl`, and applies
-  to every mode but `Invalidation`, whose values do not travel between nodes.
+- **`refresh_ahead(0.8)`** reloads a key that is read in the last fifth of the
+  cache's default `ttl`. The window is measured back from the entry's expiry:
+  an entry is due once the time left before it expires is at most a fifth of
+  the default TTL. `touch`, `expire` and a clock that runs ahead move the
+  expiry and nothing else, so they never shift the point inside the lifetime.
+  An entry written with another TTL is due in the same last stretch of the
+  default: one with a longer lifetime waits for it, and one whose whole
+  lifetime is no longer than it is due from its first read. An entry that never
+  expires is never due. Every read asks, `get`, `load` and `get_or_load`
+  alike; the reload runs through the cache's loader, not the one a
+  `get_or_load` call passes. The read answers with the old value, and the new
+  one replaces it with a full lifetime, replicated or forwarded like any
+  write. A write, removal, `touch`, `expire` or `persist` that lands while the
+  loader runs wins, and the reloaded value is dropped. A hot key reloads about
+  once per lifetime across the cluster and never misses. A reload the source
+  fails keeps the entry until it expires, and one that finds the key gone
+  leaves it to expire. In `Replicated` and `Distributed` caches the node that
+  reloads a key must have `refresh_ahead` on; peers advertise it, and a node
+  reloads the key itself when no peer that has the loader does. `Cache::close`
+  and `Cluster::shutdown` drop a reload still waiting on the loader. It needs a
+  loader and a `ttl`, and applies to every mode but `Invalidation`, whose
+  values do not travel between nodes.
 
 ### Where a miss loads
 

@@ -42,6 +42,21 @@ fn loader_peers(cluster: &Cluster, name: &str, mode: Mode) -> HashSet<NodeId> {
         .collect()
 }
 
+/// The peers [`loader_peers`] gives that also advertise refresh-ahead for
+/// `name`: the nodes a refresh hint may go to, since a node without it drops
+/// the hint. A peer on a release that does not gossip the capability is not
+/// among them.
+fn refresh_peers(cluster: &Cluster, name: &str, mode: Mode) -> HashSet<NodeId> {
+    let refreshers = cluster.advertised_refreshers();
+    let mut peers = loader_peers(cluster, name, mode);
+    peers.retain(|peer| {
+        refreshers
+            .get(peer)
+            .is_some_and(|caches| caches.contains(name))
+    });
+    peers
+}
+
 /// Whether [`Cache::load`] in `mode` gathers each key's loads on one node.
 /// `Mode::Local` has no peers, and in `Mode::Replicated` a loaded value
 /// reaches every node anyway, so each loads for itself. Pure; unit tested
@@ -152,11 +167,12 @@ pub(super) type AskLoad<'a> = dyn Fn(NodeId, Vec<bytes::Bytes>) -> BoxFuture<'a,
 const REFRESH_BURST: usize = 1_024;
 
 /// Drains the reloads reads ask for under [`CacheBuilder::refresh_ahead`].
-/// A key this node refreshes, the node [`load_target`] picks for it, and a
-/// key a peer's hint sent here reload in one [`Shard::refresh`] pass per
-/// drained burst; a key another node refreshes goes to it as a
-/// [`crate::wire::Msg::RefreshHint`], or reloads here when the hint cannot
-/// be sent. Counts `sundog_refreshes_total{cache, outcome}` and
+/// A key this node refreshes, the node [`load_target`] picks for it among
+/// the peers [`refresh_peers`] gives, and a key a peer's hint sent here
+/// reload in one [`Shard::refresh`] pass per drained burst; a key another
+/// node refreshes goes to it as a [`crate::wire::Msg::RefreshHint`], or
+/// reloads here when no peer takes hints or the hint cannot be sent. A pass
+/// still running when `cancel` fires is dropped. Counts `sundog_refreshes_total{cache, outcome}` and
 /// `sundog_refresh_hints_sent_total{cache}`.
 pub(super) async fn refresh_task<K, V>(
     shard: Arc<Shard<K, V>>,
@@ -170,7 +186,12 @@ pub(super) async fn refresh_task<K, V>(
     let name = SmolStr::new(shard.name());
     let mode = shard.mode();
     let outcome = |outcome: &'static str| metrics::counter!("sundog_refreshes_total", "cache" => name.to_string(), "outcome" => outcome);
-    let (loaded, absent, failed) = (outcome("loaded"), outcome("absent"), outcome("failed"));
+    let (loaded, discarded, absent, failed) = (
+        outcome("loaded"),
+        outcome("discarded"),
+        outcome("absent"),
+        outcome("failed"),
+    );
     let hints_sent =
         metrics::counter!("sundog_refresh_hints_sent_total", "cache" => name.to_string());
     let mut burst = Vec::new();
@@ -184,7 +205,7 @@ pub(super) async fn refresh_task<K, V>(
             }
         }
         let me = cluster.node_id();
-        let capable = loader_peers(&cluster, &name, mode);
+        let capable = refresh_peers(&cluster, &name, mode);
         let view = shard.ownership_view();
         let mut here = Vec::with_capacity(burst.len());
         for request in burst.drain(..) {
@@ -204,14 +225,21 @@ pub(super) async fn refresh_task<K, V>(
                         request.ver,
                     ) =>
                 {
+                    shard.note_hint_sent(&request.key_bytes);
                     hints_sent.increment(1);
                 }
                 _ => here.push(request),
             }
         }
         if !here.is_empty() {
-            let tally = shard.refresh(here).await;
+            // A pass still waiting on the loader when the cache closes is
+            // dropped; its in-flight entries release as it goes.
+            let tally = tokio::select! {
+                () = cancel.cancelled() => return,
+                tally = shard.refresh(here) => tally,
+            };
             loaded.increment(tally.loaded);
+            discarded.increment(tally.discarded);
             absent.increment(tally.absent);
             failed.increment(tally.failed);
         }
@@ -383,5 +411,11 @@ where
     /// [`loader_peers`] for this cache.
     pub(super) fn loader_peers(&self) -> HashSet<NodeId> {
         loader_peers(&self.cluster, self.shard.name(), self.shard.mode())
+    }
+
+    /// [`refresh_peers`] for this cache.
+    #[cfg(test)]
+    pub(super) fn refresh_peers(&self) -> HashSet<NodeId> {
+        refresh_peers(&self.cluster, self.shard.name(), self.shard.mode())
     }
 }

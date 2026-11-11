@@ -2,6 +2,7 @@
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
+use tokio::sync::Notify;
 
 use super::*;
 use crate::cache::load::{Asked, Routed};
@@ -742,6 +743,16 @@ async fn refreshing_nodes(
         },
     )
     .await;
+    wait_until(
+        Duration::from_secs(10),
+        "every node sees the others advertise refresh-ahead",
+        async || {
+            nodes
+                .iter()
+                .all(|(_, cache)| cache.refresh_peers().len() == count - 1)
+        },
+    )
+    .await;
     wait_for_full_views(&nodes).await;
     nodes
 }
@@ -1198,4 +1209,174 @@ async fn a_loader_panic_in_the_first_chunk_frees_the_keys_of_the_unpolled_chunks
         }
         cluster.shutdown().await;
     }
+}
+
+/// A `Mode::Local` node on a 10s TTL refreshed at 0.1, whose loader answers
+/// its first call and then parks for good after telling `entered`.
+async fn hung_refresh_node(name: &'static str) -> (Cluster, Cache<u32, String>, Arc<Notify>) {
+    let cluster = Cluster::builder(name)
+        .seeds(std::iter::empty())
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("node builds");
+    let entered = Arc::new(Notify::new());
+    let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let cache = cluster
+        .cache::<u32, String>(name)
+        .mode(Mode::Local)
+        .ttl(LONG_REFRESH.0)
+        .refresh_ahead(LONG_REFRESH.1)
+        .batch_loader({
+            let (entered, calls) = (Arc::clone(&entered), Arc::clone(&calls));
+            move |keys: Vec<u32>| {
+                let (entered, calls) = (Arc::clone(&entered), Arc::clone(&calls));
+                async move {
+                    if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                        entered.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                    Ok::<_, SourceDown>(
+                        keys.into_iter()
+                            .map(|key| (key, format!("v{key}")))
+                            .collect::<HashMap<_, _>>(),
+                    )
+                }
+            }
+        })
+        .open()
+        .await
+        .expect("opens");
+    assert_eq!(cache.load(&1).await.expect("load"), Some("v1".to_string()));
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert!(
+        cache.get(&1).await.is_some(),
+        "a due read asks for a reload"
+    );
+    tokio::time::timeout(Duration::from_secs(30), entered.notified())
+        .await
+        .expect("the reload reaches the loader");
+    (cluster, cache, entered)
+}
+
+/// How long `close` and `shutdown` get once the loader hangs: far more than
+/// they take, far less than forever.
+const HUNG_LOADER_BOUND: Duration = Duration::from_secs(20);
+
+#[tokio::test]
+async fn cache_close_returns_while_a_refresh_reload_hangs_in_the_loader() {
+    let (cluster, cache, _entered) = hung_refresh_node("cache-it-refresh-hung-close").await;
+    tokio::time::timeout(HUNG_LOADER_BOUND, cache.close())
+        .await
+        .expect("close drops the hung reload instead of waiting for it");
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn cluster_shutdown_returns_while_a_refresh_reload_hangs_in_the_loader() {
+    let (cluster, _cache, _entered) = hung_refresh_node("cache-it-refresh-hung-shutdown").await;
+    tokio::time::timeout(HUNG_LOADER_BOUND, cluster.shutdown())
+        .await
+        .expect("shutdown drops the hung reload instead of waiting for it");
+}
+
+/// A peer that has the loader but not refresh-ahead drops a hint, so the
+/// node that reads past the refresh point reloads the key itself instead of
+/// hinting it. A peer from a release that does not gossip the capability
+/// looks the same.
+#[tokio::test]
+async fn refresh_ahead_reloads_locally_when_the_loader_peer_has_no_refresh_ahead() {
+    let log = LoadLog::default();
+    let name = "cache-it-refresh-uneven";
+    let a = Cluster::builder(name)
+        .seeds(std::iter::empty())
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("node builds");
+    let b = Cluster::builder(name)
+        .seeds([a.local_gossip_addr()])
+        .config(loopback_config())
+        .build()
+        .await
+        .expect("node builds");
+    wait_for_peer_count(&a, 1).await;
+    wait_for_peer_count(&b, 1).await;
+    let batch = |node: NodeId| {
+        let log = Arc::clone(&log);
+        move |keys: Vec<u32>| {
+            let log = Arc::clone(&log);
+            async move {
+                log.lock().expect("log lock").push((node, keys.clone()));
+                Ok::<_, SourceDown>(
+                    keys.into_iter()
+                        .map(|key| (key, format!("v{key}")))
+                        .collect::<HashMap<_, _>>(),
+                )
+            }
+        }
+    };
+    let cache_a = a
+        .cache::<u32, String>(name)
+        .mode(Mode::Replicated)
+        .ttl(LONG_REFRESH.0)
+        .refresh_ahead(LONG_REFRESH.1)
+        .batch_loader(batch(a.node_id()))
+        .open()
+        .await
+        .expect("opens");
+    let _cache_b = b
+        .cache::<u32, String>(name)
+        .mode(Mode::Replicated)
+        .ttl(LONG_REFRESH.0)
+        .batch_loader(batch(b.node_id()))
+        .open()
+        .await
+        .expect("opens");
+    wait_until(
+        Duration::from_secs(10),
+        "a sees b's loader and no refresh-ahead",
+        async || cache_a.loader_peers().len() == 1,
+    )
+    .await;
+    assert!(
+        cache_a.refresh_peers().is_empty(),
+        "b advertises no refresh-ahead"
+    );
+    // A key whose loads gather on b.
+    let key = (0..10_000u32)
+        .find(|key| {
+            let part = PartId::of_key(&encode_key(key).expect("u32 encodes"));
+            matches!(
+                load_target(
+                    Mode::Replicated,
+                    part,
+                    a.node_id(),
+                    &[],
+                    &[b.node_id()].into_iter().collect(),
+                    &HashSet::new(),
+                ),
+                LoadTarget::Peer(_)
+            )
+        })
+        .expect("a key b wins");
+    assert!(cache_a.load(&key).await.expect("load").is_some());
+    let first = log.lock().expect("log lock").len();
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert!(cache_a.get(&key).await.is_some());
+    wait_until(
+        Duration::from_secs(10),
+        "a reloads the key it read past its refresh point",
+        async || {
+            log.lock()
+                .expect("log lock")
+                .iter()
+                .skip(first)
+                .any(|(node, keys)| *node == a.node_id() && keys == &vec![key])
+        },
+    )
+    .await;
+    b.shutdown().await;
+    a.shutdown().await;
 }

@@ -70,20 +70,24 @@ where
         }
     }
 
-    /// [`Shard::finish_fill`] for a caller with no error to return, such as
-    /// refresh-ahead: a value that fails to encode fails the load and is
-    /// stored nowhere. Returns whether the value was stored.
-    pub(super) fn store_loaded(
+    /// [`Shard::finish_fill`] for a refresh-ahead reload of the entry at
+    /// `held`, which has no error to return: the value is stored only over
+    /// that version ([`engine::Engine::complete_reload`]), and one that
+    /// fails to encode fails the load and is stored nowhere. Returns
+    /// whether the value was stored.
+    pub(super) fn store_reloaded(
         &self,
         key: &K,
         key_bytes: &Bytes,
         hash: u64,
-        ver: Hlc,
+        (ver, held): (Hlc, Hlc),
         inflight: &engine::Inflight<V>,
         fill: Fill<V>,
     ) -> bool {
         match self.plan_fill(key_bytes, ver, fill) {
-            Ok(plan) => self.commit_fill(key, key_bytes, hash, ver, inflight, plan),
+            Ok(plan) => {
+                self.commit_fill_expecting(key, key_bytes, hash, ver, Some(held), inflight, plan)
+            }
             Err(failure) => {
                 self.engine
                     .fail_inflight(key_bytes, hash, inflight, Arc::new(failure));
@@ -158,6 +162,25 @@ where
         inflight: &engine::Inflight<V>,
         plan: FillPlan<V>,
     ) -> bool {
+        self.commit_fill_expecting(key, key_bytes, hash, ver, None, inflight, plan)
+    }
+
+    /// [`Shard::commit_fill`] that, given `expected`, stores only while the
+    /// key still holds that version.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "commit_fill's arguments plus the version a reload expects"
+    )]
+    fn commit_fill_expecting(
+        &self,
+        key: &K,
+        key_bytes: &Bytes,
+        hash: u64,
+        ver: Hlc,
+        expected: Option<Hlc>,
+        inflight: &engine::Inflight<V>,
+        plan: FillPlan<V>,
+    ) -> bool {
         let (value, encoded, expires_at_ms, now_ms) = match plan {
             FillPlan::Uncached {
                 value,
@@ -177,19 +200,19 @@ where
                 now_ms,
             } => (value, encoded, expires_at_ms, now_ms),
         };
-        let outcome = self.engine.complete_fresh_load(
-            engine::FreshLoad {
-                key,
-                key_bytes,
-                hash,
-                ver,
-                value: value.clone(),
-                encoded,
-                expires_at_ms,
-            },
-            now_ms,
-            inflight,
-        );
+        let write = engine::FreshLoad {
+            key,
+            key_bytes,
+            hash,
+            ver,
+            value: value.clone(),
+            encoded,
+            expires_at_ms,
+        };
+        let outcome = match expected {
+            Some(held) => self.engine.complete_reload(write, held, now_ms, inflight),
+            None => self.engine.complete_fresh_load(write, now_ms, inflight),
+        };
         let engine::FillOutcome::Installed { replaced_visible } = outcome else {
             return false;
         };
@@ -397,6 +420,10 @@ where
     /// the caller and every joined waiter without storing it, and the next
     /// read loads afresh.
     ///
+    /// A hit in the entry's refresh window asks for a refresh-ahead reload
+    /// like a [`Shard::get`] hit does; the reload runs through the shard's
+    /// registered loader, not `loader`.
+    ///
     /// # Errors
     ///
     /// Returns [`CacheError::Loader`] if `loader` fails, and
@@ -456,10 +483,7 @@ where
         #[cfg(feature = "spill")]
         let mut spill_races = 0u8;
         loop {
-            if let Some(value) = self
-                .engine
-                .get_by_bytes(key_bytes.as_ref(), hash, self.now_ms())
-            {
+            if let Some(value) = self.read_resident(key, key_bytes.as_ref(), hash, self.now_ms()) {
                 self.hits.increment(1);
                 return Ok(value);
             }

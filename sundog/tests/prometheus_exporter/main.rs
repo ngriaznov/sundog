@@ -24,9 +24,9 @@ use crate::pins::{
     SKEW_HOLD_PIN_CAPACITY, TOMBSTONE_PIN_COUNT, accept_drop_pin_metrics, clock_skew_pin_metrics,
     count_hits_and_misses, fan_out_wait_timeout_pin_metrics, loader_calls_pin_metric,
     loader_failure_miss_pin_metric, memory_ceiling_pin_metrics, merge_refused_pin_metric,
-    read_durations_pin_metrics, refresh_hints_pin_metric, refresh_outcomes_pin_metrics,
-    skew_hold_pin_bytes, skew_hold_pin_metrics, sync_skipped_pin_metric,
-    tombstone_ignored_pin_metrics, tombstone_pin_metrics,
+    read_durations_pin_metrics, refresh_discarded_pin_metric, refresh_hints_pin_metric,
+    refresh_outcomes_pin_metrics, skew_hold_pin_bytes, skew_hold_pin_metrics,
+    sync_skipped_pin_metric, tombstone_ignored_pin_metrics, tombstone_pin_metrics,
 };
 use crate::seeds::{
     FAN_OUT_STALL_PIN, seed_crdt_compaction_metrics, seed_departed_peer_backlog_metric,
@@ -134,6 +134,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     let tombstone_node = tombstone_pin_metrics().await;
     let (skew_hold_node, skew_hold_peer) = skew_hold_pin_metrics().await;
     refresh_outcomes_pin_metrics(&cluster).await;
+    refresh_discarded_pin_metric(&cluster).await;
     refresh_hints_pin_metric(&cluster, &peer).await;
     #[cfg(feature = "spill")]
     let mut spill_dirs = spill_writes_and_promotes_pin_metrics(&cluster).await;
@@ -358,7 +359,16 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         "a cache with no loader counts no loader calls; got body:\n{body}"
     );
     // sundog_refreshes_total: pinned by refresh_outcomes_pin_metrics, one
-    // reload of each outcome.
+    // reload of each of the three outcomes it drives, none discarded.
+    assert_eq!(
+        scraped_metric_value(
+            &body,
+            "sundog_refreshes_total",
+            &[("cache", "refresh-pin"), ("outcome", "discarded")]
+        ),
+        Some(0.0),
+        "no reload on the 'refresh-pin' cache is discarded; got body:\n{body}"
+    );
     for outcome in ["loaded", "absent", "failed"] {
         assert_eq!(
             scraped_metric_value(
@@ -370,6 +380,26 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
             "expected one {outcome} reload on the 'refresh-pin' cache; got body:\n{body}"
         );
     }
+    // The discarded outcome: pinned by refresh_discarded_pin_metric, one reload
+    // a write overtook, and none stored.
+    assert_eq!(
+        scraped_metric_value(
+            &body,
+            "sundog_refreshes_total",
+            &[("cache", "refresh-discard-pin"), ("outcome", "discarded")]
+        ),
+        Some(1.0),
+        "expected one discarded reload on the 'refresh-discard-pin' cache; got body:\n{body}"
+    );
+    assert_eq!(
+        scraped_metric_value(
+            &body,
+            "sundog_refreshes_total",
+            &[("cache", "refresh-discard-pin"), ("outcome", "loaded")]
+        ),
+        Some(0.0),
+        "a discarded reload is not counted loaded; got body:\n{body}"
+    );
     // sundog_refresh_hints_sent_total: pinned by refresh_hints_pin_metric,
     // one hint for each of 16 keys, from whichever node is not its refresher.
     assert_eq!(

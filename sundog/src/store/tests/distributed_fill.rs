@@ -538,6 +538,57 @@ async fn a_refresh_of_an_owned_entry_still_reloads_it() {
     assert_eq!(s.get(&key).await, Some(format!("reloaded{key}")));
 }
 
+/// A reload whose part moves to other nodes while the loader runs is not
+/// stored, and the tally counts it discarded, not loaded.
+#[tokio::test]
+async fn a_reload_of_a_part_that_moved_away_during_the_loader_call_is_discarded() {
+    const T0: u64 = 1_000_000;
+    let clock = Arc::new(AtomicU64::new(T0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (s, view, tx) = refreshing_distributed_shard(&clock, &calls);
+    let crowded = crowded_view();
+    let key = key_moved_away(&view, &crowded);
+    s.insert(key, "held".to_string())
+        .await
+        .expect("owner insert");
+    let held = key_bytes(&key);
+    let LocalRecord::Live { version: ver, .. } = s.local_record(&held).1 else {
+        panic!("the owner holds the entry");
+    };
+    clock.store(T0 + 9_000, Ordering::SeqCst);
+    // The loader hands the part away as it returns.
+    let handover = std::sync::Mutex::new(Some((tx, crowded)));
+    let s = s.with_loader(Loader::batch(move |keys: Vec<u32>| {
+        if let Some((tx, crowded)) = handover.lock().expect("handover lock").take() {
+            tx.send(crowded).expect("receiver alive");
+        }
+        async move {
+            Ok::<_, Infallible>(
+                keys.into_iter()
+                    .map(|key| (key, "reloaded".to_string()))
+                    .collect::<HashMap<_, _>>(),
+            )
+        }
+    }));
+    let _ = s.fan_out_queue().drain();
+
+    let tally = s
+        .refresh(vec![RefreshRequest {
+            key,
+            key_bytes: held.clone(),
+            ver,
+            hinted: false,
+        }])
+        .await;
+
+    assert_eq!((tally.loaded, tally.discarded), (0, 1), "{tally:?}");
+    assert!(
+        matches!(s.local_record(&held).1, LocalRecord::Live { version: now, .. } if now == ver),
+        "the entry is as it was"
+    );
+    assert!(s.fan_out_queue().drain().is_empty(), "nothing is queued");
+}
+
 #[test]
 fn fill_route_installs_only_an_owned_fill_under_the_ceiling() {
     assert_eq!(fill_route(true, false), FillRoute::Install);
