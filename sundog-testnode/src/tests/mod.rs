@@ -422,6 +422,36 @@ fn sum_counter_resolver_merges_two_decodable_counters() {
 }
 
 #[test]
+fn sum_counter_resolver_keeps_the_later_deadline() {
+    let (a_bytes, b_bytes) = counter_bytes("3", "5");
+    let merge = |ea, eb| {
+        let a = RecordView {
+            value: Some(&a_bytes),
+            ver: hlc_at(1),
+            expires_at_ms: ea,
+        };
+        let b = RecordView {
+            value: Some(&b_bytes),
+            ver: hlc_at(2),
+            expires_at_ms: eb,
+        };
+        SumCounterResolver
+            .merge(b"key", a, b)
+            .expect("merged")
+            .expires_at_ms
+    };
+    assert_eq!(merge(None, None), None, "(None, None)");
+    assert_eq!(merge(Some(1_000), None), Some(1_000), "(Some, None)");
+    assert_eq!(merge(None, Some(1_000)), Some(1_000), "(None, Some)");
+    assert_eq!(merge(Some(1_000), Some(2_000)), Some(2_000), "(Some, Some)");
+    assert_eq!(
+        merge(Some(2_000), Some(1_000)),
+        Some(2_000),
+        "(Some, Some) reversed"
+    );
+}
+
+#[test]
 fn merges_is_true() {
     assert!(
         SumCounterResolver.merges(),

@@ -503,7 +503,7 @@ impl ConflictResolver for SumCounterResolver {
         let merged = merge_counter_bytes(av, bv)?;
         Some(Merged {
             value: Bytes::from(merged),
-            expires_at_ms: None,
+            expires_at_ms: sundog::later_deadline(a.expires_at_ms, b.expires_at_ms),
         })
     }
 }
