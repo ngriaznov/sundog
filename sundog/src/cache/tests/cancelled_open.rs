@@ -12,8 +12,20 @@ const CANCEL_AFTER: Duration = Duration::from_millis(300);
 
 /// A cluster whose only seed answers nobody and whose transfers give up after `budget`.
 async fn lone_cluster_with_dead_seed(label: &'static str, budget: Duration) -> Cluster {
+    lone_cluster_with_dead_seed_gossiping(label, budget, loopback_config().gossip_interval).await
+}
+
+/// [`lone_cluster_with_dead_seed`] with a gossip round every `gossip_interval`. An `Invalidation`
+/// or `Replicated` open waits five rounds for a first peer before it builds its shard, so the
+/// interval decides whether a cancel lands before or after the open attaches its spill tier.
+async fn lone_cluster_with_dead_seed_gossiping(
+    label: &'static str,
+    budget: Duration,
+    gossip_interval: Duration,
+) -> Cluster {
     let config = ClusterConfig {
         state_transfer_budget: budget,
+        gossip_interval,
         ..loopback_config()
     };
     Cluster::builder(label)
@@ -635,9 +647,15 @@ mod spill {
         cache.close().await;
         first.shutdown().await;
 
-        let cluster =
-            lone_cluster_with_dead_seed("cache-it-cancelled-spill-second", Duration::from_secs(5))
-                .await;
+        // Five rounds of 20 ms are the open's wait for a first peer, so the cancel lands after
+        // the open attached the tier, and the retry reopens it well within the two-second
+        // tombstone retention.
+        let cluster = lone_cluster_with_dead_seed_gossiping(
+            "cache-it-cancelled-spill-second",
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+        )
+        .await;
         let cancelled = tokio::time::timeout(
             CANCEL_AFTER,
             cluster
