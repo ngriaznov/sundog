@@ -1,8 +1,9 @@
 //! The bounds on a connection after its `Hello`: the wait for a first frame
 //! from an unknown source, and the wait inside a frame whose length prefix
 //! has arrived. Every socket test runs on the paused clock and moves it with
-//! `advance`, which lets the handler read what the test wrote before time
-//! passes.
+//! `advance`. The sockets are real loopback ones, whose bytes arrive in real
+//! time, so a test first waits in real time for the handler to read what it
+//! wrote and only then lets the clock pass.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
@@ -112,12 +113,51 @@ fn a_codec_stands_inside_a_frame_from_its_length_prefix_until_it_returns_the_fra
     assert!(!frame_started(true, true, 90, 3));
 }
 
-/// Lets the handler read what the client wrote: a few tiny steps of the
-/// paused clock, each of which runs the handler before time moves on.
+/// One step of real time for the loopback socket: the kernel hands the
+/// client's bytes to the handler's socket on its own schedule, which the
+/// paused clock does not move, and the yield lets the runtime poll the
+/// socket and run the handler.
+async fn real_step() {
+    std::thread::sleep(Duration::from_millis(1));
+    tokio::task::yield_now().await;
+}
+
+/// Lets the handler read what the client wrote where the test has nothing
+/// to watch for it: real time for the bytes to cross the loopback socket,
+/// then a few tiny steps of the paused clock, each of which runs the
+/// handler before time moves on.
 async fn settle() {
+    for _ in 0..20 {
+        real_step().await;
+    }
     for _ in 0..3 {
         tokio::time::advance(Duration::from_millis(1)).await;
     }
+}
+
+/// Waits, in real time and without moving the paused clock, until the
+/// handler has done what `done` watches for.
+///
+/// # Panics
+///
+/// Panics with `what` if ten real seconds pass first.
+async fn settle_until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "{what}");
+        real_step().await;
+    }
+}
+
+/// The next frame the handler served, once it has read it off the socket.
+async fn served(accepted: &mut Accepted) -> crate::wire::Msg {
+    let mut msg = None;
+    settle_until("the handler serves the frame", || {
+        msg = accepted.inbound.try_recv().ok().map(|served| served.msg);
+        msg.is_some()
+    })
+    .await;
+    msg.expect("invariant: settle_until returns once the frame is taken")
 }
 
 /// Moves the paused clock by `by` and lets the handler react.
@@ -132,8 +172,8 @@ const SECOND: Duration = Duration::from_secs(1);
 async fn greeted() -> Accepted {
     let mut accepted = spawn_accepted(no_tls()).await;
     send_each(&mut accepted.client, &[hello()]).await;
-    settle().await;
-    assert_eq!(accepted.mesh.admission.in_flight(), 0, "the hello decoded");
+    let admission = &accepted.mesh.admission;
+    settle_until("the hello decoded", || admission.in_flight() == 0).await;
     accepted
 }
 
@@ -176,11 +216,7 @@ async fn a_peers_idle_link_before_its_first_frame_is_never_closed() {
     assert!(!accepted.task.is_finished(), "an hour idle, still open");
 
     send_each(&mut accepted.client, &[invalidate(1)]).await;
-    settle().await;
-    assert_eq!(
-        accepted.inbound.try_recv().expect("served").msg,
-        invalidate(1)
-    );
+    assert_eq!(served(&mut accepted).await, invalidate(1));
     pass(Duration::from_hours(1)).await;
     assert!(!accepted.task.is_finished(), "idle between frames too");
 }
@@ -189,11 +225,7 @@ async fn a_peers_idle_link_before_its_first_frame_is_never_closed() {
 async fn an_unknown_source_that_has_sent_a_frame_is_a_link_and_waits_on() {
     let mut accepted = spawn_accepted(no_tls()).await;
     send_each(&mut accepted.client, &[hello(), invalidate(1)]).await;
-    settle().await;
-    assert_eq!(
-        accepted.inbound.try_recv().expect("served").msg,
-        invalidate(1)
-    );
+    assert_eq!(served(&mut accepted).await, invalidate(1));
 
     pass(Duration::from_hours(1)).await;
     assert!(!accepted.task.is_finished());
@@ -264,16 +296,8 @@ async fn a_frame_that_keeps_arriving_is_not_cut_and_completes() {
         "{FRAME_STALL_TIMEOUT:?} passed in two pauses, but each ended with progress"
     );
     accepted.client.write_all(b).await.expect("the rest");
-    settle().await;
 
-    assert_eq!(
-        accepted
-            .inbound
-            .try_recv()
-            .expect("the frame completed")
-            .msg,
-        invalidate(1)
-    );
+    assert_eq!(served(&mut accepted).await, invalidate(1));
     assert!(!accepted.task.is_finished());
 }
 
@@ -319,11 +343,7 @@ async fn an_idle_link_whose_hello_names_a_peer_at_a_foreign_address_stays_open()
     assert_eq!(dropped.total("first_frame_timeout"), None);
 
     send_each(&mut accepted.client, &[invalidate(1)]).await;
-    settle().await;
-    assert_eq!(
-        accepted.inbound.try_recv().expect("served").msg,
-        invalidate(1)
-    );
+    assert_eq!(served(&mut accepted).await, invalidate(1));
     assert_eq!(accepted.mesh.admission.open(), 1, "the slot is kept");
 }
 
