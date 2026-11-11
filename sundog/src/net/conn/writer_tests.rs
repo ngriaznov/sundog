@@ -28,6 +28,24 @@ fn frame_of(n: u8) -> Bytes {
 }
 
 #[test]
+fn the_replicate_outbox_takes_a_turn_after_four_invalidate_bursts_in_a_row() {
+    use super::writer::{INVALIDATE_BURSTS_PER_REPLICATE_TURN, replicate_turn};
+    assert_eq!(INVALIDATE_BURSTS_PER_REPLICATE_TURN, 4);
+    for streak in 0..INVALIDATE_BURSTS_PER_REPLICATE_TURN {
+        assert!(
+            !replicate_turn(streak),
+            "{streak} bursts: invalidations first"
+        );
+    }
+    for streak in [INVALIDATE_BURSTS_PER_REPLICATE_TURN, 5, u32::MAX] {
+        assert!(
+            replicate_turn(streak),
+            "{streak} bursts: the replicate turn"
+        );
+    }
+}
+
+#[test]
 fn reconnect_delay_is_the_backoff_minus_the_connection_lifetime() {
     assert_eq!(reconnect_delay(Duration::ZERO), RECONNECT_BACKOFF);
     assert_eq!(
@@ -149,7 +167,8 @@ mod scripted {
     use tokio_util::sync::CancellationToken;
 
     use super::super::writer::{
-        LinkEnd, WRITER_BURST_BYTES, WriterState, coalesce_replicate, drain_burst, drive_connection,
+        INVALIDATE_BURSTS_PER_REPLICATE_TURN, LinkEnd, WRITER_BURST_BYTES, WriterState,
+        coalesce_replicate, drain_burst, drive_connection,
     };
     use super::*;
     use crate::net::OutFrame;
@@ -165,6 +184,8 @@ mod scripted {
         fail_flush_at: Option<u32>,
         stall_flush: bool,
         inbound: VecDeque<Option<BytesMut>>,
+        /// Runs on every successful flush: a source that keeps producing.
+        on_flush: Option<Box<dyn Fn() + Send>>,
     }
 
     impl ScriptedLink {
@@ -207,6 +228,9 @@ mod scripted {
             }
             let staged = std::mem::take(&mut self.staged);
             self.accepted.lock().expect("lock").extend(staged);
+            if let Some(on_flush) = &self.on_flush {
+                on_flush();
+            }
             Poll::Ready(Ok(()))
         }
 
@@ -340,6 +364,74 @@ mod scripted {
             "two half-limit frames reach the limit"
         );
         assert_eq!(rig.replicate_rx.len(), 6, "the rest stay in the outbox");
+    }
+
+    /// An invalidation stream that refills the queue during every send never
+    /// lets the invalidate arm go idle; the replicate frame still goes out
+    /// after a bounded number of invalidate bursts, ahead of the later
+    /// invalidations and in order within each class.
+    #[tokio::test(start_paused = true)]
+    async fn a_sustained_invalidation_stream_does_not_starve_the_replicate_outbox() {
+        let mut rig = Rig::new();
+        let queue = Arc::clone(&rig.invalidate);
+        let next = Arc::new(std::sync::atomic::AtomicU8::new(100));
+        let refill = {
+            let next = Arc::clone(&next);
+            move || {
+                let n = next.fetch_add(1, Ordering::Relaxed);
+                queue.push(out_frame(Msg::Invalidate {
+                    cache: SmolStr::new("users"),
+                    key: Bytes::from(vec![n]),
+                    ver: record(n).ver,
+                }));
+            }
+        };
+        refill();
+        let mut link = ScriptedLink {
+            on_flush: Some(Box::new(refill)),
+            fail_flush_at: Some(40),
+            ..ScriptedLink::default()
+        };
+        rig.queue_replicate(1).await;
+        rig.queue_replicate(2).await;
+
+        assert_eq!(rig.drive(&mut link).await, LinkEnd::Closed);
+
+        let sent: Vec<Msg> = link
+            .accepted()
+            .iter()
+            .map(|frame| crate::wire::decode(frame).expect("a frame the writer sent decodes"))
+            .collect();
+        let replicate_at: Vec<usize> = sent
+            .iter()
+            .enumerate()
+            .filter_map(|(at, msg)| matches!(msg, Msg::ReplicateBatch { .. }).then_some(at))
+            .collect();
+        assert_eq!(
+            replicate_at,
+            [INVALIDATE_BURSTS_PER_REPLICATE_TURN as usize],
+            "one invalidation per burst, then the one coalesced replicate burst"
+        );
+        let Msg::ReplicateBatch { recs, .. } = &sent[replicate_at[0]] else {
+            unreachable!("matched above");
+        };
+        assert_eq!(
+            recs.iter().map(|rec| rec.key.clone()).collect::<Vec<_>>(),
+            [record(1).key, record(2).key],
+            "a replicate burst keeps its order"
+        );
+        let keys: Vec<u8> = sent
+            .iter()
+            .filter_map(|msg| match msg {
+                Msg::Invalidate { key, .. } => Some(key[0]),
+                _ => None,
+            })
+            .collect();
+        assert!(keys.len() > 2 * INVALIDATE_BURSTS_PER_REPLICATE_TURN as usize);
+        assert!(
+            keys.windows(2).all(|pair| pair[1] == pair[0] + 1),
+            "invalidations go once each, in the order queued: {keys:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

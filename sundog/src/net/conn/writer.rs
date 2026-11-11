@@ -477,7 +477,21 @@ where
     {
         return end;
     }
+    let mut invalidate_streak = 0u32;
     loop {
+        // A stream of invalidations that never lets the invalidate queue
+        // empty would otherwise keep the replicate arm from running.
+        if replicate_turn(invalidate_streak) {
+            invalidate_streak = 0;
+            if let Some(first) = replicate_rx.take_more() {
+                if let Err(end) =
+                    send_replicate_burst(first, replicate_rx, state, link, cancel).await
+                {
+                    return end;
+                }
+                continue;
+            }
+        }
         let mark_at = state.mark_deadline(Instant::now());
         tokio::select! {
             biased;
@@ -505,24 +519,58 @@ where
                 while let Some(item) = invalidate.try_pop() {
                     burst.push(item.frame);
                 }
+                invalidate_streak = invalidate_streak.saturating_add(1);
                 if let Err(end) = state.send_burst(link, burst, cancel).await {
                     return end;
                 }
             }
             received = replicate_rx.recv() => {
                 let Some(first) = received else { return LinkEnd::PeerGone };
-                let drained = drain_burst(first, replicate_rx);
-                let (burst, unencoded) = coalesce_replicate_counted(drained);
-                state.note_dropped(unencoded);
-                if burst.is_empty() {
-                    continue;
-                }
-                if let Err(end) = state.send_burst(link, burst, cancel).await {
+                invalidate_streak = 0;
+                if let Err(end) =
+                    send_replicate_burst(first, replicate_rx, state, link, cancel).await
+                {
                     return end;
                 }
             }
         }
     }
+}
+
+/// How many invalidate bursts in a row the writer sends while a replicate
+/// frame may be waiting, before it sends one replicate burst.
+pub(super) const INVALIDATE_BURSTS_PER_REPLICATE_TURN: u32 = 4;
+
+/// Whether the writer sends a replicate burst next, though the invalidate
+/// queue may have more: after [`INVALIDATE_BURSTS_PER_REPLICATE_TURN`]
+/// invalidate bursts in a row. Each class stays in order; the turn only
+/// decides which class goes next, so a sustained invalidation stream delays
+/// the replicate outbox by a bounded number of bursts and never starves it.
+/// Pure; unit tested directly.
+pub(super) const fn replicate_turn(invalidate_streak: u32) -> bool {
+    invalidate_streak >= INVALIDATE_BURSTS_PER_REPLICATE_TURN
+}
+
+/// Sends the replicate burst that starts with `first`: the frames
+/// [`drain_burst`] takes behind it, coalesced. Counts the records a failed
+/// re-encode drops.
+async fn send_replicate_burst<L>(
+    first: OutFrame,
+    replicate_rx: &mut OutboxRx,
+    state: &mut WriterState,
+    link: &mut L,
+    cancel: &CancellationToken,
+) -> Result<(), LinkEnd>
+where
+    L: Sink<Bytes, Error = io::Error> + Unpin,
+{
+    let drained = drain_burst(first, replicate_rx);
+    let (burst, unencoded) = coalesce_replicate_counted(drained);
+    state.note_dropped(unencoded);
+    if burst.is_empty() {
+        return Ok(());
+    }
+    state.send_burst(link, burst, cancel).await
 }
 
 /// The peer a writer serves and where it reports.
