@@ -202,7 +202,7 @@ where
     /// of data that lives elsewhere keeps the default. Nodes compare a
     /// cache's mode when it opens, not its resolver, so open the cache with
     /// the same resolver on every node. The book's
-    /// [Choosing a resolver](https://ngriaznov.github.io/sundog/resolvers.html)
+    /// [Choosing a resolver](https://zerosize-dev.github.io/sundog/resolvers.html)
     /// page says when a merging resolver fits and how its values expire.
     pub fn resolver(mut self, resolver: Arc<dyn ConflictResolver>) -> Self {
         self.resolver = resolver;

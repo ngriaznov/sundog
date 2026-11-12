@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/ngriaznov/sundog/main/assets/social-card.png" alt="sundog: an embedded, replicated cache for Rust" width="720">
+  <img src="https://raw.githubusercontent.com/zerosize-dev/sundog/main/assets/social-card.png" alt="sundog: an embedded, replicated cache for Rust" width="720">
 </p>
 
-[![CI](https://github.com/ngriaznov/sundog/actions/workflows/ci.yml/badge.svg)](https://github.com/ngriaznov/sundog/actions/workflows/ci.yml)
+[![CI](https://github.com/zerosize-dev/sundog/actions/workflows/ci.yml/badge.svg)](https://github.com/zerosize-dev/sundog/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/sundog.svg)](https://crates.io/crates/sundog)
 [![docs.rs](https://img.shields.io/docsrs/sundog)](https://docs.rs/sundog)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
@@ -32,7 +32,7 @@ effect that puts extra copies of the sun beside the real one.
 ## See it run
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/ngriaznov/sundog/main/assets/sundog-lens.gif" width="720" alt="The sundog-lens terminal UI during its scripted tour: three nodes join, a fourth and fifth scale the cluster out, an explain overlay shows where one key lives and what each of the five nodes says of reading it, then one node crashes, one leaves gracefully and one restarts while the part-ownership mosaic, member table, throughput chart and event log update">
+  <img src="https://raw.githubusercontent.com/zerosize-dev/sundog/main/assets/sundog-lens.gif" width="720" alt="The sundog-lens terminal UI during its scripted tour: three nodes join, a fourth and fifth scale the cluster out, an explain overlay shows where one key lives and what each of the five nodes says of reading it, then one node crashes, one leaves gracefully and one restarts while the part-ownership mosaic, member table, throughput chart and event log update">
 </p>
 
 `sundog-lens` is a terminal UI that watches a running cluster from outside. It
@@ -44,7 +44,7 @@ it, and `e` explains where a key lives and what each node says of reading it.
 The tour above starts a local fleet of test nodes. It runs on Linux and macOS:
 
 ```sh
-git clone https://github.com/ngriaznov/sundog && cd sundog
+git clone https://github.com/zerosize-dev/sundog && cd sundog
 cargo build --release -p sundog-testnode --features prometheus
 cargo run --release -p sundog-lens -- demo    # the tour
 
@@ -53,7 +53,7 @@ cargo run --release -p sundog-lens -- watch <cluster> --seed host:7946 \
     --metrics 'http://{ip}:9090/metrics'
 ```
 
-`asciinema play assets/sundog-lens.cast` replays the recording. [`demos/`](https://github.com/ngriaznov/sundog/tree/main/demos)
+`asciinema play assets/sundog-lens.cast` replays the recording. [`demos/`](https://github.com/zerosize-dev/sundog/tree/main/demos)
 holds two more terminal demos that kill and restart in-process nodes under write
 load: `cargo run -p sundog-demo -- --nodes 5` and `cargo run --release -p
 sundog-distributed-demo -- --nodes 5` (a `Distributed` cache).
@@ -83,10 +83,10 @@ sundog-distributed-demo -- --nodes 5` (a `Distributed` cache).
   the 1024-event channel gets a lag error and resyncs. `Cache::explain` says why a read of
   a key answers what it does.
 - **Production hooks.** Mutual TLS, Prometheus metrics with health probes, a
-  [Grafana dashboard](https://github.com/ngriaznov/sundog/blob/main/ops/grafana-dashboard.json) and rolling upgrades.
+  [Grafana dashboard](https://github.com/zerosize-dev/sundog/blob/main/ops/grafana-dashboard.json) and rolling upgrades.
 - **Tested against divergence.** Property tests, deterministic network
   simulation, container tests, fuzzing, model checking and a weekly chaos run,
-  described in [Verification](https://ngriaznov.github.io/sundog/verification.html).
+  described in [Verification](https://zerosize-dev.github.io/sundog/verification.html).
 
 ## Modes
 
@@ -123,7 +123,7 @@ grows across a real network; a `Distributed` node reads the keys it does not
 own from an owner, which sets its p99. The servers hold each entry in less
 memory: about 130 to 170 bytes against sundog's 205 to 209.
 
-The [benchmarks page](https://ngriaznov.github.io/sundog/benchmarks.html) has
+The [benchmarks page](https://zerosize-dev.github.io/sundog/benchmarks.html) has
 the method and the Olric and Hazelcast rows. The sundog rows need no container
 backend:
 
@@ -168,33 +168,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Learn more
 
-The [sundog book](https://ngriaznov.github.io/sundog/) holds the detail:
+The [sundog book](https://zerosize-dev.github.io/sundog/) holds the detail:
 
-- [Getting started](https://ngriaznov.github.io/sundog/getting-started.html),
+- [Getting started](https://zerosize-dev.github.io/sundog/getting-started.html),
   [choosing a mode][modes] and a [resolver][resolvers], and the
   [guarantees][guarantees].
-- Running it: [deployment](https://ngriaznov.github.io/sundog/deployment.html)
+- Running it: [deployment](https://zerosize-dev.github.io/sundog/deployment.html)
   (a LAN, Docker, a VPC, Kubernetes, TLS, rolling upgrades),
-  [sizing](https://ngriaznov.github.io/sundog/sizing.html),
-  [tuning](https://ngriaznov.github.io/sundog/tuning.html),
-  [feature flags](https://ngriaznov.github.io/sundog/features.html) and the
-  [operations runbook](https://ngriaznov.github.io/sundog/operations.html).
-- Recipes: [an axum HTTP cache](https://ngriaznov.github.io/sundog/recipes/http-cache.html),
+  [sizing](https://zerosize-dev.github.io/sundog/sizing.html),
+  [tuning](https://zerosize-dev.github.io/sundog/tuning.html),
+  [feature flags](https://zerosize-dev.github.io/sundog/features.html) and the
+  [operations runbook](https://zerosize-dev.github.io/sundog/operations.html).
+- Recipes: [an axum HTTP cache](https://zerosize-dev.github.io/sundog/recipes/http-cache.html),
   [read-through over sqlx][loading], with `get_or_load` and registered loaders,
-  and [a session store](https://ngriaznov.github.io/sundog/recipes/sessions.html).
+  and [a session store](https://zerosize-dev.github.io/sundog/recipes/sessions.html).
 - The [API reference](https://docs.rs/sundog) on docs.rs covers every type and
   method.
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](https://github.com/ngriaznov/sundog/blob/main/LICENSE-APACHE) or [MIT
-license](https://github.com/ngriaznov/sundog/blob/main/LICENSE-MIT) at your option.
+Licensed under either of [Apache License, Version 2.0](https://github.com/zerosize-dev/sundog/blob/main/LICENSE-APACHE) or [MIT
+license](https://github.com/zerosize-dev/sundog/blob/main/LICENSE-MIT) at your option.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in this project by you, as defined in the Apache-2.0 license,
 shall be dual licensed as above, without any additional terms or conditions.
 
-[modes]: https://ngriaznov.github.io/sundog/modes.html
-[resolvers]: https://ngriaznov.github.io/sundog/resolvers.html
-[guarantees]: https://ngriaznov.github.io/sundog/guarantees.html
-[loading]: https://ngriaznov.github.io/sundog/recipes/read-through.html
+[modes]: https://zerosize-dev.github.io/sundog/modes.html
+[resolvers]: https://zerosize-dev.github.io/sundog/resolvers.html
+[guarantees]: https://zerosize-dev.github.io/sundog/guarantees.html
+[loading]: https://zerosize-dev.github.io/sundog/recipes/read-through.html

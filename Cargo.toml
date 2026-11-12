@@ -9,6 +9,6 @@ exclude = ["sundog/fuzz"]
 edition = "2024"
 rust-version = "1.97"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/ngriaznov/sundog"
+repository = "https://github.com/zerosize-dev/sundog"
 authors = ["sundog contributors"]
 description = "Embedded, replicated, zeroconf cache: no server, no coordinator, no config beyond a cluster name"

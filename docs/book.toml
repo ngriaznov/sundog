@@ -8,8 +8,8 @@ src = "src"
 create-missing = false
 
 [output.html]
-git-repository-url = "https://github.com/ngriaznov/sundog"
-edit-url-template = "https://github.com/ngriaznov/sundog/edit/main/docs/{path}"
+git-repository-url = "https://github.com/zerosize-dev/sundog"
+edit-url-template = "https://github.com/zerosize-dev/sundog/edit/main/docs/{path}"
 site-url = "/sundog/"
 
 [output.html.playground]
