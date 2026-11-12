@@ -3,6 +3,18 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.12] – 2026-11-12
+
+### Changed
+
+- **The repository moved to
+  [zerosize-dev/sundog](https://github.com/zerosize-dev/sundog).** The book
+  is at [zerosize-dev.github.io/sundog](https://zerosize-dev.github.io/sundog/),
+  and the old `ngriaznov.github.io/sundog` address no longer serves it. The
+  crate's `repository` and `homepage`, the README, the book's repository and
+  edit links, the rustdoc and the social card point at the new home. The
+  code is unchanged from 0.6.11.
+
 ## [0.6.11] – 2026-11-12
 
 ### Added
