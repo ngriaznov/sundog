@@ -28,8 +28,11 @@ struct SkewRig {
 
 impl SkewRig {
     async fn open(name: &'static str) -> Self {
+        // Steady views: a test that sends one forward, or closes one owner,
+        // loses it when a peer the failure detector marks down for a moment
+        // leaves the sender's peer table or the receiver's view.
         let config =
-            || loopback_config().with(|c| c.max_clock_skew = Some(Duration::from_millis(SKEW_MS)));
+            || steady_config().with(|c| c.max_clock_skew = Some(Duration::from_millis(SKEW_MS)));
         let a = Cluster::builder(name)
             .seeds(std::iter::empty())
             .config(config())

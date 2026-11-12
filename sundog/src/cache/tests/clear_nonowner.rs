@@ -16,7 +16,9 @@ pub(super) async fn three_nodes_the_first_coalescing(
 ) {
     let mut nodes: Vec<(Cluster, Cache<u32, PnCounter>)> = Vec::new();
     for index in 0..3usize {
-        let builder = Cluster::builder(name).config(loopback_config());
+        // Steady views: the one forward of the non-owner's fold is lost when a
+        // peer the failure detector marks down for a moment leaves a view.
+        let builder = Cluster::builder(name).config(steady_config());
         let cluster = match nodes.first() {
             None => builder.seeds(std::iter::empty()),
             Some((seed, _)) => builder.seeds([seed.local_gossip_addr()]),
